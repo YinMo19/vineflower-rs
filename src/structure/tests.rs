@@ -86,7 +86,7 @@ fn switch_breaks_share_one_final_void_return() {
             .count(),
         3
     );
-    assert!(lines.iter().any(|line| line.text == "default: {"));
+    assert_eq!(lines.iter().filter(|line| line.text.starts_with("default:")).count(), 1);
     assert_eq!(
         lines.iter().filter(|line| line.text == "return;").count(),
         1

@@ -9,12 +9,18 @@ use crate::{
 
 use super::*;
 
-// Example extends Object; #9 is Example.side()I and #13 is Example.take(II)I.
-const CLASS: &[u8] = b"\xca\xfe\xba\xbe\0\0\0\x3c\0\x0e\
+// Example extends Object. #9/#13 method refs are side()I/take(II)I;
+// #17 is Example.<init>(String)V, which competes with <init>(Integer)V.
+// #23 is String.<init>()V.
+const CLASS: &[u8] = b"\xca\xfe\xba\xbe\0\0\0\x3c\0\x18\
     \x01\0\x07Example\x07\0\x01\x01\0\x10java/lang/Object\x07\0\x03\
     \x01\0\x04test\x01\0\x03()I\x01\0\x04side\x0c\0\x07\0\x06\x0a\0\x02\0\x08\
     \x01\0\x04take\x01\0\x05(II)I\x0c\0\x0a\0\x0b\x0a\0\x02\0\x0c\
-    \0\x21\0\x02\0\x04\0\0\0\0\0\0\0\0";
+    \x01\0\x06<init>\x01\0\x15(Ljava/lang/String;)V\x0c\0\x0e\0\x0f\x0a\0\x02\0\x10\
+    \x01\0\x16(Ljava/lang/Integer;)V\
+    \x01\0\x10java/lang/String\x07\0\x13\x01\0\x03()V\x0c\0\x0e\0\x15\x0a\0\x14\0\x16\
+    \0\x21\0\x02\0\x04\0\0\0\0\0\x02\
+    \0\x01\0\x0e\0\x0f\0\0\0\x01\0\x0e\0\x12\0\0\0\0";
 
 fn lift(
     bytes: &[u8],
@@ -22,15 +28,25 @@ fn lift(
     major: u16,
     minor: u16,
 ) -> Result<Vec<Line>, StructureError> {
-    let mut class = ClassFile::parse(CLASS).unwrap();
-    class.major_version = major;
-    class.minor_version = minor;
     let method = Member {
         access_flags: 0x0008,
         name_index: 5,
         descriptor_index: 6,
         attributes: vec![],
     };
+    lift_method(bytes, signature, major, minor, &method)
+}
+
+fn lift_method(
+    bytes: &[u8],
+    signature: &str,
+    major: u16,
+    minor: u16,
+    method: &Member<'_>,
+) -> Result<Vec<Line>, StructureError> {
+    let mut class = ClassFile::parse(CLASS).unwrap();
+    class.major_version = major;
+    class.minor_version = minor;
     let code = Code {
         max_stack: 8,
         max_locals: 3,
@@ -44,11 +60,11 @@ fn lift(
     let graph = ControlFlowGraph::build(&instructions, &[]).unwrap();
     let machine = Machine::new(
         &class,
-        &method,
+        method,
         &code,
         &descriptor,
         &options,
-        &str::to_owned,
+        &|name| name.replace('/', "."),
     )
     .unwrap();
     structure(&instructions, &graph, machine)
@@ -95,6 +111,69 @@ fn render(line: &Line) -> (String, Vec<(u32, usize)>) {
         },
     );
     (text, mapping)
+}
+
+#[test]
+fn resumes_a_default_only_switch_at_the_selected_constructor() {
+    let mut bytes = vec![0x2a, 0x1b];
+    lookup(&mut bytes, 0, &[]);
+    bytes.extend([0x01, 0xb7, 0, 17, 0xb1]);
+    let method = Member {
+        access_flags: 0x0001,
+        name_index: 14,
+        descriptor_index: 6,
+        attributes: vec![],
+    };
+    let lines = lift_method(&bytes, "(I)V", 60, 0, &method).unwrap();
+    let (text, mapping) = render(&lines[0]);
+    assert_eq!(text, "this(switch (var1) {\n   default -> (java.lang.String)null;\n});");
+    assert_eq!(mapping.iter().find(|&&(byte, _)| byte == 12), Some(&(12, 1)));
+    assert_eq!(mapping.iter().find(|&&(byte, _)| byte == 13), Some(&(13, 0)));
+    assert_eq!(lines[1].text.as_flat(), "return;");
+    assert!(lift_method(&bytes, "(I)V", 59, 0, &method).is_err());
+}
+
+#[test]
+fn retains_a_nested_allocation_in_the_default_constructor_rule() {
+    let mut bytes = vec![0x2a, 0x1b];
+    lookup(&mut bytes, 0, &[]);
+    bytes.extend([0xbb, 0, 20, 0x59, 0xb7, 0, 23, 0xb7, 0, 17, 0xb1]);
+    let method = Member {
+        access_flags: 0x0001,
+        name_index: 14,
+        descriptor_index: 6,
+        attributes: vec![],
+    };
+    let lines = lift_method(&bytes, "(I)V", 60, 0, &method).unwrap();
+    assert_eq!(
+        render(&lines[0]).0,
+        "this(switch (var1) {\n   default -> new java.lang.String();\n});"
+    );
+}
+
+#[test]
+fn recovers_shared_predicate_continuations_with_edge_polarity() {
+    let mut bytes = vec![0x1a];
+    lookup(&mut bytes, 14, &[(1, 0), (2, 7)]);
+    bytes.extend([
+        0x1b, 0x9c, 0, 19, 0xa7, 0, 14,
+        0x1b, 0x9d, 0, 10, 0xa7, 0, 9,
+        0x1b, 0x9a, 0, 5,
+        0x08, 0xac, 0x06, 0xac,
+    ]);
+    let lines = lift(&bytes, "(II)I", 60, 0).unwrap();
+    let (text, mapping) = render(&lines[0]);
+    assert_eq!(
+        text,
+        "if (switch (var0) {\n   case 1 -> var1 < 0;\n   case 2 -> var1 > 0;\n   default -> var1 == 0;\n}) {"
+    );
+    assert!(mapping.contains(&(29, 1)));
+    assert!(mapping.contains(&(36, 2)));
+    assert!(mapping.contains(&(43, 3)));
+    assert!(!mapping.iter().any(|&(byte, _)| matches!(byte, 32..=34 | 39..=41)));
+    let returns: Vec<_> = lines.iter().filter(|line| line.text.as_flat().starts_with("return "))
+        .map(|line| line.text.as_flat()).collect();
+    assert_eq!(returns, ["return 5;", "return 3;"]);
 }
 
 #[test]

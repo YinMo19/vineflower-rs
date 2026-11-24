@@ -857,6 +857,11 @@ impl<'a, 'c> Writer<'a, 'c> {
                 prefix
             };
             initializers.strip(name, descriptor, &mut instructions);
+            if self.options.decompile_inner {
+                crate::lift::qualified_new::mask_guards(
+                    self.class, method, self.group, &mut instructions, &code.exceptions,
+                )?;
+            }
             let uses_subroutines = instructions[prefix..]
                 .iter()
                 .any(|op| matches!(op.opcode, 0xa8 | 0xa9 | 0xc9));

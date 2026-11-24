@@ -19,6 +19,7 @@ mod numeric;
 mod operations;
 mod overloads;
 pub(crate) mod pattern_dispatch;
+pub(crate) mod qualified_new;
 mod switch_expression;
 
 pub(crate) use anonymous::{AnonymousBindings, AnonymousSite, AnonymousSites};
@@ -300,6 +301,23 @@ impl<'a, 'c> Machine<'a, 'c> {
         &self.class.pool
     }
 
+    pub(crate) fn switch_requires_case_scopes(&self) -> bool {
+        // Regular locals already share a method-wide unique name allocator.
+        // Local classes preserve their JVM source names and can shadow each
+        // other across explicit case blocks.
+        self.options.decompile_inner
+            && self.group.is_some_and(|group| {
+                group.children(self.owner).any(|(_, child)| {
+                    matches!(child.kind, crate::context::NestedKind::Local(_))
+                        && child.method.as_ref().is_some_and(|(name, descriptor)| {
+                            name == self.method_name
+                                && self.class.pool.utf8(self.method.descriptor_index)
+                                    .is_ok_and(|current| descriptor == current)
+                        })
+                })
+            })
+    }
+
     pub(crate) fn ascii_strings(&self) -> bool {
         self.options.ascii_strings
     }
@@ -383,7 +401,10 @@ impl<'a, 'c> Machine<'a, 'c> {
             && let Some(action) = self.enum_switch_action(op.offset)
         {
             return match action {
-                enum_switch::Action::Skip => Ok(Effect::None),
+                enum_switch::Action::Skip => {
+                    self.instruction_has_source = false;
+                    Ok(Effect::None)
+                }
                 enum_switch::Action::Switch(owner) => Ok(Effect::Switch {
                     selector: self.enum_switch_selector(owner)?,
                 }),

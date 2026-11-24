@@ -339,6 +339,14 @@ impl Emitter<'_> {
                 }
                 Effect::Switch { selector } => {
                     let control = control.expect("switch control schedule");
+                    if let Some((target, start)) = self.try_default_constructor_switch(
+                        block, region, machine, depth, &selector, &control,
+                    ) {
+                        block = target;
+                        first_instruction = Some(start);
+                        *pending = offsets;
+                        continue;
+                    }
                     let Some(next) = self.emit_switch(
                         block,
                         region,
@@ -1125,11 +1133,11 @@ impl Emitter<'_> {
             if target != default || dispatch.is_some() {
                 let (text, offsets) = if let Some(dispatch) = dispatch {
                     let (text, offsets) = dispatch.label(key);
-                    (text.to_owned(), offsets)
+                    (Document::from(text), offsets)
                 } else {
                     let text = machine
                         .enum_switch_label(instruction.offset, key)
-                        .map_or_else(|| key.to_string(), str::to_owned);
+                        .unwrap_or_else(|| key.to_string().into());
                     (text, Vec::new())
                 };
                 groups
@@ -1137,6 +1145,11 @@ impl Emitter<'_> {
                     .or_default()
                     .push(CaseLabel { text, offsets });
             }
+        }
+        if let Some((condition, schedule)) = self.try_predicate_switch(
+            block, region, machine, depth, &selector, &groups, default, &control,
+        ) {
+            return self.emit_if(block, region, machine, depth, condition, None, offsets, schedule);
         }
         let join = self
             .layout
@@ -1189,6 +1202,7 @@ impl Emitter<'_> {
             mem::take(offsets),
         );
         let mut arms = Vec::new();
+        let scoped_arms = machine.switch_requires_case_scopes();
         let mut groups = groups.into_iter().peekable();
         while let Some((target, keys)) = groups.next() {
             let fallthrough = groups
@@ -1203,7 +1217,7 @@ impl Emitter<'_> {
             let mut keys = keys.into_iter().peekable();
             while let Some(CaseLabel { mut text, offsets }) = keys.next() {
                 text.insert_str(0, "case ");
-                text.push_str(if keys.peek().is_none() && target != default {
+                text.push_str(if scoped_arms && keys.peek().is_none() && target != default {
                     ": {"
                 } else {
                     ":"
@@ -1211,7 +1225,7 @@ impl Emitter<'_> {
                 self.push(depth + 1, text, offsets);
             }
             if target == default {
-                self.syntax(depth + 1, "default: {");
+                self.syntax(depth + 1, if scoped_arms { "default: {" } else { "default:" });
             }
             let arm = self.branch_arm(target, arm_region, machine, depth + 2)?;
             if let Some(end) = &arm.exit {
@@ -1230,7 +1244,9 @@ impl Emitter<'_> {
                     self.syntax(depth + 2, "break;");
                 }
             }
-            self.syntax(depth + 1, "}");
+            if scoped_arms {
+                self.syntax(depth + 1, "}");
+            }
         }
         self.syntax(depth, "}");
         if arms.is_empty() {

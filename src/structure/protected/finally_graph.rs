@@ -218,8 +218,15 @@ impl BranchedFinally {
             } else {
                 expected.instructions.end
             };
-            let expected_code = &instructions[start..end];
-            let actual_code = &instructions[actual.instructions.clone()];
+            let mut expected_code = &instructions[start..end];
+            let mut actual_code = &instructions[actual.instructions.clone()];
+            if !trim && expected.successors.len() == 1 && actual.successors.len() == 1 {
+                // An inlined cleanup can jump over the exception handler
+                // where the handler's copy simply falls through. The
+                // successor pairing below proves the corresponding target.
+                expected_code = before_unconditional_jump(expected_code);
+                actual_code = before_unconditional_jump(actual_code);
+            }
             if actual_code.len() < expected_code.len()
                 || !actual_code
                     .iter()
@@ -254,6 +261,13 @@ impl BranchedFinally {
             }
         }
         Some((continuation?, removed))
+    }
+}
+
+fn before_unconditional_jump(code: &[Instruction]) -> &[Instruction] {
+    match code {
+        [body @ .., last] if matches!(last.opcode, 0xa7 | 0xc8) => body,
+        _ => code,
     }
 }
 

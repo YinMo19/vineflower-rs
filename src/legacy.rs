@@ -76,6 +76,37 @@ pub fn normalize(
     }
 }
 
+/// Word-level pop/push counts for instructions inside a straight-line proof.
+/// The caller supplies the protected entry height; flow terminators cannot be
+/// composed by this interface.
+pub(crate) fn straight_line_stack_effect(
+    op: &Instruction,
+    pool: &ConstantPool<'_>,
+) -> Option<(u16, u16)> {
+    use frame::Effect;
+
+    if matches!(op.opcode, 0x99..=0xb1 | 0xbf | 0xc6..=0xc9) {
+        return None;
+    }
+    Some(match Effect::of(op, pool).ok()? {
+        Effect::Ordinary { pop, push } => (pop, push),
+        Effect::Read { width, .. } => (0, width),
+        Effect::Write { width, .. } => (width, 0),
+        Effect::Stack => match op.opcode {
+            0x57 => (1, 0),
+            0x58 => (2, 0),
+            0x59 => (1, 2),
+            0x5a => (2, 3),
+            0x5b => (3, 4),
+            0x5c => (2, 4),
+            0x5d => (3, 5),
+            0x5e => (4, 6),
+            0x5f => (2, 2),
+            _ => return None,
+        },
+    })
+}
+
 fn invalid(offset: u32, reason: &'static str) -> LegacyError {
     LegacyError::Invalid { offset, reason }
 }

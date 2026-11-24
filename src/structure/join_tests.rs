@@ -288,7 +288,7 @@ fn switch_fallthrough_can_update_the_dispatch_stack_binding() {
     .unwrap();
     let case_two = lines
         .iter()
-        .position(|line| line.text == "case 2: {")
+        .position(|line| line.text == "case 2:")
         .unwrap();
     assert_eq!(lines[0].text, "int stack0 = 1;");
     assert!(

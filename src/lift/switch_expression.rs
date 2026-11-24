@@ -3,7 +3,8 @@
 use std::{mem, ops::RangeInclusive};
 
 use crate::{
-    descriptor::{Primitive, Type},
+    bytecode::{Instruction, Operand},
+    descriptor::{MethodDescriptor, Primitive, Type},
     source_text::Document,
 };
 
@@ -65,6 +66,71 @@ impl<'a, 'c> Machine<'a, 'c> {
         }
     }
 
+    /// The default rule supplies the final argument to a constructor. The
+    /// receiver and earlier arguments must already be on the untouched
+    /// dispatch stack, and the rule's single value must be legal for the JVM
+    /// descriptor. Use the formal Java type in the yield to keep overload
+    /// selection stable, in particular for `null` and narrow primitives.
+    pub(crate) fn join_default_constructor_value(
+        &self,
+        arm: &Self,
+        constructor: &Instruction,
+        control: &RangeInclusive<u32>,
+        last: u32,
+    ) -> Option<SwitchValue> {
+        let Operand::Constant(index) = constructor.operand else {
+            return None;
+        };
+        let (owner, name, descriptor) = self.class.pool.member_ref(index).ok()?;
+        if constructor.opcode != 0xb7 || name != "<init>" {
+            return None;
+        }
+        let descriptor = MethodDescriptor::parse(descriptor).ok()?;
+        let (expected, prefix) = descriptor.parameters.split_last()?;
+        let receiver_index = self.stack.len().checked_sub(prefix.len() + 1)?;
+        let receiver = &self.stack[receiver_index];
+        match receiver.source {
+            Source::This
+                if !self.initialized_this
+                    && receiver_index == 0
+                    && (owner == self.owner || self.super_class == Some(owner)) => {}
+            Source::New(_) if matches!(&receiver.ty, Type::Object(name) if name == owner) => {}
+            _ => return None,
+        }
+        if descriptor.return_type != Type::Void
+            || self.stack[receiver_index + 1..]
+                .iter()
+                .zip(prefix)
+                .any(|(value, ty)| {
+                    value.is_uninitialized(self.initialized_this)
+                        || Category::of(&value.ty) != Category::of(ty)
+                })
+        {
+            return None;
+        }
+        let value = arm.switch_yield()?;
+        if value
+            .order
+            .is_some_and(|order| order.first <= *control.end() || order.last > last)
+            || (Category::of(expected) == Some(Category::Ref)
+                && !matches!(value.source, Source::Null)
+                && !self.known_assignable(&value.ty, expected))
+        {
+            return None;
+        }
+        let yielded = self.coerce(value.clone(), expected, true).ok()?;
+        if yielded.ty != *expected {
+            return None;
+        }
+        Some(SwitchValue {
+            yields: vec![yielded.text],
+            ty: expected.clone(),
+            order: Order {
+                first: *control.start(),
+                last,
+            },
+        })
+    }
     pub(crate) fn join_switch_values(
         &self,
         arms: &[&Self],

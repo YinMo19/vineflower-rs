@@ -12,7 +12,7 @@ use crate::{
     classfile::{ClassFile, Constant, ConstantPool, ExceptionHandler, Member, find_attribute},
     context::NestedKind,
     descriptor::{MethodDescriptor, Type},
-    source_text::Document,
+    source_text::{Document, tokens::{Token, TokenKind}},
 };
 
 use super::{Effect, LiftError, Machine, expr::Category};
@@ -276,7 +276,7 @@ impl<'a, 'c> Machine<'a, 'c> {
         )
     }
 
-    pub(crate) fn enum_switch_label(&self, offset: u32, key: i32) -> Option<&str> {
+    pub(crate) fn enum_switch_label(&self, offset: u32, key: i32) -> Option<Document> {
         let (descriptor, label) = self.group?.enum_switches().label(
             self.owner,
             self.enum_switch_method(),
@@ -284,7 +284,16 @@ impl<'a, 'c> Machine<'a, 'c> {
             key,
             self.options.decompile_inner,
         )?;
-        Some(self.source_field_name(object_descriptor(descriptor)?, label, descriptor))
+        let owner = object_descriptor(descriptor)?;
+        let visible = self.source_field_name(owner, label, descriptor);
+        let mut doc = Document::from(visible);
+        if self.options.dump_text_tokens {
+            doc.token_at(0..doc.len(), Token {
+                declaration: false,
+                kind: TokenKind::Field { owner: owner.into(), name: label.into(), descriptor: descriptor.into() },
+            });
+        }
+        Some(doc)
     }
 
     pub(super) fn enum_switch_selector(&mut self, enum_name: &str) -> Result<Document, LiftError> {

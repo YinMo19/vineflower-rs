@@ -10,7 +10,7 @@ use super::protected::{
     Catch, ExceptionId, Legacy, LegacyExit, Monitor, ProtectedRegion, cleanup_locals,
     local_touches, reference_load, reference_store,
 };
-use super::{Emitter, Region, StructureError};
+use super::{Emitter, Line, Region, StructureError};
 
 struct Resource {
     acquisition: usize,
@@ -33,6 +33,78 @@ enum CloseExit {
         transfer: usize,
         local: cleanup_locals::Local,
     },
+}
+
+// Return the header length only when these lines form a single catchless
+// resource statement. Independent statements and clauses stay nested.
+fn resource_header_length(lines: &[Line], depth: usize) -> Option<usize> {
+    let (end, content) = lines.split_last()?;
+    let (header, tail) = content.split_first()?;
+    if end.depth != depth
+        || end.text.as_flat() != "}"
+        || !end.offsets.is_empty()
+        || header.depth != depth
+    {
+        return None;
+    }
+    let header_text = header.text.as_flat();
+    let length = if header_text == "try (" && header.offsets.is_empty() {
+        let close = tail.iter().position(|line| line.depth <= depth)?;
+        if close < 2
+            || tail[close].depth != depth
+            || tail[close].text.as_flat() != ") {"
+            || !tail[close].offsets.is_empty()
+            || !tail[..close].iter().all(|line| line.depth == depth + 1)
+        {
+            return None;
+        }
+        close + 2
+    } else if header_text.starts_with("try (") && header_text.ends_with(") {") {
+        1
+    } else {
+        return None;
+    };
+    content[length..]
+        .iter()
+        .all(|line| line.depth > depth)
+        .then_some(length)
+}
+
+fn split_resource_declaration(line: &mut Line, depth: usize, needs_separator: bool) {
+    let end = line.text.as_flat().len() - ") {".len();
+    line.text.truncate(end);
+    line.text.replace_literal_prefix("try (".len(), "");
+    if needs_separator {
+        line.text.push(';');
+    }
+    line.depth = depth;
+}
+
+fn merge_nested_resource(lines: &mut Vec<Line>, outer: usize, depth: usize) {
+    let inner = outer + 1;
+    let Some(length) = resource_header_length(&lines[inner..], depth + 1) else {
+        return;
+    };
+    // JLS lowering of multiple resources is precisely this nesting:
+    // acquire in declaration order, close in reverse, preserving suppression.
+    lines.pop();
+    split_resource_declaration(&mut lines[outer], depth + 1, true);
+    let body = if length == 1 {
+        split_resource_declaration(&mut lines[inner], depth + 1, false);
+        lines.insert(inner + 1, Line::new(depth, ") {", Vec::new()));
+        inner + 2
+    } else {
+        lines.remove(inner);
+        let body = inner + length - 1;
+        for line in &mut lines[inner..body] {
+            line.depth -= 1;
+        }
+        body
+    };
+    for line in &mut lines[body..] {
+        line.depth -= 1;
+    }
+    lines.insert(outer, Line::new(depth, "try (", Vec::new()));
 }
 
 impl Emitter<'_> {
@@ -186,17 +258,7 @@ impl Emitter<'_> {
     }
 
     fn fuse_resource_wrapper(&mut self, wrapper: usize, depth: usize) {
-        let lines = &self.lines[wrapper..];
-        let [_, header, middle @ .., end] = lines else {
-            return;
-        };
-        if header.depth != depth + 1
-            || !header.text.as_flat().starts_with("try (")
-            || end.depth != depth + 1
-            || end.text.as_flat() != "}"
-            || !end.offsets.is_empty()
-            || middle.iter().any(|line| line.depth <= depth + 1)
-        {
+        if resource_header_length(&self.lines[wrapper + 1..], depth + 1).is_none() {
             return;
         }
         self.lines.pop();
@@ -370,6 +432,7 @@ impl Emitter<'_> {
                 None
             }
         };
+        merge_nested_resource(&mut self.lines, resource.acquisition, depth);
         self.syntax(depth, "}");
         machine.forget_resource_local(resource.slot);
         Ok(next)

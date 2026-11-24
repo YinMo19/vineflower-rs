@@ -324,6 +324,32 @@ fn branched_finally_matches_each_edge_and_preserves_an_overriding_return() {
 }
 
 #[test]
+fn branched_finally_matches_fallthrough_to_an_explicit_jump() {
+    let mut bytes = [
+        0xb8, 0, 22,   // 0: try body
+        0x2a, 0xc6, 0, 19, // 3: normal cleanup; ifnull 23
+        0xb8, 0, 22,   // 7: work
+        0xa7, 0, 13,   // 10: jump over the exceptional copy
+        0x4c, 0x2a, 0xc6, 0, 6, // 13: exceptional cleanup; ifnull 21
+        0xb8, 0, 22,   // 18: work; fall through to 21
+        0x2b, 0xbf,   // 21: rethrow the original exception
+        0xb1, // 23: normal continuation
+    ];
+    let handlers = [handler(0, 3, 13, 0)];
+    let lines = test_method(&bytes, &handlers, &[]).unwrap();
+    assert_eq!(lines[0].text, "try {");
+    assert_eq!(lines[2].text, "} finally {");
+    assert_eq!(
+        lines.iter().filter(|line| line.text == "C.work();").count(),
+        2
+    );
+
+    bytes[12] = 3; // Explicit jump now enters the exception handler.
+    let (_, regions) = classify(&bytes, &handlers);
+    assert!(matches!(regions, Err(StructureError::ExceptionHandlers)));
+}
+
+#[test]
 fn each_branched_finally_copy_projects_to_one_proven_continuation() {
     let mut bytes = vec![
         0x2a, // 0: aload_0
@@ -486,6 +512,97 @@ fn nullable_resource_return_preserves_the_value_before_closing() {
         ]
     );
     assert_eq!(lines[1].depth, 1);
+}
+
+#[test]
+fn primitive_resource_return_can_extend_to_an_exclusive_unprotected_tail() {
+    let bytes = [
+        0x2a, 0x4c, // 0: aload_0; astore_1
+        0x08, 0x3d, // 2: iconst_5; istore_2
+        0x2b, 0xc6, 0, 9, // 4: aload_1; ifnull 14
+        0x2b, 0xb9, 0, 13, 1, 0, // 8: aload_1; close
+        0x1c, 0xac, // 14: iload_2; ireturn (outside ambient catch range)
+        0x4d, 0x2b, 0xc6, 0, 18, // 16: save original exception; ifnull 36
+        0x2b, 0xb9, 0, 13, 1, 0, // 21: aload_1; close
+        0xa7, 0, 9, // 27: goto 36
+        0x4e, 0x2c, 0x2d, 0xb6, 0, 19, // 30: addSuppressed
+        0x2c, 0xbf, // 36: rethrow original exception
+        0x4c, 0x10, 0xfe, 0xac, // 38: ambient catch; return -2
+    ];
+    let handlers = [
+        handler(2, 4, 16, 15),
+        handler(21, 27, 30, 15),
+        handler(0, 14, 38, 24),
+        handler(16, 38, 38, 24),
+    ];
+    let lines =
+        test_method_with_descriptor(&bytes, &handlers, &[], "(Ljava/lang/AutoCloseable;)I").unwrap();
+    let text: Vec<_> = lines.iter().map(|line| line.text.as_flat()).collect();
+    assert_eq!(
+        text,
+        [
+            "try (java.lang.AutoCloseable var1 = var0) {",
+            "return 5;",
+            "} catch (java.io.IOException var1_1) {",
+            "return -2;",
+            "}",
+        ]
+    );
+    assert_eq!(lines[1].offsets, [2, 15]);
+}
+
+#[test]
+fn catchless_nested_resources_share_one_header_and_keep_acquisition_offsets() {
+    let bytes = [
+        0x2a, 0x4d, // 0: outer resource declaration
+        0x2b, 0x4e, // 2: inner resource declaration
+        0xb8, 0, 22, // 4: work under both resources
+        0x2d, 0xc6, 0, 39, // 7: if inner resource is null, go to 47
+        0x2d, 0xb9, 0, 13, 1, 0, // 11: normal inner close
+        0xa7, 0, 30, // 17: goto 47
+        0x3a, 4, 0x2d, 0xc6, 0, 21, // 20: save throwable; ifnull 44
+        0x2d, 0xb9, 0, 13, 1, 0, // 26: exceptional inner close
+        0xa7, 0, 12, // 32: goto 44
+        0x3a, 5, 0x19, 4, 0x19, 5, 0xb6, 0, 19, // 35: addSuppressed
+        0x19, 4, 0xbf, // 44: rethrow inner exception
+        0x2c, 0xc6, 0, 39, // 47: if outer resource is null, go to 87
+        0x2c, 0xb9, 0, 13, 1, 0, // 51: normal outer close
+        0xa7, 0, 30, // 57: goto 87
+        0x3a, 4, 0x2c, 0xc6, 0, 21, // 60: save throwable; ifnull 84
+        0x2c, 0xb9, 0, 13, 1, 0, // 66: exceptional outer close
+        0xa7, 0, 12, // 72: goto 84
+        0x3a, 5, 0x19, 4, 0x19, 5, 0xb6, 0, 19, // 75: addSuppressed
+        0x19, 4, 0xbf, // 84: rethrow outer exception
+        0xb1, // 87: return
+    ];
+    let handlers = [
+        handler(4, 7, 20, 15),
+        handler(26, 32, 35, 15),
+        handler(2, 47, 60, 15),
+        handler(66, 72, 75, 15),
+    ];
+    let lines = test_method_with_descriptor(
+        &bytes,
+        &handlers,
+        &[],
+        "(Ljava/lang/AutoCloseable;Ljava/lang/AutoCloseable;)V",
+    )
+    .unwrap();
+    let text: Vec<_> = lines.iter().map(|line| line.text.as_flat()).collect();
+    assert_eq!(
+        &text[..6],
+        [
+            "try (",
+            "java.lang.AutoCloseable var2 = var0;",
+            "java.lang.AutoCloseable var3 = var1",
+            ") {",
+            "C.work();",
+            "}",
+        ]
+    );
+    assert!(lines[1].offsets.contains(&1));
+    assert!(lines[2].offsets.contains(&3));
+    assert_eq!(lines[1].depth, lines[4].depth);
 }
 
 #[test]

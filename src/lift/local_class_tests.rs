@@ -28,6 +28,92 @@ fn local_class_cannot_recover_a_capture_from_a_mutating_slot() {
     assert!(error.to_string().contains("effectively final"));
 }
 
+#[test]
+fn qualified_new_checks_receiver_before_evaluating_explicit_arguments() {
+    let (outer, inner) = qualified_inputs();
+    let source = decompile_group(&outer, [&inner[..]], &Options::default()).unwrap();
+
+    assert!(source.text.contains("return outer.new Inner(Outer.argument());"), "{}", source.text);
+    assert!(!source.text.contains("requireNonNull"), "{}", source.text);
+}
+
+#[test]
+fn qualified_new_proof_does_not_cross_an_exception_boundary_or_a_receiver_replacement() {
+    use crate::{ClassGroup, bytecode::{Operand, decode}, classfile::ExceptionHandler};
+    use crate::lift::qualified_new::mask_guards;
+    let (outer, inner) = qualified_inputs();
+    let group = ClassGroup::new([&outer[..], &inner[..]]).unwrap();
+    let class = group.get("Outer").unwrap();
+    let method = &class.methods[0];
+    let code = method.code(&class.pool).unwrap().unwrap();
+    let original = decode(code.bytes).unwrap();
+
+    let mut protected = original.clone();
+    let call = u16::try_from(original[4].offset).unwrap();
+    let ret = u16::try_from(original.last().unwrap().offset).unwrap();
+    let handlers = [ExceptionHandler { start_pc: call, end_pc: ret, handler_pc: ret, catch_type: 0 }];
+    mask_guards(class, method, &group, &mut protected, &handlers).unwrap();
+    assert_eq!(protected, original);
+
+    // A discarded qualifier is no longer the argument of this constructor.
+    let mut changed = original;
+    changed[6].opcode = 0x57;
+    changed[6].operand = Operand::None;
+    mask_guards(class, method, &group, &mut changed, &[]).unwrap();
+    assert_eq!(changed[3].opcode, 0x59);
+    assert_eq!(changed[4].opcode, 0xb8);
+}
+
+fn qualified_inputs() -> (Vec<u8>, Vec<u8>) {
+    let mut outer = Pool::default();
+    let class = outer.class("Outer");
+    let object = outer.class("java/lang/Object");
+    let inner = outer.class("Outer$Inner");
+    let objects = outer.class("java/util/Objects");
+    let constructor = outer.member(10, inner, "<init>", "(LOuter;I)V");
+    let require_nonnull = outer.member(10, objects, "requireNonNull", "(Ljava/lang/Object;)Ljava/lang/Object;");
+    let argument = outer.member(10, class, "argument", "()I");
+    let mut body = Vec::new();
+    push_op(&mut body, 0xbb, inner);
+    body.extend([0x59, 0x2a, 0x59]);
+    push_op(&mut body, 0xb8, require_nonnull);
+    body.push(0x57);
+    push_op(&mut body, 0xb8, argument);
+    push_op(&mut body, 0xb7, constructor);
+    body.push(0xb0);
+    let parameter = outer.utf8("outer");
+    let parameter_type = outer.utf8("LOuter;");
+    let variables = outer.attribute("LocalVariableTable", &words(&[1, 0, body.len() as u16, parameter, parameter_type, 0]));
+    let make_code = outer.code(4, 1, &body, &[variables]);
+    let make_name = outer.utf8("make");
+    let make_type = outer.utf8("(LOuter;)LOuter$Inner;");
+    let argument_name = outer.utf8("argument");
+    let argument_type = outer.utf8("()I");
+    let argument_code = outer.code(1, 0, &[0x10, 7, 0xac], &[]);
+    let simple = outer.utf8("Inner");
+    let relationship = outer.attribute("InnerClasses", &words(&[1, inner, class, simple, 1]));
+    let outer = outer.classfile(class, object, &[], &[
+        member(0x0008, make_name, make_type, &[make_code]),
+        member(0x0008, argument_name, argument_type, &[argument_code]),
+    ], &[relationship]);
+
+    let mut inner = Pool::default();
+    let class = inner.class("Outer$Inner");
+    let enclosing = inner.class("Outer");
+    let object = inner.class("java/lang/Object");
+    let init = inner.member(10, object, "<init>", "()V");
+    let mut body = vec![0x2a];
+    push_op(&mut body, 0xb7, init);
+    body.push(0xb1);
+    let code = inner.code(1, 3, &body, &[]);
+    let name = inner.utf8("<init>");
+    let ty = inner.utf8("(LOuter;I)V");
+    let simple = inner.utf8("Inner");
+    let relationship = inner.attribute("InnerClasses", &words(&[1, class, enclosing, simple, 1]));
+    let inner = inner.classfile(class, object, &[], &[member(1, name, ty, &[code])], &[relationship]);
+    (outer, inner)
+}
+
 fn inputs(mutate: bool) -> (Vec<u8>, Vec<u8>) {
     let mut outer = Pool::default();
     let class = outer.class("CaptureLocal");
