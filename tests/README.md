@@ -71,6 +71,7 @@ Exact upstream comparison with all fixture bytecode and required JDKs:
 | Generic local types, assignment widening and Java preview templates | 129 | 146 | 422 | 0 |
 | Constructor argument patterns, record `instanceof`, nested resource returns and Kotlin extensions | 129 | 140 | 428 | 0 |
 | Boolean layout, compact records, nested monitors/resources and typed calls | 135 | 131 | 431 | 0 |
+| Nested record and nullable recovery, proven varargs, switch source maps | 138 | 127 | 432 | 0 |
 
 All eight upstream CLI and bulk cases match. The full test remains failing
 until all 697 comparisons match.
