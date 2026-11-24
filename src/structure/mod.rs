@@ -807,7 +807,7 @@ impl Emitter<'_> {
         let arm_entry = |target| {
             assigned_test
                 .as_ref()
-                .filter(|test| test.target == target)
+                .filter(|test| test.target.is_none_or(|assigned| assigned == target))
                 .map_or(&*machine, |test| &test.state)
         };
         let then = self.instanceof_branch_arm(

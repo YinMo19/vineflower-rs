@@ -919,6 +919,85 @@ impl<'c> Machine<'_, 'c> {
         (ty == value.ty).then_some(!same)
     }
 
+    /// A decision graph may split an initialized slot into a separate source
+    /// declaration, but it may not change its category or evict a wide neighbor.
+    pub(crate) fn has_only_predicate_local(&self, evaluated: &Self, index: u16) -> bool {
+        let index = usize::from(index);
+        self.initialized_this == evaluated.initialized_this
+            && self.early_final_fields == evaluated.early_final_fields
+            && self.locals.slots.iter().zip(&evaluated.locals.slots).enumerate().all(
+                |(slot, (before, after))| {
+                    if slot == index {
+                        after.as_ref().is_some_and(|new| {
+                            before.as_ref().is_none_or(|old| {
+                                !old.receiver && old.ty == new.ty && old != new
+                            })
+                        })
+                    } else {
+                        before == after
+                    }
+                },
+            )
+    }
+
+    /// Keep the trial's helper registrations and reconnect the accepted
+    /// branch state to the method's registry before it lifts the arm.
+    pub(crate) fn commit_predicate_state(&self, state: &mut Self) {
+        self.commit_switch_dynamic_helpers(state);
+        state.dynamic_helpers.clone_from(&self.dynamic_helpers);
+    }
+
+    /// Forks may reach separate LVT fragments for the same source variable.
+    /// Install the selected declaration for this exact store only; the caller
+    /// checks the duplicated value and retains the canonical state for edges.
+    pub(crate) fn use_predicate_store_binding(
+        &mut self,
+        source: &Self,
+        store: &Instruction,
+        index: u16,
+    ) -> Option<()> {
+        let mut binding = source.locals.slots.get(usize::from(index))?.as_ref()?.clone();
+        binding.debug_range = self.predicate_local_fragment(index, &binding, self.store_debug(store, index))?;
+        self.locals.slots[usize::from(index)] = Some(binding);
+        Some(())
+    }
+
+    pub(crate) fn finish_predicate_local(&mut self, index: u16, [first, second]: [u32; 2]) {
+        let binding = self.locals.slots[usize::from(index)].as_ref().expect("proved predicate local");
+        let debug = self.locals.debug_at(index, self.debug_offset(first)).copied();
+        let other = self.locals.debug_at(index, self.debug_offset(second));
+        if debug.as_ref().map(local_key) != other.map(local_key) {
+            return;
+        }
+        let Some(range) = self.predicate_local_fragment(index, binding, debug) else { return };
+        self.locals.slots[usize::from(index)].as_mut().unwrap().debug_range = range;
+    }
+
+    fn predicate_local_fragment(
+        &self,
+        index: u16,
+        binding: &Local,
+        debug: Option<LocalVariable<'c>>,
+    ) -> Option<Option<(u16, u16)>> {
+        let Some(debug) = debug else { return binding.debug_range.is_none().then_some(None) };
+        let original = self.locals.debug.iter().find(|entry| {
+            entry.index == index && Some((entry.start_pc, entry.length)) == binding.debug_range
+        })?;
+        let range = (debug.start_pc, debug.length);
+        // Capture proof uses the physical LVT range to count writes.
+        if self.anonymous_source.is_some() && Some(range) != binding.debug_range {
+            return None;
+        }
+        if original.name != debug.name || original.descriptor != debug.descriptor
+            || Type::parse(debug.descriptor).ok()? != binding.ty
+            || self.locals.declaration_signature(&binding.ty, Some(&debug)).is_some()
+            || !matches!(self.annotated_local_type(index, range, (&binding.ty).into()), Ok(None))
+        {
+            return None;
+        }
+        Some(Some(range))
+    }
+
     pub(super) fn pattern_store_type(
         &self, store: &Instruction, index: u16,
     ) -> Result<Option<Type>, LiftError> {
@@ -1051,6 +1130,10 @@ impl<'c> Machine<'_, 'c> {
         let Source::Local(slot) = value.source else { return None };
         let local = self.locals.slots.get(usize::from(slot))?.as_ref()?;
         (value.ty == local.ty && value.text == local.name).then_some(local)
+    }
+
+    pub(super) fn is_current_local_value(&self, value: &Expr) -> bool {
+        self.source_local(value).is_some()
     }
 
     fn anonymous_origin(&self, value: &Expr) -> Option<AnonymousOrigin> {

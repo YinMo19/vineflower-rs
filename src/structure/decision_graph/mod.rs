@@ -9,16 +9,31 @@ use crate::source_text::{Document, Infix};
 
 use super::{Condition, Emitter, Region, logical};
 
+mod assigned;
+
 /// Keep speculative analysis and recursive rendering bounded, just like the
 /// enclosing region emitter. Larger graphs remain ordinary control flow.
 const MAX_NODES: usize = 128;
 
 impl Emitter<'_> {
-    /// The inner predicate assigns a local on the bypass edge. The other
-    /// two edges enter one initializer, so Java's `||` definite-assignment
-    /// rule expresses the join without copying the initializer or reading
-    /// the assigned value along the short-circuited edge.
+    /// Recover an edge-dependent blank local without evaluating its initializer
+    /// on any path that bypasses the actual JVM store.
     pub(super) fn collapse_assigned_test<'a, 'c>(
+        &mut self,
+        head: usize,
+        region: Region<'_, 'a, 'c>,
+        machine: &mut Machine<'a, 'c>,
+        condition: &mut Condition,
+        offsets: &mut Vec<u32>,
+        control: &mut RangeInclusive<u32>,
+    ) -> Option<AssignedTest<'a, 'c>> {
+        self.collapse_shared_assigned_test(head, region, machine, condition, offsets, control)
+            .or_else(|| self.collapse_assigned_decisions(
+                head, region, machine, condition, offsets, control,
+            ))
+    }
+
+    fn collapse_shared_assigned_test<'a, 'c>(
         &mut self,
         head: usize,
         region: Region<'_, 'a, 'c>,
@@ -35,24 +50,24 @@ impl Emitter<'_> {
         {
             return None;
         }
-        let target = self.layout.normal_join(head, region)?;
-        if region.post_test_latch() == Some(target)
-            || target == condition.taken
-            || target == condition.fallthrough
-        {
-            return None;
-        }
-        let (inner, missing) = [
+        let join = self.layout.normal_join(head, region)?;
+        let (inner, missing, target) = [
             (condition.fallthrough, condition.taken),
             (condition.taken, condition.fallthrough),
         ]
         .into_iter()
-        .find(|&(inner, missing)| {
+        .find_map(|(inner, missing)| {
             let test = &self.graph.blocks[inner];
             let shared = &self.graph.blocks[missing];
-            test.successors.len() == 2
-                && test.successors.contains(&target)
-                && test.successors.contains(&missing)
+            let &[a, b] = test.successors.as_slice() else { return None };
+            let target = if a == missing { b } else if b == missing { a } else { return None };
+            let assigned = &self.graph.blocks[target];
+            (region.post_test_latch() != Some(target)
+                && (target == join || (assigned.predecessors.as_slice() == [inner]
+                    && assigned.exception_predecessors.is_empty()
+                    && !self.emitted[target]
+                    && self.layout.inside(target, region)
+                    && region.loop_transfer(target).is_none()))
                 && shared.predecessors.len() == 2
                 && shared.predecessors.contains(&head)
                 && shared.predecessors.contains(&inner)
@@ -60,22 +75,13 @@ impl Emitter<'_> {
                 && !self.emitted[missing]
                 && self.layout.inside(missing, region)
                 && region.loop_transfer(missing).is_none()
-                && self.decision_block_available(head, region, inner, *control.end(), |p| p == head)
+                && self.decision_block_available(head, region, inner, *control.end(), |p| p == head))
+                .then_some((inner, missing, target))
         })?;
         let instructions = self.instructions;
         let instructions = &instructions[self.graph.blocks[inner].instructions.clone()];
-        let [prefix @ .., dup, store, tail] = instructions else {
-            return None;
-        };
-        let (slots, false) = store.local_access()? else {
-            return None;
-        };
-        let slot = u16::try_from(slots.start).ok()?;
-        if !matches!(dup.opcode, 0x59 | 0x5c)
-            || !matches!(tail.opcode, 0x99..=0xa6 | 0xc6..=0xc7)
-            || !prefix.iter().all(expression_op)
-            || !self.local_is_live(target, slot)
-        {
+        let (tail, prefix) = instructions.split_last()?;
+        if !matches!(tail.opcode, 0x99..=0xa6 | 0xc6..=0xc7) || !has_test_assignment(prefix) {
             return None;
         }
         let mut state = machine.switch_arm_entry(control).ok()?;
@@ -83,14 +89,22 @@ impl Emitter<'_> {
         let sites = machine.switch_anonymous_checkpoint();
         let result = (|| {
             let mut mapped = Vec::new();
-            lift_test_prefix(prefix, &mut state, &mut mapped)?;
-            let assignment = &instructions[prefix.len()..prefix.len() + 2];
-            let step = state.step_assignment(assignment, |_, _| true).ok()??;
-            let declaration = step.declaration?;
-            if step.consumed != 2
-                || !matches!(step.effect, Effect::None)
-                || !state.take_prelude().is_empty()
-            {
+            let mut declaration = None;
+            let mut written = None;
+            lift_test_prefix(prefix, &mut state, &mut mapped, |trial, pair, slot| {
+                if written.is_some_and(|other| other != slot) {
+                    return None;
+                }
+                written = Some(slot);
+                if let Some(blank) = lift_test_assignment(trial, pair)? {
+                    if declaration.replace(blank).is_some() {
+                        return None;
+                    }
+                }
+                Some(())
+            })?;
+            let (declaration, slot) = (declaration?, written?);
+            if !self.local_is_live(target, slot) || self.local_is_live(missing, slot) {
                 return None;
             }
             let Effect::Branch { target, when_true, when_false } = state.step(tail).ok()? else {
@@ -103,16 +117,15 @@ impl Emitter<'_> {
                 return None;
             }
             let (taken, _) = self.branch_targets(inner, target).ok()?;
-            mapped.extend(store.offset..store.offset + store.len);
             mapped.extend(tail.offset..tail.offset + tail.len);
             let tests = if taken == missing {
                 (when_true, when_false)
             } else {
                 (when_false, when_true)
             };
-            Some((declaration, mapped, tests))
+            Some((declaration, slot, mapped, tests))
         })();
-        let Some((declaration, mapped, (inner_missing, inner_assigned))) = result else {
+        let Some((declaration, slot, mapped, (inner_missing, inner_assigned))) = result else {
             machine.restore_local_names(names);
             machine.restore_switch_anonymous_sites(sites);
             return None;
@@ -131,8 +144,8 @@ impl Emitter<'_> {
         self.emitted[inner] = true;
         offsets.extend(mapped);
         *control = *control.start()..=tail.offset;
-        machine.commit_switch_dynamic_helpers(&state);
-        Some(AssignedTest { target, state, declaration, slot })
+        machine.commit_predicate_state(&mut state);
+        Some(AssignedTest { target: Some(target), state, declaration, slot })
     }
 
     pub(super) fn collapse_decision_graph<'a, 'c>(
@@ -335,7 +348,7 @@ impl Emitter<'_> {
                 if matches!(op.opcode, 0xa7 | 0xc8) && matches!(op.operand, Operand::Branch(_))),
             2 => ops.split_last().is_some_and(|(tail, expression)| {
                 matches!(tail.opcode, 0x99..=0xa6 | 0xc6..=0xc7)
-                    && expression.iter().all(expression_op)
+                    && test_expression_ops(expression)
             }),
             _ => false,
         }
@@ -388,7 +401,9 @@ impl Emitter<'_> {
         // the retained input or evaluates independently of the old prefix.
         let mut trial = entry.clone();
         let mut offsets = Vec::new();
-        lift_test_prefix(expression, &mut trial, &mut offsets)?;
+        lift_test_prefix(expression, &mut trial, &mut offsets, |trial, pair, _| {
+            lift_test_assignment(trial, pair)?.is_none().then_some(())
+        })?;
         let Effect::Branch {
             target,
             when_true,
@@ -416,7 +431,8 @@ impl Emitter<'_> {
 }
 
 pub(super) struct AssignedTest<'a, 'c> {
-    pub(super) target: usize,
+    /// `None` means the condition has definitely assigned the local on both outcomes.
+    pub(super) target: Option<usize>,
     pub(super) state: Machine<'a, 'c>,
     pub(super) declaration: Document,
     pub(super) slot: u16,
@@ -430,20 +446,61 @@ fn expression_op(op: &Instruction) -> bool {
     )
 }
 
-fn lift_test_prefix(
-    expression: &[Instruction],
-    trial: &mut Machine<'_, '_>,
+fn lift_test_prefix<'a, 'c>(
+    mut expression: &[Instruction],
+    trial: &mut Machine<'a, 'c>,
     offsets: &mut Vec<u32>,
+    mut assign: impl FnMut(&mut Machine<'a, 'c>, &[Instruction], u16) -> Option<()>,
 ) -> Option<()> {
-    for op in expression {
-        if !matches!(trial.step(op).ok()?, Effect::None) || !trial.take_prelude().is_empty() {
+    while let [op, rest @ ..] = expression {
+        if let Some((store, slot)) = test_assignment(expression) {
+            assign(trial, &expression[..2], slot)?;
+            offsets.extend(store.offset..store.offset + store.len);
+            expression = &rest[1..];
+            continue;
+        }
+        if !expression_op(op)
+            || !matches!(trial.step(op).ok()?, Effect::None)
+            || !trial.take_prelude().is_empty()
+        {
             return None;
         }
         if trial.instruction_has_source() {
             offsets.extend(op.offset..op.offset + op.len);
         }
+        expression = rest;
     }
     Some(())
+}
+
+fn has_test_assignment(expression: &[Instruction]) -> bool {
+    expression.windows(2).any(|pair| test_assignment(pair).is_some())
+}
+
+fn test_expression_ops(mut expression: &[Instruction]) -> bool {
+    while let [op, rest @ ..] = expression {
+        if test_assignment(expression).is_some() {
+            expression = &rest[1..];
+        } else if expression_op(op) {
+            expression = rest;
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+fn test_assignment(expression: &[Instruction]) -> Option<(&Instruction, u16)> {
+    let [dup, store, ..] = expression else { return None };
+    let (slots, false) = store.local_access()? else { return None };
+    (dup.opcode == if slots.len() == 2 { 0x5c } else { 0x59 })
+        .then_some((store, slots.start as u16))
+}
+
+fn lift_test_assignment(trial: &mut Machine<'_, '_>, pair: &[Instruction]) -> Option<Option<Document>> {
+    let step = trial.step_assignment(pair, |_, _| true).ok()??;
+    (step.consumed == 2 && matches!(step.effect, Effect::None) && trial.take_prelude().is_empty())
+        .then_some(step.declaration)
 }
 
 struct Fold {
