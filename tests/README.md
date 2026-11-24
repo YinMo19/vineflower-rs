@@ -81,6 +81,7 @@ Exact upstream comparison with all fixture bytecode and required JDKs:
 | Boolean layout, compact records, nested monitors/resources and typed calls | 135 | 131 | 431 | 0 |
 | Nested record and nullable recovery, proven varargs, switch source maps | 138 | 127 | 432 | 0 |
 | Legacy bytecode recovery, subword calls, protected foreach, Kotlin tail calls and preview guards | 138 | 117 | 442 | 0 |
+| Primitive class literals, enum/switch edge maps, predicate loops, array assignments and Kotlin infix | 146 | 113 | 438 | 0 |
 
 All eight upstream CLI and bulk cases match. The full test remains failing
 until all 697 comparisons match.
