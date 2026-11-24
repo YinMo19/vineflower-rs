@@ -115,7 +115,10 @@ pub(super) fn lower<'a, 'data>(bytecode: &Bytecode<'a, 'data>, instructions: Vec
         }
     }
     let bindings = Binding { slot: template.slot, element: template.element, name, suffix, first_free: template.first_free };
-    let statements = statements::lower_scoped(bytecode, shape.instructions, template.body.clone(), locals, declaration, Some(bindings))?;
+    let statements = statements::lower_scoped(
+        bytecode, shape.instructions, template.body.clone(), locals, declaration,
+        &[super::ScopedLocal::Loop(bindings)],
+    )?;
     let lines = if trace { code.line_numbers(&bytecode.class.pool)? } else { Vec::new() };
     Ok(LoopBody { bindings, source: template.source, statements, instructions, start, body: template.body, lines })
 }

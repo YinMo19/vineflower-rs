@@ -39,6 +39,8 @@ const BRANCHES: &str = include_str!("fixtures/Branches.class.hex");
 const WHEN_BOOLEAN: &str = include_str!("fixtures/TestWhenBoolean.class.hex");
 const FOR_RANGE: &str = include_str!("fixtures/TestForRange.class.hex");
 const FOR_LOOPS: &str = include_str!("fixtures/ForLoops.class.hex");
+const TRY_REGIONS: &str = include_str!("fixtures/TryRegions.class.hex");
+const TRY_THROWABLE: &str = include_str!("fixtures/TestTryCatchThrowable.class.hex");
 
 fn bytes(hex: &str) -> Vec<u8> {
     assert!(hex.lines().all(|line| line.len() % 2 == 0));
@@ -333,6 +335,146 @@ fn rejects_wrong_progression_exit_and_iterator_slot_alias() {
         let class = ClassFile::parse(&class_bytes).unwrap();
         assert!(matches!(decompile_class(&class), Err(KotlinError::Unsupported {
             declaration, feature: "loop or backward control transfer"
+        }) if declaration == name));
+    }
+}
+
+#[test]
+fn recovers_ordered_and_nested_throwable_handlers() {
+    let source = render(TRY_THROWABLE);
+    for fragment in [
+        concat!(
+            "   public fun testEmptyCatch() {\n",
+            "      try {\n",
+            "         System.out.println(\"Hi\")\n",
+            "      } catch (caught1: kotlin.Throwable) {\n",
+            "      }\n",
+            "   }\n",
+        ),
+        concat!(
+            "   public fun testCatchWithReturnAndTail(): String? {\n",
+            "      try {\n",
+            "         System.out.println(\"Hi\")\n",
+            "      } catch (ignored: kotlin.Throwable) {\n",
+            "         return null\n",
+            "      }\n\n",
+            "      System.out.println(\"Ho\")\n",
+            "      return \"bye\"\n",
+            "   }\n",
+        ),
+        concat!(
+            "      } catch (ignored: kotlin.Throwable) {\n",
+            "         try {\n",
+            "            System.out.println(\"Hi!\")\n",
+            "            return \"5\"\n",
+            "         } catch (throwable: kotlin.Throwable) {\n",
+            "            return throwable.message\n",
+            "         }\n",
+            "      }\n",
+        ),
+        concat!(
+            "      } catch (throwable: kotlin.Throwable) {\n",
+            "         System.out.println(\"Oh no\")\n",
+            "         throw throwable\n",
+            "      }\n",
+        ),
+        concat!(
+            "      } catch (ignored: kotlin.RuntimeException) {\n",
+            "         System.out.println(\"Hello\")\n",
+            "      } catch (ignored: kotlin.Throwable) {\n",
+            "         System.out.println(\"Oh no\")\n",
+            "      }\n",
+        ),
+    ] {
+        assert!(source.contains(fragment), "missing {fragment:?} in {source}");
+    }
+    assert_eq!(source.matches(" catch (").count(), 11);
+}
+
+#[test]
+fn renders_try_value_joins_and_proves_cleanup_return_order() {
+    let options = crate::Options {
+        decompile_kotlin: true,
+        include_line_mappings: true,
+        ..crate::Options::default()
+    };
+    let source = crate::decompile(&bytes(TRY_REGIONS), &options).unwrap();
+    for fragment in [
+        concat!(
+            "   public fun divide(value: Int): Int {\n",
+            "      return try {\n",
+            "         100 / value\n",
+            "      } catch (failure: kotlin.ArithmeticException) {\n",
+            "         System.out.println(failure)\n",
+            "         -1\n",
+            "      }\n",
+            "   }\n",
+        ),
+        concat!(
+            "   public fun divideAndClean(value: Int): Int {\n",
+            "      return try {\n",
+            "         100 / value\n",
+            "      } catch (failure: kotlin.ArithmeticException) {\n",
+            "         System.out.println(failure)\n",
+            "         -1\n",
+            "      } finally {\n",
+            "         System.out.println(\"cleanup\")\n",
+            "      }\n",
+            "   }\n",
+        ),
+        concat!(
+            "   public fun returnAndClean(value: Int): Int {\n",
+            "      return try {\n",
+            "         100 / value\n",
+            "      } finally {\n",
+            "         System.out.println(\"cleanup\")\n",
+            "      }\n",
+            "   }\n",
+        ),
+        concat!(
+            "   public fun cleanupThenTail(value: Int) {\n",
+            "      try {\n",
+            "         System.out.println(value)\n",
+            "      } finally {\n",
+            "         System.out.println(\"cleanup\")\n",
+            "      }\n\n",
+            "      System.out.println(\"tail\")\n",
+            "   }\n",
+        ),
+    ] {
+        assert!(source.text.contains(fragment), "missing {fragment:?} in {}", source.text);
+    }
+    let map = source.map.unwrap();
+    let method = map.methods.iter().find(|method| method.name == "divideAndClean").unwrap();
+    let cleanup = method.offsets[&12];
+    assert_eq!(source.text.lines().nth(cleanup), Some("         System.out.println(\"cleanup\")"));
+    for offset in [34, 47] {
+        assert_eq!(method.offsets[&offset], cleanup);
+    }
+    assert!(method.offsets[&4] < cleanup);
+    assert!(method.offsets[&53] > cleanup);
+}
+
+#[test]
+fn rejects_different_cleanup_copies_or_returns_from_unspilled_slots() {
+    for (name, offset, from, to) in [
+        ("divideAndClean", 42, 33, 42),
+        ("returnAndClean", 15, 0x1c, 0x1b),
+    ] {
+        let mut data = bytes(TRY_REGIONS);
+        let index = {
+            let class = ClassFile::parse(&data).unwrap();
+            let method = class.methods.iter().find(|method| {
+                class.pool.utf8(method.name_index).unwrap() == name
+            }).unwrap();
+            let code = method.code(&class.pool).unwrap().unwrap();
+            assert_eq!(code.bytes[offset], from);
+            code.bytes.as_ptr() as usize - data.as_ptr() as usize + offset
+        };
+        data[index] = to;
+        let class = ClassFile::parse(&data).unwrap();
+        assert!(matches!(decompile_class(&class), Err(KotlinError::Unsupported {
+            declaration, feature: "unsupported Kotlin exception region"
         }) if declaration == name));
     }
 }

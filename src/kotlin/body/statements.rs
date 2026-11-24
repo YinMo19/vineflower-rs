@@ -4,7 +4,7 @@ use std::ops::Range;
 
 use super::{
     Bytecode, Expected, Expr, ExprKind, Instruction, KotlinError, Literal, Locals, Primitive,
-    StackValue, ValueParameter, pop_value,
+    ScopedLocal, StackValue, ValueParameter, pop_value,
 };
 
 /// Statements and their original bytecode spans. Stack shuffles do not have
@@ -56,6 +56,7 @@ impl Statement<'_> {
                         {
                             ""
                         }
+                        ExprKind::CatchLocal(_) => "",
                         _ => " as kotlin.Any?",
                     };
                     (Expected::Reference, cast)
@@ -74,6 +75,7 @@ impl Statement<'_> {
                         {
                             ""
                         }
+                        ExprKind::CatchMessage(_) => "",
                         _ => {
                             return Err(KotlinError::unsupported(
                                 declaration,
@@ -115,7 +117,7 @@ pub(super) fn lower_range<'a>(
     locals: &Locals<'_>,
     declaration: &str,
 ) -> Result<Vec<Statement<'a>>, KotlinError> {
-    lower_scoped(bytecode, instructions, range, locals, declaration, None)
+    lower_scoped(bytecode, instructions, range, locals, declaration, &[])
 }
 
 pub(super) fn lower_scoped<'a>(
@@ -124,14 +126,40 @@ pub(super) fn lower_scoped<'a>(
     range: Range<usize>,
     locals: &Locals<'_>,
     declaration: &str,
-    scoped: Option<super::loops::Binding<'a>>,
+    scoped: &[ScopedLocal<'a>],
 ) -> Result<Vec<Statement<'a>>, KotlinError> {
+    let (statements, value) = lower_open(bytecode, instructions, range, locals, declaration, scoped)?;
+    if value.is_some() {
+        return Err(KotlinError::unsupported(
+            declaration,
+            "live operands at Kotlin statement return",
+        ));
+    }
+    Ok(statements)
+}
+
+pub(super) struct TailValue<'a> {
+    pub expr: Expr<'a>,
+    pub instructions: Range<usize>,
+}
+
+/// A straight block has either no result or one stack value after the
+/// final statement. The caller proves how its region consumes that value.
+pub(super) fn lower_open<'a>(
+    bytecode: &Bytecode<'a, '_>,
+    instructions: &[Instruction],
+    range: Range<usize>,
+    locals: &Locals<'_>,
+    declaration: &str,
+    scoped: &[ScopedLocal<'a>],
+) -> Result<(Vec<Statement<'a>>, Option<TailValue<'a>>), KotlinError> {
     let mut statements = Vec::new();
     let mut stack = Vec::new();
     let mut index = range.start;
     let mut first = index;
     let invalid = || KotlinError::unsupported(declaration, "unsupported Kotlin statement bytecode");
-    let first_free = scoped.map_or_else(|| locals.next_slot(), |local| local.first_free);
+    let first_free = scoped.iter().map(|local| local.first_free())
+        .fold(locals.next_slot(), u16::max);
     while index < range.end {
         let instruction = &instructions[index];
         if let Some((store, slot)) = super::local_store(instruction)
@@ -144,8 +172,8 @@ pub(super) fn lower_scoped<'a>(
             && argument.stack_load() == Some(store - 0x21)
             && argument.infallible()
         {
-            // The inline primitive println uses a fresh temporary instead of
-            // swap. Only its proven store/reload is modeled as a stack move.
+            // Some inline print calls use a fresh temporary instead of swap.
+            // Only its proven store/reload is modeled as a stack move.
             stack.insert(0, StackValue::PrintStream);
             index += 3;
             continue;
@@ -184,17 +212,18 @@ pub(super) fn lower_scoped<'a>(
             });
             first = index + 1;
         } else {
-            bytecode.expression_with_local(instruction, locals, &mut stack, declaration, scoped)?;
+            bytecode.expression_with_locals(instruction, locals, &mut stack, declaration, scoped)?;
         }
         index += 1;
     }
-    if !stack.is_empty() {
-        return Err(KotlinError::unsupported(
-            declaration,
-            "live operands at Kotlin statement return",
-        ));
-    }
-    Ok(statements)
+    let value = if stack.is_empty() {
+        None
+    } else if let [StackValue::Value(_)] = stack.as_slice() {
+        Some(TailValue { expr: pop_value(&mut stack, declaration)?, instructions: first..range.end })
+    } else {
+        return Err(invalid());
+    };
+    Ok((statements, value))
 }
 
 fn println_operand(descriptor: &str) -> Option<Option<PrintOperand>> {

@@ -23,6 +23,7 @@ mod logic;
 mod loops;
 mod statements;
 mod switches;
+mod try_regions;
 
 pub(super) use defaults::{recover as parameter_defaults, verify_copy, verify_copy_defaults};
 use logic::{Comparison, Conditional, Relation};
@@ -44,6 +45,7 @@ pub(super) enum Body<'a> {
     Switch(switches::SwitchBody<'a>),
     Decision(decisions::DecisionBody<'a>),
     Loop(loops::LoopBody<'a>),
+    Try(try_regions::TryBody<'a>),
 }
 
 pub(super) struct ExpressionTrace {
@@ -71,6 +73,8 @@ enum ExprKind<'a> {
         load: u8,
     },
     LoopLocal(loops::Binding<'a>),
+    CatchLocal(try_regions::Binding<'a>),
+    CatchMessage(try_regions::Binding<'a>),
     Binary(Operator, Primitive, Box<(Expr<'a>, Expr<'a>)>),
     Compare(Box<Comparison<'a>>),
     Not(Box<Expr<'a>>),
@@ -289,13 +293,21 @@ impl<'a, 'data> Bytecode<'a, 'data> {
         member: &Member<'data>,
         declaration: &str,
     ) -> Result<Code<'data>, KotlinError> {
-        let code = member.code(&self.class.pool)?.ok_or_else(|| {
-            KotlinError::unsupported(declaration, "missing method implementation")
-        })?;
+        let code = self.function_code(member, declaration)?;
         if !code.exceptions.is_empty() {
             return Err(KotlinError::unsupported(declaration, "exception handlers"));
         }
         Ok(code)
+    }
+
+    fn function_code(
+        &self,
+        member: &Member<'data>,
+        declaration: &str,
+    ) -> Result<Code<'data>, KotlinError> {
+        member.code(&self.class.pool)?.ok_or_else(|| {
+            KotlinError::unsupported(declaration, "missing method implementation")
+        })
     }
 
     pub fn function(
@@ -312,10 +324,24 @@ impl<'a, 'data> Bytecode<'a, 'data> {
             parameters,
             declaration,
         )?;
-        let code = self.code(member, declaration)?;
+        let code = self.function_code(member, declaration)?;
         let decoded = bytecode::decode(code.bytes)?;
         let instructions = self.parameter_checks(&decoded, &locals, parameters)?;
         let mut start = decoded.len() - instructions.len();
+        if !code.exceptions.is_empty() {
+            return try_regions::lower(
+                self,
+                decoded,
+                start,
+                &code,
+                &locals,
+                parameters,
+                &descriptor.return_type,
+                declaration,
+                trace,
+            )
+            .map(Body::Try);
+        }
         if instructions
             .iter()
             .any(|instruction| matches!(instruction.operand, Operand::Switch { .. }))
@@ -669,7 +695,39 @@ impl<'a, 'data> Bytecode<'a, 'data> {
         }
         Ok(Some(self.class.pool.member_ref(index)?))
     }
+}
 
+#[derive(Clone, Copy)]
+enum ScopedLocal<'a> {
+    Loop(loops::Binding<'a>),
+    Catch(try_regions::Binding<'a>),
+}
+
+impl<'a> ScopedLocal<'a> {
+    fn slot(self) -> u16 {
+        match self {
+            Self::Loop(local) => local.slot,
+            Self::Catch(local) => local.slot,
+        }
+    }
+
+    fn first_free(self) -> u16 {
+        match self {
+            Self::Loop(local) => local.first_free,
+            Self::Catch(local) => local.slot.saturating_add(1),
+        }
+    }
+
+    fn load(self, opcode: u8) -> Option<ExprKind<'a>> {
+        match self {
+            Self::Loop(local) if opcode == local.element.load() => Some(ExprKind::LoopLocal(local)),
+            Self::Catch(local) if opcode == 0x19 => Some(ExprKind::CatchLocal(local)),
+            _ => None,
+        }
+    }
+}
+
+impl<'a> Bytecode<'a, '_> {
     fn expression(
         &self,
         instruction: &Instruction,
@@ -677,23 +735,26 @@ impl<'a, 'data> Bytecode<'a, 'data> {
         stack: &mut Vec<StackValue<'a>>,
         declaration: &str,
     ) -> Result<(), KotlinError> {
-        self.expression_with_local(instruction, locals, stack, declaration, None)
+        self.expression_with_locals(instruction, locals, stack, declaration, &[])
     }
 
-    fn expression_with_local(
+    fn expression_with_locals(
         &self,
         instruction: &Instruction,
         locals: &Locals<'_>,
         stack: &mut Vec<StackValue<'a>>,
         declaration: &str,
-        scoped: Option<loops::Binding<'a>>,
+        scoped: &[ScopedLocal<'a>],
     ) -> Result<(), KotlinError> {
         if instruction.opcode == 0x00 {
             return Ok(());
         }
         if let Some((opcode, slot)) = local_load(instruction) {
-            if let Some(local) = scoped.filter(|local| local.slot == slot && local.element.load() == opcode) {
-                stack.push(StackValue::Value(Expr { kind: ExprKind::LoopLocal(local), depth: 1 }));
+            if let Some(kind) = scoped.iter().rev()
+                .find(|local| local.slot() == slot)
+                .and_then(|local| local.load(opcode))
+            {
+                stack.push(StackValue::Value(Expr { kind, depth: 1 }));
             } else if locals.instance && opcode == 0x19 && slot == 0 {
                 stack.push(StackValue::This);
             } else {
@@ -791,6 +852,22 @@ impl<'a, 'data> Bytecode<'a, 'data> {
                     declaration,
                 )?
             }
+            (0xb6, _) => {
+                let [.., StackValue::Value(Expr { kind: ExprKind::CatchLocal(binding), .. })] =
+                    stack.as_slice()
+                else {
+                    return Err(unsupported_expression(declaration));
+                };
+                if !self.reference(instruction, 0xb6)?.is_some_and(|(owner, name, descriptor)| {
+                    (owner == binding.ty || owner == "java/lang/Throwable")
+                        && name == "getMessage" && descriptor == "()Ljava/lang/String;"
+                }) {
+                    return Err(unsupported_expression(declaration));
+                }
+                let binding = *binding;
+                let _ = stack.pop();
+                Expr::new(ExprKind::CatchMessage(binding), 2, declaration)?
+            }
             (0xb8, _)
                 if self.reference(instruction, 0xb8)?
                     == Some(("java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;")) =>
@@ -804,12 +881,7 @@ impl<'a, 'data> Bytecode<'a, 'data> {
                 let lhs = pop_value(stack, declaration)?;
                 Comparison::reference(Relation::Eq, lhs, rhs, declaration)?
             }
-            _ => {
-                return Err(KotlinError::unsupported(
-                    declaration,
-                    "bytecode outside the supported expression subset",
-                ));
-            }
+            _ => return Err(unsupported_expression(declaration)),
         };
         stack.push(StackValue::Value(expr));
         Ok(())
@@ -839,6 +911,10 @@ impl<'a, 'data> Bytecode<'a, 'data> {
             }
         })
     }
+}
+
+fn unsupported_expression(declaration: &str) -> KotlinError {
+    KotlinError::unsupported(declaration, "bytecode outside the supported expression subset")
 }
 
 fn pop_value<'a>(
@@ -942,7 +1018,8 @@ impl<'a> Expr<'a> {
 
     fn infallible(&self) -> bool {
         match &self.kind {
-            ExprKind::Literal(_) | ExprKind::Parameter { .. } | ExprKind::LoopLocal(_) => true,
+            ExprKind::Literal(_) | ExprKind::Parameter { .. } | ExprKind::LoopLocal(_)
+            | ExprKind::CatchLocal(_) => true,
             ExprKind::Binary(operator, _, pair) => {
                 !matches!(operator, Operator::Divide | Operator::Remainder)
                     && pair.0.infallible()
@@ -954,7 +1031,8 @@ impl<'a> Expr<'a> {
 
     fn stack_load(&self) -> Option<u8> {
         match &self.kind {
-            ExprKind::Literal(Literal::Null | Literal::String(_)) => Some(0x19),
+            ExprKind::Literal(Literal::Null | Literal::String(_)) | ExprKind::CatchLocal(_)
+            | ExprKind::CatchMessage(_) => Some(0x19),
             ExprKind::Literal(Literal::Int(_))
             | ExprKind::Compare(_)
             | ExprKind::Not(_)
@@ -977,7 +1055,7 @@ impl<'a> Expr<'a> {
             ExprKind::Literal(Literal::Long(_)) => Some(Primitive::Long),
             ExprKind::Literal(Literal::Float(_)) => Some(Primitive::Float),
             ExprKind::Literal(Literal::Double(_)) => Some(Primitive::Double),
-            ExprKind::Literal(_) => None,
+            ExprKind::Literal(_) | ExprKind::CatchLocal(_) | ExprKind::CatchMessage(_) => None,
             ExprKind::Compare(_) | ExprKind::Not(_) | ExprKind::TypeTest { .. } => {
                 Some(Primitive::Boolean)
             }
@@ -1049,6 +1127,25 @@ impl<'a> Expr<'a> {
                     return Err(mismatch());
                 }
                 local.write(out, declaration)?;
+            }
+            ExprKind::CatchLocal(local) => {
+                if !matches!(expected, Expected::Reference)
+                    && !matches!(expected, Expected::Type(_, JvmType::Object(raw))
+                        if raw == local.ty || matches!(raw.as_str(), "java/lang/Object" | "java/lang/Throwable"))
+                {
+                    return Err(mismatch());
+                }
+                local.write(out, declaration)?;
+            }
+            ExprKind::CatchMessage(local) => {
+                if !matches!(expected, Expected::Reference)
+                    && !matches!(expected, Expected::Type(ty, JvmType::Object(raw))
+                        if ty.nullable && matches!(raw.as_str(), "java/lang/String" | "java/lang/Object"))
+                {
+                    return Err(mismatch());
+                }
+                local.write(out, declaration)?;
+                out.push_str(".message");
             }
             ExprKind::Binary(operator, primitive, arguments) => {
                 let result = expected.primitive().ok_or_else(mismatch)?;
