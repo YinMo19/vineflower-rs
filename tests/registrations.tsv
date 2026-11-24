@@ -1,0 +1,738 @@
+# Registration data ported from Vineflower b8273988af850e8cfb234ca08d129058502b032f.
+# Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors; Apache-2.0.
+# Fields are TAB-separated. A case uses the preceding set and the shared fixture options.
+# case <version> <registration kind> <JVM internal name> <output override or -> <alternate .dec or -> [<companion> ...]
+fixture	log-level=warn	decompile-generics=1	remove-synthetic=1	remove-bridge=1	keep-literals=1	__unit_test_mode__=1	new-line-separator=1	error-message=	include-runtime=
+
+set	core	Default	bytecode-source-mapping=1	__dump_original_lines__=1	dump-exception-on-error=0	ignore-invalid-bytecode=1	verify-anonymous-classes=1	include-classpath=0	ternary-in-if=1	force-jsr-inline=1	verify-pre-post-merges=1
+case	JAVA_8	register	pkg/TestEnhancedForLoops	-	-
+case	JAVA_8	register	pkg/TestPrimitiveNarrowing	-	-
+case	JAVA_8	register	pkg/TestClassFields	-	-
+case	JAVA_8	register	pkg/TestInterfaceFields	-	-
+case	JAVA_8	register	pkg/TestClassLambda	-	-
+case	JAVA_8	register	pkg/TestClassLoop	-	-
+case	JAVA_8	register	pkg/TestClassSwitch	-	-
+case	JAVA_8	register	pkg/TestClassVar	-	-
+case	JAVA_8	register	pkg/TestClassNestedInitializer	-	-
+case	JAVA_8	register	pkg/TestDeprecations	-	-
+case	JAVA_8	register	pkg/TestExtendsList	-	-
+case	JAVA_8	register	pkg/TestMethodParameters	-	-
+case	JAVA_8	register	pkg/TestMethodParametersAttr	-	-
+case	JAVA_8	register	pkg/TestCodeConstructs	-	-
+case	JAVA_8	register	pkg/TestConstants	-	-
+case	JAVA_8	register	pkg/TestEnum	-	-
+case	JAVA_8	register	pkg/TestDebugSymbols	-	-
+case	CUSTOM	registerRaw	InvalidMethodSignature	i.java	-
+case	JAVA_8	register	pkg/TestAnonymousClassConstructor	-	-
+case	JAVA_8	register	pkg/TestInnerClassConstructor	-	-
+case	CUSTOM	register	v11/TestInnerClassConstructor	-	-
+case	JAVA_8	register	pkg/TestTryCatchFinally	-	-
+case	JAVA_8	register	pkg/TestTryFinally	-	-
+case	JAVA_8	register	pkg/TestAmbiguousCall	-	-
+case	JAVA_8	register	pkg/TestSynchronizedMapping	-	-
+case	JAVA_8	register	pkg/TestAbstractMethods	-	-
+case	JAVA_8	register	pkg/TestLocalClass	-	-
+case	JAVA_8	register	pkg/TestChainedCFG	-	-
+case	JAVA_8	register	pkg/TestInnerLocal	-	-
+case	JAVA_8	register	pkg/TestInnerSignature	-	-
+case	JAVA_8	register	pkg/TestParameterizedTypes	-	-
+case	JAVA_8	register	pkg/TestStringConcat	-	-
+case	JAVA_9	register	pkg/TestJava9StringConcat	-	-
+case	JAVA_9	registerRaw	module-info	-	-
+case	JAVA_11	register	pkg/TestJava11StringConcat	-	pkg/TestJava11StringConcat_1.dec
+case	JAVA_8	register	pkg/TestMethodReferenceSameName	-	-
+case	JAVA_8	register	pkg/TestMethodReferenceLetterClass	-	-
+case	JAVA_8	register	pkg/TestConstructorReference	-	-
+case	JAVA_8	register	pkg/TestMemberAnnotations	-	-
+case	JAVA_8	register	pkg/MoreAnnotations	-	-
+case	JAVA_8	register	pkg/TypeAnnotations	-	-
+case	JAVA_8	register	pkg/TestStaticNameClash	-	-
+case	JAVA_8	register	pkg/TestExtendingSubclass	-	-
+case	JAVA_8	register	pkg/TestSyntheticAccess	-	-
+case	KOTLIN	register	pkg/TestIllegalVarName	-	-
+case	JAVA_8	register	pkg/TestIffSimplification	-	-
+case	JAVA_8	register	pkg/TestAsserts	-	-
+case	JAVA_8	register	pkg/TestLocalsNames	-	-
+case	JAVA_8	register	pkg/TestAnonymousParamNames	-	-
+case	JAVA_8	register	pkg/TestAccessReplace	-	-
+case	JAVA_8	register	pkg/TestStringLiterals	-	-
+case	JAVA_8	register	pkg/TestClashName	-	-	pkg/SharedName1	pkg/SharedName2	pkg/SharedName3	pkg/SharedName4	pkg/NonSharedName	pkg/TestClashNameParent	ext/TestClashNameParent	pkg/TestClashNameIface	ext/TestClashNameIface
+case	JAVA_8	register	pkg/TestSwitchOnEnum	-	-
+case	JAVA_8	register	pkg/TestSwitchOnStrings	-	-
+case	JAVA_8	register	pkg/TestLambdaParams	-	-
+case	JAVA_8	register	pkg/TestInterfaceMethods	-	-
+case	JAVA_8	register	pkg/TestConstType	-	-
+case	JASM	register	pkg/TestPop2OneDoublePop2	-	-
+case	JASM	register	pkg/TestPop2OneLongPop2	-	-
+case	JASM	register	pkg/TestPop2TwoIntPop2	-	-
+case	JASM	register	pkg/TestPop2TwoIntTwoPop	-	-
+case	JAVA_8	register	pkg/TestSuperInner	-	-	pkg/TestSuperInnerBase
+case	JASM	register	pkg/TestMissingConstructorCallGood	-	-
+case	JASM	register	pkg/TestMissingConstructorCallBad	-	-
+case	JASM	register	pkg/TestOldECJInner	-	-
+case	JASM	register	pkg/TestRecursiveLambda	-	-
+case	JAVA_8	register	pkg/TestEmptyBlocks	-	-
+case	JAVA_8	register	pkg/TestInvertedFloatComparison	-	-
+case	JAVA_8	register	pkg/TestPrivateEmptyConstructor	-	-
+case	JAVA_8	register	pkg/TestQualifiedNew	-	-
+case	KOTLIN	register	pkg/TestSynchronizedUnprotected	-	-
+case	JAVA_8	register	pkg/TestInterfaceSuper	-	-
+case	JASM	register	pkg/TestFieldSingleAccess	-	-
+case	JAVA_8	register	pkg/package-info	-	-
+case	JAVA_8	register	pkg/TestInner2	-	-
+case	JAVA_8	register	pkg/TestInUse	-	-
+case	GROOVY	register	pkg/TestGroovyClass	-	-
+case	GROOVY	register	pkg/TestGroovyTrait	-	-
+case	GROOVY	register	pkg/TestGroovyTryCatch	-	-
+case	JAVA_8	register	pkg/TestPrivateClasses	-	-
+case	KOTLIN	register	pkg/TestSuspendLambdaKt	-	-
+case	KOTLIN	register	pkg/TestRunSuspend	-	-
+case	JAVA_8	register	pkg/TestGenericArgs	-	-
+case	JAVA_16	register	pkg/TestRecordEmpty	-	-
+case	JAVA_16	register	pkg/TestRecordSimple	-	-
+case	JAVA_16	register	pkg/TestRecordVararg	-	-
+case	JAVA_16	register	pkg/TestRecordGenericVararg	-	-
+case	JAVA_16	register	pkg/TestRecordAnno	-	-
+case	JAVA_16	register	pkg/TestRecordBig	-	-
+case	JAVA_16	register	pkg/TestRecordGenericSuperclass	-	-
+case	JAVA_8	register	pkg/TestMultiCast	-	-
+case	JAVA_8	register	pkg/TestComplexIfElseChain	-	-
+case	JAVA_8	register	pkg/TestNestedLambdas	-	-
+case	JAVA_8	register	pkg/TestSwitchAssign	-	-
+case	JAVA_8	register	pkg/TestSwitchReturn	-	-
+case	JAVA_8	register	pkg/TestWhileCondition	-	-
+case	JAVA_8	register	pkg/TestLocalScopes	-	-
+case	JAVA_8	register	pkg/TestInterfaceSubclass	-	-
+case	JAVA_8	register	pkg/TestGenericStatic	-	-
+case	JAVA_8	register	pkg/TestAssignmentInLoop	-	-
+case	JAVA_8	register	pkg/TestArrays	-	-
+case	JAVA_8	register	pkg/TestArrayForeach	-	-
+case	JAVA_8	register	pkg/TestArrayInitializations	-	-
+case	JAVA_8	register	pkg/TestTernaryCall	-	-
+case	JAVA_8	register	pkg/TestAnonymousObject	-	-
+case	JAVA_8	register	pkg/TestArrayAssignmentEquals	-	-
+case	JAVA_8	register	pkg/TestArrayCopy	-	-
+case	JAVA_8	register	pkg/TestArrayDoWhile	-	-
+case	JAVA_8_NODEBUG	register	pkg/TestArrayNull1	-	-
+case	JAVA_8_NODEBUG	register	pkg/TestArrayNull2	-	-
+case	JAVA_8	register	pkg/TestArrayNullAccess	-	-
+case	JAVA_8	register	pkg/TestArrayTernary	-	-
+case	JAVA_8	register	pkg/TestAssignmentInDoWhile	-	-
+case	JAVA_8	register	pkg/TestBooleanAssignment	-	-
+case	JAVA_8	register	pkg/TestCastObjectToPrimitive	-	-
+case	JAVA_8	register	pkg/TestCastPrimitiveToObject	-	-
+case	JAVA_8	register	pkg/TestDoWhileTrue	-	-
+case	JAVA_8	register	pkg/TestExtraClass	-	-
+case	JAVA_8	register	pkg/TestGenericMapInput	-	-
+case	JAVA_8	register	pkg/TestInlineAssignments	-	-
+case	JAVA_8	register	pkg/TestInterfaceLambdaCast	-	-
+case	JAVA_8	register	pkg/TestLocalScopeClash	-	-
+case	JAVA_8	register	pkg/TestMultiBoolean	-	-
+case	JAVA_8	register	pkg/TestNestedFor	-	-
+case	JAVA_8	register	pkg/TestNestedLoops2	-	-
+case	JAVA_8	register	pkg/TestOverloadedNull	-	-
+case	JAVA_8	register	pkg/TestReturnIf	-	-
+case	JAVA_8	register	pkg/TestShiftAssignmentInCall	-	-
+case	JAVA_8	register	pkg/TestSplitColorComponents	-	-
+case	JAVA_8	register	pkg/TestStaticBlockNull	-	-
+case	JAVA_8	register	pkg/TestStringLiteral	-	-
+case	JAVA_8	register	pkg/TestSwitchStringHashcodeCollision	-	-
+case	JAVA_8	register	pkg/TestSynchronized	-	-
+case	JAVA_8	register	pkg/TestSynchronizedLoop	-	-
+case	JAVA_8	register	pkg/TestSynchronizedTry	-	-
+case	JAVA_8	register	pkg/TestSynchronizedThrow	-	-
+case	JAVA_8	register	pkg/TestSynchronizeNull	-	-
+case	JAVA_8	register	pkg/TestSynchronizedTrySharing	-	-
+case	JAVA_8	register	pkg/TestWhileIterator	-	-
+case	JAVA_8	register	pkg/TestReturnTernaryChar	-	-
+case	JAVA_8	register	pkg/TestCompoundAssignment	-	-
+case	JAVA_8	register	pkg/TestInfiniteLoop	-	-
+case	JAVA_8	register	pkg/TestIfLoop	-	-
+case	JASM	register	pkg/TestInheritanceChainCycle	-	-
+case	JAVA_16	register	pkg/TestRecordEmptyConstructor	-	-
+case	JAVA_16	register	pkg/TestRecordInner	-	-
+case	JAVA_16	register	pkg/TestRecordMixup	-	-
+case	JAVA_8	register	pkg/TestMultiAssignmentInStaticBlock	-	-
+case	JAVA_8	register	pkg/TestMultiAssignmentInDynamicBlock	-	-
+case	JAVA_8	register	pkg/TestNextGaussian	-	-
+case	JAVA_8	register	pkg/TestLongMethodDeclaration	-	-
+case	JAVA_8	register	pkg/TestLongMethodInvocation	-	-
+case	JAVA_8	register	pkg/TestBinaryOperationWrapping	-	-
+case	JAVA_8	register	pkg/TestBlankLinesSpaces	-	-
+case	JAVA_8	register	pkg/TestLoopBreak	-	-
+case	JAVA_8	register	pkg/TestLoopBreak2	-	-
+case	JAVA_8	register	pkg/TestSimpleWhile	-	-
+case	JAVA_8	register	pkg/TestLoopBreakException	-	-
+case	JAVA_8	register	pkg/TestWhileTernary1	-	-
+case	JAVA_8	register	pkg/TestWhileTernary2	-	-
+case	JAVA_8	register	pkg/TestWhileTernaryFake	-	-
+case	JAVA_8	register	pkg/TestWhileTernary3	-	-
+case	JAVA_8	register	pkg/TestWhileTernary4	-	-
+case	JAVA_8	register	pkg/TestWhileTernary5	-	-
+case	JAVA_8	register	pkg/TestWhileTernary6	-	-
+case	JAVA_8	register	pkg/TestWhileTernary7	-	-
+case	JAVA_8	register	pkg/TestWhileTernary8	-	-
+case	JAVA_8	register	pkg/TestWhileTernary9	-	-
+case	JAVA_8	register	pkg/TestWhileTernary10	-	-
+case	JAVA_8	register	pkg/TestOperatorPrecedence	-	-
+case	JAVA_8	register	pkg/TestMultipleStaticBlocks	-	-
+case	JAVA_8	register	pkg/TestTrySynchronized	-	-
+case	JASM	register	pkg/TestEnumStaticField	-	-
+case	JASM	register	pkg/TestEnumStaticField2	-	-
+case	JASM	register	pkg/TestIrreducible	-	-
+case	JAVA_8	register	pkg/TestForContinue	-	-
+case	JAVA_8	register	pkg/TestExceptionElse	-	-
+case	JAVA_8	register	pkg/TestGenericCasts	-	-
+case	JAVA_8	register	pkg/TestNativeMethods	-	-
+case	JAVA_8	register	pkg/TestThrowLoop	-	-
+case	JAVA_8	register	pkg/TestShiftLoop	-	-
+case	JASM	register	pkg/TestDoubleCast	-	-
+case	JASM	register	pkg/TestDoublePopAfterJump	-	-
+case	JAVA_16	register	pkg/TestLocalEnum	-	-
+case	JAVA_16	register	pkg/TestLocalInterface	-	-
+case	JAVA_16	register	pkg/TestLocalRecord	-	-
+case	JAVA_9	register	pkg/TestPrivateInterfaceMethod	-	-
+case	JAVA_16	register	pkg/TestAssignmentSwitchExpression1	-	-
+case	JAVA_16	register	pkg/TestAssignmentSwitchExpression2	-	-
+case	JAVA_16	register	pkg/TestAssignmentSwitchExpression3	-	-
+case	JAVA_16	register	pkg/TestAssignmentSwitchExpression4	-	-
+case	JAVA_16	register	pkg/TestAssignmentSwitchExpression5	-	-
+case	JAVA_16	register	pkg/TestAssignmentSwitchExpression6	-	-
+case	JAVA_16	register	pkg/TestAssignmentSwitchExpression7	-	-
+case	JAVA_16	register	pkg/TestBooleanSwitchExpression1	-	-
+case	JAVA_16	register	pkg/TestBooleanSwitchExpression2	-	-
+case	JAVA_16	register	pkg/TestBooleanSwitchExpression3	-	-
+case	JAVA_16	register	pkg/TestBooleanSwitchExpression4	-	-
+case	JAVA_16	register	pkg/TestBooleanSwitchExpression5	-	-
+case	JAVA_16	register	pkg/TestInlineSwitchExpression1	-	-	ext/Direction
+case	JAVA_16	register	pkg/TestInlineSwitchExpression2	-	-
+case	JAVA_16	register	pkg/TestInlineSwitchExpression3	-	-	ext/Direction
+case	JAVA_16	register	pkg/TestInlineSwitchExpression4	-	-
+case	JAVA_16	register	pkg/TestInlineSwitchExpression5	-	-
+case	JAVA_16	register	pkg/TestInlineSwitchExpression6	-	-
+case	JAVA_16	register	pkg/TestInlineSwitchExpression7	-	-
+case	JAVA_16	register	pkg/TestReturnSwitchExpression1	-	-
+case	JAVA_16	register	pkg/TestReturnSwitchExpression2	-	-
+case	JAVA_16	register	pkg/TestReturnSwitchExpression3	-	-
+case	JAVA_16	register	pkg/TestReturnSwitchExpression4	-	-
+case	JAVA_16	register	pkg/TestReturnSwitchExpression5	-	-
+case	JAVA_16	register	pkg/TestSwitchExprString1	-	-
+case	JAVA_16	register	pkg/TestConstructorSwitchExpression1	-	-
+case	JAVA_16	register	pkg/TestConstructorSwitchExpression2	-	-
+case	JAVA_16	register	pkg/TestAssertSwitchExpression	-	-
+case	JAVA_16	register	pkg/TestSwitchExpressionFallthrough1	-	-
+case	JAVA_16	register	pkg/TestConstructorSwitchExpression3	-	-
+case	JAVA_16	register	pkg/TestSwitchExpressionPPMM	-	-
+case	JAVA_16	register	pkg/TestSwitchExpressionNested1	-	-
+case	JAVA_16	register	pkg/TestSwitchExprInvoc	-	-
+case	JAVA_16	register	pkg/TestAccidentalSwitchExpression	-	-
+case	JAVA_16_PREVIEW	register	pkg/TestSealedClasses	-	-
+case	JAVA_16_PREVIEW	register	pkg/PermittedSubClassA	-	-	pkg/TestSealedClasses
+case	JAVA_16_PREVIEW	register	pkg/PermittedSubClassB	-	-	pkg/PermittedSubClassA	pkg/TestSealedClasses
+case	JAVA_16_PREVIEW	register	pkg/TestSealedInterfaces	-	-
+case	JAVA_16_PREVIEW	register	pkg/PermittedSubInterfaceA	-	-	pkg/TestSealedInterfaces
+case	JAVA_16_PREVIEW	register	pkg/PermittedSubInterfaceB	-	-	pkg/PermittedSubInterfaceA	pkg/TestSealedInterfaces
+case	JAVA_16_PREVIEW	register	pkg/PermittedSubClassC	-	-	pkg/TestSealedInterfaces
+case	JAVA_16_PREVIEW	register	pkg/PermittedSubClassD	-	-	pkg/PermittedSubClassC	pkg/TestSealedInterfaces
+case	JAVA_16_PREVIEW	register	pkg/PermittedSubClassE	-	-	pkg/TestSealedInterfaces
+case	JAVA_8_NODEBUG	register	pkg/TestDuplicateLocals	-	-
+case	CUSTOM	register	pkg/TestConflictingLvtNamer	-	-
+case	JAVA_8	register	pkg/TestMethodHandles	-	-
+case	JAVA_9	register	pkg/TestVarHandles	-	-
+case	JASM	register	pkg/TestIllegalMethodNames	-	-
+case	JAVA_8	register	pkg/TestSwitchOnlyDefault	-	-
+case	JAVA_8	register	pkg/TestSwitchEmpty	-	-
+case	JAVA_8	register	pkg/TestSwitchDefaultBefore	-	-
+case	JAVA_8_NODEBUG	register	pkg/TestIterationOverGenericsWithoutLvt	-	-
+case	JAVA_8_NODEBUG	register	pkg/TestIterationOverGenericsWithoutLvt1	-	-
+case	JAVA_8	register	pkg/TestNestedTernaryAssign	-	-
+case	JAVA_8	register	pkg/TestNestedTernaryCondition	-	-
+case	JAVA_17_PREVIEW	register	pkg/TestSwitchPatternMatching1	-	-
+case	JAVA_17_PREVIEW	register	pkg/TestSwitchPatternMatching2	-	-
+case	JAVA_17_PREVIEW	register	pkg/TestSwitchPatternMatching3	-	-
+case	JAVA_17_PREVIEW	register	pkg/TestSwitchPatternMatching4	-	-
+case	JAVA_17_PREVIEW	register	pkg/TestSwitchPatternMatching5	-	-
+case	JAVA_17_PREVIEW	register	pkg/TestSwitchPatternMatching6	-	-	ext/Direction
+case	JAVA_17_PREVIEW	register	pkg/TestSwitchPatternMatching7	-	-
+case	JAVA_17_PREVIEW	register	pkg/TestSwitchPatternMatching8	-	-
+case	JAVA_17_PREVIEW	register	pkg/TestSwitchPatternMatching9	-	-
+case	JAVA_17_PREVIEW	register	pkg/TestSwitchPatternMatching10	-	-
+case	JAVA_17_PREVIEW	register	pkg/TestSwitchPatternMatching11	-	-
+case	JAVA_17_PREVIEW	register	pkg/TestSwitchPatternMatching12	-	-
+case	JAVA_17_PREVIEW	register	pkg/TestSwitchPatternMatching13	-	-
+case	JAVA_17_PREVIEW	register	pkg/TestSwitchPatternMatching14	-	-
+case	JAVA_17_PREVIEW	register	pkg/TestSwitchPatternMatching15	-	-
+case	JAVA_17_PREVIEW	register	pkg/TestSwitchPatternMatching16	-	-
+case	JAVA_17_PREVIEW	register	pkg/TestSwitchPatternMatching17	-	-
+case	JAVA_17_PREVIEW	register	pkg/TestSwitchPatternMatching18	-	-
+case	JAVA_17_PREVIEW	register	pkg/TestSwitchPatternMatching19	-	-
+case	JAVA_17_PREVIEW	register	pkg/TestSwitchPatternMatching20	-	-
+case	JAVA_17_PREVIEW	register	pkg/TestSwitchPatternMatching21	-	-
+case	JAVA_17_PREVIEW	register	pkg/TestSwitchPatternMatching22	-	pkg/TestSwitchPatternMatching22_1.dec
+case	JAVA_17_PREVIEW	register	pkg/TestSwitchPatternMatchingLoop	-	-
+case	JAVA_17_PREVIEW	register	pkg/TestSwitchPatternMatchingInstanceof1	-	-
+case	JAVA_17_PREVIEW	register	pkg/TestSwitchPatternMatchingInstanceof2	-	-
+case	JAVA_17_PREVIEW	register	pkg/TestSwitchPatternMatchingInstanceof3	-	-
+case	JAVA_17_PREVIEW	register	pkg/TestSwitchPatternMatchingInstanceof4	-	-
+case	JAVA_17_PREVIEW	register	pkg/TestSwitchPatternMatchingReturn1	-	-
+case	JAVA_17_PREVIEW	register	pkg/TestSwitchPatternMatchingReturn2	-	-
+case	JAVA_17_PREVIEW	register	pkg/TestSwitchPatternMatchingConstructor1	-	-
+case	JAVA_17_PREVIEW	register	pkg/TestSwitchPatternMatchingConstructor2	-	-
+case	JAVA_17_PREVIEW	register	pkg/TestSwitchPatternMatchingWithNull	-	-
+case	JAVA_17_PREVIEW	register	pkg/TestSwitchPatternMatchingFuzz1	-	pkg/TestSwitchPatternMatchingFuzz1_1.dec
+case	JASM	register	pkg/TestCondy	-	-
+case	JASM	register	pkg/TestBackwardsExceptionHandler	-	-
+case	JASM	register	pkg/TestLeakyMethod	-	-
+case	JASM	register	pkg/TestSelfIterableLoop	-	-
+case	JAVA_8	register	pkg/TestStaticInit	-	-
+case	JAVA_8_NODEBUG	register	pkg/TestDoubleNestedClass	-	-
+case	JAVA_8	register	pkg/TestDuplicateSwitchLocals	-	-
+case	JAVA_8	register	pkg/TestIfTernary1	-	-
+case	JAVA_8	register	pkg/TestIfTernary2	-	-
+case	JAVA_8	register	pkg/TestIfTernary3	-	-
+case	JAVA_8	register	pkg/TestIfTernaryReturn	-	-
+case	JAVA_8	register	pkg/TestIfElseTernary1	-	-
+case	JAVA_17	register	pkg/TestIfTernary1J17	-	-
+case	JAVA_17	register	pkg/TestIfElseTernary1J17	-	-
+case	JAVA_8	register	pkg/TestSimpleIf	-	-
+case	JAVA_8	register	pkg/TestInlineNoSuccessor	-	-
+case	JAVA_8	register	pkg/TestEnumArrayStaticInit	-	-
+case	JAVA_16	register	pkg/TestAssertJ16	-	-
+case	JAVA_8	register	pkg/TestSynchronizedTernary	-	-
+case	JAVA_8	register	pkg/TestUnicodeIdentifiers	-	-
+case	JAVA_8	register	pkg/TestDoubleBraceInitializers	-	-
+case	JAVA_8	register	pkg/TestPPMM	-	-
+case	JAVA_8	register	pkg/TestPPMMByte	-	-
+case	JAVA_8	register	pkg/TestPPMMLong	-	-
+case	JAVA_8	register	pkg/TestPPMMBoxed	-	-
+case	JAVA_8	register	pkg/TestPPMMOnObjectField	-	-
+case	JAVA_8	register	pkg/TestPPMMOnStaticField	-	-
+case	JAVA_8	register	pkg/TestPPMMPhi	-	-
+case	JAVA_17	register	pkg/TestImplicitlySealedEnum	-	-
+case	JAVA_16	register	pkg/TestTextBlocks	-	-
+case	CUSTOM	registerRaw	Java14Test	-	-
+case	CUSTOM	registerRaw	JsHurt	-	-
+case	CUSTOM	registerRaw	TestJsr	-	-
+case	CUSTOM	registerRaw	TestJsr2	-	-
+case	JAVA_8	register	pkg/TestOverrideIndirect	-	-
+case	CUSTOM	registerRaw	TestIdeaNotNull	-	-
+case	CUSTOM	registerRaw	TestHotjava	-	-
+case	CUSTOM	registerRaw	TestJava1Synchronized	-	-
+case	JAVA_8	register	pkg/TestLabeledBreaks	-	-
+case	JAVA_8	register	pkg/TestLabeledBlockInConstructor	-	-
+case	JAVA_8	register	pkg/TestSwitchLoop	-	-
+case	JAVA_8	register	pkg/TestSwitchFinally	-	-
+case	JAVA_8	register	pkg/TestLoopFinally	-	-
+case	JAVA_8	register	pkg/TestUnknownCast	-	-
+case	JAVA_8	register	pkg/TestLocalClassesSwitch	-	-
+case	JAVA_8	register	pkg/TestFinallyThrow	-	-
+case	JAVA_8	register	pkg/TestFloatInvertedIfConditionEarlyExit	-	-
+case	JAVA_8	register	pkg/TestWhile1	-	-
+case	CUSTOM	registerRaw	TestEclipseSwitchEnum	-	-
+case	CUSTOM	registerRaw	TestEclipseSwitchString	-	-
+case	CUSTOM	registerRaw	TestStringConcatJ19	-	-
+case	JAVA_8	register	pkg/TestNestedAnonymousClass	-	-
+case	JAVA_8	register	pkg/TestPPMMLoop	-	-
+case	JAVA_8	register	pkg/TestPPMMIf	-	-
+case	JAVA_8	register	pkg/TestForeachMultipleLoops	-	-
+case	JAVA_8	register	pkg/TestLoopBreak3	-	-
+case	JAVA_8	register	pkg/TestDoWhileMerge	-	-
+case	JAVA_8	register	pkg/TestTernaryReturn	-	-
+case	JAVA_8	register	pkg/TestArrayAssign	-	-
+case	JASM	register	pkg/TestGoto	-	-
+case	JAVA_8	register	pkg/TestLambdaQualified	-	-
+case	JAVA_16	register	pkg/TestTernaryReturn2	-	-
+case	JAVA_8	register	pkg/TestGenericMap	-	-
+case	JAVA_8	register	pkg/TestArrayNewAccess	-	-
+case	JAVA_8	register	pkg/TestAnnotationFormatting	-	-
+case	JAVA_8	register	pkg/TestConstructorInvoc	-	-
+case	JAVA_8	register	pkg/TestInterfaceNullInvoc	-	-
+case	JAVA_8	register	pkg/TestUnionTypeAssign	-	-
+case	JAVA_8	register	pkg/TestGenericsInvocUnchecked	-	-
+case	JAVA_8	register	pkg/TestGenericSuperCast	-	-
+case	JAVA_8	register	pkg/TestLocalVariableMerge	-	-
+case	JAVA_8	register	pkg/TestLocalVariableMergeSwitch	-	-
+case	JAVA_8	register	pkg/TestLoopBreak4	-	-
+case	JAVA_17	register	pkg/TestDoubleBraceInitializersJ17	-	-
+case	JAVA_17	register	pkg/TestDuplicateAssignmentInSwitchExpr	-	-
+case	JAVA_8	register	pkg/TestLoopMerging2	-	-
+case	JAVA_8	register	pkg/TestAssertConst	-	-
+case	JAVA_8	register	pkg/TestLambdaLocalCapture	-	-
+case	JAVA_8	register	pkg/TestArrayFieldAccess	-	-
+case	JAVA_8	register	pkg/TestArrayPPMM	-	-
+case	JAVA_8	register	pkg/TestArrayPPMM1	-	-
+case	JAVA_8	register	pkg/TestDoubleAdd	-	-
+case	JAVA_8	register	pkg/TestTempAssign	-	-
+case	JAVA_8	register	pkg/TestArrayFieldAccess1	-	-
+case	JAVA_8	register	pkg/TestPPMMMath	-	-
+case	JASM	register	pkg/TestSwapException	-	-
+case	KOTLIN	register	pkg/TestKotlinEnumWhen	-	-
+case	JAVA_8	register	pkg/TestSynchronizedTryReturn	-	-
+case	JAVA_8	register	pkg/TestWhileConditionTernary	-	-
+case	JAVA_17	register	pkg/TestDefiniteAssignment	-	-
+case	JAVA_8_NODEBUG	register	pkg/TestNoUse	-	-
+case	JAVA_8_NODEBUG	register	pkg/TestTryReturnNoDebug	-	-
+case	JAVA_8	register	pkg/TestArrayAssign2	-	-
+case	JAVA_8	register	pkg/TestTryLoopNoCatch	-	-
+case	JAVA_8	register	pkg/TestCollectionItr	-	-
+case	JAVA_8	register	pkg/TestListEquals	-	-
+case	JAVA_8	register	pkg/TestIfElseSwitch	-	-
+case	JAVA_8	register	pkg/TestInstanceStaticInvoke	-	-
+case	JAVA_8	register	pkg/TestFinallyBlockVariableUse	-	-
+case	JAVA_8	register	pkg/TestIntBoolMerge	-	-
+case	JAVA_8_NODEBUG	register	pkg/TestIntBoolMergeNoDebug	-	-
+case	JAVA_8	register	pkg/TestInnerClassGeneric	-	-
+case	JAVA_8	register	pkg/TestArrayFieldAccess2	-	-
+case	JAVA_8	register	pkg/TestNestedArrayPP	-	-
+case	JAVA_8_NODEBUG	register	pkg/TestCompoundAssignmentReplace	-	-
+case	JAVA_8	register	pkg/TestSharedVarIndex	-	-
+case	JAVA_8	register	pkg/TestTryVar	-	-
+case	JAVA_8_NODEBUG	register	pkg/TestTryVarNoDebug	-	-
+case	JAVA_8	register	pkg/TestFloatOrderOfOperations	-	-
+case	JAVA_8	register	pkg/TestMixedCompoundAssignment	-	-
+case	JAVA_8	register	pkg/TestForeachVardef	-	-
+case	JAVA_8	register	pkg/TestGenericStaticCall	-	-
+case	JAVA_8	register	pkg/TestAssertMerge	-	-
+case	JAVA_8	register	pkg/TestTernaryAssign	-	-
+case	JAVA_8	register	pkg/TestLoopReturn	-	-
+case	JAVA_8	register	pkg/TestForCyclicVarDef	-	-
+case	JAVA_8	register	pkg/TestTryCatchNested	-	-
+case	JAVA_8	register	pkg/TestSwitchTernary	-	-
+case	JAVA_8	register	pkg/TestBooleanExpressions	-	-
+case	JAVA_8	register	pkg/TestObjectBitwise	-	-
+case	JAVA_17	register	pkg/TestSealedFinal	-	-	pkg/SealedInterface
+case	JAVA_17	register	pkg/TestSealedRecord	-	-	pkg/SealedInterface
+case	JAVA_8	register	pkg/TestEnumSwitchEmpty	-	-
+case	JAVA_8	register	pkg/TestArrayConstructorReference	-	-
+case	JAVA_8	register	pkg/TestInnerClassExtend	-	-
+case	JAVA_8	register	pkg/TestInnerClassReference	-	-	ext/SomeOuterClass	ext/SomeOuterClass$SomeInner
+case	JAVA_17	register	pkg/TestInnerClassExtendJ17	-	-
+case	SCALA	register	pkg/TestCaseClasses	-	-	pkg/Option1	pkg/Option1$	pkg/Option2	pkg/Option2$	pkg/Option3	pkg/Option3$	pkg/EnumLike	pkg/EnumLike$
+case	SCALA	register	pkg/TestObject	-	-	pkg/TestObject$
+case	SCALA	register	pkg/TestCompanionObject	-	-	pkg/TestCompanionObject$
+case	JAVA_8	register	pkg/TestForeachMultiDimensionalArray	-	-
+case	JAVA_17_PREVIEW	register	pkg/TestUnknownCastJ17	-	-
+case	JAVA_8_NODEBUG	register	pkg/TestVarIndex	-	-
+case	JAVA_8	register	pkg/TestStaticIterator	-	-
+case	JAVA_16	register	pkg/TestPatternMatchingInline	-	-
+case	JAVA_16	register	pkg/TestPatternMatchingCompoundBool	-	-
+case	JAVA_8	register	pkg/TestStackCastParam	-	-
+case	JAVA_8	register	pkg/TestObjectPhi	-	-
+case	JASM	register	pkg/TestMethodParamsNoLvt	-	-
+case	JAVA_8	register	pkg/TestPrimitiveTypeClasses	-	-
+case	JAVA_17	register	pkg/TestVarRedef	-	-
+case	JAVA_17	register	pkg/TestDoubleForeach	-	-
+case	JAVA_8	register	pkg/TestVarMergeSupertype	-	-
+case	JAVA_8	register	pkg/TestAmbiguousArraylen	-	-
+case	JAVA_17	register	pkg/TestSwitchDefaultCaseReturn	-	-
+case	JAVA_17	register	pkg/TestSingleCaseStrSwitch	-	-
+case	JAVA_16	register	pkg/TestIfPatternMatchMethod	-	-
+case	JAVA_16	register	pkg/TestPatternMatchingInvoke	-	-
+case	JAVA_8	register	pkg/TestLambdaParamTypes	-	-
+case	JAVA_8	register	pkg/TestGenericComparison	-	-
+case	JAVA_8	register	pkg/TestStaticBlockFinalField	-	-
+case	JAVA_8	register	pkg/TestWhileLambda	-	-
+case	JAVA_8	register	pkg/TestTrySplit	-	-
+case	JAVA_8	register	pkg/TestWhileForeach	-	-
+case	JAVA_21	register	pkg/TestRecordPatterns1	-	-
+case	JAVA_21	register	pkg/TestRecordPatterns2	-	-
+case	JAVA_21	register	pkg/TestRecordPatterns3	-	-
+case	JAVA_21	register	pkg/TestRecordPatterns4	-	-
+case	JAVA_21	register	pkg/TestRecordPatterns5	-	-
+case	JAVA_21	register	pkg/TestRecordPatterns6	-	-
+case	JAVA_21	register	pkg/TestRecordPatterns7	-	-
+case	JAVA_21	register	pkg/TestRecordPatterns8	-	-
+case	JAVA_21	register	pkg/TestRecordPatterns9	-	-
+case	JAVA_21_PREVIEW	register	pkg/TestStrProcessor	-	-
+case	JAVA_21_PREVIEW	register	pkg/TestRawProcessor	-	-
+case	JAVA_21_PREVIEW	register	pkg/TestFmtProcessor	-	-
+case	JAVA_21_PREVIEW	register	pkg/TestCustomProcessor	-	-
+case	JAVA_16	register	pkg/TestMissingLambdaBody	-	-
+case	JAVA_25	register	pkg/TestUnnamedVar1	-	-
+case	JAVA_25	register	pkg/TestRecordPatterns1J25	-	-
+case	JAVA_25	register	pkg/TestSwitchPatternMatchingJ25	-	-
+case	JAVA_8	register	pkg/TestNumberCasts	-	-
+case	JAVA_8	register	pkg/TestNumberDisambiguation	-	-
+case	JAVA_8	register	pkg/TestDanglingBoxingCall	-	-
+case	JAVA_21	register	pkg/TestSwitchOnEnumJ21	-	-	ext/TestEnum2
+case	CUSTOM	registerRaw	TestSwitchOnEnumWithoutEnumJ21	-	-
+case	JAVA_21	register	pkg/TestSwitchSimpleMultiLine	-	-
+case	JAVA_21	register	pkg/TestInnerClassesJ21	-	-
+case	JAVA_21	register	pkg/TestInnerClasses2J21	-	-
+case	JAVA_21	register	pkg/TestInnerClasses3J21	-	-
+case	JAVA_21	register	pkg/TestInnerClasses4J21	-	-
+case	JAVA_8	register	pkg/TestInnerClassesJ8	-	-
+case	JAVA_8	register	pkg/TestSwitchInTry	-	-
+case	JAVA_21	register	pkg/TestSwitchPatternMatchingJ21	-	-
+case	JAVA_21	register	pkg/TestCastIntersectionJ21	-	-
+case	JAVA_16	register	pkg/TestRecordLocal	-	-
+case	JAVA_8	register	pkg/TestAnonymousClassToLambda	-	-
+case	JAVA_17	register	pkg/TestPatternMatchingLoops	-	-
+case	JAVA_8	register	pkg/TestBoxingSuperclass	-	-
+case	JAVA_8	register	pkg/TestLVTReassignment	-	-
+case	JAVA_8	register	pkg/TestCatchVariable	-	-
+case	JAVA_8	register	pkg/TestExtraneousImports	-	-
+case	JAVA_17	register	pkg/TestSwitchOnEnumFake	-	-
+case	JAVA_16	register	pkg/TestSwitchExpressionReturnType	-	-
+case	JAVA_8	register	pkg/TestGenericMapping	-	-
+case	JAVA_8	register	pkg/TestNestedGenerics1	-	-
+case	JAVA_11	register	pkg/TestNestedGenerics2	-	-
+case	CUSTOM	registerRaw	TestCorruptedSignatures	Signatures.java	-
+case	JAVA_8	register	pkg/TestWhileLoopPromotion	-	-
+case	JAVA_21	register	pkg/TestTypeAnnotations	-	-
+case	JAVA_8	register	pkg/TestCatchClashing	-	-
+case	JAVA_8_NODEBUG	register	pkg/TestLVTReassignmentNoDebug	-	-
+case	JAVA_8	register	pkg/TestMultiException	-	-
+case	JAVA_16	register	pkg/TestPatternMatching	-	-
+case	JAVA_16	register	pkg/TestPatternMatchingFake	-	-
+case	JAVA_16	register	pkg/TestPatternMatchingFakeLoops	-	-
+case	JAVA_16	register	pkg/TestPatternMatchingFakeLoopsInverted	-	-
+case	JAVA_16	register	pkg/TestPatternMatchingFakeNew	-	-
+case	JAVA_16	register	pkg/TestPatternMatchingMerge	-	-
+case	JAVA_16	register	pkg/TestPatternMatchingStatic	-	-
+case	JAVA_16_NODEBUG	register	pkg/TestPatternMatchingAssign	-	-
+case	JAVA_16	register	pkg/TestPatternMatchingLocalCapture	-	-
+case	JAVA_16	register	pkg/TestPatternMatchingReturn	-	-
+case	JAVA_17	register	pkg/TestPatternMatching17	-	-
+case	JAVA_17	register	pkg/TestPatternMatching17Fake	-	-
+case	JAVA_17	register	pkg/TestPatternMatching17FakeLoops	-	-
+case	JAVA_17	register	pkg/TestPatternMatching17FakeLoopsInverted	-	-
+case	JAVA_17	register	pkg/TestPatternMatching17FakeNew	-	-
+case	JAVA_17	register	pkg/TestPatternMatching17AlreadyUsed	-	-
+case	JAVA_17	register	pkg/TestPatternMatchingInteger	-	-
+case	JAVA_8	register	pkg/TestTryLoop	-	-
+case	JAVA_8	register	pkg/TestTryLoop2	-	-
+case	JAVA_8	register	pkg/TestTryLoopRecompile	-	-
+case	JAVA_8	register	pkg/TestTryLoopSimpleFinally	-	-
+case	JAVA_8	register	pkg/TestTryLoopReturnFinally	-	-
+case	JASM	register	pkg/TestNumberCompareToBoolean	-	-
+case	JAVA_21	register	pkg/TestMethodReferenceJ21	-	-	ext/RefsExt
+case	JAVA_25	register	pkg/TestMethodReferenceJ25	-	-	ext/RefsExt
+case	JAVA_16_NODEBUG	register	pkg/TestObjectLambda	-	-
+case	JAVA_25	register	pkg/TestAnonymousClassJ25	-	-
+case	JAVA_25	register	pkg/TestAssertInterface1	-	-
+case	JAVA_25	register	pkg/TestAssertInterface2	-	-
+case	JAVA_25	register	pkg/TestAssertInterface3	-	-
+case	JAVA_25	register	pkg/TestAssertsEnabled	-	-
+case	JAVA_8	register	pkg/TestFloatPiAdd	-	-
+case	JAVA_25	register	pkg/TestAssertPatternMatching	-	-
+case	JAVA_8	register	pkg/TestFinallyVarDef	-	-
+case	JAVA_25	register	pkg/TestPatternMatchSwitchString	-	-
+case	JAVA_16	register	pkg/TestPatternMatchingVariableScope	-	-
+case	JAVA_17	register	pkg/TestStringSwitchTypes	-	-
+case	JAVA_16	register	pkg/TestSwitchExpressionIfBlocks	-	-
+
+set	core	Entire Classpath	bytecode-source-mapping=1	__dump_original_lines__=1	dump-exception-on-error=0	ignore-invalid-bytecode=1	verify-anonymous-classes=1	include-classpath=1	verify-pre-post-merges=1
+case	KOTLIN	register	pkg/TestKotlinConstructorKt	-	-
+case	KOTLIN	register	pkg/TestNamedSuspendFun2Kt	-	-
+
+set	core	Java Runtime	bytecode-source-mapping=1	__dump_original_lines__=1	dump-exception-on-error=0	ignore-invalid-bytecode=1	verify-anonymous-classes=1	include-runtime=1	verify-pre-post-merges=1
+case	JAVA_8	register	pkg/TestGenerics	-	-
+case	JAVA_8	register	pkg/TestClassTypes	-	-
+case	JAVA_8	register	pkg/TestGenericNull	-	-
+case	JAVA_8	register	pkg/TestClassCast	-	-
+case	JAVA_8	register	pkg/TestBoxingConstructor	-	-
+case	JAVA_8	register	pkg/TestLocalsSignature	-	-
+case	JAVA_8	register	pkg/TestShadowing	-	-	pkg/Shadow	ext/Shadow	pkg/TestShadowingSuperClass
+case	JAVA_8	register	pkg/TestPrimitives	-	-
+case	JAVA_8	register	pkg/TestVarArgCalls	-	-
+case	JAVA_8	register	pkg/TestUnionType	-	-
+case	JAVA_8	register	pkg/TestTryWithResources	-	-
+case	JAVA_8	register	pkg/TestTryWithResourcesLoop	-	-
+case	JAVA_8	register	pkg/TestTryWithResourcesMulti	-	-
+case	JAVA_8	register	pkg/TestTryWithResourcesNestedLoop	-	-
+case	JAVA_8	register	pkg/TestTryWithResourcesReturn	-	-
+case	JAVA_8	register	pkg/TestNestedLoops	-	-
+case	JAVA_8	register	pkg/TestAnonymousClass	-	-
+case	JAVA_16	register	pkg/TestAnonymousClassJ16	-	-
+case	JAVA_8	register	pkg/TestObjectArrays	-	-
+case	JAVA_8	register	pkg/TestAnonymousParams	-	-
+case	JAVA_8	register	pkg/TestThrowException	-	-
+case	JAVA_8	register	pkg/TestClassSimpleBytecodeMapping	-	-
+case	JAVA_8	register	pkg/TestAnonymousSignature	-	-
+case	JAVA_16	register	pkg/TestTryWithResourcesJ16	-	-
+case	JAVA_16	register	pkg/TestTryWithResourcesCatchJ16	-	-
+case	JAVA_16	register	pkg/TestTryWithResourcesMultiJ16	-	-
+case	JAVA_16	register	pkg/TestTryWithResourcesFinallyJ16	-	-
+case	JAVA_16	register	pkg/TestTryWithResourcesCatchFinallyJ16	-	-
+case	JAVA_16	register	pkg/TestTryWithResourcesReturnJ16	-	-
+case	JAVA_16	register	pkg/TestTryWithResourcesNestedJ16	-	-
+case	JAVA_16	register	pkg/TestTryWithResourcesNullJ16	-	-
+case	JAVA_16	register	pkg/TestTryWithResourcesOuterJ16	-	-
+case	JAVA_16	register	pkg/TestTryWithResourcesLoopJ16	-	-
+case	JAVA_16	register	pkg/TestTryWithResourcesFake	-	-
+case	JAVA_16	register	pkg/TestTryWithResourcesSwitchJ16	-	-
+case	JAVA_16	register	pkg/TestTryWithResourcesNestedLoopJ16	-	-
+case	JAVA_16	register	pkg/TestTryWithResourcesFakeTrigger	-	-
+case	JAVA_16	register	pkg/TestTryWithResourcesManyJ16	-	-
+case	JAVA_8	register	pkg/TestGenericMapEntireClasspath	-	-
+case	JAVA_8	register	pkg/TestGenericsTernary	-	-
+case	JAVA_8	register	pkg/TestGenericSuper	-	-
+case	JAVA_8	register	pkg/TestGenericsQualified	-	-
+case	JAVA_8	register	pkg/TestGenericCast	-	-
+case	JAVA_8	register	pkg/TestItrLoop	-	-
+case	JAVA_8	register	pkg/TestNoGenericDiamonds	-	-
+case	JAVA_8	register	pkg/TestGenericCastSuper	-	-
+case	JAVA_8	register	pkg/TestGenericCastCall	-	-
+case	JAVA_8	register	pkg/TestGenericInput	-	-
+case	JAVA_8	register	pkg/TestGenericsHierarchy	-	-
+case	JAVA_8	register	pkg/TestLambdaGenericCall	-	-
+case	JAVA_8	register	pkg/TestTryWithResourcesAfterSwitch	-	-
+case	JAVA_8	register	pkg/TestArrayConstructorReferenceJrt	-	-
+case	JAVA_8_NODEBUG	register	pkg/TestVarIndex2	-	-
+case	JAVA_8	register	pkg/TestTryReturn	-	-
+case	JAVA_8	register	pkg/TestGenericWildcard	-	-
+case	JAVA_8	register	pkg/TestGenericObjectType	-	-
+case	JAVA_8	register	pkg/TestGenericSubclassTypes	-	-
+case	JAVA_16_NODEBUG	register	pkg/TestRecordCanonicalConstructor	-	-
+case	JAVA_16_NODEBUG	register	pkg/TestRecordCanonicalConstructor2	-	-
+case	JAVA_8	register	pkg/TestGenericArrays	-	-
+case	JAVA_8	register	pkg/TestInstanceGeneric	-	-
+case	JAVA_8	register	pkg/TestArrayGenerics	-	-
+case	JAVA_8	register	pkg/TestEmptyLambda	-	-
+case	JAVA_8	register	pkg/TestArrayArg	-	-
+case	JAVA_8	register	pkg/TestGenericLattice	-	-
+case	JAVA_21	register	pkg/TestTryWithResourcesJ21	-	-
+
+set	core	Literals	bytecode-source-mapping=1	__dump_original_lines__=1	dump-exception-on-error=0	ignore-invalid-bytecode=1	verify-anonymous-classes=1	keep-literals=0	verify-pre-post-merges=1
+case	JAVA_8	register	pkg/TestFloatPrecision	-	-
+case	JAVA_8	register	pkg/TestNotFloatPrecision	-	-
+case	JAVA_8	register	pkg/TestConstantUninlining	-	-
+case	JAVA_8	register	pkg/TestPiDivision	-	-
+
+set	core	Ternary Constant Simplification	bytecode-source-mapping=1	__dump_original_lines__=1	dump-exception-on-error=0	ignore-invalid-bytecode=1	verify-anonymous-classes=1	keep-literals=0	ternary-constant-simplification=1	verify-pre-post-merges=1
+case	JAVA_8	register	pkg/TestReturnTernaryConstantSimplification	-	-
+case	JAVA_8	register	pkg/TestAssignmentTernaryConstantSimplification	-	-
+
+set	core	LVT	decompile-inner=1	dump-exception-on-error=0	decompile-generics=1	ascii-strings=1	remove-synthetic=1	remove-bridge=1	use-lvt-names=1	verify-pre-post-merges=1
+case	JAVA_8	register	pkg/TestLVT	-	-
+case	JAVA_8	register	pkg/TestLVTScoping	-	-
+case	JAVA_8	register	pkg/TestLVTComplex	-	-
+case	JAVA_8	register	pkg/TestVarType	-	-
+case	JAVA_8	register	pkg/TestLoopMerging	-	-
+
+set	core	No LVT	decompile-inner=1	dump-exception-on-error=0	decompile-generics=1	ascii-strings=1	remove-synthetic=1	remove-bridge=1	use-lvt-names=0	verify-pre-post-merges=1
+case	JAVA_8	register	pkg/TestNoLvt	-	-
+
+set	core	Javadoc	fabric:javadoc=javadoc
+case	JAVA_8	register	pkg/TestJavadoc	-	-
+
+set	core	Markdown Javadoc	fabric:javadoc=markdown
+case	JAVA_8	register	pkg/TestMarkdownJavadoc	-	-
+
+set	core	Renaming	bytecode-source-mapping=1	__dump_original_lines__=1	dump-exception-on-error=0	ignore-invalid-bytecode=1	verify-anonymous-classes=1	include-classpath=0	rename-members=1	verify-pre-post-merges=1
+case	JAVA_8	registerFailable	pkg/TestRenameEntities	-	-
+
+set	core	Complex Condys	bytecode-source-mapping=1	__dump_original_lines__=1	dump-exception-on-error=0	ignore-invalid-bytecode=1	verify-anonymous-classes=1	include-classpath=0	decompile-complex-constant-dynamic=1	preferred-line-length=250	verify-pre-post-merges=1
+case	JASM	register	pkg/TestComplexCondy	-	-
+
+set	core	Text Tokens	dump-text-tokens=1	bytecode-source-mapping=1	__dump_original_lines__=1	dump-exception-on-error=0	ignore-invalid-bytecode=1	verify-anonymous-classes=1	include-classpath=0	ternary-in-if=1	force-jsr-inline=1	preferred-line-length=120	verify-pre-post-merges=1
+case	JAVA_8	register	pkg/TestTextTokens	-	-
+case	JAVA_16	register	pkg/TestTextTokens2	-	-
+case	JAVA_8	register	pkg/TestTextTokens3	-	-
+case	JAVA_21	register	pkg/TestTypeAnnotationsTokens	-	-
+
+set	core	Synthetics Marking	bytecode-source-mapping=1	__dump_original_lines__=1	dump-exception-on-error=0	ignore-invalid-bytecode=1	verify-anonymous-classes=1	mark-corresponding-synthetics=1	verify-pre-post-merges=1
+case	JAVA_8	register	pkg/TestLambdaNaming	-	-
+case	JAVA_8	register	pkg/TestAnonymousClassNaming	-	-
+case	JAVA_8	register	pkg/TestLocalClassNaming	-	-
+
+set	core	Lambda to Anonymous Class	bytecode-source-mapping=1	__dump_original_lines__=1	dump-exception-on-error=0	ignore-invalid-bytecode=1	verify-anonymous-classes=1	include-classpath=0	ternary-in-if=1	force-jsr-inline=1	lambda-to-anonymous-class=1	verify-pre-post-merges=1
+case	JAVA_8	register	pkg/TestLambdaToAnonymousClass	-	-
+case	JAVA_8	register	pkg/TestLambdaToAnonymousClass2	-	-
+
+set	core	Single method	bytecode-source-mapping=1	__dump_original_lines__=1	dump-exception-on-error=0	ignore-invalid-bytecode=1	verify-anonymous-classes=1	include-classpath=1	verify-pre-post-merges=1	method-to-decompile=test()V
+case	JAVA_8	register	pkg/TestSingleMethod	-	-
+
+set	core	Single method in inner class	bytecode-source-mapping=1	__dump_original_lines__=1	dump-exception-on-error=0	ignore-invalid-bytecode=1	verify-anonymous-classes=1	include-classpath=1	verify-pre-post-merges=1	method-to-decompile=pkg/TestSingleMethodInInnerClass$Inner.test()V
+case	JAVA_8	register	pkg/TestSingleMethodInInnerClass	-	-
+
+set	idea-not-null	With Idea Not Null	bytecode-source-mapping=1	__dump_original_lines__=1	dump-exception-on-error=0	ignore-invalid-bytecode=1	verify-anonymous-classes=1	include-classpath=0	ternary-in-if=1	force-jsr-inline=1
+case	CUSTOM	registerRaw	TestIdeaNotNull	-	-
+
+set	kotlin	Entire Classpath	bytecode-source-mapping=1	__dump_original_lines__=1	dump-exception-on-error=0	ignore-invalid-bytecode=1	remove-synthetic=0	verify-anonymous-classes=1
+case	KOTLIN	register	pkg/TestKt	-	-
+case	KOTLIN	register	pkg/TestParams	-	-
+case	KOTLIN	register	pkg/TestInfixFun	-	-
+case	KOTLIN	register	pkg/TestFunVarargs	-	-
+case	KOTLIN	register	pkg/TestSmartCasts	-	-
+case	KOTLIN	register	pkg/TestTailrecFunctions	-	-
+case	KOTLIN	register	pkg/TestTryCatchExpressions	-	-
+case	KOTLIN	register	pkg/TestTryCatchFinally	-	-
+case	KOTLIN	register	pkg/TestTryCatchNested	-	-
+case	KOTLIN	register	pkg/TestTryCatchThrowable	-	-
+case	KOTLIN	register	pkg/TestTryFinally	-	-
+case	KOTLIN	register	pkg/TestTryFinallyExpressions	-	-
+case	KOTLIN	register	pkg/TestTryLoop	-	-
+case	KOTLIN	register	pkg/TestTryLoop2	-	-
+case	KOTLIN	register	pkg/TestTryLoopNoCatch	-	-
+case	KOTLIN	register	pkg/TestTryLoopRecompile	-	-
+case	KOTLIN	register	pkg/TestTryLoopReturnFinally	-	-
+case	KOTLIN	register	pkg/TestTryLoopSimpleFinally	-	-
+case	KOTLIN	register	pkg/TestTryReturn	-	-
+case	KOTLIN	register	pkg/TestTrySplit	-	-
+case	KOTLIN	register	pkg/TestTrySynchronized	-	-
+case	KOTLIN	register	pkg/TestTryVar	-	-
+case	KOTLIN	register	pkg/TestVars	-	-
+case	KOTLIN	register	pkg/TestNonInlineLambda	-	-
+case	KOTLIN	register	pkg/TestNothingReturns	-	-
+case	KOTLIN	register	pkg/TestNullable	-	-
+case	KOTLIN	register	pkg/TestExtensionFun	-	-
+case	KOTLIN	register	pkg/TestClassDec	-	-
+case	KOTLIN	register	pkg/TestAnyType	-	-
+case	KOTLIN	register	pkg/TestWhen	-	-
+case	KOTLIN	register	pkg/TestWhenBoolean	-	-
+case	KOTLIN	register	pkg/TestForRange	-	-
+case	KOTLIN	register	pkg/TestIfRange	-	-
+case	KOTLIN	register	pkg/TestComparison	-	-
+case	KOTLIN	register	pkg/TestNullableOperator	-	-
+case	KOTLIN	register	pkg/TestShadowParam	-	-
+case	KOTLIN	register	pkg/TestWhenControlFlow	-	-
+case	KOTLIN	register	pkg/TestLabeledJumps	-	-
+case	KOTLIN	register	pkg/TestFuncRef	-	-
+case	KOTLIN	register	pkg/TestTopLevelKt	-	-
+case	KOTLIN	register	pkg/TestConvertedK2JOps	-	-
+case	KOTLIN	register	pkg/TestDataClass	-	-
+case	KOTLIN	register	pkg/TestDestructors	-	-
+case	KOTLIN	register	pkg/TestGenerics	-	-
+case	KOTLIN	register	pkg/TestKotlinTypes	-	-
+case	KOTLIN	register	pkg/TestObject	-	-
+case	KOTLIN	register	pkg/TestSealedHierarchy	-	-
+case	KOTLIN	register	pkg/TestAnnotations	-	-
+case	KOTLIN	register	pkg/TestBitwiseFunctions	-	-
+case	KOTLIN	register	pkg/TestCompileTimeErrors	-	-
+case	KOTLIN	register	pkg/TestPoorNames	-	-
+case	KOTLIN	register	pkg/TestSafeCasts	-	-
+case	KOTLIN	register	pkg/TestSynchronized	-	-
+case	KOTLIN	register	pkg/TestReflection	-	-
+case	KOTLIN	register	pkg/TestConstructors	-	-
+case	KOTLIN	register	pkg/TestContracts	-	-
+case	KOTLIN	register	pkg/TestStringInterpolation	-	-
+case	KOTLIN_OLD	register	pkg/TestClassicStringInterpolation	-	-
+case	KOTLIN	register	pkg/TestCompanionObject	-	-
+case	KOTLIN	register	pkg/TestEnumClass	-	-
+case	KOTLIN	register	pkg/TestAnonymousEverything	-	-
+case	KOTLIN	register	pkg/TestPropertyAccess	-	-	ext/Person
+case	KOTLIN	register	pkg/TestVarReplace	-	-
+
+set	kotlin	Multifile Facade	bytecode-source-mapping=1	__dump_original_lines__=1	dump-exception-on-error=0	ignore-invalid-bytecode=1	remove-synthetic=0	kt-decompile-facades=1
+case	KOTLIN	register	pkg/TestMultifile	-	-
+case	KOTLIN	register	pkg/TestMultifile__TestMultifileA	-	-
+case	KOTLIN	register	pkg/TestMultifile__TestMultifileB	-	-
+
+set	scala	Entire Classpath	bytecode-source-mapping=1	__dump_original_lines__=1	dump-exception-on-error=0	ignore-invalid-bytecode=1	verify-anonymous-classes=1	include-classpath=0	ternary-in-if=1	force-jsr-inline=1
+case	SCALA	register	pkg/TestCaseClasses	-	-	pkg/Option1	pkg/Option1$	pkg/Option2	pkg/Option2$	pkg/Option3	pkg/Option3$	pkg/EnumLike	pkg/EnumLike$
+case	SCALA	register	pkg/TestObject	-	-	pkg/TestObject$
+case	SCALA	register	pkg/TestCompanionObject	-	-	pkg/TestCompanionObject$
+case	SCALA	register	pkg/TestDefaultParams	-	-	pkg/TestDefaultParams$
+case	SCALA	register	pkg/TestImplicits	-	-	pkg/AddMonoid	pkg/AddMonoid$	pkg/MulMonoid	pkg/MulMonoid$	pkg/ConcatMonoid	pkg/ConcatMonoid$	pkg/Monoid
+case	SCALA	register	pkg/TestAssocTypes	-	-	pkg/Shuffler	pkg/IntShuffler	pkg/IntShuffler$	pkg/StringShuffler	pkg/StringShuffler$
+
+set	variable-renaming	JAD Naming	bytecode-source-mapping=1	__dump_original_lines__=1	dump-exception-on-error=0	variable-renaming=jad
+case	JAVA_8	register	pkg/TestJADNaming	-	-
+case	CUSTOM	registerRaw	TestJadLvtCollision	-	-
+case	JAVA_8	register	pkg/TestJADLocalClasses	-	-
+
+set	variable-renaming	Tiny Naming	bytecode-source-mapping=1	__dump_original_lines__=1	dump-exception-on-error=0	variable-renaming=tiny
+case	JAVA_8	register	pkg/TestTinyNaming	-	-
+

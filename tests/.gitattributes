@@ -1,0 +1,4 @@
+upstream/** -text
+upstream/**/*.class binary
+upstream/**/*.jar binary
+upstream/**/*.zip binary
