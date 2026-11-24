@@ -12,13 +12,24 @@ use crate::{
 };
 use super::pattern_switch::{Head, local, push_zero};
 
+#[path = "pattern_instanceof.rs"]
+mod pattern_instanceof;
+use pattern_instanceof::Instance;
+
 #[cfg(test)]
 #[path = "pattern_record_tests.rs"]
 mod tests;
 
 pub(super) struct Plans {
     arms: BTreeMap<(u32, u32), RecordArm>,
-    claimed: RefCell<BTreeSet<(u32, u32)>>,
+    instances: BTreeMap<u32, Instance>,
+    claimed: RefCell<BTreeSet<Site>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Site {
+    Switch(u32, u32),
+    Instance(u32),
 }
 
 pub(super) struct RecordArm {
@@ -34,11 +45,20 @@ enum Pattern {
 
 impl Pattern {
     fn render(&self, machine: &mut Machine<'_, '_>) -> Result<Document, LiftError> {
+        self.render_with(machine, &mut |machine, ty, store, cast, slot| {
+            machine.pattern_binding(ty, Some((store, cast, slot)), store.offset)
+        })
+    }
+
+    fn render_with<'a, 'c>(
+        &self, machine: &mut Machine<'a, 'c>,
+        binding: &mut impl FnMut(&mut Machine<'a, 'c>, &Type, &Instruction, Option<&Instruction>, u16) -> Result<Document, LiftError>,
+    ) -> Result<Document, LiftError> {
         match self {
-            Self::Binding { ty, store, cast, slot } => machine.pattern_binding(ty, Some((store, cast.as_ref(), *slot)), store.offset),
+            Self::Binding { ty, store, cast, slot } => binding(machine, ty, store, cast.as_ref(), *slot),
             Self::Record(ty, children) => {
                 let mut text = Document::from(machine.pattern_record_type(ty));
-                let children = children.iter().map(|child| child.render(machine)).collect::<Result<Vec<_>, _>>()?;
+                let children = children.iter().map(|child| child.render_with(machine, binding)).collect::<Result<Vec<_>, _>>()?;
                 text.append(Document::relative_delimited(children));
                 Ok(text)
             }
@@ -59,12 +79,12 @@ impl Plans {
 
     pub(super) fn claim(&self, dispatch: u32, block: u32) {
         if self.get(dispatch, block).is_some() {
-            self.claimed.borrow_mut().insert((dispatch, block));
+            self.claimed.borrow_mut().insert(Site::Switch(dispatch, block));
         }
     }
 
     pub(super) fn all_claimed(&self) -> bool {
-        self.claimed.borrow().len() == self.arms.len()
+        self.claimed.borrow().len() == self.arms.len() + self.instances.len()
     }
 
     /// Collapse exactly the verified deconstruction prefixes. Offsets of the
@@ -105,14 +125,31 @@ impl Plans {
         for range in wrappers.values() {
             removed[range.clone()].fill(true);
         }
-        let mut plans = Self { arms: BTreeMap::new(), claimed: RefCell::new(BTreeSet::new()) };
+        let mut plans = Self {
+            arms: BTreeMap::new(),
+            instances: BTreeMap::new(),
+            claimed: RefCell::new(BTreeSet::new()),
+        };
         let mut replacements = BTreeMap::new();
         let mut consumed_accesses = BTreeSet::new();
         let mut dead = Vec::new();
         let mut retry_owners = BTreeMap::new();
         let mut dispatch_headers = BTreeMap::new();
+        let mut instance_slots = Vec::new();
         for (dispatch_block, block) in graph.blocks.iter().enumerate() {
             let range = block.instructions.clone();
+            if let Some(proof) = Instance::prove(instructions, graph, &accesses, machine, dispatch_block) {
+                if proof.removed.clone().any(|index| removed[index]) {
+                    return None;
+                }
+                removed[proof.removed].fill(true);
+                consumed_accesses.extend(proof.accesses);
+                if plans.instances.insert(proof.branch, proof.instance).is_some() {
+                    return None;
+                }
+                instance_slots.push(proof.slots);
+                continue;
+            }
             let Some(indy) = range.end.checked_sub(2).filter(|index| *index >= range.start) else { continue };
             let [invoke, switch] = &instructions[indy..range.end] else { continue };
             let Operand::Switch { default, cases } = &switch.operand else { continue };
@@ -139,6 +176,7 @@ impl Plans {
                 let mut parser = Prefix {
                     instructions, graph, pool, accesses: &accesses, machine,
                     pos: start, alias, restart, dispatch: dispatch_block, key,
+                    failure: None,
                     first_temporary,
                     temporaries: BTreeSet::new(), receivers: BTreeSet::new(), leaves: BTreeSet::new(),
                     used_accesses: BTreeSet::new(), retries: BTreeSet::new(), may_fail: false,
@@ -147,7 +185,7 @@ impl Plans {
                 if parser.used_accesses.is_empty() { continue; }
                 let layout = parser.pos;
                 let owned: BTreeSet<_> = (start..layout).chain(parser.retries.iter().flat_map(|&block| graph.blocks[block].instructions.clone())).collect();
-                if !owns_prefix(instructions, graph, dispatch_block, start, resume, &owned, &parser.retries)
+                if !owns_prefix(instructions, graph, dispatch_block, start, resume, |index| owned.contains(&index), &parser.retries, None)
                     || owned.iter().any(|&index| removed[index])
                 {
                     return None;
@@ -175,7 +213,7 @@ impl Plans {
                 }
             }
         }
-        if plans.arms.is_empty() || accesses != consumed_accesses {
+        if (plans.arms.is_empty() && plans.instances.is_empty()) || accesses != consumed_accesses {
             return None;
         }
         for (header, preheader) in dispatch_headers {
@@ -194,7 +232,12 @@ impl Plans {
             }
         }
         let new_graph = ControlFlowGraph::build(&projected, &[]).ok()?;
-        let by_start: BTreeMap<_, _> = plans.arms.iter().map(|(&(_, start), arm)| (start, &arm.label)).collect();
+        let by_start: BTreeMap<_, _> = plans.arms.iter().map(|(&(_, start), arm)| (start, &arm.label))
+            .chain(plans.instances.values().map(Instance::definition))
+            .collect();
+        for slots in instance_slots {
+            slots.verify(&projected, &new_graph, &by_start)?;
+        }
         for SlotProof { resume, dispatch, key, hidden, partial_bindings } in dead {
             let success = new_graph.block_at(instructions[resume].offset)?;
             if !temps_are_dead(&projected, &new_graph, &by_start, &[success], &hidden) {
@@ -252,6 +295,7 @@ struct Prefix<'s, 'm, 'a, 'c> {
     accesses: &'s BTreeSet<usize>, machine: &'m Machine<'a, 'c>,
     pos: usize, alias: u16, restart: Option<u16>, dispatch: usize, key: i32,
     first_temporary: u16,
+    failure: Option<u32>,
     temporaries: BTreeSet<u16>, receivers: BTreeSet<u16>, leaves: BTreeSet<u16>,
     used_accesses: BTreeSet<usize>, retries: BTreeSet<usize>, may_fail: bool,
 }
@@ -366,6 +410,13 @@ impl Prefix<'_, '_, '_, '_> {
     fn retry(&mut self, op: &Instruction, real: bool) -> Option<()> {
         if op.opcode != 0x99 { return None; }
         let Operand::Branch(target) = op.operand else { return None };
+        if let Some(failure) = self.failure {
+            if target != failure {
+                return None;
+            }
+            self.may_fail |= real;
+            return Some(());
+        }
         let block = self.graph.block_at(target)?;
         let node = &self.graph.blocks[block];
         let [index, store, jump] = &self.instructions[node.instructions.clone()] else { return None };
@@ -406,16 +457,16 @@ impl Prefix<'_, '_, '_, '_> {
 
 fn owns_prefix(
     instructions: &[Instruction], graph: &ControlFlowGraph, dispatch: usize, start: usize, resume: usize,
-    owned: &BTreeSet<usize>, retries: &BTreeSet<usize>,
+    owns: impl Fn(usize) -> bool, retries: &BTreeSet<usize>, failure: Option<u32>,
 ) -> bool {
     let first = instructions[start].offset;
     let continuation = instructions[resume].offset;
     let continuation_block = graph.block_at(continuation);
     for (block, node) in graph.blocks.iter().enumerate() {
-        if Some(block) == continuation_block || node.instructions.clone().any(|index| owned.contains(&index)) {
+        if Some(block) == continuation_block || node.instructions.clone().any(&owns) {
             if !node.exception_predecessors.is_empty() || node.predecessors.iter().any(|&pred| {
                 let edge = graph.blocks[pred].instructions.end - 1;
-                !owned.contains(&edge) && !(pred == dispatch && node.instructions.start == start)
+                !owns(edge) && !(pred == dispatch && node.instructions.start == start)
             }) { return false; }
             if retries.contains(&block) && node.predecessors.is_empty() { return false; }
         }
@@ -424,12 +475,12 @@ fn owns_prefix(
         let targets: &[u32] = match &op.operand { Operand::Branch(target) => std::slice::from_ref(target), _ => &[] };
         let check = |target| {
             let Ok(destination) = instructions.binary_search_by_key(&target, |op| op.offset) else { return false; };
-            if owned.contains(&index) {
-                owned.contains(&destination) || target == continuation
+            if owns(index) {
+                owns(destination) || target == continuation || failure == Some(target)
                     || matches!(op.opcode, 0xa7 | 0xc8) && graph.block_at(target) == Some(dispatch)
                     && retries.iter().any(|&block| graph.blocks[block].instructions.contains(&index))
             } else {
-                !owned.contains(&destination) || target == first && graph.blocks[dispatch].instructions.contains(&index)
+                !owns(destination) || target == first && graph.blocks[dispatch].instructions.contains(&index)
             }
         };
         if !targets.iter().all(|&target| check(target)) { return false; }

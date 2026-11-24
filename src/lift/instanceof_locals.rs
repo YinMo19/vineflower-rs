@@ -1,6 +1,7 @@
 use crate::classfile::{TypeArgumentTarget, TypeTarget};
 
 use super::{Category, Effect, Instruction, LiftError, Local, Machine, Source, Type};
+use crate::source_text::Document;
 
 /// A local introduced by the successful flow of an `instanceof` expression.
 /// It is prepared at the test but never installed in the failing arm.
@@ -45,8 +46,19 @@ impl Machine<'_, '_> {
         store: &Instruction,
         slot: u16,
     ) -> Result<Option<IfPatternLocal>, LiftError> {
+        self.prepare_if_binding(ty, Some(cast), store, slot)
+    }
+
+    fn prepare_if_binding(
+        &self,
+        ty: &Type,
+        cast: Option<&Instruction>,
+        store: &Instruction,
+        slot: u16,
+    ) -> Result<Option<IfPatternLocal>, LiftError> {
         let index = usize::from(slot);
-        let Some(previous) = self.locals.slots.get(index) else {
+        let width = usize::from(ty.slots());
+        let Some(previous) = self.locals.slots.get(index..index + width) else {
             return Ok(None);
         };
         if index > 0
@@ -56,7 +68,8 @@ impl Machine<'_, '_> {
         {
             return Ok(None);
         }
-        if let Ok(offset) = u16::try_from(self.debug_offset(cast.offset))
+        if let Some(cast) = cast
+            && let Ok(offset) = u16::try_from(self.debug_offset(cast.offset))
             && self
                 .render_code_type(
                     ty,
@@ -80,7 +93,7 @@ impl Machine<'_, '_> {
         if debug.is_some_and(|entry| Type::parse(entry.descriptor).ok().as_ref() != Some(ty)) {
             return Ok(None);
         }
-        if previous.as_ref().is_some_and(|local| {
+        if previous.iter().flatten().any(|local| {
             local.receiver
                 || local
                     .debug_range
@@ -105,6 +118,38 @@ impl Machine<'_, '_> {
         }))
     }
 
+    pub(crate) fn prepare_record_if_component(
+        &self,
+        ty: &Type,
+        cast: Option<&Instruction>,
+        store: &Instruction,
+        slot: u16,
+    ) -> Result<(Document, IfPatternLocal), LiftError> {
+        if self.locals.declaration_signature(ty, self.store_debug(store, slot).as_ref()).is_some() {
+            return Err(self.unsupported("record pattern component requires a generic source type"));
+        }
+        let local = self.prepare_if_binding(ty, cast, store, slot)?
+            .ok_or_else(|| self.unsupported("record pattern cannot declare a fresh component local"))?;
+        let mut text = self.local_type_document(ty);
+        text.push(' ');
+        text.append(self.local_binding_document(slot, &local.local, true));
+        Ok((text, local))
+    }
+
+    pub(crate) fn record_if_selector(
+        &self, slot: u16, pattern: &Type, has_cast: bool,
+    ) -> Result<Document, LiftError> {
+        let local = self.locals.slots.get(usize::from(slot)).and_then(Option::as_ref)
+            .ok_or_else(|| self.invalid_local(slot, "unbound record-pattern selector"))?;
+        if local.generic.is_some()
+            || !self.known_assignable(&local.ty, pattern)
+                && (!has_cast || !self.known_assignable(pattern, &local.ty))
+        {
+            return Err(self.unsupported("record-pattern selector cannot supply the deconstruction receiver"));
+        }
+        Ok(self.local_binding_document(slot, local, false))
+    }
+
     pub(crate) fn lift_if_pattern_test(
         &mut self,
         instruction: &Instruction,
@@ -123,11 +168,16 @@ impl Machine<'_, '_> {
     }
 
     pub(crate) fn install_if_pattern_local(&mut self, binding: &IfPatternLocal) {
-        self.locals.slots[usize::from(binding.slot)] = Some(binding.local.clone());
+        let slot = usize::from(binding.slot);
+        self.locals.slots[slot] = Some(binding.local.clone());
+        if binding.local.ty.slots() == 2 {
+            self.locals.slots[slot + 1] = None;
+        }
     }
 
     pub(crate) fn restore_if_pattern_slot(&mut self, baseline: &Self, binding: &IfPatternLocal) {
         let slot = usize::from(binding.slot);
-        self.locals.slots[slot].clone_from(&baseline.locals.slots[slot]);
+        let slots = slot..slot + usize::from(binding.local.ty.slots());
+        self.locals.slots[slots.clone()].clone_from_slice(&baseline.locals.slots[slots]);
     }
 }

@@ -593,6 +593,9 @@ impl Emitter<'_> {
         if self.assertion_starts(block) {
             return self.emit_assertion(block, region, machine, depth, offsets);
         }
+        if binding.is_none() {
+            binding = self.record_instanceof_binding(block, machine, &mut condition, offsets)?;
+        }
         let condition_end = *control.end();
         let condition_facts = machine.last_boolean_condition();
         let held = machine.hold_control_stack(&control)?;

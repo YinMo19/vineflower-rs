@@ -15,16 +15,43 @@ use super::{Arm, Condition, Emitter, Region, StructureError, Tail, logical};
 pub(super) struct Binding {
     success: usize,
     body_start: Option<usize>,
-    local: IfPatternLocal,
+    locals: BoundLocals,
+}
+
+enum BoundLocals {
+    Single(IfPatternLocal),
+    Record(Vec<IfPatternLocal>),
+}
+
+impl BoundLocals {
+    fn as_slice(&self) -> &[IfPatternLocal] {
+        match self {
+            Self::Single(local) => std::slice::from_ref(local),
+            Self::Record(locals) => locals,
+        }
+    }
 }
 
 impl Binding {
+    pub(super) fn record(success: usize, locals: Vec<IfPatternLocal>) -> Self {
+        Self { success, body_start: None, locals: BoundLocals::Record(locals) }
+    }
+
+    fn locals_are_dead(&self, emitter: &mut Emitter<'_>, block: usize) -> bool {
+        self.locals
+            .as_slice()
+            .iter()
+            .all(|local| !emitter.local_is_live(block, local.slot()))
+    }
+
     pub(super) fn succeeds_at(&self, block: usize) -> bool {
         self.success == block
     }
 
     pub(super) fn enter(&self, machine: &mut Machine<'_, '_>) -> Option<usize> {
-        machine.install_if_pattern_local(&self.local);
+        for local in self.locals.as_slice() {
+            machine.install_if_pattern_local(local);
+        }
         self.body_start
     }
 }
@@ -167,7 +194,9 @@ impl Emitter<'_> {
         depth: usize,
         offsets: Vec<u32>,
     ) -> Result<(Tail, Option<Binding>), StructureError> {
-        let Some(site) = self.instanceof_site(block, machine, region, None) else {
+        let site = (!self.has_record_instance(block))
+            .then(|| self.instanceof_site(block, machine, region, None)).flatten();
+        let Some(site) = site else {
             return Ok((
                 self.lift_block(block, machine, region, depth, offsets)?,
                 None,
@@ -290,7 +319,7 @@ impl Emitter<'_> {
             Some(Binding {
                 success: site.success,
                 body_start: Some(site.store + 1),
-                local,
+                locals: BoundLocals::Single(local),
             }),
         ))
     }
@@ -309,7 +338,9 @@ impl Emitter<'_> {
         offsets: &mut Vec<u32>,
         control: &mut RangeInclusive<u32>,
     ) -> Result<bool, StructureError> {
-        if self.fold_instanceof_alternative(head, region, machine, depth, condition, binding, offsets, control)? {
+        if matches!(binding.locals, BoundLocals::Single(_))
+            && self.fold_instanceof_alternative(head, region, machine, depth, condition, binding, offsets, control)?
+        {
             return Ok(false);
         }
         let mut folded = Vec::new();
@@ -460,10 +491,9 @@ impl Emitter<'_> {
                 break;
             }
             let mut along = machine.clone();
-            along.install_if_pattern_local(&binding.local);
+            let start = binding.enter(&mut along).unwrap_or(node.instructions.start);
             let baseline = along.clone();
-            let range =
-                binding.body_start.unwrap_or(node.instructions.start)..node.instructions.end;
+            let range = start..node.instructions.end;
             let name_checkpoint = machine.local_name_checkpoint();
             let start = self.lines.len();
             let tail = self.lift_range(next, range, &mut along, region, depth, Vec::new());
@@ -506,7 +536,7 @@ impl Emitter<'_> {
                     && survivor.predecessors.len() == 2
                     && survivor.predecessors.contains(&next)
                     && survivor.predecessors.contains(&outer)
-            }) && !self.local_is_live(unique, binding.local.slot());
+            }) && binding.locals_are_dead(self, unique);
             if !(owned || bypasses_binding)
                 || !self.graph.blocks[unique].exception_predecessors.is_empty()
                 || !self.layout.inside(unique, region)
@@ -636,7 +666,7 @@ impl Emitter<'_> {
             let binding = if binding.succeeds_at(unique) {
                 Some(binding)
             } else if binding.body_start.is_none()
-                && !self.local_is_live(shared, binding.local.slot())
+                && binding.locals_are_dead(self, shared)
             {
                 None
             } else {
@@ -722,13 +752,13 @@ impl Emitter<'_> {
             false,
             body_start,
         )?;
-        if reaches
-            && !self.local_is_live(
-                region.stop.expect("branch reached its stop"),
-                binding.local.slot(),
-            )
-        {
-            body.restore_if_pattern_slot(baseline, &binding.local);
+        if reaches {
+            let stop = region.stop.expect("branch reached its stop");
+            for local in binding.locals.as_slice() {
+                if !self.local_is_live(stop, local.slot()) {
+                    body.restore_if_pattern_slot(baseline, local);
+                }
+            }
         }
         Ok(Arm {
             exit: reaches.then_some(body),
