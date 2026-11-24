@@ -436,7 +436,7 @@ fn actual<'a>(expr: &'a Expr<'_>, locals: &'a Locals<'_>) -> Shape<'a> {
         ExprKind::Compare(_) | ExprKind::Not(_) | ExprKind::TypeTest { .. } => Shape::Primitive(Primitive::Boolean),
         ExprKind::BoxedInt(_) => Shape::Object("java/lang/Integer"),
         ExprKind::ClassLiteral(_) => Shape::Object(CLASS),
-        ExprKind::Conditional(_) => Shape::Unknown,
+        ExprKind::Conditional(_) | ExprKind::Nullable(_) => Shape::Unknown,
     }
 }
 
