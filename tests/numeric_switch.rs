@@ -73,4 +73,5 @@ fn table_switch_emits_only_true_default_aliases_and_keeps_fallthrough() {
     ] {
         assert_eq!(lines[method.offsets[&offset]].trim(), statement, "offset {offset}");
     }
+    assert!(!method.offsets.contains_key(&103) && !method.offsets.contains_key(&104));
 }

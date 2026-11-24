@@ -1472,9 +1472,9 @@ impl Emitter<'_> {
                             .map(|_| &instructions[self.graph.blocks[target].instructions.end - 1]);
                         let jump = direct_exit.filter(|op| matches!(op.opcode, 0xa7 | 0xc8));
                         if !last || direct_exit.is_none() || jump.is_some() {
-                            let mapped = jump.map_or_else(Vec::new, |op| {
-                                (op.offset..op.offset + op.len).collect()
-                            });
+                            // A structural break owns the jump site, not the
+                            // encoded destination bytes of the JVM branch.
+                            let mapped = jump.map_or_else(Vec::new, |op| vec![op.offset]);
                             self.push(depth + 2, "break;", mapped);
                         }
                     }
