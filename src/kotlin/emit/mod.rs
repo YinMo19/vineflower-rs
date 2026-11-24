@@ -18,6 +18,7 @@ use super::{
     syntax::{INDENT, Types, identifier, qualified, variance_prefix, visibility},
 };
 
+mod constructors;
 mod data;
 mod multifile;
 mod nesting;
@@ -443,6 +444,15 @@ fn render_class<'a, 'data>(
         {
             Some(constructor)
         }
+        [_, _, ..] if !interface && !sealed && supertype.is_none() && !data_class => {
+            let mut primary = declaration.constructors.iter().filter(|c| !c.flags.has(4));
+            let constructor = primary.next().filter(|c| !c.flags.has_annotations())
+                .ok_or_else(|| invalid("missing Kotlin primary constructor"))?;
+            if primary.next().is_some() {
+                return Err(invalid("multiple Kotlin primary constructors"));
+            }
+            Some(constructor)
+        }
         _ => return Err(invalid("nontrivial constructor declarations")),
     };
     if sealed || supertype.is_some() {
@@ -559,6 +569,17 @@ fn render_class<'a, 'data>(
         interface,
     };
     let members_line = location.as_ref().map_or(0, |(_, base)| *base + trace::line_count(out) + 1);
+    if let Some(primary) = constructor.filter(|_| declaration.constructors.len() > 1) {
+        constructors::render(
+            &mut members,
+            bytecode,
+            &types,
+            declaration,
+            primary,
+            style,
+            location.as_mut().map(|(map, _)| (&mut **map, members_line)),
+        )?;
+    }
     render_members(
         &mut members,
         bytecode,
