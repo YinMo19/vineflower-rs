@@ -197,6 +197,35 @@ fn constructor_arguments_do_not_spill_open_allocations_or_uninitialized_this() {
 }
 
 #[test]
+fn constructor_array_initializer_needs_an_unchanged_prefix_in_both_arms() {
+    let mut bytes = [
+        0xbb, 0, 2, 0x59,       // new Example; dup
+        0x04, 0xbc, 10, 0x59,   // new int[1]; dup
+        0x03, 0x1a, 0x99, 0, 7, // index 0; branch on the parameter
+        0x04, 0xa7, 0, 4, 0x05, // 1 or 2
+        0x4f, 0xb7, 0, 14, 0xb0,
+    ];
+    with_machine(&bytes, "(Z)LExample;", false, |machine| {
+        let instructions = decode(&bytes).unwrap();
+        let graph = ControlFlowGraph::build(&instructions, &[]).unwrap();
+        let lines = structure_with_handlers(&instructions, &graph, machine, &[]).unwrap();
+        assert_eq!(lines.len(), 1);
+        let text = lines[0].text.as_str();
+        assert!(text.starts_with("return new Example(new int[]{"), "{text}");
+        assert!(text.ends_with(" ? 1 : 2});"), "{text}");
+    });
+
+    // A branch that consumes the saved index instead of supplying an element
+    // may not be turned into a conditional over the original stack prefix.
+    bytes[13] = 0x57;
+    with_machine(&bytes, "(Z)LExample;", false, |machine| {
+        let instructions = decode(&bytes).unwrap();
+        let graph = ControlFlowGraph::build(&instructions, &[]).unwrap();
+        assert!(structure_with_handlers(&instructions, &graph, machine, &[]).is_err());
+    });
+}
+
+#[test]
 fn primitive_elements_use_jvm_narrowing_and_nested_references_use_array_types() {
     let bytes = [0x04, 0xbc, 8, 0x59, 0x03, 0x11, 0, 255, 0x54];
     with_machine(&bytes, "()V", false, |mut machine| {

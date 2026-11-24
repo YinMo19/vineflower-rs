@@ -708,6 +708,9 @@ impl<'a, 'c> Machine<'a, 'c> {
     }
 
     fn pop_raw(&mut self) -> Result<Expr, LiftError> {
+        if self.stack.last().is_some_and(Expr::is_open_array) {
+            return Err(self.unsupported("array initializer reference used before completion"));
+        }
         let value = self
             .stack
             .pop()
@@ -748,6 +751,12 @@ impl<'a, 'c> Machine<'a, 'c> {
         if self.stack_slots + u32::from(width) > self.max_stack {
             return Err(self.invalid_stack("dup exceeds max_stack"));
         }
+        if width == 1 && beneath == 0 && self.duplicate_array_initializer()? {
+            return Ok(());
+        }
+        if self.stack[insert..].iter().any(Expr::is_open_array) {
+            return Err(self.unsupported("stack manipulation of an unfinished array initializer"));
+        }
         if self.stack[start..]
             .iter()
             .any(|value| value.order.is_some())
@@ -771,6 +780,9 @@ impl<'a, 'c> Machine<'a, 'c> {
     fn swap(&mut self) -> Result<(), LiftError> {
         let top = self.group(self.stack.len(), 1)?;
         let lower = self.group(top, 1)?;
+        if self.stack[lower..].iter().any(Expr::is_open_array) {
+            return Err(self.unsupported("stack manipulation of an unfinished array initializer"));
+        }
         if self.stack[top].order.is_some() && self.stack[lower].order.is_some() {
             self.freeze_stack(None)?;
         }
@@ -810,6 +822,9 @@ impl<'a, 'c> Machine<'a, 'c> {
     }
 
     fn spill(&mut self, value: &mut Expr) -> Result<(), LiftError> {
+        if value.is_open_array() {
+            return Err(self.unsupported("stack spills across an unfinished array initializer"));
+        }
         let origin = self.inferred_anonymous_origin(&value.ty, value)?;
         let name = self.locals.temporary(self.debug_offset(self.offset));
         let ty = if origin.is_some() { Cow::Borrowed("var") } else { Cow::Owned(self.render_type(&value.ty)) };
@@ -828,6 +843,9 @@ impl<'a, 'c> Machine<'a, 'c> {
     fn freeze_stack(&mut self, following: Option<Order>) -> Result<Option<Order>, LiftError> {
         if self.array_probe_depth != 0 {
             return Err(self.unsupported("array initializer element requires a spill"));
+        }
+        if self.stack.iter().any(Expr::is_open_array) {
+            return Err(self.unsupported("stack spills across an unfinished array initializer"));
         }
         if self.stack.iter().any(|value| {
             // The raw constructor receiver is just an unordered marker for a

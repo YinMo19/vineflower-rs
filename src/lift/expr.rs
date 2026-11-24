@@ -85,6 +85,11 @@ pub(super) enum Source {
     This,
     OuterThis,
     New(u32),
+    /// A literal-sized allocation eligible for an immediately following dup.
+    ArrayInitializerSeed { length: usize, dup: u32 },
+    /// Stack-only initializer state and its synthetic store receiver.
+    OpenArray(std::rc::Rc<super::array_initializer::OpenArray>),
+    OpenArrayReceiver(u32),
     /// A fresh, fully initialized array for the immediately following call.
     /// That call renders either the explicit array or the proven varargs form.
     PendingArrayArgument(Box<super::array_initializer::ArrayArgument>),
@@ -250,6 +255,10 @@ impl Expr {
             Source::New(_) | Source::Comparison(_)
         ));
         self.precedence < min
+    }
+
+    pub(super) fn is_open_array(&self) -> bool {
+        matches!(self.source, Source::OpenArray(_) | Source::OpenArrayReceiver(_))
     }
 
     pub(super) fn is_uninitialized(&self, this_initialized: bool) -> bool {

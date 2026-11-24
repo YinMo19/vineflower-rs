@@ -1,5 +1,5 @@
 // Based on Vineflower SimplifyExprentsHelper (Apache-2.0).
-use std::{mem, vec::IntoIter};
+use std::{mem, rc::Rc, vec::IntoIter};
 
 use crate::{
     bytecode::{Instruction, Operand},
@@ -46,6 +46,19 @@ impl ArrayElement {
     }
 }
 
+#[derive(Clone)]
+pub(super) struct OpenArray {
+    length: usize,
+    elements: Vec<Document>,
+    stage: OpenArrayStage,
+}
+
+#[derive(Clone, Copy)]
+enum OpenArrayStage {
+    DuplicateAt(u32),
+    StoreFrom(u32),
+}
+
 struct ArrayPlan {
     start: usize,
     first_receiver: usize,
@@ -61,6 +74,89 @@ struct ArrayProbe<'a, P> {
 }
 
 impl Machine<'_, '_> {
+    // The straight-line probe cannot see an element split by a value fork.
+    // Where an enclosing allocation already forbids a spill, keep the
+    // compiler's dup/store pair on the stack until the initializer is proven.
+    pub(super) fn seed_array_initializer(&self, op: &Instruction, count: &Expr, array: &mut Expr) {
+        if self.array_probe_depth == 0
+            && let Some(length) = array_length(count).filter(|&length| length != 0)
+            && self.stack.iter().any(|value| matches!(value.source, Source::New(_)))
+        {
+            array.source = Source::ArrayInitializerSeed { length, dup: op.offset + op.len };
+        }
+    }
+
+    pub(super) fn duplicate_array_initializer(&mut self) -> Result<bool, LiftError> {
+        let array = self.stack.last_mut().expect("dup checked its operand");
+        match &mut array.source {
+            Source::ArrayInitializerSeed { length, dup } if *dup == self.offset => {
+                array.source = Source::OpenArray(Rc::new(OpenArray {
+                    length: *length,
+                    elements: Vec::new(),
+                    stage: OpenArrayStage::StoreFrom(self.offset),
+                }));
+                array.text = Document::new();
+            }
+            Source::OpenArray(open)
+                if matches!(open.stage, OpenArrayStage::DuplicateAt(dup) if dup == self.offset) =>
+            {
+                Rc::make_mut(open).stage = OpenArrayStage::StoreFrom(self.offset);
+            }
+            _ => return Ok(false),
+        }
+        // Only the carrier owns the allocation's evaluation order. The
+        // duplicate has no source or order, and may only feed an array store.
+        let receiver = Expr {
+            source: Source::OpenArrayReceiver(self.offset),
+            ..Expr::atom(array.ty.clone(), Document::new())
+        };
+        self.push(receiver)?;
+        Ok(true)
+    }
+
+    pub(super) fn store_array_initializer_element(
+        &mut self,
+        opcode: u8,
+        index: Expr,
+        value: Expr,
+    ) -> Result<Effect, LiftError> {
+        let [.., array, receiver] = self.stack.as_slice() else {
+            return Err(self.invalid_stack("array initializer store is missing its allocation"));
+        };
+        let (Source::OpenArray(open), Source::OpenArrayReceiver(dup), Type::Array(component)) =
+            (&array.source, &receiver.source, &array.ty)
+        else {
+            return Err(self.invalid_stack("array initializer store is missing its allocation"));
+        };
+        if !matches!(open.stage, OpenArrayStage::StoreFrom(expected) if expected == *dup)
+            || array_store_opcode(component) != opcode
+            || array_length(&index) != Some(open.elements.len())
+        {
+            return Err(self.unsupported("array initializer needs an identical receiver and sequential literal index"));
+        }
+        let value = self.array_initializer_element(value, component)?;
+        let order = self.order_of([array, &index, &value], true)?;
+
+        self.stack.pop(); // verified synthetic receiver
+        let mut array = self.stack.pop().expect("verified initializer carrier");
+        self.stack_slots -= 2;
+        let Source::OpenArray(mut open) = mem::replace(&mut array.source, Source::Plain) else {
+            unreachable!("verified initializer carrier")
+        };
+        let state = Rc::make_mut(&mut open);
+        if state.elements.len() + 1 == state.length {
+            let elements = mem::take(&mut state.elements).into_iter().chain([value.text]);
+            array.text = self.render_array_elements(&array.ty, elements);
+        } else {
+            state.elements.push(value.text);
+            state.stage = OpenArrayStage::DuplicateAt(self.offset + 1);
+            array.source = Source::OpenArray(open);
+        }
+        array.order = order;
+        self.push(array)?;
+        Ok(Effect::None)
+    }
+
     /// Try a compiler-style array creation within one straight-line block.
     /// Success leaves one typed array in the dimension's original stack slot
     /// and returns the number of instructions represented by that expression.
@@ -174,13 +270,29 @@ impl Machine<'_, '_> {
     }
 
     pub(super) fn render_array_argument(&self, ty: &Type, elements: Vec<ArrayElement>) -> Document {
+        self.render_array_elements(ty, elements.into_iter().map(|element| element.text))
+    }
+
+    fn render_array_elements(&self, ty: &Type, elements: impl IntoIterator<Item = Document>) -> Document {
         let mut text = self.array_initializer_header(ty);
         let mut initializer = text.array_initializer(ArrayStyle::New);
         for element in elements {
-            initializer.append(element.text);
+            initializer.append(element);
         }
         initializer.finish();
         text
+    }
+
+    fn array_initializer_element(&self, value: Expr, component: &Type) -> Result<Expr, LiftError> {
+        if Category::of(component) != Some(Category::Ref) {
+            return self.coerce(value, component, false);
+        }
+        if !matches!(value.source, Source::Null) && !self.known_assignable(&value.ty, component) {
+            // A cast to the component type could turn an array-store
+            // exception into a cast exception.
+            return Err(self.unsupported("array initializer reference is not assignable"));
+        }
+        Ok(value)
     }
 
     fn array_initializer_header(&self, ty: &Type) -> Document {
@@ -403,20 +515,7 @@ impl Machine<'_, '_> {
                             **component,
                             Type::Primitive(Primitive::Byte | Primitive::Short)
                         );
-                    let value = if category == Category::Ref {
-                        if !matches!(value.source, Source::Null)
-                            && !self.known_assignable(&value.ty, component)
-                        {
-                            // A cast to the component type could turn the JVM
-                            // array-store exception into a cast exception.
-                            return Err(
-                                self.unsupported("array initializer reference is not assignable")
-                            );
-                        }
-                        value
-                    } else {
-                        self.coerce(value, component, false)?
-                    };
+                    let value = self.array_initializer_element(value, component)?;
                     if let Some(value) = self.order_of([&value], true)? {
                         order = Some(self.join_order(order, value)?);
                     }

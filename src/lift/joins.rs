@@ -323,8 +323,12 @@ impl Machine<'_, '_> {
             .map(|_| ())
     }
 
+    /// Deferred allocations may survive a value fork, but cannot become
+    /// standalone source bindings while their constructor/initializer is open.
     pub(crate) fn has_uninitialized_stack(&self) -> bool {
-        self.stack.iter().any(|value| value.is_uninitialized(self.initialized_this))
+        self.stack.iter().any(|value| {
+            value.is_uninitialized(self.initialized_this) || value.is_open_array()
+        })
     }
 
     /// Join two expression-only arms without evaluating either arm eagerly.
@@ -355,7 +359,9 @@ impl Machine<'_, '_> {
                 && self.same_control_stack(no))
             || (held.is_none()
                 && self.stack[prefix..].iter().any(|value| {
-                    value.is_uninitialized(self.initialized_this) || value.order.is_some()
+                    value.is_uninitialized(self.initialized_this)
+                        || value.is_open_array()
+                        || value.order.is_some()
                 }))
         {
             return Ok(None);
@@ -364,12 +370,19 @@ impl Machine<'_, '_> {
         let no_value = &no.stack[prefix];
         if [yes_value, no_value].into_iter().any(|value| {
             value.is_uninitialized(self.initialized_this)
+                || value.is_open_array()
                 || matches!(value.source, Source::Comparison(_))
                 || value
                     .order
                     .is_some_and(|order| order.first <= *control.end())
         }) {
             return Ok(None);
+        }
+        if held.is_none() {
+            // No prefix was spilled: the whole prefix must execute before
+            // the condition in the resulting expression.
+            let prior = self.order_of(&self.stack[..prefix], false)?;
+            self.join_order(prior, Order::at(*control.start()))?;
         }
         let Some(mut ty) = self.common_value_type(yes_value, no_value) else {
             return Ok(None);
@@ -531,6 +544,7 @@ impl Machine<'_, '_> {
             for arm in arms {
                 let value = &arm.stack[index];
                 if value.is_uninitialized(arm.initialized_this)
+                    || value.is_open_array()
                     || matches!(value.source, Source::Comparison(_))
                 {
                     return Err(self.invalid_stack("unrepresentable operand at control-flow join"));
@@ -1068,6 +1082,10 @@ fn same_value(a: &Expr, b: &Expr) -> bool {
         && match (&a.source, &b.source) {
             (Source::Local(a), Source::Local(b)) => a == b,
             (Source::New(a), Source::New(b)) => a == b,
+            (Source::ArrayInitializerSeed { length: a, dup: a_dup },
+                Source::ArrayInitializerSeed { length: b, dup: b_dup }) => a == b && a_dup == b_dup,
+            (Source::OpenArray(a), Source::OpenArray(b)) => Rc::ptr_eq(a, b),
+            (Source::OpenArrayReceiver(a), Source::OpenArrayReceiver(b)) => a == b,
             (Source::Anonymous(a), Source::Anonymous(b)) => a == b,
             (Source::Integer(a), Source::Integer(b)) => a == b,
             (Source::Boxing(a), Source::Boxing(b)) | (Source::Unboxing(a), Source::Unboxing(b)) => a == b,

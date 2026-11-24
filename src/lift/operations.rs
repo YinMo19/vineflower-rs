@@ -312,6 +312,9 @@ impl Machine<'_, '_> {
         };
         let value = self.pop_category(category)?;
         let index = self.pop_category(Category::Int)?;
+        if self.stack.last().is_some_and(|array| matches!(array.source, Source::OpenArrayReceiver(_))) {
+            return self.store_array_initializer_element(0x4f + kind, index, value);
+        }
         let (mut array, component) = self.array_operand(kind)?;
         let value = if kind == 4 {
             if !matches!(value.source, Source::Null)
@@ -453,7 +456,11 @@ impl Machine<'_, '_> {
         }
         // Parenthesize before [] access: otherwise a subsequent subscript
         // could be parsed as another dimension of the array creation.
-        self.push(self.expression(ty, text, UNARY, &counts, true)?)
+        let mut array = self.expression(ty, text, UNARY, &counts, true)?;
+        if matches!(op.opcode, 0xbc | 0xbd) && let [count] = counts.as_slice() {
+            self.seed_array_initializer(op, count, &mut array);
+        }
+        self.push(array)
     }
 
     pub(super) fn type_test(&mut self, op: &Instruction) -> Result<(), LiftError> {
