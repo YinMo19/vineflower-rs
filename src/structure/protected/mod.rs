@@ -75,10 +75,9 @@ pub(super) struct Finally {
     plan: Cleanup,
 }
 
-struct LoopDeparture {
-    header: usize,
-    latch: usize,
-    target: usize,
+enum LoopDeparture {
+    Break { header: usize, latch: usize, target: usize },
+    TerminalRetry,
 }
 
 pub(super) struct Monitor {
@@ -492,15 +491,26 @@ impl Exceptions {
 
     pub(super) fn handler_latch(&self, header: usize, target: usize) -> Option<usize> {
         self.regions.iter().find_map(|region| {
-            let departure = region.loop_departure.as_ref()?;
-            (departure.header == header && departure.target == target).then_some(departure.latch)
+            match region.loop_departure.as_ref()? {
+                LoopDeparture::Break { header: head, latch, target: end }
+                    if *head == header && *end == target => Some(*latch),
+                _ => None,
+            }
         })
     }
 
-    pub(super) fn retry_loop_body(&self, header: usize) -> Option<ArmId> {
+    // The flag distinguishes a terminal protected arm from one that breaks
+    // out of the retry loop on its normal path.
+    pub(super) fn retry_loop_body(&self, header: usize) -> Option<(ArmId, bool)> {
         self.regions.iter().find_map(|region| {
-            (region.start == header && region.loop_departure.as_ref()?.header == header)
-                .then_some(region.body)
+            if region.start != header {
+                return None;
+            }
+            match region.loop_departure.as_ref()? {
+                LoopDeparture::Break { header: head, .. } if *head == header => Some((region.body, false)),
+                LoopDeparture::TerminalRetry => Some((region.body, true)),
+                _ => None,
+            }
         })
     }
 
@@ -525,9 +535,8 @@ impl Exceptions {
         let region = self.region(self.arms[arm.0].region);
         region.body == arm
             && region.enclosing == enclosing
-            && region.loop_departure.as_ref().is_some_and(|departure| {
-                departure.header == header && departure.target == target
-            })
+            && matches!(region.loop_departure,
+                Some(LoopDeparture::Break { header: head, target: end, .. }) if head == header && end == target)
     }
 
     pub(super) fn allows_finally_loop_transfer(
@@ -876,8 +885,9 @@ impl Exceptions {
             exits.remove(&departure.target);
             monitor.departure = Some(departure);
         }
-        let loop_departure = if exits.len() == 2
-            && finally_route.is_none()
+        let loop_departure = if finally_route.is_some() {
+            None
+        } else if exits.len() == 2
             && let (Some(target), [catch]) = (only_body_exit, catches.as_slice())
         {
             let catch_blocks = &self.arms[catch.arm.0].blocks;
@@ -887,14 +897,18 @@ impl Exceptions {
             classic.or_else(|| LoopDeparture::prove_retry(
                 instructions, graph, &body, catch_blocks, start, catch.start, target,
             ))
-            .filter(|departure| exits.contains(&departure.header))
+            .filter(|departure| matches!(departure, LoopDeparture::Break { header, .. } if exits.contains(header)))
+        } else if exits.len() == 1 && exits.contains(&start)
+            && self.prove_terminal_retry(graph, dominators, &body, start, &catches)
+        {
+            Some(LoopDeparture::TerminalRetry)
         } else {
             None
         };
-        if let Some(departure) = &loop_departure {
+        if let Some(LoopDeparture::Break { target, .. }) = &loop_departure {
             // The handler completes at the loop backedge, but the protected
             // body must break before it reaches the catch's continuation.
-            exits.remove(&departure.target);
+            exits.remove(target);
         }
         if exits.len() > 1 {
             // An ordinary try has one normal continuation. Leave separate
@@ -992,6 +1006,41 @@ impl Exceptions {
             exits.remove(&target);
         }
         true
+    }
+
+    fn prove_terminal_retry(
+        &self,
+        graph: &ControlFlowGraph,
+        dominators: &Dominance,
+        body: &BTreeSet<usize>,
+        header: usize,
+        catches: &[Catch],
+    ) -> bool {
+        // Exclusive split returns have already been absorbed into the body.
+        // Only the catches can leave their arm by looping back to the entry.
+        if catches.is_empty()
+            || !graph.blocks[header].exception_predecessors.is_empty()
+            || normal_exits(graph, body).next().is_some()
+        {
+            return false;
+        }
+        let Some(natural) = dominators.natural_loops(graph).iter().find(|shape| shape.header == header)
+        else {
+            return false;
+        };
+        natural.latches.iter().all(|latch| {
+            catches.iter().any(|catch| self.arms[catch.arm.0].blocks.contains(latch))
+        }) && catches.iter().all(|catch| {
+            let blocks = &self.arms[catch.arm.0].blocks;
+            let incoming = &graph.blocks[catch.start].exception_predecessors;
+            !incoming.is_empty()
+                && incoming.iter().all(|pred| body.contains(pred))
+                && blocks.iter().all(|&block| {
+                    natural.blocks.binary_search(&block).is_ok()
+                        && graph.blocks[block].exception_successors.is_empty()
+                })
+                && normal_exits(graph, blocks).all(|target| target == header)
+        })
     }
 
     pub(super) fn enclosing_terminal_copy(
@@ -1524,7 +1573,7 @@ impl LoopDeparture {
         {
             return None;
         }
-        Some(Self { header, latch, target })
+        Some(Self::Break { header, latch, target })
     }
 
     fn prove_retry(
@@ -1569,7 +1618,7 @@ impl LoopDeparture {
                 return None;
             }
             if next == header {
-                return (index == catch.len()).then_some(Self { header, latch: current, target });
+                return (index == catch.len()).then_some(Self::Break { header, latch: current, target });
             }
             previous = Some(current);
             current = next;

@@ -311,7 +311,14 @@ impl Layout {
                         !exceptions.contains(Some(region.body), latch)
                     })).then_some(region.body)
                 })
-            }).or(repeating_try).or_else(|| exceptions.retry_loop_body(header));
+            }).or(repeating_try);
+            let retry = if exception_body.is_none() {
+                exceptions.retry_loop_body(header)
+            } else {
+                None
+            };
+            let terminal_retry = retry.is_some_and(|(_, terminal)| terminal);
+            let exception_body = exception_body.or(retry.map(|(body, _)| body));
             let mirrored_exit = {
                 let mut targets = exceptions
                     .loop_finally_regions()
@@ -343,7 +350,9 @@ impl Layout {
                 },
                 _ => None,
             };
-            let post_test = if let Some((_, latch, _, _)) = wrapped {
+            let post_test = if terminal_retry {
+                None
+            } else if let Some((_, latch, _, _)) = wrapped {
                 Some(PostTest::classify_latch(graph, instructions, &natural_loop, latch)
                     .ok_or_else(unsupported)?)
             } else {
@@ -391,9 +400,9 @@ impl Layout {
             });
             let mut exit = conditional_case.as_ref().map(|case| case.continuation)
                 .or(post_exit).or(mirrored_exit).or_else(|| {
-                // A proven repeating try owns even the noncyclic terminal
-                // tails of its body and handlers; none is a loop exit.
-                if repeating_try.is_some() {
+                // A repeating try or terminal retry owns even the noncyclic
+                // terminal tails of its body; none is a loop exit.
+                if repeating_try.is_some() || terminal_retry {
                     return None;
                 }
                 let mut normal = exits.iter().copied().filter(|&target| !is_failure(target));
