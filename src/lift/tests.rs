@@ -112,6 +112,87 @@ fn duplicated_call_runs_once() {
 }
 
 #[test]
+fn own_static_members_keep_symbols_and_respect_local_and_initializer_scope() {
+    use crate::{classfile::Attribute, source_text::tokens::TokenKind};
+
+    const CLASS: &[u8] = b"\xca\xfe\xba\xbe\0\0\0\x3d\0\x12\
+        \x01\0\x07Example\x07\0\x01\x01\0\x10java/lang/Object\x07\0\x03\
+        \x01\0\x04test\x01\0\x03()I\x01\0\x04side\x0c\0\x07\0\x06\x0a\0\x02\0\x08\
+        \x01\0\x05value\x01\0\x01I\x0c\0\x0a\0\x0b\x09\0\x02\0\x0c\
+        \x01\0\x12LocalVariableTable\x01\0\x04(I)I\x01\0\x08<clinit>\x01\0\x03()V\
+        \0\x21\0\x02\0\x04\0\0\0\0\0\0\0\0";
+    let mut class = ClassFile::parse(CLASS).unwrap();
+    let member = |name_index, descriptor_index| Member {
+        access_flags: 0x0008,
+        name_index,
+        descriptor_index,
+        attributes: Vec::new(),
+    };
+    class.methods.push(member(7, 6));
+    class.fields.push(member(10, 11));
+    let options = Options {
+        dump_text_tokens: true,
+        ..Options::default()
+    };
+
+    let lift = |name, kind, bytes: &[u8], locals: Option<&[u8]>| {
+        let method = member(name, kind);
+        let code = Code {
+            max_stack: 1,
+            max_locals: 1,
+            bytes,
+            exceptions: Vec::new(),
+            attributes: locals.map_or_else(Vec::new, |data| vec![Attribute {
+                name_index: 14,
+                data,
+            }]),
+        };
+        let descriptor =
+            MethodDescriptor::parse(class.pool.utf8(kind).unwrap()).unwrap();
+        let mut machine =
+            Machine::new(&class, &method, &code, &descriptor, &options, &str::to_owned).unwrap();
+        for instruction in decode(bytes).unwrap() {
+            match machine.step(&instruction).unwrap() {
+                Effect::Return(Some(text)) | Effect::Statement(text) => return text,
+                Effect::FieldAssignment { value, .. } => return value,
+                _ => continue,
+            }
+        }
+        panic!("expected lifted expression");
+    };
+    let getstatic = &[0xb2, 0, 13, 0xac];
+    let field = lift(5, 6, getstatic, None);
+    assert_eq!(field, "value");
+    let mut tokens = field.flat_tokens();
+    let (range, token) = tokens.next().unwrap();
+    assert_eq!(range, 0..5);
+    assert!(matches!(&token.kind, TokenKind::Field { owner, name, descriptor }
+        if owner == "Example" && name == "value" && descriptor == "I"));
+    assert!(tokens.next().is_none());
+
+    let call = lift(5, 6, &[0xb8, 0, 9, 0xac], None);
+    assert_eq!(call, "side()");
+    let mut tokens = call.flat_tokens();
+    let (range, token) = tokens.next().unwrap();
+    assert_eq!(range, 0..4);
+    assert!(matches!(&token.kind, TokenKind::Method { owner, name, descriptor }
+        if owner == "Example" && name == "side" && descriptor == "()I"));
+    assert!(tokens.next().is_none());
+
+    let parameter = b"\0\x01\0\0\0\x04\0\x0a\0\x0b\0\0";
+    assert_eq!(lift(5, 15, getstatic, Some(parameter)), "Example.value");
+    let later_local = b"\0\x01\0\x04\0\x02\0\x0a\0\x0b\0\0";
+    assert_eq!(
+        lift(5, 6, &[0xb2, 0, 13, 0x3b, 0x1a, 0xac], Some(later_local)),
+        "int value = Example.value;",
+    );
+    assert_eq!(
+        lift(16, 17, &[0xb2, 0, 13, 0xb3, 0, 13, 0xb1], None),
+        "Example.value",
+    );
+}
+
+#[test]
 fn recovers_postincrement_of_the_loaded_local_without_a_spill() {
     with_machine(|mut machine| {
         let instructions = decode(&[0x04, 0x3b, 0x1a, 0x84, 0, 1, 0xac]).unwrap();

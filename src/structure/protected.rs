@@ -33,6 +33,7 @@ pub(super) struct Exceptions {
     return_splits: BTreeMap<usize, usize>,
     cleanup_prefixes: BTreeMap<usize, usize>,
     cleanup_copies: BTreeSet<usize>,
+    terminal_cleanup_copies: BTreeSet<usize>,
     cleanup_returns: BTreeSet<usize>,
     cleanup_forward: BTreeSet<usize>,
     cleanup_bypasses: BTreeMap<usize, usize>,
@@ -90,6 +91,7 @@ struct Cleanup {
     block: usize,
     instructions: Range<usize>,
     branched: Option<BranchedFinally>,
+    terminal_copies: Option<BTreeSet<usize>>,
     spill_offsets: Vec<(usize, usize)>,
 }
 
@@ -109,6 +111,10 @@ impl Finally {
 
     pub(super) fn branched(&self) -> Option<&BranchedFinally> {
         self.plan.branched.as_ref()
+    }
+
+    pub(super) fn terminal_copies(&self) -> Option<&BTreeSet<usize>> {
+        self.plan.terminal_copies.as_ref()
     }
 
     /// (return opcode, original spill store) instruction indices.
@@ -296,6 +302,12 @@ impl Exceptions {
         self.entries.get(&(arm, block)).copied()
     }
 
+    pub(super) fn children_of(&self, arm: ArmId) -> impl Iterator<Item = ExceptionId> + '_ {
+        self.entries
+            .range((Some(arm), 0)..=(Some(arm), usize::MAX))
+            .map(|(_, &id)| id)
+    }
+
     pub(super) fn contains(&self, arm: Option<ArmId>, block: usize) -> bool {
         arm.is_none_or(|arm| self.arms[arm.0].blocks.contains(&block))
     }
@@ -472,7 +484,9 @@ impl Exceptions {
             let (Some(machine), [route]) = (machine, routes) else {
                 return Err(unsupported());
             };
-            if route.catch_type == 0 || machine.exception_class(route.catch_type)? != "java/lang/Throwable" {
+            if route.catch_type == 0
+                || machine.exception_class(route.catch_type)? != "java/lang/Throwable"
+            {
                 return Err(unsupported());
             }
         }
@@ -496,6 +510,10 @@ impl Exceptions {
         Ok(())
     }
 
+    fn is_cleanup_copy(&self, block: usize) -> bool {
+        self.cleanup_copies.contains(&block) || self.terminal_cleanup_copies.contains(&block)
+    }
+
     fn can_include_exit(
         &mut self,
         instructions: &[Instruction],
@@ -506,7 +524,7 @@ impl Exceptions {
     ) -> bool {
         let block = &graph.blocks[exit];
         if exit == 0
-            || self.cleanup_copies.contains(&exit)
+            || self.is_cleanup_copy(exit)
             || !block.exception_predecessors.is_empty()
             || block.predecessors.iter().any(|pred| !body.contains(pred))
             || table.by_block[exit].iter().any(|route| {
@@ -577,6 +595,7 @@ impl Exceptions {
         for &copy in &branch.removed {
             if self.cleanup_prefixes.contains_key(&copy)
                 || self.cleanup_landings.contains(&copy)
+                || self.terminal_cleanup_copies.contains(&copy)
                 || !self.cleanup_copies.insert(copy)
             {
                 return Err(unsupported());
@@ -584,7 +603,7 @@ impl Exceptions {
         }
         if !branch.projected_entries.is_empty() {
             let next = branch.continuation.ok_or_else(unsupported)?;
-            if self.cleanup_copies.contains(&next) {
+            if self.is_cleanup_copy(next) {
                 return Err(unsupported());
             }
             self.cleanup_landings.insert(next);
@@ -597,7 +616,7 @@ impl Exceptions {
         let instructions = std::mem::take(&mut branch.tail_code);
         if let Some(next) = branch.prefix_block
             && !instructions.is_empty()
-            && (self.cleanup_copies.contains(&next)
+            && (self.is_cleanup_copy(next)
                 || self
                     .cleanup_prefixes
                     .insert(next, instructions.len())
@@ -610,6 +629,7 @@ impl Exceptions {
             block: branch.tail,
             instructions,
             branched: Some(branch),
+            terminal_copies: None,
             spill_offsets: Vec::new(),
         })
     }
@@ -643,16 +663,18 @@ impl Exceptions {
             (handler, entry.instructions.start + 1)
         };
         let cleanup = &graph.blocks[block];
-        let end = cleanup
-            .instructions
-            .end
-            .checked_sub(2)
-            .ok_or_else(unsupported)?;
-        if start > end
-            || body.contains(&block)
+        let full_end = cleanup.instructions.end;
+        let rethrow = full_end.checked_sub(2).filter(|&load| {
+            load >= start
+                && reference_load(&instructions[load]) == Some(throwable)
+                && instructions[load + 1].opcode == 0xbf
+        });
+        if rethrow.is_none() && !matches!(instructions[full_end - 1].opcode, 0xac..=0xb1 | 0xbf) {
+            return Err(unsupported());
+        }
+        let end = rethrow.unwrap_or(full_end);
+        if body.contains(&block)
             || !cleanup.successors.is_empty()
-            || reference_load(&instructions[end]) != Some(throwable)
-            || instructions[end + 1].opcode != 0xbf
             || instructions[start..end]
                 .iter()
                 .any(|instruction| local_touches(instruction, throwable))
@@ -667,11 +689,15 @@ impl Exceptions {
         }
         let count = end - start;
         let exits: BTreeSet<_> = normal_exits(graph, body).collect();
+        let terminal = rethrow.is_none();
+        let canonical = exits.first().copied();
+        let has_distinct_exits = exits.len() > 1;
         let mut spill_offsets = Vec::new();
-        for exit in exits {
+        for &exit in &exits {
             let target = &graph.blocks[exit];
             if target.instructions.len() < count
-                || self.cleanup_copies.contains(&exit)
+                || self.is_cleanup_copy(exit)
+                || (terminal && target.instructions.len() != count)
                 || target.predecessors.iter().any(|pred| !body.contains(pred))
                 || !target.exception_predecessors.is_empty()
                 || table.by_block[exit] != table.by_block[block]
@@ -682,6 +708,21 @@ impl Exceptions {
                 )
             {
                 return Err(unsupported());
+            }
+            if terminal {
+                if self.cleanup_prefixes.contains_key(&exit)
+                    || self.cleanup_landings.contains(&exit)
+                    || !self.terminal_cleanup_copies.insert(exit)
+                {
+                    return Err(unsupported());
+                }
+                if let Some(next) = canonical
+                    && exit != next
+                    && self.cleanup_bypasses.insert(exit, next).is_some()
+                {
+                    return Err(unsupported());
+                }
+                continue;
             }
             // One physical copy cannot stand for cleanups of two distinct
             // exception regions: nesting would execute it twice.
@@ -720,6 +761,11 @@ impl Exceptions {
                         spill_offsets.push((suffix + 1, store));
                     }
                 }
+                [Instruction { opcode: 0xb1, .. }] if has_distinct_exits => {
+                    // The copy ends in a void return, so there is no value
+                    // spill to retain and no second normal continuation.
+                    self.cleanup_returns.insert(exit);
+                }
                 []
                 | [
                     Instruction {
@@ -737,6 +783,7 @@ impl Exceptions {
             block,
             instructions: start..end,
             branched: None,
+            terminal_copies: terminal.then_some(exits),
             spill_offsets,
         })
     }
@@ -888,14 +935,12 @@ impl Table {
             if start >= end {
                 return Err(unsupported());
             }
-            // javac can cover a catch-all's own initial exception store.
-            // Storing the incoming throwable cannot transfer to that handler.
-            if entry.catch_type == 0
-                && start == handler
-                && end == start + 1
-                && graph.blocks[start].instructions.len() == 1
-                && reference_store(&instructions[graph.blocks[start].instructions.start]).is_some()
-            {
+            // An isolated store of the incoming throwable cannot transfer
+            // to its own handler, even when a wider row covers the store.
+            let own_exception_store = entry.catch_type == 0
+                && graph.blocks[handler].instructions.len() == 1
+                && reference_store(&instructions[graph.blocks[handler].instructions.start]).is_some();
+            if own_exception_store && start == handler && end == handler + 1 {
                 continue;
             }
             let route = Route {
@@ -910,9 +955,10 @@ impl Table {
             for block in start..end {
                 if entry.catch_type == 0
                     && block == handler
-                    && monitor_handlers
-                        .get(&handler)
-                        .is_some_and(MonitorHandler::has_self_protected_prefix)
+                    && (own_exception_store
+                        || monitor_handlers
+                            .get(&handler)
+                            .is_some_and(MonitorHandler::has_self_protected_prefix))
                 {
                     continue;
                 }
@@ -992,7 +1038,10 @@ fn catch_blocks(
                 node.successors
                     .iter()
                     .copied()
-                    .filter(|next| !exceptions.cleanup_bypasses.contains_key(next)),
+                    .filter(|next| {
+                        !exceptions.cleanup_bypasses.contains_key(next)
+                            && !exceptions.terminal_cleanup_copies.contains(next)
+                    }),
             );
         }
         pending.extend(node.exception_successors.iter().copied());

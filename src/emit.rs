@@ -401,7 +401,7 @@ impl<'a, 'c> Writer<'a, 'c> {
     fn class(&mut self, name: &str) -> Result<(), DecompileError> {
         let flags = self.flags;
         let is_enum = flags & ENUM != 0;
-        let enumeration = is_enum.then(|| Enumeration::recover(self)).transpose()?;
+        let mut enumeration = is_enum.then(|| Enumeration::recover(self)).transpose()?;
         let is_interface = flags & INTERFACE != 0;
         let is_annotation = flags & ANNOTATION != 0;
         let components = self.class.record_components()?;
@@ -554,10 +554,12 @@ impl<'a, 'c> Writer<'a, 'c> {
 
         let mut needs_gap = false;
         let emit_fields = self.options.method_to_decompile.is_empty();
-        if let Some(info) = enumeration.as_ref().filter(|_| emit_fields) {
-            self.emit_enum_constants(info)?;
+        let enum_offsets = if let Some(info) = enumeration.as_mut().filter(|_| emit_fields) {
             needs_gap = true;
-        }
+            self.emit_enum_constants(info)?
+        } else {
+            BTreeMap::new()
+        };
         let mut wrote_field = false;
         let mut initializers =
             self.field_initializers(emit_fields, is_enum || components.is_some())?;
@@ -618,6 +620,9 @@ impl<'a, 'c> Writer<'a, 'c> {
             &initializers,
         )?;
         initializers.finish(self)?;
+        if let Some(info) = enumeration {
+            self.finish_enum_initializer_map(info, enum_offsets);
+        }
         self.member_classes(needs_gap)?;
         self.line(0, "}");
         Ok(())
@@ -1290,13 +1295,17 @@ impl<'a, 'c> Writer<'a, 'c> {
         let mapping = self.mapping.is_some();
         let mut offsets = BTreeMap::new();
         let mut closed_block = None;
+        let mut previous_depth = None;
         for (index, line) in lines.into_iter().enumerate() {
-            if closed_block == Some(line.depth) && !line.text.starts_with('}') {
+            if (closed_block == Some(line.depth) && !line.text.starts_with('}'))
+                || (line.sequence_boundary && previous_depth == Some(line.depth))
+            {
                 self.line(0, "");
             }
             self.write_local_declarations(index, line.depth, true, &mut declarations)?;
             closed_block =
                 (line.text == "}" || line.text.starts_with("} while ")).then_some(line.depth);
+            previous_depth = Some(line.depth);
             let start = self.lines;
             let depth = 2 + line.depth;
             if line.text.contains('\0') {

@@ -658,6 +658,10 @@ impl Access {
     }
 }
 
+pub(super) fn local_slot(op: &Instruction) -> Option<u16> {
+    access(op).map(Access::slot)
+}
+
 fn access(op: &Instruction) -> Option<Access> {
     const KINDS: [Kind; 5] = [Kind::Int, Kind::Long, Kind::Float, Kind::Double, Kind::Ref];
     let (relative, kind, slot): (u8, fn(Kind, u16) -> Access, u16) = match (op.opcode, &op.operand)

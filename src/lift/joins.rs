@@ -4,11 +4,12 @@ use std::{borrow::Cow, ops::RangeInclusive, rc::Rc};
 
 use super::Local;
 use crate::lift::{
-    BooleanCondition, BooleanFact, BooleanSelection, LiftError, Machine,
-    expr::{BOOLEAN, Category, Expr, INT, Order, Source, TERNARY},
+    BooleanCondition, BooleanFact, BooleanSelection, Effect, LiftError, Machine,
+    expr::{BOOLEAN, Category, Expr, INT, Order, Source, TERNARY, UNARY},
 };
 use crate::{
-    bytecode::Instruction,
+    bytecode::{Instruction, Operand},
+    classfile::LocalVariable,
     descriptor::{GenericType, MethodSignature, Type, TypeArgument},
     source_text::{Document, tokens::Token},
 };
@@ -30,6 +31,24 @@ impl JoinCode {
 pub(crate) struct LocalJoinCode {
     pub(crate) declarations: Vec<Document>,
     pub(crate) arms: Vec<Vec<LocalCopy>>,
+    pub(crate) hoists: Vec<LocalHoist>,
+}
+
+type HoistSites = Vec<(usize, Option<usize>)>;
+type ProveHoist<'a> = dyn FnMut(usize, &str, &str, bool) -> Option<HoistSites> + 'a;
+
+pub(crate) struct LocalHoist {
+    /// The existing arm lines. `None` denotes a blank declaration whose
+    /// original line can disappear when its declaration moves to the join.
+    pub(crate) sites: HoistSites,
+    target: String,
+    token: Option<Rc<Token>>,
+}
+
+impl LocalHoist {
+    pub(crate) fn rewrite(&self, line: &mut Document, prefix: usize) {
+        rewrite_local_binding(line, prefix, &self.target, self.token.as_ref());
+    }
 }
 
 pub(crate) struct LocalCopy {
@@ -53,11 +72,15 @@ impl LocalCopy {
         if !line.starts_with(&copy.source) {
             return false;
         }
-        line.replace_literal_prefix(copy.source.len(), &copy.target);
-        if let Some(token) = &copy.token {
-            line.token_at(0..copy.target.len() - " = ".len(), Rc::clone(token));
-        }
+        rewrite_local_binding(line, copy.source.len(), &copy.target, copy.token.as_ref());
         true
+    }
+}
+
+fn rewrite_local_binding(line: &mut Document, prefix: usize, target: &str, token: Option<&Rc<Token>>) {
+    line.replace_literal_prefix(prefix, target);
+    if let Some(token) = token {
+        line.token_at(0..target.len() - " = ".len(), Rc::clone(token));
     }
 }
 
@@ -149,6 +172,44 @@ impl Machine<'_, '_> {
 
     pub(crate) fn forget_loop_binding(&mut self, slot: u16) {
         self.locals.slots[usize::from(slot)] = None;
+    }
+
+    pub(crate) fn same_live_loop_bindings(&self, other: &Self, mut live: impl FnMut(u16) -> bool) -> bool {
+        self.locals.slots.iter().zip(&other.locals.slots).enumerate()
+            .all(|(slot, (left, right))| left == right || !live(slot as u16))
+    }
+
+    /// Combine a JVM increment and its adjacent read without moving either
+    /// past another pending operand or changing a lexical/captured binding.
+    pub(crate) fn step_loop_prefix_update(
+        &mut self,
+        increment: &Instruction,
+        load: &Instruction,
+    ) -> Result<bool, LiftError> {
+        let Operand::Increment { index, amount: amount @ (-1 | 1) } = increment.operand else {
+            return Ok(false);
+        };
+        let load_index = match (load.opcode, &load.operand) {
+            (0x15, Operand::Local(index)) => *index,
+            (op @ 0x1a..=0x1d, _) => u16::from(op - 0x1a),
+            _ => return Ok(false),
+        };
+        if index != load_index || !self.stack.is_empty() || !self.prelude.is_empty()
+            || self.loop_binding_type(index) != Some(&INT) || self.lexical_parameter(index).is_some()
+        {
+            return Ok(false);
+        }
+        let effect = self.step(load)?;
+        debug_assert!(matches!(effect, Effect::None));
+        let mut value = self.pop_category(Category::Int)?;
+        value.text.prepend_str(if amount == 1 { "++" } else { "--" });
+        value.precedence = UNARY;
+        value.source = Source::Plain;
+        value.observable = true;
+        value.statement = true;
+        value.order = Some(self.join_order(Some(Order::at(increment.offset)), Order::at(load.offset))?);
+        self.push(value)?;
+        Ok(true)
     }
 
     pub(crate) fn loop_receiver(&self, slot: u16) -> Option<Document> {
@@ -574,12 +635,33 @@ impl Machine<'_, '_> {
         &mut self,
         arms: &[&Self],
         offset: u32,
+        live: impl FnMut(u16) -> bool,
+    ) -> Result<LocalJoinCode, LiftError> {
+        self.merge_local_bindings(arms, offset, live, None)
+    }
+
+    pub(crate) fn merge_locals_with_hoists(
+        &mut self,
+        arms: &[&Self],
+        offset: u32,
+        live: impl FnMut(u16) -> bool,
+        mut prove_move: impl FnMut(usize, &str, &str, bool) -> Option<HoistSites>,
+    ) -> Result<LocalJoinCode, LiftError> {
+        self.merge_local_bindings(arms, offset, live, Some(&mut prove_move))
+    }
+
+    fn merge_local_bindings(
+        &mut self,
+        arms: &[&Self],
+        offset: u32,
         mut live: impl FnMut(u16) -> bool,
+        mut prove_move: Option<&mut ProveHoist<'_>>,
     ) -> Result<LocalJoinCode, LiftError> {
         self.offset = offset;
         let mut code = LocalJoinCode {
             declarations: Vec::new(),
             arms: (0..arms.len()).map(|_| Vec::new()).collect(),
+            hoists: Vec::new(),
         };
         if arms
             .iter()
@@ -613,12 +695,29 @@ impl Machine<'_, '_> {
             // Reuse a visible binding only within the same source lifetime.
             let debug = self.locals.debug_at(index, self.debug_offset(offset));
             let debug_range = debug.map(|entry| (entry.start_pc, entry.length));
+            let adopted = if let Some(prove) = &mut prove_move
+                && before.is_none()
+                && let Some(debug) = debug
+                && let Some(owner) = self.debug_join_owner(arms, slot, debug, &ty)
+            {
+                let binding = arms[owner].locals.slots[slot].as_ref().expect("proved owner");
+                let declaration = format!("{} {}", self.render_type(&ty), binding.name);
+                prove(owner, &declaration, &binding.name, false).map(|sites| (binding, sites))
+            } else {
+                None
+            };
+            let mut move_sites = None;
             let local = if let Some(before) = before.filter(|before| {
                 !before.receiver && before.ty == ty && before.debug_range == debug_range
             }) {
                 before.clone()
             } else {
-                let name = self.locals.local_name(index, &ty, debug);
+                let (name, token_index) = if let Some((binding, sites)) = adopted {
+                    move_sites = Some(sites);
+                    (binding.name.clone(), binding.token_index)
+                } else {
+                    (self.locals.local_name(index, &ty, debug), self.locals.new_local_token_index(index))
+                };
                 let mut declaration = self.local_type_document(&ty);
                 declaration.push(' ');
                 let local = Local {
@@ -626,18 +725,27 @@ impl Machine<'_, '_> {
                     ty,
                     debug_range,
                     receiver: false,
-                    token_index: self.locals.new_local_token_index(index),
+                    token_index,
                 };
                 self.append_local_binding(&mut declaration, index, &local, true);
                 declaration.push(';');
                 code.declarations.push(declaration);
                 local
             };
-            for (arm, assignments) in arms.iter().zip(&mut code.arms) {
+            for (position, (arm, assignments)) in arms.iter().zip(&mut code.arms).enumerate() {
                 let value = arm.locals.slots[slot]
                     .as_ref()
                     .expect("checked incoming binding");
                 if value.name != local.name {
+                    if let (Some(sites), Some(prove)) = (&mut move_sites, &mut prove_move)
+                        && arm.stack_is_empty()
+                    {
+                        let declaration = format!("{} {}", self.render_type(&value.ty), value.name);
+                        if let Some(moved) = prove(position, &declaration, &value.name, true) {
+                            sites.extend(moved);
+                            continue;
+                        }
+                    }
                     let expr = arm.coerce(
                         Expr::atom(
                             value.ty.clone(),
@@ -663,6 +771,13 @@ impl Machine<'_, '_> {
                     });
                 }
             }
+            if let Some(sites) = move_sites {
+                code.hoists.push(LocalHoist {
+                    sites,
+                    target: format!("{} = ", local.name),
+                    token: self.local_binding_token(index, &local, false),
+                });
+            }
             if slot > 0
                 && self.locals.slots[slot - 1]
                     .as_ref()
@@ -676,6 +791,40 @@ impl Machine<'_, '_> {
             self.locals.slots[slot] = Some(local);
         }
         Ok(code)
+    }
+
+    fn debug_join_owner(
+        &self,
+        arms: &[&Self],
+        slot: usize,
+        debug: &LocalVariable<'_>,
+        ty: &Type,
+    ) -> Option<usize> {
+        if arms.len() < 2 || !self.locals.use_debug_names || self.locals.names.borrow().namer.is_some()
+            || Type::parse(debug.descriptor).ok()? != *ty
+        {
+            return None;
+        }
+        // javac splits one source lifetime into LVT fragments at reaching
+        // definitions and at the continuation. All fragments must describe
+        // the same slot, spelling and exact Java type. The shared registry
+        // proves that the reaching local already owns this spelling.
+        let mut owner = None;
+        for (position, arm) in arms.iter().enumerate() {
+            let binding = arm.locals.slots[slot].as_ref()?;
+            let range = binding.debug_range?;
+            if binding.receiver || binding.ty != *ty
+                || !Rc::ptr_eq(&self.locals.names, &arm.locals.names)
+                || !self.locals.debug.iter().any(|entry| {
+                    entry.index == debug.index && (entry.start_pc, entry.length) == range
+                        && entry.name == debug.name && entry.descriptor == debug.descriptor
+                })
+                || binding.name == debug.name && owner.replace(position).is_some()
+            {
+                return None;
+            }
+        }
+        owner
     }
 
     /// The shared code uses the original source bindings. Copy into them

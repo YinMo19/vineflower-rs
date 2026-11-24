@@ -1,7 +1,8 @@
 // Based on Vineflower enum handling in ClassWriter and InitializerProcessor (Apache-2.0).
-use std::{collections::BTreeSet, fmt::Write, rc::Rc};
+use std::{collections::{BTreeMap, BTreeSet}, fmt::Write, rc::Rc};
 
 use super::{DecompileError, ENUM, FINAL, PRIVATE, PUBLIC, STATIC, SYNTHETIC, Writer, parse};
+use super::initializers::{InitializerMapOrder, merge_initializer_mapping};
 use crate::{
     bytecode::{Instruction, Operand, decode},
     classfile::{ClassFile, Constant, Member},
@@ -32,6 +33,7 @@ pub(super) struct Enumeration<'a> {
     values_field: Option<&'a str>,
     helper: Option<&'a str>,
     skip_initializer: usize,
+    initializer_lines: Vec<(u16, u16)>,
 }
 
 impl<'a> Enumeration<'a> {
@@ -62,6 +64,8 @@ impl<'a> Enumeration<'a> {
             .methods
             .iter()
             .find(|method| matches!(pool.utf8(method.name_index), Ok("<clinit>")));
+        let map_offsets = writer.mapping.is_some() && writer.options.method_to_decompile.is_empty();
+        let mut has_visible_arguments = false;
         let mut result = Self {
             constants: Vec::with_capacity(names.len()),
             sites: writer.anonymous_sites(),
@@ -69,6 +73,7 @@ impl<'a> Enumeration<'a> {
             values_field,
             helper: None,
             skip_initializer: 0,
+            initializer_lines: Vec::new(),
         };
         let Some(initializer) = initializer else {
             // Some assemblers provide enum-flagged fields without a generated initializer.
@@ -188,9 +193,10 @@ impl<'a> Enumeration<'a> {
                     machine.set_anonymous_sites(Rc::clone(sites));
                 }
                 machine
-                    .enum_constant_arguments(arg_ops, &descriptor)
+                    .enum_constant_arguments(arg_ops, &descriptor, map_offsets)
                     .map_err(wrap)?
             };
+            has_visible_arguments |= !arguments.is_empty();
             result.constants.push(ConstantInit {
                 name,
                 arguments,
@@ -242,6 +248,9 @@ impl<'a> Enumeration<'a> {
             return Err(unsupported("control flow enters enum construction"));
         }
         verify_generated_lookup_methods(class, owner, Some(values), &values_type)?;
+        if map_offsets && has_visible_arguments {
+            result.initializer_lines = code.line_numbers(pool)?;
+        }
         Ok(result)
     }
 
@@ -339,9 +348,11 @@ impl<'a> Enumeration<'a> {
 impl Writer<'_, '_> {
     pub(super) fn emit_enum_constants(
         &mut self,
-        enumeration: &Enumeration<'_>,
-    ) -> Result<(), DecompileError> {
+        enumeration: &mut Enumeration<'_>,
+    ) -> Result<BTreeMap<u32, usize>, DecompileError> {
         let count = enumeration.constants.len();
+        let map_offsets = self.mapping.is_some();
+        let mut offsets = BTreeMap::new();
         if count == 0 {
             self.line(1, ";");
         }
@@ -349,21 +360,44 @@ impl Writer<'_, '_> {
             .options
             .dump_text_tokens
             .then(|| format!("L{};", self.owner));
-        for (index, constant) in enumeration.constants.iter().enumerate() {
+        for (index, constant) in enumeration.constants.drain(..).enumerate() {
             let mut head = Document::new();
             if let Some(descriptor) = &descriptor {
                 self.field_symbol(&mut head, constant.name, constant.name, descriptor);
             } else {
                 head.push_str(constant.name);
             }
-            head.append_ref(&constant.arguments);
+            head.append(constant.arguments);
             if let Some(id) = constant.subclass {
                 let _ = write!(head, "\0{id}\0");
             }
             head.push(if index + 1 == count { ';' } else { ',' });
-            self.line_with_anonymous(1, &head, enumeration.sites.as_ref())?;
+            if map_offsets {
+                self.line_with_anonymous_anchors(
+                    1, &head, enumeration.sites.as_ref(),
+                    Some(&mut |bytes: std::ops::Range<u32>, line| {
+                        offsets.extend(bytes.map(|offset| (offset, line)));
+                    }),
+                )?;
+                for offset in head.omitted_bytecode().flatten() {
+                    offsets.remove(&offset);
+                }
+            } else {
+                self.line_with_anonymous(1, &head, enumeration.sites.as_ref())?;
+            }
         }
-        Ok(())
+        Ok(offsets)
+    }
+
+    pub(super) fn finish_enum_initializer_map(
+        &mut self,
+        enumeration: Enumeration<'_>,
+        offsets: BTreeMap<u32, usize>,
+    ) {
+        merge_initializer_mapping(
+            self, "<clinit>", "()V", offsets, enumeration.initializer_lines,
+            InitializerMapOrder::ClassDeclarations,
+        );
     }
 }
 

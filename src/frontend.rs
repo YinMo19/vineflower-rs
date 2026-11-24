@@ -176,6 +176,11 @@ const SETTINGS: &[Setting] = &[
         "Mark the implementation of lambdas, anonymous classes, and local classes",
     ),
     flag(
+        "lambda-to-anonymous-class",
+        "lac",
+        "Render supported lambdas and method references as anonymous classes",
+    ),
+    flag(
         "unit-test-mode",
         "__unit_test_mode__",
         "Append source maps for test comparisons",

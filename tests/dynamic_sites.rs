@@ -229,8 +229,8 @@ fn emits_typed_unbound_bound_and_constructor_references() {
         text.contains("Function<String, Integer>)String::length"),
         "{text}"
     );
-    assert!(text.contains("DynamicSites.receiver()::length"), "{text}");
-    assert_eq!(text.matches("DynamicSites.receiver()").count(), 1, "{text}");
+    assert!(text.contains("receiver()::length"), "{text}");
+    assert_eq!(text.matches("receiver()").count(), 2, "{text}"); // declaration and one call
     assert!(
         text.contains("Supplier<StringBuilder>)StringBuilder::new"),
         "{text}"
@@ -586,4 +586,58 @@ fn rejects_malformed_bootstraps_even_after_opt_in() {
         format!("{error:#?}").contains("not a verified primitiveClass"),
         "{error:#?}"
     );
+}
+
+#[test]
+fn renders_primitive_sam_as_a_typed_anonymous_method() {
+    let mut class = Class::default();
+    let helper = class.handle(6, SAMPLE, "lambda$operator$0", "(I)I");
+    let factory = "()Ljava/util/function/IntUnaryOperator;";
+    let indy = class.lambda(helper, "applyAsInt", factory, "(I)I", "(I)I", None);
+    class.method(9, "operator", factory, &[indy.as_slice(), &[0xb0]].concat());
+    class.method(0x100a, "lambda$operator$0", "(I)I", &[0x1a, 0x04, 0x60, 0xac]);
+    let mut options = Options::default();
+    options.set("lambda-to-anonymous-class", "1").unwrap();
+    let source = decompile(&class.finish(), &options).unwrap().text;
+    assert!(source.contains("new IntUnaryOperator() {"), "{source}");
+    assert!(source.contains("public int applyAsInt(int "), "{source}");
+    assert!(source.contains(" + 1;"), "{source}");
+    assert!(!source.contains("->") && !source.contains("lambda$"), "{source}");
+}
+
+#[test]
+fn renders_parameterized_method_references_with_their_lexical_receiver() {
+    let mut class = Class::default();
+    let owner_type = "Lexample/DynamicSites;";
+    let handle = class.handle(5, SAMPLE, "size", "()I");
+    let factory = format!("({owner_type})Ljava/util/function/Supplier;");
+    let indy = class.lambda(
+        handle, "get", &factory, "()Ljava/lang/Object;", "()Ljava/lang/Integer;", None,
+    );
+    class.method(1, "supplier", "()Ljava/util/function/Supplier;", &[&[0x2a], indy.as_slice(), &[0xb0]].concat());
+    class.method(1, "size", "()I", &[0x04, 0xac]);
+    let mut options = Options::default();
+    options.set("lambda-to-anonymous-class", "true").unwrap();
+    let source = decompile(&class.finish(), &options).unwrap().text;
+    assert!(source.contains("new Supplier<Integer>() {"), "{source}");
+    assert!(source.contains("public Integer get()"), "{source}");
+    assert!(source.contains("DynamicSites.this.size()"), "{source}");
+    assert!(!source.contains("::"), "{source}");
+}
+
+#[test]
+fn rejects_intersection_lambdas_that_an_anonymous_class_cannot_implement() {
+    let mut class = Class::default();
+    let helper = class.handle(6, SAMPLE, "lambda$factory$0", "()V");
+    let flags = class.entry(3, &2i32.to_be_bytes());
+    let one = class.entry(3, &1i32.to_be_bytes());
+    let marker = class.class("java/lang/Cloneable");
+    let factory = "()Ljava/lang/Runnable;";
+    let indy = class.lambda(helper, "run", factory, "()V", "()V", Some(&[flags, one, marker]));
+    class.method(9, "factory", factory, &[indy.as_slice(), &[0xb0]].concat());
+    class.method(0x100a, "lambda$factory$0", "()V", &[0xb1]);
+    let mut options = Options::default();
+    options.lambda_to_anonymous_class = true;
+    let error = decompile(&class.finish(), &options).unwrap_err();
+    assert!(format!("{error:#?}").contains("additional interfaces"), "{error:#?}");
 }

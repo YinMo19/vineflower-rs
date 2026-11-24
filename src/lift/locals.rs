@@ -2,7 +2,7 @@
 
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet},
+    collections::{HashMap, hash_map::Entry},
     fmt::Write,
     rc::Rc,
 };
@@ -59,11 +59,17 @@ impl Eq for Local {}
 
 #[derive(Clone, Default)]
 pub(crate) struct Names {
-    used: HashSet<String>,
+    used: HashMap<String, NameUse>,
     suffix: u32,
     version: u16,
     namer: Option<VariableNamer>,
     token_indices: Option<LocalTokenIndices>,
+}
+
+#[derive(Clone, Copy)]
+enum NameUse {
+    Reserved,
+    Local,
 }
 
 impl Names {
@@ -72,22 +78,22 @@ impl Names {
     }
 
     fn fresh_owned(&mut self, mut name: String) -> String {
-        if !self.used.contains(&name) {
-            self.used.insert(name.clone());
+        if !self.used.contains_key(&name) {
+            self.used.insert(name.clone(), NameUse::Local);
             return name;
         }
         if self.namer.is_some() {
-            while self.used.contains(&name) {
+            while self.used.contains_key(&name) {
                 name.push('x');
             }
-            self.used.insert(name.clone());
+            self.used.insert(name.clone(), NameUse::Local);
             return name;
         }
         loop {
             self.suffix += 1;
             let candidate = format!("{name}_{}", self.suffix);
-            if self.used.insert(candidate.clone()) {
-                return candidate;
+            if let Entry::Vacant(entry) = self.used.entry(candidate) {
+                return entry.insert_entry(NameUse::Local).key().clone();
             }
         }
     }
@@ -175,17 +181,20 @@ impl<'a> Locals<'a> {
                     name
                 };
                 let leaf = name.rsplit('/').next().unwrap_or(name);
-                names
-                    .used
-                    .insert(leaf.split('$').next().unwrap_or(leaf).into());
+                names.used.insert(
+                    leaf.split('$').next().unwrap_or(leaf).into(),
+                    NameUse::Reserved,
+                );
                 if let Some((package, _)) = name.split_once('/') {
-                    names.used.insert(package.into());
+                    names.used.insert(package.into(), NameUse::Reserved);
                 }
             }
         }
         for field in &class.fields {
             if custom_names || field.access_flags & 0x0018 == 0x0018 {
-                names.used.insert(class.pool.utf8(field.name_index)?.into());
+                names
+                    .used
+                    .insert(class.pool.utf8(field.name_index)?.into(), NameUse::Reserved);
             }
         }
         let debug = if options.use_debug_names || custom_names {
@@ -294,6 +303,29 @@ impl<'a> Locals<'a> {
 
     pub(super) fn parameters(&self) -> &[String] {
         &self.parameter_names
+    }
+
+    pub(super) fn reserve_unshadowed_field(&self, name: &str, in_lambda: bool) -> bool {
+        // A debug variable can begin at the store following this load, and a
+        // control-flow join may hoist its declaration. Check the whole table
+        // rather than only the scope at the instruction being lifted.
+        if self.use_debug_names && self.debug.iter().any(|entry| entry.name == name)
+            || self.slots.iter().flatten().any(|local| local.name == name)
+        {
+            return false;
+        }
+        let mut names = self.names.borrow_mut();
+        match names.used.get(name) {
+            Some(NameUse::Local) => false,
+            Some(NameUse::Reserved) => true,
+            // An inline lambda uses a copy of its enclosing name registry.
+            // It cannot reserve a new identifier against future outer locals.
+            None if in_lambda => false,
+            None => {
+                names.used.insert(name.to_owned(), NameUse::Reserved);
+                true
+            }
+        }
     }
 
     pub(super) fn same_as(&self, other: &Self) -> bool {

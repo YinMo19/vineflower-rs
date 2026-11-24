@@ -57,6 +57,7 @@ Exact upstream comparison with all fixture bytecode and required JDKs:
 | Kotlin when and single-pass JVM pattern switches | 101 | 221 | 375 | 0 |
 | Java loops, lexical captures, resource returns and text tokens | 105 | 211 | 381 | 0 |
 | Qualified construction, scoped switches and nested resources | 108 | 206 | 383 | 0 |
+| Typed assignments, contextual boxing and opt-in source rewrites | 114 | 191 | 392 | 0 |
 
 All eight upstream CLI and bulk cases match. The full test remains failing
 until all 697 comparisons match.

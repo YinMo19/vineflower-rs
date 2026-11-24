@@ -436,6 +436,15 @@ impl Document {
         }
     }
 
+    /// Bytecode anchors in the flat representation, for text fragments
+    /// interleaved with externally emitted anonymous class bodies.
+    pub(crate) fn flat_anchors(&self) -> impl Iterator<Item = (usize, Range<u32>)> + '_ {
+        self.events.iter().filter_map(|event| match event.kind {
+            Kind::Anchor { start, end } => Some((event.at, start..end)),
+            _ => None,
+        })
+    }
+
     /// A compiler-only operation absorbed by an expression rewrite. Keep
     /// its CFG provenance but omit it from source mappings.
     pub(crate) fn omit_bytes(&mut self, offsets: Range<u32>) {
@@ -511,6 +520,15 @@ impl Document {
     /// Invocation arguments whose rendered depth is not known during lifting.
     pub(crate) fn relative_delimited(items: impl IntoIterator<Item = impl Into<Self>>) -> Self {
         Self::parenthesized(BaseDepth::Relative(0), items, false)
+    }
+
+    pub(crate) fn relative_delimited_with<T>(
+        items: impl IntoIterator<Item = T>,
+        append: impl FnMut(&mut Self, T),
+    ) -> Self {
+        let mut doc = Self::new();
+        doc.append_parenthesized(BaseDepth::Relative(0), items, false, append);
+        doc
     }
 
     pub(crate) fn append_relative_arguments<'a>(

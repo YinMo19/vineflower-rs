@@ -49,7 +49,7 @@ fn qualified_new_checks_receiver_before_evaluating_explicit_arguments() {
     let (outer, inner) = qualified_inputs();
     let source = decompile_group(&outer, [&inner[..]], &Options::default()).unwrap();
 
-    assert!(source.text.contains("return outer.new Inner(Outer.argument());"), "{}", source.text);
+    assert!(source.text.contains("return outer.new Inner(argument());"), "{}", source.text);
     assert!(!source.text.contains("requireNonNull"), "{}", source.text);
 }
 

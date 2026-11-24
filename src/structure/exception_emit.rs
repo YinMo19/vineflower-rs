@@ -19,12 +19,26 @@ struct Resource {
     exit: ResourceExit,
     skipped: Vec<usize>,
     redirects: Vec<usize>,
+    fulfilled_return: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
 enum ResourceExit {
     Continue(usize),
     Return { spill: usize, transfer: usize },
+    DelegateReturn { recipient: ExceptionId, value: ReturnValue },
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct ReturnValue {
+    transfer: usize,
+    local: cleanup_locals::Local,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum ExceptionRedirect {
+    Continue(usize),
+    Return { recipient: ExceptionId, value: ReturnValue },
 }
 
 enum CloseExit {
@@ -71,13 +85,11 @@ fn resource_header_length(lines: &[Line], depth: usize) -> Option<usize> {
         .then_some(length)
 }
 
-fn split_resource_declaration(line: &mut Line, depth: usize, needs_separator: bool) {
+fn split_resource_declaration(line: &mut Line, depth: usize) {
     let end = line.text.as_flat().len() - ") {".len();
     line.text.truncate(end);
     line.text.replace_literal_prefix("try (".len(), "");
-    if needs_separator {
-        line.text.push(';');
-    }
+    line.text.push(';');
     line.depth = depth;
 }
 
@@ -89,9 +101,9 @@ fn merge_nested_resource(lines: &mut Vec<Line>, outer: usize, depth: usize) {
     // JLS lowering of multiple resources is precisely this nesting:
     // acquire in declaration order, close in reverse, preserving suppression.
     lines.pop();
-    split_resource_declaration(&mut lines[outer], depth + 1, true);
+    split_resource_declaration(&mut lines[outer], depth + 1);
     let body = if length == 1 {
-        split_resource_declaration(&mut lines[inner], depth + 1, false);
+        split_resource_declaration(&mut lines[inner], depth + 1);
         lines.insert(inner + 1, Line::new(depth, ") {", Vec::new()));
         inner + 2
     } else {
@@ -109,6 +121,14 @@ fn merge_nested_resource(lines: &mut Vec<Line>, outer: usize, depth: usize) {
 }
 
 impl Emitter<'_> {
+    pub(super) fn redirected_exception_block(&self, block: usize) -> Result<usize, StructureError> {
+        match self.exception_redirects.get(&block) {
+            None => Ok(block),
+            Some(&ExceptionRedirect::Continue(next)) => Ok(next),
+            Some(ExceptionRedirect::Return { .. }) => Err(self.unstructured(block)),
+        }
+    }
+
     pub(super) fn emit_exception<'a, 'c>(
         &mut self,
         id: ExceptionId,
@@ -130,7 +150,7 @@ impl Emitter<'_> {
         if let Some(legacy) = &shape.legacy_resource {
             return self.emit_legacy_resource(shape, legacy, region, machine, depth);
         }
-        if let Some(resource) = self.prove_resource(shape, region, machine, depth)? {
+        if let Some(resource) = self.prove_resource(id, shape, region, machine, depth)? {
             return self.emit_resource(shape, resource, region, machine, depth);
         }
         if !shape.split_resource_exits.is_empty() {
@@ -246,18 +266,34 @@ impl Emitter<'_> {
             {
                 return Err(self.unstructured(finally.start()));
             }
-            if mem::replace(&mut self.emitted[finally.block()], true) {
-                return Err(self.unstructured(finally.block()));
-            }
-            let cleanup = self.lift_block(
-                finally.block(),
-                &mut body,
-                region.exception(None, finally.arm, None),
-                depth + 1,
-                offsets,
-            )?;
-            if !matches!(cleanup.effect, Effect::None) {
-                return Err(self.unstructured(finally.block()));
+            let terminal = finally.block();
+            let cleanup_scope = region.exception(None, finally.arm, None);
+            if let Some(copies) = finally.terminal_copies() {
+                for &copy in copies {
+                    if !self.exceptions.contains(region.exception_arm, copy)
+                        || mem::replace(&mut self.emitted[copy], true)
+                    {
+                        return Err(self.unstructured(copy));
+                    }
+                }
+                if self.region_with_offsets(
+                    terminal,
+                    cleanup_scope.with_exception_layout(self.layout.containing_loop(terminal)),
+                    &mut body,
+                    depth + 1,
+                    &mut offsets,
+                )? {
+                    return Err(self.unstructured(terminal));
+                }
+                continuation = None;
+            } else {
+                if mem::replace(&mut self.emitted[terminal], true) {
+                    return Err(self.unstructured(terminal));
+                }
+                let cleanup = self.lift_block(terminal, &mut body, cleanup_scope, depth + 1, offsets)?;
+                if !matches!(cleanup.effect, Effect::None) {
+                    return Err(self.unstructured(terminal));
+                }
             }
             Self::check_scope(body, machine, self.offset(finally.block()))?;
         }
@@ -378,6 +414,7 @@ impl Emitter<'_> {
                 exit,
                 skipped,
                 redirects: Vec::new(),
+                fulfilled_return: None,
             },
             region,
             machine,
@@ -418,6 +455,14 @@ impl Emitter<'_> {
         machine: &mut Machine<'a, 'c>,
         depth: usize,
     ) -> Result<Option<usize>, StructureError> {
+        if let Some(landing) = resource.fulfilled_return {
+            if !matches!(
+                self.exception_redirects.remove(&landing),
+                Some(ExceptionRedirect::Return { .. })
+            ) {
+                return Err(self.unstructured(landing));
+            }
+        }
         let line = &mut self.lines[resource.acquisition];
         line.text.pop(); // Verified declaration terminator.
         line.text.surround("try (", ") {");
@@ -435,7 +480,8 @@ impl Emitter<'_> {
                     return Err(StructureError::ExceptionHandlers);
                 }
                 for &entry in &resource.redirects {
-                    self.exception_redirects.insert(entry, resource.body_stop);
+                    self.exception_redirects
+                        .insert(entry, ExceptionRedirect::Continue(resource.body_stop));
                 }
                 let reaches_stop = self.scoped_arm(
                     shape.start,
@@ -453,6 +499,27 @@ impl Emitter<'_> {
             }
             ResourceExit::Return { spill, transfer } => {
                 self.emit_resource_return(shape, spill, transfer, region, machine, depth + 1)?;
+                None
+            }
+            ResourceExit::DelegateReturn { recipient, value } => {
+                let landing = resource.body_stop;
+                if self.exception_redirects.contains_key(&landing) {
+                    return Err(self.unstructured(landing));
+                }
+                self.exception_redirects.insert(
+                    landing,
+                    ExceptionRedirect::Return { recipient, value },
+                );
+                let reaches = self.scoped_arm(
+                    shape.start,
+                    region.exception(Some(landing), shape.body, Some(machine)),
+                    machine,
+                    depth + 1,
+                );
+                let unfulfilled = self.exception_redirects.remove(&landing).is_some();
+                if reaches? || unfulfilled {
+                    return Err(self.unstructured(landing));
+                }
                 None
             }
         };
@@ -511,6 +578,7 @@ impl Emitter<'_> {
     // exception coverage, and every edge in those paths before hiding them.
     fn prove_resource(
         &mut self,
+        id: ExceptionId,
         shape: &ProtectedRegion,
         region: Region<'_, '_, '_>,
         machine: &Machine<'_, '_>,
@@ -653,6 +721,8 @@ impl Emitter<'_> {
             skipped.push(normal_cleanup);
         }
         skipped.push(normal_close);
+        let mut fulfilled_return = None;
+        let mut return_transfer = None;
         let exit = match close_exit {
             CloseExit::Continue(next) => {
                 if skipped.contains(&next)
@@ -662,39 +732,50 @@ impl Emitter<'_> {
                 {
                     return Ok(None);
                 }
-                ResourceExit::Continue(next)
+                match self.exception_redirects.get(&next).copied() {
+                    Some(ExceptionRedirect::Return { recipient, value }) if recipient == id => {
+                        let Some(exit) = self.resource_body_return(
+                            shape,
+                            normal_cleanup,
+                            normal_close,
+                            primary.start,
+                            value,
+                        ) else {
+                            return Ok(None);
+                        };
+                        fulfilled_return = Some(next);
+                        exit
+                    }
+                    _ => ResourceExit::Continue(next),
+                }
             }
             CloseExit::Return {
                 block,
                 transfer,
                 local,
             } => {
-                let &[spill] = self.graph.blocks[normal_cleanup].predecessors.as_slice() else {
-                    return Ok(None);
-                };
-                let spill_node = &self.graph.blocks[spill];
-                let spill_index = spill_node.instructions.end - 1;
-                if !self.exceptions.contains(Some(shape.body), spill)
-                    || self.exceptions.at_start(Some(shape.body), spill).is_some()
-                    || self.exceptions.skips_binding(spill)
-                    || self.exceptions.skips_instruction(spill_index)
-                    || self.exceptions.cleanup_prefix(spill) != 0
-                    || self.exceptions.monitor_acquisition_end(spill).is_some()
-                    || spill_node.successors != [normal_cleanup]
-                    || (block != normal_close
-                        && self.graph.blocks[block]
-                            .predecessors
-                            .iter()
-                            .any(|pred| !skipped.contains(pred)))
-                    || cleanup_locals::store(&self.instructions[spill_index]) != Some(local)
-                    || self.protected_resource_slot_overlap(local, normal_close, primary.start)
+                if block != normal_close
+                    && self.graph.blocks[block]
+                        .predecessors
+                        .iter()
+                        .any(|pred| !skipped.contains(pred))
                 {
                     return Ok(None);
                 }
                 if block != normal_close {
                     skipped.push(block);
                 }
-                ResourceExit::Return { spill, transfer }
+                return_transfer = Some(transfer);
+                let Some(exit) = self.resource_body_return(
+                    shape,
+                    normal_cleanup,
+                    normal_close,
+                    primary.start,
+                    ReturnValue { local, transfer },
+                ) else {
+                    return Ok(None);
+                };
+                exit
             }
         };
 
@@ -768,8 +849,8 @@ impl Emitter<'_> {
                     || self.exceptions.bypass_cleanup(block) != block
                     || self.exceptions.cleanup_prefix(block) != 0
                     || (!self.exceptions.contains(region.exception_arm, block)
-                        && !matches!(exit, ResourceExit::Return { transfer, .. }
-                            if self.graph.blocks[block].instructions.contains(&transfer)
+                        && !return_transfer.is_some_and(|transfer|
+                            self.graph.blocks[block].instructions.contains(&transfer)
                                 && self.graph.blocks[block].exception_successors.is_empty()))
                     || (!self.graph.blocks[block].exception_predecessors.is_empty()
                         && !self.exceptions.contains(Some(primary.arm), block))
@@ -793,7 +874,67 @@ impl Emitter<'_> {
             exit,
             skipped,
             redirects,
+            fulfilled_return,
         }))
+    }
+
+    fn resource_body_return(
+        &mut self,
+        shape: &ProtectedRegion,
+        landing: usize,
+        close: usize,
+        primary: usize,
+        value: ReturnValue,
+    ) -> Option<ResourceExit> {
+        if self.protected_resource_slot_overlap(value.local, close, primary) {
+            return None;
+        }
+        let predecessors = self.graph.blocks[landing].predecessors.as_slice();
+        if let &[spill] = predecessors {
+            let block = &self.graph.blocks[spill];
+            let store = block.instructions.end - 1;
+            if self.exceptions.contains(Some(shape.body), spill)
+                && self.exceptions.at_start(Some(shape.body), spill).is_none()
+                && !self.exceptions.skips_binding(spill)
+                && !self.exceptions.skips_instruction(store)
+                && self.exceptions.cleanup_prefix(spill) == 0
+                && self.exceptions.monitor_acquisition_end(spill).is_none()
+                && block.successors == [landing]
+                && cleanup_locals::store(&self.instructions[store]) == Some(value.local)
+            {
+                return Some(ResourceExit::Return { spill, transfer: value.transfer });
+            }
+        }
+
+        // If a child closes first, the spill belongs to that child, not
+        // the parent. Assign the obligation to the one lexical child whose
+        // close edges account for every normal predecessor of this landing.
+        let mut children = self.exceptions.children_of(shape.body).filter(|&id| {
+            let child = self.exceptions.region(id);
+            let Some(entry) = child.join else { return false };
+            if child.catches.len() != 1
+                || !child.split_resource_exits.is_empty()
+                || entry == landing
+                || !self.exceptions.contains(Some(shape.body), entry)
+            {
+                return false;
+            }
+            match self.graph.blocks[entry].successors.as_slice() {
+                &[next] => next == landing && predecessors == [entry],
+                &[next, close] => {
+                    next == landing
+                        && self.exceptions.contains(Some(shape.body), close)
+                        && self.graph.blocks[close].predecessors == [entry]
+                        && self.graph.blocks[close].successors == [landing]
+                        && predecessors.len() == 2
+                        && predecessors.contains(&entry)
+                        && predecessors.contains(&close)
+                }
+                _ => false,
+            }
+        });
+        let recipient = children.next()?;
+        children.next().is_none().then_some(ResourceExit::DelegateReturn { recipient, value })
     }
 
     fn match_normal_resource_close(

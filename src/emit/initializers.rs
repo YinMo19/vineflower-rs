@@ -112,49 +112,68 @@ impl FieldInitializers<'_> {
                 feature: "recovered initializer for a hidden field",
             });
         }
-        let Some(mapping) = &mut writer.mapping else {
-            return Ok(());
-        };
         for ((name, descriptor), moved) in self.methods {
-            if moved.mappings.iter().all(|(_, offsets)| offsets.is_empty()) {
-                continue;
-            }
-            let source_name = writer
-                .names
-                .renames()
-                .method_alias(writer.owner, name, descriptor)
-                .unwrap_or(name);
-            let index = mapping.methods.iter().position(|map| {
-                map.class_name == writer.owner
-                    && map.name == source_name
-                    && map.descriptor == descriptor
+            let offsets = moved.mappings.into_iter().flat_map(|(field, offsets)| {
+                let line = self.declarations[&field].source_line.expect("verified field line");
+                offsets.into_iter().map(move |offset| (offset, line))
             });
-            let mut map = index.map_or_else(
-                || MethodMap {
-                    class_name: writer.owner.into(),
-                    name: source_name.into(),
-                    descriptor: descriptor.into(),
-                    offsets: BTreeMap::new(),
-                },
-                |index| mapping.methods.swap_remove(index),
+            merge_initializer_mapping(
+                writer, name, descriptor, offsets, moved.original_lines, InitializerMapOrder::Retained,
             );
-            for (field, offsets) in moved.mappings {
-                if let Some(line) = self.declarations[&field].source_line {
-                    map.offsets
-                        .extend(offsets.into_iter().map(|offset| (offset, line)));
-                }
-            }
-            mapping.add(map, moved.original_lines);
-            if let Some(index) = index {
-                let last = mapping.methods.len() - 1;
-                mapping.methods.swap(index, last);
-            }
         }
-        mapping
-            .unmapped_lines
-            .retain(|line| !mapping.original_lines.contains_key(line));
         Ok(())
     }
+}
+
+pub(super) enum InitializerMapOrder {
+    Retained,
+    ClassDeclarations,
+}
+
+/// Join bytecode now rendered in a declaration with any remaining code in
+/// the original method. Both fragments use the method's original line table.
+pub(super) fn merge_initializer_mapping(
+    writer: &mut Writer<'_, '_>,
+    name: &str,
+    descriptor: &str,
+    offsets: impl IntoIterator<Item = (u32, usize)>,
+    original: Vec<(u16, u16)>,
+    order: InitializerMapOrder,
+) {
+    let Some(mapping) = &mut writer.mapping else { return };
+    let mut offsets = offsets.into_iter().peekable();
+    if offsets.peek().is_none() {
+        return;
+    }
+    let owner = writer.owner;
+    let source_name = writer.names.renames().method_alias(owner, name, descriptor).unwrap_or(name);
+    let index = mapping.methods.iter().position(|map| {
+        map.class_name == owner && map.name == source_name && map.descriptor == descriptor
+    });
+    let mut map = index.map_or_else(
+        || MethodMap {
+            class_name: owner.into(),
+            name: source_name.into(),
+            descriptor: descriptor.into(),
+            offsets: BTreeMap::new(),
+        },
+        |index| mapping.methods.swap_remove(index),
+    );
+    map.offsets.extend(offsets);
+    mapping.add(map, original);
+    let end = mapping.methods.len() - 1;
+    let index = if let Some(index) = index {
+        mapping.methods.swap(index, end);
+        index
+    } else {
+        end
+    };
+    if matches!(order, InitializerMapOrder::ClassDeclarations)
+        && let Some(first) = mapping.methods[..index].iter().position(|map| map.class_name == owner)
+    {
+        mapping.methods[first..=index].rotate_right(1);
+    }
+    mapping.unmapped_lines.retain(|line| !mapping.original_lines.contains_key(line));
 }
 
 impl<'c> Writer<'_, 'c> {

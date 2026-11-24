@@ -26,6 +26,10 @@ use super::{
     expr::{Expr, PRIMARY, Source, UNARY},
 };
 
+#[path = "lambda_anonymous.rs"]
+mod lambda_anonymous;
+use lambda_anonymous::AnonymousSam;
+
 const METAFACTORY: &str = "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodHandle;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/CallSite;";
 const ALT_METAFACTORY: &str = "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;[Ljava/lang/Object;)Ljava/lang/invoke/CallSite;";
 const CONSTANT_BOOTSTRAP_PREFIX: &str =
@@ -281,22 +285,29 @@ impl<'a, 'c> Machine<'a, 'c> {
                 self.invalid_operand("void lambda implementation has a value-returning SAM")
             );
         }
+        let anonymous = self.options.lambda_to_anonymous_class
+            .then(|| AnonymousSam::read(self, interface, &site))
+            .transpose()?;
         let target = self.lambda_target(interface, &site)?;
         let helper = (site.owner == self.owner)
             .then(|| self.synthetic_method(site.name, site.implementation_descriptor))
             .flatten();
         let mut captures = self.arguments(&factory, None)?;
-        let super_qualifier = if site.dispatch == Dispatch::Special {
+        let mut super_qualifier = if site.dispatch == Dispatch::Special {
             self.lambda_special_qualifier(&site, captures.first())?
         } else {
             None
         };
+        if anonymous.is_some() && let Some(qualifier) = super_qualifier.as_mut() {
+            self.qualify_anonymous_lambda_super(qualifier)?;
+        }
 
         // A capture-free static/constructor reference or a bound reference is
         // representable directly only if javac will select the linked overload.
         // When the adaptation changes a parameter type, name the exact overload
         // in an adapter with ordinary calls and explicit conversions instead.
-        let direct = helper.is_none()
+        let direct = anonymous.is_none()
+            && helper.is_none()
             && capture_count == usize::from(bound)
             && instantiated == implementation
             && self.direct_lambda_return(&implementation_return, instantiated_return)
@@ -337,17 +348,24 @@ impl<'a, 'c> Machine<'a, 'c> {
             // order before the adapter can defer their use to SAM invocation.
             self.keep_final_captures(&mut captures);
             self.freeze_values(&mut captures)?;
+            let lexical_receiver = bound && matches!(captures[0].source, Source::This);
+            if anonymous.is_some() {
+                self.prepare_anonymous_lambda_captures(&mut captures)?;
+            }
             if let Some(helper) = helper
                 && instantiated == implementation
                 && instantiated_return == &implementation_return
-                && let Some(text) = self.inline_lambda(helper, &site, &captures, &target)?
+                && let Some(text) = self.inline_lambda(
+                    helper, &site, &captures, &target, anonymous.as_ref(),
+                )?
             {
-                let expression =
-                    self.expression(factory.return_type, text, UNARY, &captures, true)?;
+                let expression = self.lambda_expression(
+                    factory.return_type, text, &captures, anonymous.is_some(),
+                )?;
                 self.push(expression)?;
                 return Ok(Effect::None);
             }
-            if bound && !matches!(captures[0].source, Source::This) {
+            if bound && !lexical_receiver {
                 self.before_statement(None)?;
                 let owner = "java/util/Objects";
                 let mut statement = self.class_reference(owner);
@@ -441,17 +459,14 @@ impl<'a, 'c> Machine<'a, 'c> {
             } else {
                 self.lambda_conversion(call, &implementation_return, instantiated_return)?
             };
-            let expression = self.expression(
-                factory.return_type,
-                render_lambda(
-                    lambda_cast(&target),
-                    parameters.into_iter().map(Document::from).collect(),
-                    body,
-                ),
-                UNARY,
-                &captures,
-                true,
-            )?;
+            let parameters = parameters.into_iter().map(Document::from).collect();
+            let text = if let Some(anonymous) = &anonymous {
+                anonymous.call_body(self, &target, parameters, body)
+            } else {
+                render_lambda(lambda_cast(&target), parameters, body)
+            };
+            let expression =
+                self.lambda_expression(factory.return_type, text, &captures, anonymous.is_some())?;
             if let Some(helper) = helper {
                 self.note_synthetic_method(helper);
             }
@@ -534,6 +549,7 @@ impl<'a, 'c> Machine<'a, 'c> {
         site: &LambdaSite<'_>,
         captures: &[Expr],
         target: &Document,
+        anonymous: Option<&AnonymousSam<'_, '_>>,
     ) -> Result<Option<Document>, LiftError> {
         // Multiple indy instructions can reference the same helper, including
         // recursively in hand-written bytecode; bound source expansion.
@@ -542,10 +558,10 @@ impl<'a, 'c> Machine<'a, 'c> {
         }
         let is_static = site.dispatch == Dispatch::Static;
         if (helper.access_flags & STATIC != 0) != is_static
-            || (!is_static
-                && !captures
+            || (!is_static && (anonymous.is_some()
+                || !captures
                     .first()
-                    .is_some_and(|value| matches!(value.source, Source::This)))
+                    .is_some_and(|value| matches!(value.source, Source::This))))
         {
             return Ok(None);
         }
@@ -645,6 +661,9 @@ impl<'a, 'c> Machine<'a, 'c> {
                 .is_some_and(|line| line.depth == 0 && line.text == "return;")
         {
             lines.pop();
+        }
+        if let Some(anonymous) = anonymous {
+            return Ok(Some(anonymous.inline_body(self, target, parameters, lines)));
         }
         let mut prefix = lambda_cast(target);
         append_lambda_mark(
@@ -962,7 +981,7 @@ impl<'a, 'c> Machine<'a, 'c> {
             );
         }
         for &marker in &site.markers {
-            if marker == interface {
+            if marker == interface || self.options.lambda_to_anonymous_class {
                 continue;
             }
             if self

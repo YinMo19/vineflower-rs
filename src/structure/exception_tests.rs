@@ -206,15 +206,82 @@ fn catch_all_ranges_can_cover_inner_catches_and_their_own_initial_store() {
         text,
         [
             "try {",
-            "C.work();",
+            "work();",
             "} catch (java.lang.RuntimeException var1) {",
-            "C.work();",
+            "work();",
             "} finally {",
-            "C.work();",
+            "work();",
             "}",
             "return;",
         ]
     );
+}
+
+#[test]
+fn one_finally_copy_can_return_void_while_the_other_continues() {
+    let bytes = [
+        0xb8, 0, 22, // 0: try work
+        0xb8, 0, 22, // 3: normal finally copy
+        0xa7, 0, 17, // 6: goto 23
+        0x4c, 0xb8, 0, 22, // 9: typed catch and work
+        0xb8, 0, 22, // 13: catch's finally copy
+        0xb1, // 16: catch returns
+        0x4d, 0xb8, 0, 22, // 17: exceptional finally copy
+        0x2c, 0xbf, // 21: rethrow
+        0xb1, // 23: normal continuation
+    ];
+    let handlers = [
+        handler(0, 3, 9, 24),
+        handler(0, 3, 17, 0),
+        handler(9, 13, 17, 0),
+    ];
+    let lines = test_method(&bytes, &handlers, &[]).unwrap();
+    let text: Vec<_> = lines.iter().map(|line| line.text.as_flat()).collect();
+    assert_eq!(
+        text,
+        [
+            "try {",
+            "work();",
+            "} catch (java.io.IOException var1) {",
+            "work();",
+            "return;",
+            "} finally {",
+            "work();",
+            "}",
+            "return;",
+        ]
+    );
+    assert_eq!(lines[4].offsets, [16]);
+}
+
+#[test]
+fn terminal_finally_supersedes_both_normal_paths_and_the_saved_throwable() {
+    let mut bytes = [
+        0x1a, 0x99, 0, 8, // 0: branch to 9
+        0xb8, 0, 22, // 4: first protected call
+        0x04, 0xac, // 7: first normal copy returns 1
+        0xb8, 0, 22, // 9: second protected call
+        0xa7, 0, 6, // 12: goto second normal copy
+        0x4c, // 15: exceptional binding, covered by its own handler row
+        0x04, 0xac, // 16: exceptional copy returns 1
+        0x04, 0xac, // 18: second normal copy returns 1
+    ];
+    let handlers = [handler(0, 7, 15, 0), handler(9, 16, 15, 0)];
+    let lines = test_method_with_descriptor(&bytes, &handlers, &[], "(Z)I").unwrap();
+    let cleanup = lines
+        .iter()
+        .position(|line| line.text == "} finally {")
+        .unwrap();
+    assert_eq!(lines[cleanup + 1].text, "return 1;");
+    assert_eq!(lines[cleanup + 1].offsets, [16, 17]);
+    assert_eq!(
+        lines.iter().filter(|line| line.text.starts_with("return ")).count(),
+        1
+    );
+
+    bytes[18] = 0x05; // Returning 2 is not the same overriding cleanup.
+    let (_, regions) = classify(&bytes, &handlers);
+    assert!(matches!(regions, Err(StructureError::ExceptionHandlers)));
 }
 
 #[test]
@@ -270,9 +337,9 @@ fn copied_cleanup_can_finish_a_try_return_while_the_catch_falls_through() {
             "try {",
             "return 1;",
             "} catch (java.lang.RuntimeException var1) {",
-            "C.work();",
+            "work();",
             "} finally {",
-            "C.work();",
+            "work();",
             "}",
             "return -1;",
         ]
@@ -313,7 +380,7 @@ fn branched_finally_matches_each_edge_and_preserves_an_overriding_return() {
             .any(|line| line.depth == 2 && line.text == "return;")
     );
     assert_eq!(
-        lines.iter().filter(|line| line.text == "C.work();").count(),
+        lines.iter().filter(|line| line.text == "work();").count(),
         2
     );
     assert!(!lines.iter().any(|line| line.text.starts_with("throw ")));
@@ -340,7 +407,7 @@ fn branched_finally_matches_fallthrough_to_an_explicit_jump() {
     assert_eq!(lines[0].text, "try {");
     assert_eq!(lines[2].text, "} finally {");
     assert_eq!(
-        lines.iter().filter(|line| line.text == "C.work();").count(),
+        lines.iter().filter(|line| line.text == "work();").count(),
         2
     );
 
@@ -373,7 +440,7 @@ fn exceptional_finally_copy_can_be_detached_from_the_enclosing_loop_cfg() {
         .unwrap();
     assert_eq!(lines[cleanup].depth, 1);
     assert_eq!(
-        lines.iter().filter(|line| line.text == "C.work();").count(),
+        lines.iter().filter(|line| line.text == "work();").count(),
         2
     );
     assert!(!lines.iter().any(|line| line.text.starts_with("throw ")));
@@ -411,7 +478,7 @@ fn each_branched_finally_copy_projects_to_one_proven_continuation() {
     assert_eq!(regions.bypass_cleanup(graph.block_at(21).unwrap()), join);
     let lines = test_method(&bytes, &handlers, &[]).unwrap();
     assert_eq!(
-        lines.iter().filter(|line| line.text == "C.work();").count(),
+        lines.iter().filter(|line| line.text == "work();").count(),
         2
     );
     assert_eq!(
@@ -460,7 +527,7 @@ fn resource_fold_requires_suppression_on_the_original_exception() {
     assert!(
         lines
             .iter()
-            .any(|line| line.depth == 1 && line.text == "C.work();")
+            .any(|line| line.depth == 1 && line.text == "work();")
     );
     assert!(!lines.iter().any(|line| line.text.contains("close()")));
 
@@ -624,15 +691,35 @@ fn catchless_nested_resources_share_one_header_and_keep_acquisition_offsets() {
         [
             "try (",
             "java.lang.AutoCloseable var2 = var0;",
-            "java.lang.AutoCloseable var3 = var1",
+            "java.lang.AutoCloseable var3 = var1;",
             ") {",
-            "C.work();",
+            "work();",
             "}",
         ]
     );
     assert!(lines[1].offsets.contains(&1));
     assert!(lines[2].offsets.contains(&3));
     assert_eq!(lines[1].depth, lines[4].depth);
+
+    // The value is selected inside the inner try, but reloaded only after
+    // the outer close. The single source return must keep the real opcode.
+    let mut bytes = bytes[..87].to_vec();
+    bytes[4..7].copy_from_slice(&[0x2d, 0x3a, 4]); // aload_3; astore 4
+    bytes.extend([0x19, 4, 0xb0]); // 87: aload 4; areturn
+    let lines = test_method_with_descriptor(
+        &bytes,
+        &handlers,
+        &[],
+        "(Ljava/lang/AutoCloseable;Ljava/lang/AutoCloseable;)Ljava/lang/AutoCloseable;",
+    )
+    .unwrap();
+    let returned: Vec<_> = lines
+        .iter()
+        .filter(|line| line.text.starts_with("return "))
+        .collect();
+    assert_eq!(returned.len(), 1);
+    assert_eq!(returned[0].text, "return var3;");
+    assert_eq!(returned[0].offsets, [4, 89]);
 }
 
 #[test]
@@ -667,7 +754,7 @@ fn split_normal_resource_copies_must_rejoin_at_the_same_continuation() {
         "try (java.lang.AutoCloseable var2 = var0) {"
     );
     assert_eq!(
-        lines.iter().filter(|line| line.text == "C.work();").count(),
+        lines.iter().filter(|line| line.text == "work();").count(),
         2
     );
     assert!(!lines.iter().any(|line| line.text.as_flat().contains("close()")));
@@ -750,7 +837,7 @@ fn synchronized_owns_the_same_monitor_on_both_exit_paths() {
     let lines = test_method(&bytes, &handlers, &[]).unwrap();
     assert_eq!(lines[0].text, "synchronized (var0) {");
     assert_eq!(lines[0].offsets, [0, 3]);
-    assert_eq!(lines[1].text, "C.work();");
+    assert_eq!(lines[1].text, "work();");
     assert_eq!(lines[1].depth, 1);
     assert_eq!(lines[2].text, "}");
     assert_eq!(lines[2].offsets, [8]);
@@ -775,7 +862,7 @@ fn synchronized_can_release_outside_an_older_protected_range() {
     let handlers = [handler(4, 7, 12, 0)];
     let lines = test_method(&bytes, &handlers, &[]).unwrap();
     assert_eq!(lines[0].text, "synchronized (var0) {");
-    assert_eq!(lines[1].text, "C.work();");
+    assert_eq!(lines[1].text, "work();");
     assert_eq!(lines[3].text, "return;");
 }
 

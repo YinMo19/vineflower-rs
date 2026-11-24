@@ -553,7 +553,7 @@ impl SwitchExpression<'_> {
                 }
                 result => {
                     document.push('{');
-                    for line in statements {
+                    for line in statements.into_iter().filter(|line| !line.detached_declaration) {
                         let depth = line.depth - self.depth;
                         document.hard_line(depth);
                         Self::append_statement(&mut document, line, depth);

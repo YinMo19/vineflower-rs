@@ -19,51 +19,84 @@ mod tests;
 
 struct ArrayPlan {
     start: usize,
+    first_receiver: usize,
     end: usize,
     length: usize,
     ty: Type,
+}
+
+struct ArrayProbe<'a, P> {
+    instructions: &'a [Instruction],
+    permits: P,
+    temporary: Option<u16>,
 }
 
 impl Machine<'_, '_> {
     /// Try a compiler-style array creation within one straight-line block.
     /// Success leaves one typed array in the dimension's original stack slot
     /// and returns the number of instructions represented by that expression.
+    /// For a local transport the final aload is included, leaving its areturn
+    /// to the normal return lifter.
     pub(crate) fn try_array_initializer(
         &mut self,
         instructions: &[Instruction],
         permits: impl Fn(usize, &Instruction) -> bool,
     ) -> Option<usize> {
-        let [allocation, duplicate, first_index, ..] = instructions else {
+        let [allocation, transport, ..] = instructions else {
             return None;
         };
-        if !matches!(allocation.opcode, 0xbc | 0xbd)
-            || duplicate.opcode != 0x59
-            || self.literal_index(first_index) != Some(0)
-            || !self.prelude.is_empty()
-        {
+        if !matches!(allocation.opcode, 0xbc | 0xbd) || !self.prelude.is_empty() {
+            return None;
+        }
+        let temporary = if transport.opcode == 0x59 {
+            None
+        } else {
+            Some(self.array_return_temporary(instructions)?)
+        };
+        let first_index = 2 + usize::from(temporary.is_some());
+        if self.literal_index(instructions.get(first_index)?) != Some(0) {
             return None;
         }
         let length = array_length(self.stack.last()?)?;
-        let permits = |index: usize, op: &Instruction| {
-            allows_contiguous(instructions, index, op) && permits(index, op)
+        let probe = ArrayProbe {
+            instructions,
+            permits: |index: usize, op: &Instruction| {
+                allows_contiguous(instructions, index, op) && permits(index, op)
+            },
+            temporary,
         };
         let mut arrays = Vec::new();
-        self.plan_array(instructions, 0, length, 0, &permits, &mut arrays)?;
+        self.plan_array(&probe, 0, length, 0, &mut arrays)?;
         let mut arrays = arrays.into_iter();
         let root = arrays.next().expect("array preflight produced a root");
-        let consumed = root.end;
+        let consumed = if temporary.is_some() {
+            let [load, ret] = &instructions[root.end..] else {
+                return None;
+            };
+            if !(probe.permits)(root.end, load)
+                || !(probe.permits)(root.end + 1, ret)
+                || !self.known_assignable(&root.ty, &self.descriptor.return_type)
+            {
+                return None;
+            }
+            root.end + 1
+        } else {
+            root.end
+        };
 
         // Only the typed pass renders. Stage method retention until it has
         // also proved the element assignment conversions and operand order.
         let original_helpers = self.dynamic_helpers.take();
         self.dynamic_helpers = original_helpers.as_ref().map(|_| Default::default());
         let position = (self.offset, self.opcode);
+        let has_source = self.instruction_has_source;
         let initialized = self.initialized_this;
         let result = self.fold_array(instructions, root, &mut arrays);
         self.initialized_this = initialized;
         let staged = mem::replace(&mut self.dynamic_helpers, original_helpers);
         if result.is_err() {
             (self.offset, self.opcode) = position;
+            self.instruction_has_source = has_source;
             return None;
         }
         if let (Some(outer), Some(staged)) = (&self.dynamic_helpers, staged) {
@@ -73,18 +106,51 @@ impl Machine<'_, '_> {
         Some(consumed)
     }
 
+    fn array_return_temporary(&self, instructions: &[Instruction]) -> Option<u16> {
+        let [allocation, store, .., load, ret] = instructions else {
+            return None;
+        };
+        let slot = reference_store_slot(store)?;
+        if !self.initialized_this
+            || self.stack_slots != 1
+            || slot >= self.code.max_locals
+            || (self.method.access_flags & 0x0008 == 0 && slot == 0)
+            || ret.opcode != 0xb0
+            || local_load(load) != Some((slot, Category::Ref))
+        {
+            return None;
+        }
+
+        // The temporary may disappear only if no exception edge can observe it
+        // before the return. Use the same instruction space as the lifted block.
+        let handlers = self
+            .normalized
+            .map_or(self.code.exceptions.as_slice(), |code| code.handlers.as_slice());
+        let end = ret.offset.checked_add(ret.len)?;
+        if handlers.iter().any(|handler| {
+            u32::from(handler.start_pc) < end && allocation.offset < u32::from(handler.end_pc)
+        }) {
+            return None;
+        }
+        Some(slot)
+    }
+
     fn plan_array(
         &self,
-        instructions: &[Instruction],
+        probe: &ArrayProbe<impl Fn(usize, &Instruction) -> bool>,
         start: usize,
         length: usize,
         depth: u8,
-        permits: &impl Fn(usize, &Instruction) -> bool,
         arrays: &mut Vec<ArrayPlan>,
     ) -> Option<usize> {
-        // Each store needs at least dup, a literal index, a value, and the
+        // Each store needs a receiver, a literal index, a value, and the
         // store itself. In particular, never allocate based on a class-file
         // dimension without a corresponding amount of bytecode.
+        let ArrayProbe {
+            instructions,
+            permits,
+            temporary,
+        } = probe;
         if length == 0 || length > (instructions.len() - start - 1) / 4 || depth == 32 {
             return None;
         }
@@ -106,19 +172,28 @@ impl Machine<'_, '_> {
             return None;
         }
         let store = store_opcode(component);
+        let local_receiver = temporary.filter(|_| start == 0);
+        let first_receiver = start + 1 + usize::from(local_receiver.is_some());
+        if local_receiver.is_some() && !permits(start + 1, instructions.get(start + 1)?) {
+            return None;
+        }
         let plan = arrays.len();
         arrays.push(ArrayPlan {
             start,
+            first_receiver,
             end: 0,
             length,
             ty,
         });
-        let mut cursor = start + 1;
+        let mut cursor = first_receiver;
         for expected_index in 0..length {
-            let duplicate = instructions.get(cursor)?;
+            let receiver = instructions.get(cursor)?;
             let index = instructions.get(cursor + 1)?;
-            if duplicate.opcode != 0x59
-                || !permits(cursor, duplicate)
+            let correct_receiver = local_receiver.map_or(receiver.opcode == 0x59, |slot| {
+                local_load(receiver) == Some((slot, Category::Ref))
+            });
+            if !correct_receiver
+                || !permits(cursor, receiver)
                 || self.literal_index(index) != i32::try_from(expected_index).ok()
                 || !permits(cursor + 1, index)
             {
@@ -138,6 +213,17 @@ impl Machine<'_, '_> {
                     cursor += 1;
                     break;
                 }
+                // This also applies to nested array elements: no RHS can
+                // inspect, publish, or load through the partially filled array.
+                if temporary.is_some_and(|slot| {
+                    local_load(op).is_some_and(|(index, category)| {
+                        index == slot
+                            || index.checked_add(1) == Some(slot)
+                                && matches!(category, Category::Long | Category::Double)
+                    })
+                }) {
+                    return None;
+                }
                 if matches!(op.opcode, 0xbc | 0xbd)
                     && instructions
                         .get(cursor + 1)
@@ -149,8 +235,7 @@ impl Machine<'_, '_> {
                         .checked_sub(1)
                         .filter(|&index| index >= value_start)?;
                     let length = usize::try_from(self.literal_index(&instructions[count])?).ok()?;
-                    cursor =
-                        self.plan_array(instructions, cursor, length, depth + 1, permits, arrays)?;
+                    cursor = self.plan_array(probe, cursor, length, depth + 1, arrays)?;
                 } else {
                     let follows_new =
                         cursor > value_start && instructions[cursor - 1].opcode == 0xbb;
@@ -175,13 +260,14 @@ impl Machine<'_, '_> {
             return Err(self.invalid_stack("array initializer needs its literal dimension"));
         }
         let slots = self.stack_slots;
-        // The allocation replaces the count (one slot), then dup and the
-        // index add two more. Size checks must still see those hidden slots.
-        if slots + 2 > self.max_stack {
+        // With dup, the array remains below the receiver and index. A local
+        // store leaves only the latter two on the stack while evaluating a RHS.
+        let hidden_slots = slots + if plan.first_receiver == plan.start + 1 { 2 } else { 1 };
+        if hidden_slots > self.max_stack {
             return Err(self.invalid_stack("array initializer exceeds max_stack"));
         }
         let outer_stack = mem::take(&mut self.stack);
-        self.stack_slots = slots + 2;
+        self.stack_slots = hidden_slots;
         self.array_probe_depth += 1;
         let expression = self.fold_array_values(instructions, plan, arrays);
         self.array_probe_depth -= 1;
@@ -205,9 +291,9 @@ impl Machine<'_, '_> {
         let mut text = Document::from("new ");
         text.push_str(&self.render_type(&plan.ty));
         let mut elements = text.array_initializer(ArrayStyle::New);
-        let mut cursor = plan.start + 1;
+        let mut cursor = plan.first_receiver;
         for _ in 0..plan.length {
-            cursor += 2; // verified dup and literal index
+            cursor += 2; // verified receiver and literal index
             loop {
                 let op = &instructions[cursor];
                 if matches!(op.opcode, 0x4f..=0x56) {
@@ -322,6 +408,26 @@ fn array_length(value: &Expr) -> Option<usize> {
     } else {
         None
     }
+}
+
+fn reference_store_slot(op: &Instruction) -> Option<u16> {
+    match (op.opcode, &op.operand) {
+        (0x3a, Operand::Local(slot)) => Some(*slot),
+        (opcode @ 0x4b..=0x4e, _) => Some(u16::from(opcode - 0x4b)),
+        _ => None,
+    }
+}
+
+fn local_load(op: &Instruction) -> Option<(u16, Category)> {
+    let (slot, kind) = match (op.opcode, &op.operand) {
+        (opcode @ 0x15..=0x19, Operand::Local(slot)) => (*slot, opcode - 0x15),
+        (opcode @ 0x1a..=0x2d, _) => {
+            let compact = opcode - 0x1a;
+            (u16::from(compact % 4), compact / 4)
+        }
+        _ => return None,
+    };
+    Some((slot, Category::for_local(kind)))
 }
 
 fn store_opcode(component: &Type) -> u8 {

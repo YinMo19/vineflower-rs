@@ -2,7 +2,7 @@ use crate::{
     Options,
     bytecode::decode,
     cfg::ControlFlowGraph,
-    classfile::{ClassFile, Code, Member},
+    classfile::{ClassFile, Code, ExceptionHandler, Member},
     descriptor::MethodDescriptor,
     structure::structure_with_handlers,
 };
@@ -24,6 +24,17 @@ fn with_machine(
     constructor: bool,
     test: impl FnOnce(Machine<'_, '_>),
 ) {
+    with_method(bytes, descriptor, constructor, Vec::new(), Options::default(), test);
+}
+
+fn with_method(
+    bytes: &[u8],
+    descriptor: &str,
+    constructor: bool,
+    exceptions: Vec<ExceptionHandler>,
+    options: Options,
+    test: impl FnOnce(Machine<'_, '_>),
+) {
     let class = ClassFile::parse(CLASS).unwrap();
     let method = Member {
         access_flags: if constructor { 0 } else { 8 },
@@ -35,11 +46,10 @@ fn with_machine(
         max_stack: 16,
         max_locals: 4,
         bytes,
-        exceptions: Vec::new(),
+        exceptions,
         attributes: Vec::new(),
     };
     let descriptor = MethodDescriptor::parse(descriptor).unwrap();
-    let options = Options::default();
     test(
         Machine::new(&class, &method, &code, &descriptor, &options, &|name| {
             name.rsplit('/').next().unwrap().into()
@@ -67,6 +77,80 @@ fn effectful_elements_execute_once_in_bytecode_order_with_offsets() {
             lines[0].offsets,
             (0..bytes.len() as u32).collect::<Vec<_>>()
         );
+    });
+}
+
+const LOCAL_RETURN: &[u8] = &[
+    0x05, 0xbc, 10, 0x4c, // int[] temp = new int[2];
+    0x2b, 0x03, 0x04, 0xb8, 0, 10, 0x4f, // temp[0] = Example.side(1);
+    0x2b, 0x04, 0x05, 0xb8, 0, 10, 0x4f, // temp[1] = Example.side(2);
+    0x2b, 0xb0, // return temp;
+];
+
+#[test]
+fn return_temporary_preserves_element_evaluation_order_and_anchors() {
+    let options = Options { include_line_mappings: true, ..Options::default() };
+    with_method(LOCAL_RETURN, "()[I", false, Vec::new(), options, |mut machine| {
+        let instructions = decode(LOCAL_RETURN).unwrap();
+        let graph = ControlFlowGraph::build(&instructions, &[]).unwrap();
+        // Unlike dup initializers, the allocation itself is not on the
+        // operand stack while evaluating an element.
+        machine.max_stack = 3;
+        let lines = structure_with_handlers(&instructions, &graph, machine, &[]).unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].offsets, (0..LOCAL_RETURN.len() as u32).collect::<Vec<_>>());
+        let mut out = String::new();
+        let mut anchors = Vec::new();
+        lines[0].text.render_at(&mut out, 24, "  ", false, 0, |range, line| {
+            anchors.push((range, line));
+        });
+        assert_eq!(out, "return new int[]{\n  Example.side(1),\n  Example.side(2)\n};");
+        assert_eq!(anchors, [(7..10, 1), (14..17, 2)]);
+    });
+}
+
+#[test]
+fn rejects_an_observable_temporary_or_nonterminal_transport() {
+    let cases: &[(&[u8], &str)] = &[
+        // An element reads the partially constructed array.
+        (&[0x04, 0xbc, 10, 0x4c, 0x2b, 0x03, 0x2b, 0xbe, 0x4f, 0x2b, 0xb0], "(I[I)[I"),
+        // The temporary is published as a second local alias or overwritten.
+        (&[0x04, 0xbc, 10, 0x4c, 0x2b, 0x4d, 0x2b, 0x03, 0x04, 0x4f, 0x2b, 0xb0], "()[I"),
+        (&[0x04, 0xbc, 10, 0x4c, 0x01, 0x4c, 0x2b, 0x03, 0x04, 0x4f, 0x2b, 0xb0], "()[I"),
+        // Nested initializers are also forbidden to read the transported slot.
+        (&[0x04, 0xbd, 0, 18, 0x4c, 0x2b, 0x03, 0x04, 0xbc, 10, 0x59, 0x03,
+            0x2b, 0xbe, 0x4f, 0x53, 0x2b, 0xb0], "(I[[I)[[I"),
+        // The stores must proceed in source initializer order.
+        (&[0x05, 0xbc, 10, 0x4c, 0x2b, 0x04, 0x04, 0x4f, 0x2b, 0x03, 0x05, 0x4f,
+            0x2b, 0xb0], "()[I"),
+        // This is not an immediate return of the temporary.
+        (&[0x04, 0xbc, 10, 0x4c, 0x2b, 0x03, 0x04, 0x4f, 0x2b, 0x00, 0xb0], "()[I"),
+    ];
+    for &(bytes, desc) in cases {
+        with_machine(bytes, desc, false, |mut machine| {
+            let instructions = decode(bytes).unwrap();
+            machine.step(&instructions[0]).unwrap();
+            let original = machine.stack[0].text.clone();
+            assert!(machine.try_array_initializer(&instructions[1..], |_, _| true).is_none(), "{bytes:?}");
+            assert_eq!(machine.stack[0].text, original);
+            assert_eq!(machine.stack_slots, 1);
+            assert!(machine.take_prelude().is_empty());
+        });
+    }
+}
+
+#[test]
+fn return_temporary_cannot_span_an_exception_handler() {
+    let mut bytes = LOCAL_RETURN.to_vec();
+    // The handler can read the array after assignment, if the second RHS throws.
+    bytes.extend([0x57, 0x2b, 0xb0]);
+    let handlers = vec![ExceptionHandler { start_pc: 11, end_pc: 18, handler_pc: 20, catch_type: 0 }];
+    with_method(&bytes, "()[I", false, handlers, Options::default(), |mut machine| {
+        let instructions = decode(&bytes).unwrap();
+        machine.step(&instructions[0]).unwrap();
+        let candidate = &instructions[1..instructions.len() - 3];
+        assert!(machine.try_array_initializer(candidate, |_, _| true).is_none());
+        assert_eq!(machine.stack[0].text, "2");
     });
 }
 

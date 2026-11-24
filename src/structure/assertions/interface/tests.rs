@@ -107,7 +107,7 @@ fn removes_only_the_eager_holder_trigger_before_an_interface_field_initializer()
     )
     .unwrap();
     assert!(
-        source.text.contains("int value = Test.initial();"),
+        source.text.contains("int value = initial();"),
         "{}",
         source.text
     );

@@ -9,6 +9,7 @@ use crate::lift::Machine;
 
 use super::StructureError;
 use super::assertions::Sites;
+use super::do_while::PostTest;
 use super::protected::ArmId;
 
 #[derive(Clone, Copy)]
@@ -95,6 +96,16 @@ impl<'r, 'a, 'c> Region<'r, 'a, 'c> {
         (latch != scope.header && scope.update.get().is_some()).then_some(latch)
     }
 
+    pub(super) fn post_test_latch(&self) -> Option<usize> {
+        let scope = self.loop_scope?;
+        scope.test_continues.as_ref()?;
+        Some(scope.continue_at.get())
+    }
+
+    pub(super) fn is_loop_test(&self, block: usize) -> bool {
+        self.loop_header == Some(block) || self.post_test_latch() == Some(block)
+    }
+
     pub(super) fn exception(
         &'r self,
         stop: Option<usize>,
@@ -135,6 +146,7 @@ pub(super) struct LoopScope<'a, 'c> {
     pub(super) exit: Option<usize>,
     pub(super) entry: Machine<'a, 'c>,
     pub(super) breaks: RefCell<Vec<Machine<'a, 'c>>>,
+    pub(super) test_continues: Option<Cell<bool>>,
     pub(super) labeled: Cell<bool>,
     pub(super) switch_depth: usize,
     pub(super) exception_arm: Option<ArmId>,
@@ -155,6 +167,7 @@ pub(super) struct While {
 #[derive(Clone, Copy)]
 pub(super) struct Loop {
     pub(super) test: Option<While>,
+    pub(super) post_test: Option<PostTest>,
     pub(super) exit: Option<usize>,
     parent: Option<usize>,
 }
@@ -240,19 +253,41 @@ impl Layout {
                 },
                 _ => None,
             };
-            let mut normal = exits.iter().copied().filter(|&target| !is_failure(target));
-            let first = normal.next();
-            let mut exit = match (first, normal.next()) {
-                (Some(target), None) => Some(target),
-                (Some(a), Some(b)) => test.map(|test| test.exit).or_else(|| {
-                    let common = normal.try_fold(postdominators.common(a, b)?, |a, b| {
-                        postdominators.common(a, b)
-                    })?;
-                    (!inside(common) && !outer_transfer(common) && level[common] == parent)
-                        .then_some(common)
-                }),
-                (None, _) => None,
-            };
+            let post_test = PostTest::classify(graph, instructions, &natural_loop);
+            // A header that already executes body code can branch to an
+            // early method exit. Keep such abrupt tails in the body when
+            // the unique conditional latch supplies the normal continuation.
+            let post_exit = post_test.map(PostTest::exit).filter(|&candidate| {
+                exits.contains(&candidate)
+                    && !is_failure(candidate)
+                    && level[candidate] == parent
+                    && exits.iter().all(|&target| {
+                        if target == candidate || is_failure(target) {
+                            return true;
+                        }
+                        let node = &graph.blocks[target];
+                        node.successors.is_empty()
+                            && node.exception_successors.is_empty()
+                            && node.exception_predecessors.is_empty()
+                            && node.predecessors.iter().copied().all(inside)
+                            && matches!(instructions[node.instructions.end - 1].opcode, 0xac..=0xb1 | 0xbf)
+                    })
+            });
+            let mut exit = post_exit.or_else(|| {
+                let mut normal = exits.iter().copied().filter(|&target| !is_failure(target));
+                let first = normal.next();
+                match (first, normal.next()) {
+                    (Some(target), None) => Some(target),
+                    (Some(a), Some(b)) => test.map(|test| test.exit).or_else(|| {
+                        let common = normal.try_fold(postdominators.common(a, b)?, |a, b| {
+                            postdominators.common(a, b)
+                        })?;
+                        (!inside(common) && !outer_transfer(common) && level[common] == parent)
+                            .then_some(common)
+                    }),
+                    (None, _) => None,
+                }
+            });
 
             // A natural loop contains only blocks that can return to its
             // header. Include dominated exit-only tails in the same source
@@ -321,6 +356,7 @@ impl Layout {
             }
             loops[header] = Some(Loop {
                 test: test.filter(|test| Some(test.exit) == exit),
+                post_test: post_test.filter(|test| Some(test.exit()) == exit),
                 exit,
                 parent,
             });

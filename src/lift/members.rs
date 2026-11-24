@@ -96,6 +96,17 @@ impl Machine<'_, '_> {
             // A blank static final must be assigned by simple name in its
             // declaring class, even though ordinary static writes can qualify.
             Document::new()
+        } else if !write
+            && self.is_lexical_member_owner(owner)
+            && !matches!(self.method_name, "<init>" | "<clinit>")
+            && self.own_static_field_is_unambiguous(name, descriptor, source_name)?
+            && !self
+                .anonymous_bindings
+                .as_deref()
+                .is_some_and(|bindings| bindings.binds_name(source_name))
+            && self.locals.reserve_unshadowed_field(source_name, self.lambda_depth != 0)
+        {
+            Document::new()
         } else {
             let mut head = self.class_reference(owner);
             head.push('.');
@@ -126,6 +137,51 @@ impl Machine<'_, '_> {
             if field.access_flags & 0x0018 == 0x0018
                 && pool.utf8(field.name_index)? == name
                 && pool.utf8(field.descriptor_index)? == descriptor
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn is_lexical_member_owner(&self, owner: &str) -> bool {
+        // Anonymous SAM bodies are emitted in a new Java class, while the
+        // inlined helper still uses the enclosing class's constant pool.
+        owner == self.owner && !(self.options.lambda_to_anonymous_class && self.lambda_depth != 0)
+    }
+
+    fn own_static_field_is_unambiguous(
+        &self,
+        name: &str,
+        descriptor: &str,
+        source_name: &str,
+    ) -> Result<bool, LiftError> {
+        let pool = &self.class.pool;
+        let mut found = false;
+        for field in &self.class.fields {
+            let field_name = pool.utf8(field.name_index)?;
+            let field_type = pool.utf8(field.descriptor_index)?;
+            if self.source_field_name(self.owner, field_name, field_type) != source_name {
+                continue;
+            }
+            if found
+                || field_name != name
+                || field_type != descriptor
+                || field.access_flags & 0x0008 == 0
+            {
+                return Ok(false);
+            }
+            found = true;
+        }
+        Ok(found)
+    }
+
+    fn own_method_is_static(&self, name: &str, descriptor: &str) -> Result<bool, LiftError> {
+        let pool = &self.class.pool;
+        for method in &self.class.methods {
+            if method.access_flags & 0x0008 != 0
+                && pool.utf8(method.name_index)? == name
+                && pool.utf8(method.descriptor_index)? == descriptor
             {
                 return Ok(true);
             }
@@ -228,9 +284,16 @@ impl Machine<'_, '_> {
         {
             return Ok(effect);
         }
-        let unqualified = receiver
+        let enclosing_receiver = receiver
             .as_ref()
             .is_some_and(|receiver| self.unnamed_enclosing_receiver(receiver));
+        // With a declaration in the current class, a simple invocation
+        // searches the same overload set as the written class qualifier.
+        // A symbolic owner alone is insufficient: it may resolve upstairs.
+        let unqualified = enclosing_receiver
+            || op.opcode == 0xb8
+                && self.is_lexical_member_owner(owner)
+                && self.own_method_is_static(name, method_type)?;
         let (mut text, chain) = if unqualified {
             (Document::new(), false)
         } else if let Some(receiver) = &receiver {
@@ -251,11 +314,10 @@ impl Machine<'_, '_> {
         };
         self.record_synthetic_invocation(owner, name, method_type);
         let source_name = self.source_invocation_name(owner, name, method_type);
-        if unqualified {
-            if self.current_member_named(&source_name, true)? {
-                return Err(self.unsupported("an unnameable enclosing method is shadowed"));
-            }
-        } else {
+        if enclosing_receiver && self.current_member_named(&source_name, true)? {
+            return Err(self.unsupported("an unnameable enclosing method is shadowed"));
+        }
+        if !unqualified {
             text.push('.');
         }
         self.anchor_member(&mut text, op);

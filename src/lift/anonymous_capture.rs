@@ -162,7 +162,7 @@ impl CaptureFrame {
         None
     }
 
-    fn binds_name(&self, name: &str) -> bool {
+    pub(in crate::lift) fn binds_name(&self, name: &str) -> bool {
         let mut frame = Some(self);
         while let Some(candidate) = frame {
             if candidate

@@ -198,7 +198,7 @@ fn ascending_dependencies_move_but_an_explicit_statement_is_a_barrier() {
     let source = f.source();
     let first = line_of(&source, "int first = 1;");
     let second = line_of(&source, "final int second = Fixture.first + 1;");
-    let callback = line_of(&source, "Fixture.callback();");
+    let callback = line_of(&source, "callback();");
     let last = line_of(&source, "Fixture.last = 3;");
     assert!(first < second && second < callback && callback < last);
 }

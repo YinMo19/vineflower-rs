@@ -15,7 +15,7 @@ const CLASS: &[u8] = b"\xca\xfe\xba\xbe\0\0\0\x3d\0\x0a\
     \x01\0\x04test\x01\0\x03()I\x01\0\x04side\x0c\0\x07\0\x06\x0a\0\x02\0\x08\
     \0\x21\0\x02\0\x04\0\0\0\0\0\0\0\0";
 
-fn lift(bytes: &[u8], signature: &str) -> Result<Vec<Line>, StructureError> {
+pub(super) fn lift(bytes: &[u8], signature: &str) -> Result<Vec<Line>, StructureError> {
     let class = ClassFile::parse(CLASS).unwrap();
     let method = Member {
         access_flags: 0x0008,

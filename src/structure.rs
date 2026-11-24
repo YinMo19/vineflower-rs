@@ -2,6 +2,8 @@
 
 pub(crate) mod assertions;
 mod boolean_returns;
+mod decision_graph;
+mod do_while;
 mod exception_emit;
 #[cfg(test)]
 mod exception_tests;
@@ -10,6 +12,7 @@ mod for_loops;
 mod instanceof_patterns;
 #[cfg(test)]
 mod join_tests;
+mod local_joins;
 mod pattern_switch;
 mod protected;
 mod string_switch;
@@ -31,6 +34,7 @@ use crate::lift::{BooleanCondition, Effect, LiftError, Machine};
 use crate::source_text::Document;
 
 use self::boolean_returns::BooleanReturn;
+use self::exception_emit::ExceptionRedirect;
 use self::flow::{Layout, Loop, LoopScope, Region, Transfer, While};
 use self::protected::Exceptions;
 use self::switch_expression::CaseLabel;
@@ -40,8 +44,10 @@ pub(crate) struct Line {
     pub depth: usize,
     pub text: Document,
     pub offsets: Vec<u32>,
+    pub sequence_boundary: bool,
     loop_break: Option<LoopBreak>,
     boolean_return: Option<BooleanReturn>,
+    detached_declaration: bool,
 }
 
 impl Line {
@@ -50,8 +56,10 @@ impl Line {
             depth,
             text: text.into(),
             offsets,
+            sequence_boundary: false,
             loop_break: None,
             boolean_return: None,
+            detached_declaration: false,
         }
     }
 }
@@ -148,6 +156,7 @@ fn structure_regions(
             return Err(emitter.unstructured(block));
         }
     }
+    emitter.lines.retain(|line| !line.detached_declaration);
     Ok(emitter.lines)
 }
 
@@ -156,7 +165,7 @@ struct Emitter<'a> {
     graph: &'a ControlFlowGraph,
     layout: Layout,
     exceptions: &'a Exceptions,
-    exception_redirects: BTreeMap<usize, usize>,
+    exception_redirects: BTreeMap<usize, ExceptionRedirect>,
     assertions: Option<&'a assertions::Sites>,
     emitted: Vec<bool>,
     lines: Vec<Line>,
@@ -223,7 +232,7 @@ impl Emitter<'_> {
         }
         loop {
             block = self.exceptions.bypass_cleanup(block);
-            block = self.exception_redirects.get(&block).copied().unwrap_or(block);
+            block = self.redirected_exception_block(block)?;
             let first_header = mem::take(&mut enter_loop);
             if !first_header {
                 if region.stop == Some(block) {
@@ -427,6 +436,19 @@ impl Emitter<'_> {
                 continue;
             }
             let instruction = &self.instructions[index];
+            if instruction.opcode == 0x84
+                && index + 2 < range.end
+                && do_while::is_conditional(self.instructions[range.end - 1].opcode)
+                && region.is_loop_test(block)
+                && !self.exceptions.skips_instruction(index + 1)
+                && !region.for_loop_omits(index + 1)
+                && machine.step_loop_prefix_update(instruction, &self.instructions[index + 1])?
+            {
+                let load = &self.instructions[index + 1];
+                offsets.extend(instruction.offset..load.offset + load.len);
+                index += 2;
+                continue;
+            }
             if matches!(instruction.opcode, 0xbc | 0xbd)
                 && let Some(consumed) = machine.try_array_initializer(
                     &self.instructions[index..range.end],
@@ -559,6 +581,7 @@ impl Emitter<'_> {
                 offsets,
                 &mut control,
             )?;
+            self.collapse_decision_graph(block, region, machine, &mut condition, offsets, &mut control);
         }
         let Condition {
             taken,
@@ -582,13 +605,16 @@ impl Emitter<'_> {
             self.syntax(depth, "}");
             return Ok(Some(taken));
         }
-        let join = self
-            .layout
-            .normal_join(block, region)
-            .or_else(|| {
-                self.layout
-                    .common_join(self.graph, region, [(fallthrough, None), (taken, None)])
-            })
+        let normal_join = self.layout.normal_join(block, region);
+        let shared_join = || self.layout.common_join(self.graph, region, [(fallthrough, None), (taken, None)]);
+        // A continue reaches the latch, not the ordinary lexical tail of
+        // this iteration. Prefer a shared body tail when the CFG join
+        // overlooks it because of a continue edge.
+        let join = if normal_join.is_some() && normal_join == region.post_test_latch() {
+            shared_join().or(normal_join)
+        } else {
+            normal_join.or_else(shared_join)
+        }
             .or_else(|| {
                 let abrupt = |arm| self.is_terminal(arm) || region.loop_transfer(arm).is_some();
                 let next = match (abrupt(taken), abrupt(fallthrough)) {
@@ -942,8 +968,14 @@ impl Emitter<'_> {
             self.push(depth, statement, mem::take(pending));
         }
         pending.clear();
-        let scope = Self::loop_scope(header, shape.exit, region, machine);
         let head_line = self.lines.len();
+        if let Some(test) = shape.post_test
+            && let Some(exit) = self.try_post_test_loop(header, test, region, machine, depth)
+        {
+            self.lines[head_line].sequence_boundary = true;
+            return Ok(Some((exit, None)));
+        }
+        let scope = Self::loop_scope(header, shape.exit, region, machine);
         self.syntax(depth, "while (true) {");
         let mut iteration = machine.clone();
         let mut for_loop = None;
@@ -1018,6 +1050,7 @@ impl Emitter<'_> {
 
         let breaks = scope.breaks.borrow();
         let Some(exit) = shape.exit.filter(|_| !breaks.is_empty()) else {
+            self.lines[head_line].sequence_boundary = true;
             self.label_loop(head_line, &scope);
             return Ok(None);
         };
@@ -1098,6 +1131,7 @@ impl Emitter<'_> {
                 .chain(locals.declarations)
                 .map(|text| Line::new(depth, text, Vec::new())),
         );
+        self.lines[head_line].sequence_boundary = true;
         Ok(Some((exit, exit_binding.and_then(|binding| binding.enter(machine)))))
     }
 
@@ -1115,6 +1149,7 @@ impl Emitter<'_> {
             exit,
             entry: machine.clone(),
             breaks: RefCell::default(),
+            test_continues: None,
             labeled: Cell::new(false),
             switch_depth: region.switch_depth,
             exception_arm: region.exception_arm,
@@ -1171,7 +1206,16 @@ impl Emitter<'_> {
         };
         match transfer {
             Transfer::Continue => {
-                self.emit_backedge(scope, machine, depth, offsets)?;
+                if let Some(continues) = &scope.test_continues {
+                    if !machine.stack_is_empty()
+                        || !machine.same_live_loop_bindings(&scope.entry, |slot| self.local_is_live(target, slot))
+                    {
+                        return Err(self.unstructured(target));
+                    }
+                    continues.set(true);
+                } else {
+                    self.emit_backedge(scope, machine, depth, offsets)?;
+                }
                 self.push(depth, text, mem::take(offsets));
             }
             Transfer::Break => {
@@ -1394,7 +1438,26 @@ impl Emitter<'_> {
             .map(|arm| arm.exit.as_ref().expect("arm reached the join"))
             .collect::<Vec<_>>();
         let mut code = machine.merge_stack(&exits, offset)?;
-        let locals = machine.merge_locals(&exits, offset, |slot| self.local_is_live(join, slot))?;
+        let locals = machine.merge_locals_with_hoists(
+            &exits,
+            offset,
+            |slot| self.layout.local_is_live(self.graph, self.instructions, join, slot),
+            |arm, declaration, name, retarget| {
+                local_joins::prove_local_relocation(&self.lines, arms[arm], declaration, name, retarget)
+            },
+        )?;
+        for hoist in locals.hoists {
+            for &(index, prefix) in &hoist.sites {
+                let line = &mut self.lines[index];
+                if let Some(prefix) = prefix {
+                    hoist.rewrite(&mut line.text, prefix);
+                } else {
+                    // Retain arm indices until statement rendering; the
+                    // uninitialized declaration has no evaluation or offsets.
+                    line.detached_declaration = true;
+                }
+            }
+        }
         code.declarations.extend(locals.declarations);
         for ((arm, stack), locals) in arms.iter().zip(&mut code.arms).zip(locals.arms) {
             let mut last = (stack.is_empty() && arm.start < arm.end)

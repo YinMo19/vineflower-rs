@@ -87,14 +87,14 @@ fn recovers_constant_short_circuit_and_lazy_detail_but_not_a_user_throw() {
     assert!(
         source
             .text
-            .contains("assert var0 && var1 : Example.message(11, 22, 33, 44);"),
+            .contains("assert var0 && var1 : message(11, 22, 33, 44);"),
         "{}",
         source.text
     );
     assert!(
         source
             .text
-            .contains("assert Example.condition() : Example.message(11, 22, 33, 44);")
+            .contains("assert condition() : message(11, 22, 33, 44);")
     );
     assert!(source.text.contains("assert false;"));
     assert!(source.text.contains("throw new AssertionError();"));

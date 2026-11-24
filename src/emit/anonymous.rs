@@ -31,9 +31,24 @@ impl<'a, 'c> Writer<'a, 'c> {
         doc: &Document,
         sites: Option<&AnonymousSites>,
     ) -> Result<(), DecompileError> {
+        self.line_with_anonymous_anchors(depth, doc, sites, None)
+    }
+
+    pub(super) fn line_with_anonymous_anchors(
+        &mut self,
+        depth: usize,
+        doc: &Document,
+        sites: Option<&AnonymousSites>,
+        mut on_anchor: Option<&mut dyn FnMut(Range<u32>, usize)>,
+    ) -> Result<(), DecompileError> {
         let text = doc.as_str();
         if !text.contains('\0') {
-            self.document_line(depth, doc);
+            if let Some(on_anchor) = on_anchor {
+                let first = self.lines;
+                self.document_line_with_anchors(depth, doc, |bytes, line| on_anchor(bytes, first + line));
+            } else {
+                self.document_line(depth, doc);
+            }
             return Ok(());
         }
         let invalid = || DecompileError::InvalidAttribute("anonymous class expression");
@@ -43,6 +58,21 @@ impl<'a, 'c> Writer<'a, 'c> {
         self.indent_anonymous(depth);
         let first = fragments.next().expect("split yields initial fragment");
         let mut tokens = doc.flat_tokens().peekable();
+        let mut anchors = doc.flat_anchors().peekable();
+        let mut record_anchors = |fragment: &str, start, mut line| {
+            let Some(on_anchor) = on_anchor.as_deref_mut() else { return };
+            let mut previous = 0;
+            while let Some((at, bytes)) = anchors.next_if(|(at, _)| *at <= start + fragment.len()) {
+                if at < start {
+                    continue;
+                }
+                let offset = at - start;
+                line += fragment.as_bytes()[previous..offset].iter().filter(|&&byte| byte == b'\n').count();
+                on_anchor(bytes, line);
+                previous = offset;
+            }
+        };
+        record_anchors(first, 0, self.lines);
         self.append_anonymous_fragment(first, 0, &mut tokens);
         let mut fragment_start = first.len() + 1;
         while let Some(id) = fragments.next() {
@@ -71,6 +101,7 @@ impl<'a, 'c> Writer<'a, 'c> {
                 self.indent_anonymous(depth);
             }
             self.body.push('}');
+            record_anchors(tail, fragment_start, self.lines);
             self.append_anonymous_fragment(tail, fragment_start, &mut tokens);
             fragment_start += tail.len() + 1;
         }
