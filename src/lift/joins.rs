@@ -384,11 +384,21 @@ impl Machine<'_, '_> {
             if simplify {
                 uses = [selection.uses(true), selection.uses(false)];
             }
-            let (result, text) = selection.render(
+            let (result, mut text) = selection.render(
                 (facts, [Cow::Borrowed(condition), Cow::Borrowed(inverse)]),
                 (yes_fact, boolean_document(yes, yes_fact, selection.uses(true))),
                 (no_fact, boolean_document(no, no_fact, selection.uses(false))),
             );
+            if self.options.include_line_mappings
+                && matches!(selection, BooleanSelection::Condition { .. })
+                && text.materialize_short_circuit_predicates()
+            {
+                // The two stack arms are only the encoding of this boolean.
+                // Neither constant has a source operand after the merge.
+                for origin in [yes, no].into_iter().filter_map(Expr::deferred_operand_origin) {
+                    text.omit_bytes(origin.bytes());
+                }
+            }
             (text, result.precedence())
         } else {
             let yes = self.conditional_operand(yes, &ty, &no.ty)?;

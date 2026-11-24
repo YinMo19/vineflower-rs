@@ -43,6 +43,7 @@ enum Kind {
     Anchor {
         start: u32,
         end: u32,
+        branch: Option<(u32, u32)>,
     },
     OmittedBytes {
         start: u32,
@@ -180,7 +181,9 @@ impl Document {
     }
 
     pub(crate) fn has_layout(&self) -> bool {
-        !self.events.is_empty()
+        self.events
+            .iter()
+            .any(|event| !matches!(event.kind, Kind::Anchor { branch: Some(_), .. }))
     }
 
     pub(crate) fn prepend_str(&mut self, text: &str) {
@@ -563,16 +566,80 @@ impl Document {
                 kind: Kind::Anchor {
                     start: offsets.start,
                     end: offsets.end,
+                    branch: None,
                 },
             });
         }
+    }
+
+    /// Carry a direct local test through speculative condition folding. Until
+    /// a boolean value is actually materialized, its statement keeps owning
+    /// both the load and the branch.
+    pub(crate) fn defer_local_predicate(&mut self, load: Range<u32>, branch: Range<u32>) {
+        self.events.push(Event {
+            at: self.flat.len(),
+            kind: Kind::Anchor {
+                start: load.start,
+                end: load.end,
+                branch: Some((branch.start, branch.end)),
+            },
+        });
+    }
+
+    /// When a decision graph becomes a short-circuit value, the branches
+    /// belong to the whole expression; the loads follow their predicate
+    /// leaves across the infix layout's soft breaks.
+    pub(crate) fn materialize_short_circuit_predicates(&mut self) -> bool {
+        if !matches!(self.infix(), Some(Infix::AND | Infix::OR)) {
+            return false;
+        }
+        // Each logical separator introduces one additional operand. Do not
+        // guess origins for comparisons, invocations, or ternary operands.
+        let mut operands = 1;
+        let mut predicates = 0;
+        for event in &self.events {
+            match event.kind {
+                Kind::Begin {
+                    role: GroupRole::Infix(Infix::AND | Infix::OR) | GroupRole::Plain,
+                    ..
+                }
+                | Kind::End
+                | Kind::Break { len: 0, .. } => {}
+                Kind::Break { len: 1, dedent: false } => operands += 1,
+                Kind::Anchor { branch: Some(_), .. } => predicates += 1,
+                _ => return false,
+            }
+        }
+        if operands != predicates {
+            return false;
+        }
+        let original_len = self.events.len();
+        for index in 0..original_len {
+            if let Kind::Anchor { branch, .. } = &mut self.events[index].kind
+                && let Some((start, end)) = branch.take()
+            {
+                self.events.push(Event {
+                    at: 0,
+                    kind: Kind::Anchor { start, end, branch: None },
+                });
+            }
+        }
+        let added = self.events.len() - original_len;
+        debug_assert_eq!(added, predicates);
+        for event in &mut self.events[..original_len] {
+            if let Kind::Begin { link: Link::Closed { end }, .. } = &mut event.kind {
+                *end += added;
+            }
+        }
+        self.events.rotate_right(added);
+        true
     }
 
     /// Bytecode anchors in the flat representation, for text fragments
     /// interleaved with externally emitted anonymous class bodies.
     pub(crate) fn flat_anchors(&self) -> impl Iterator<Item = (usize, Range<u32>)> + '_ {
         self.events.iter().filter_map(|event| match event.kind {
-            Kind::Anchor { start, end } => Some((event.at, start..end)),
+            Kind::Anchor { start, end, branch: None } => Some((event.at, start..end)),
             _ => None,
         })
     }
@@ -1002,8 +1069,10 @@ where
                     }
                     index += 1;
                 }
-                Kind::Anchor { start, end } => {
-                    (self.on_anchor)(start..end, self.lines);
+                Kind::Anchor { start, end, branch } => {
+                    if branch.is_none() {
+                        (self.on_anchor)(start..end, self.lines);
+                    }
                     index += 1;
                 }
                 Kind::OmittedBytes { .. } => index += 1,

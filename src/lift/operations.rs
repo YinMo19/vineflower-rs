@@ -173,7 +173,19 @@ impl Machine<'_, '_> {
                     );
                     let mut negation = Document::from("!");
                     value.append_at(UNARY, &mut negation);
-                    let truth = value.text;
+                    let local_load = match value.source {
+                        Source::Local(_) if !value.observable => value
+                            .deferred_operand_origin()
+                            .map(|origin| origin.bytes())
+                            .filter(|bytes| bytes.end == op.offset),
+                        _ => None,
+                    };
+                    let mut truth = value.text;
+                    if let Some(load) = local_load {
+                        let branch = op.offset..op.offset + op.len;
+                        truth.defer_local_predicate(load.clone(), branch.clone());
+                        negation.defer_local_predicate(load, branch);
+                    }
                     if matches!(relation, Relation::Eq) {
                         (negation, truth)
                     } else {

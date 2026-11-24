@@ -160,3 +160,35 @@ fn factors_converging_short_circuit_paths_without_copying_a_predicate() {
     );
     assert_eq!(render.used.len(), 3);
 }
+
+#[test]
+fn maps_the_original_long_boolean_argument_at_either_width() {
+    let class = include_bytes!("../../../tests/smoke/java8/TestBinaryOperationWrapping.class");
+    let golden = include_str!(
+        "../../../tests/upstream/testData/results/pkg/TestBinaryOperationWrapping.dec"
+    );
+    let options = Options {
+        include_line_mappings: true,
+        dump_original_lines: true,
+        unit_test_mode: true,
+        keep_literals: true,
+        ..Options::default()
+    };
+    let wrapped = crate::decompile(class, &options).unwrap();
+    assert_eq!(wrapped.text.trim_end(), golden.trim_end());
+
+    let flat = crate::decompile(class, &Options { preferred_line_length: 512, ..options }).unwrap();
+    let invocation_line = flat.text.lines()
+        .position(|line| line.contains("System.out.println(a && b"))
+        .expect("the wider document keeps the boolean argument on the invocation line");
+    let boolean_offsets = |source: crate::Source| {
+        source.map.unwrap().methods.into_iter()
+            .find(|method| method.name == "testBooleanOperation").unwrap().offsets
+    };
+    let wrapped = boolean_offsets(wrapped);
+    let flat = boolean_offsets(flat);
+    assert!(wrapped.keys().eq(flat.keys()));
+    let (&ret, &closing_line) = flat.last_key_value().unwrap();
+    assert!(flat.range(..ret).all(|(_, &line)| line == invocation_line));
+    assert_eq!(closing_line, invocation_line + 1);
+}
