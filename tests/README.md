@@ -59,7 +59,8 @@ Exact upstream comparison with all fixture bytecode and required JDKs:
 | Qualified construction, scoped switches and nested resources | 108 | 206 | 383 | 0 |
 | Typed assignments, contextual boxing and opt-in source rewrites | 114 | 191 | 392 | 0 |
 | Guarded patterns, local joins, post-test loops and anonymous SAMs | 120 | 161 | 416 | 0 |
-| Record patterns, resource exits and Kotlin template/member recovery | 124 | 149 | 423 | 0 |
+| Record patterns, resource exits and Kotlin template/member recovery | 124 | 149 | 423 | 1 |
+| Instance initializer maps, float literals and optional method signatures | 126 | 149 | 422 | 0 |
 
 All eight upstream CLI and bulk cases match. The full test remains failing
 until all 697 comparisons match.

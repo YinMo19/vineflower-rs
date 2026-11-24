@@ -2,6 +2,8 @@
 
 use std::fmt::{Display, UpperExp, Write};
 
+use unicode_general_category::{GeneralCategory, get_general_category};
+
 use crate::{
     Options,
     classfile::{Constant, ConstantPool},
@@ -113,34 +115,40 @@ pub(crate) fn string_literal(units: &[u16], ascii: bool) -> String {
 fn quoted(units: &[u16], quote: char, ascii: bool) -> String {
     let mut result = String::with_capacity(units.len() + 2);
     result.push(quote);
-    for ch in char::decode_utf16(units.iter().copied()) {
-        match ch {
-            Ok('\u{8}') => result.push_str("\\b"),
-            Ok('\t') => result.push_str("\\t"),
-            Ok('\n') => result.push_str("\\n"),
-            Ok('\u{c}') => result.push_str("\\f"),
-            Ok('\r') => result.push_str("\\r"),
-            Ok('\\') => result.push_str("\\\\"),
-            Ok(ch) if ch == quote => {
+    for &unit in units {
+        match char::from_u32(u32::from(unit)) {
+            Some('\u{8}') => result.push_str("\\b"),
+            Some('\t') => result.push_str("\\t"),
+            Some('\n') => result.push_str("\\n"),
+            Some('\u{c}') => result.push_str("\\f"),
+            Some('\r') => result.push_str("\\r"),
+            Some('\\') => result.push_str("\\\\"),
+            Some(ch) if ch == quote => {
                 result.push('\\');
                 result.push(ch);
             }
-            Ok(ch) if ch.is_control() && (ch as u32) <= 0x7f => {
-                let _ = write!(result, "\\{:03o}", ch as u32);
-            }
-            Ok(ch) if ch.is_control() || (ascii && !ch.is_ascii()) => {
-                for &mut unit in ch.encode_utf16(&mut [0; 2]) {
-                    let _ = write!(result, "\\u{unit:04x}");
-                }
-            }
-            Ok(ch) => result.push(ch),
-            Err(err) => {
-                let _ = write!(result, "\\u{:04x}", err.unpaired_surrogate());
+            Some(ch) if java_printable(ch, ascii) => result.push(ch),
+            _ => {
+                // Escape code units, including either half of a surrogate
+                // pair. The Java lexer restores the original UTF-16 input.
+                let _ = write!(result, "\\u{unit:04x}");
             }
         }
     }
     result.push(quote);
     result
+}
+
+fn java_printable(ch: char, ascii: bool) -> bool {
+    if ch.is_ascii() {
+        return (' '..'\x7f').contains(&ch);
+    }
+    use GeneralCategory::*;
+    !ascii
+        && !matches!(
+            get_general_category(ch),
+            Unassigned | LineSeparator | ParagraphSeparator | Control | Format | PrivateUse
+        )
 }
 
 #[cfg(test)]
@@ -151,11 +159,12 @@ mod tests {
     fn quotes_java_utf16_without_losing_units() {
         assert_eq!(
             string_literal(&[0, 0x37, 0x22, 0x5c, 0xa, 0xd800], true),
-            r#""\0007\"\\\n\ud800""#
+            r#""\u00007\"\\\n\ud800""#
         );
         let units = [0xd83d, 0xde00];
         assert_eq!(string_literal(&units, true), r#""\ud83d\ude00""#);
-        assert_eq!(string_literal(&units, false), "\"😀\"");
+        assert_eq!(string_literal(&units, false), r#""\ud83d\ude00""#);
+        assert_eq!(string_literal(&[0xffff, 0x200c, 0xe000, 0x2028], false), r#""\uffff\u200c\ue000\u2028""#);
         assert_eq!(
             integer_literal(0x27, Some(&Type::Primitive(Primitive::Char)), false),
             "'\\''"
