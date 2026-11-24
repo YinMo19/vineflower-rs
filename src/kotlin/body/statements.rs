@@ -1,12 +1,12 @@
 // Copyright 2026 Vineflower contributors. Licensed under the Apache License, Version 2.0.
 
-use std::{ops::Range, rc::Rc};
+use std::{borrow::Cow, ops::Range, rc::Rc};
 
 use crate::classfile::LocalVariable;
 
 use super::{
     Bytecode, Code, Expected, Expr, ExprKind, Instruction, JvmType, KotlinError, Literal, Locals,
-    Primitive, ScopedLocal, StackValue, Type, ValueParameter, extensions::{Value, exact_type},
+    Operand, Primitive, ScopedLocal, StackValue, Type, ValueParameter, extensions::{Value, exact_type},
     identifier, invocations::{Call, kotlin_type}, load_opcode, local_load, local_store, logic, nullable, pop_value,
 };
 
@@ -30,6 +30,7 @@ enum Kind<'a> {
         argument_first: bool,
     },
     Declare(Rc<Binding<'a>>, Expr<'a>),
+    Increment(Rc<Binding<'a>>, i16),
     Evaluate(Box<Call<'a>>),
     EvaluateNullable(Box<nullable::Expression<'a>>),
     Return(Expr<'a>, Value),
@@ -37,12 +38,12 @@ enum Kind<'a> {
 
 #[derive(Debug)]
 pub(super) struct Binding<'a> {
-    pub(super) name: &'a str,
+    pub(super) name: Cow<'a, str>,
     pub(super) value: Value,
     slot: u16,
     range: Range<u32>,
+    mutable: bool,
 }
-
 
 pub(super) struct ConditionalInitializer<'a> {
     pub(super) instructions: Range<usize>,
@@ -54,10 +55,12 @@ pub(super) struct ConditionalInitializer<'a> {
     pub(super) no: Expr<'a>,
 }
 
-enum Initial<'a> {
+enum Initial<'a, 'scope> {
     Stack(usize, Expr<'a>),
-    Declaration(Statement<'a>, Rc<Binding<'a>>),
+    Declaration(Statement<'a>),
+    Scope(&'scope [Statement<'a>]),
 }
+
 #[derive(Default)]
 struct DebugLocals<'a> {
     entries: Vec<LocalVariable<'a>>,
@@ -81,8 +84,8 @@ impl Statement<'_> {
         let (argument, argument_first) = match &self.kind {
             Kind::Print { argument, argument_first } => (argument, *argument_first),
             Kind::Declare(local, value) => {
-                out.push_str("val ");
-                identifier(out, local.name, declaration)?;
+                out.push_str(if local.mutable { "var " } else { "val " });
+                identifier(out, &local.name, declaration)?;
                 // Without an expected type Kotlin gives small numeric
                 // literals type Int, even when JVM iload read a Byte/Short.
                 match local.value.jvm {
@@ -92,6 +95,16 @@ impl Statement<'_> {
                 }
                 out.push_str(" = ");
                 return value.write(out, &local.value.ty, &local.value.jvm, parameters, declaration);
+            }
+            Kind::Increment(local, amount) => {
+                use std::fmt::Write;
+                identifier(out, &local.name, declaration)?;
+                match amount {
+                    1 => out.push_str("++"),
+                    -1 => out.push_str("--"),
+                    _ => write!(out, " += {amount}").unwrap(),
+                }
+                return Ok(());
             }
             Kind::Evaluate(call) => return call.write(out, parameters, declaration),
             Kind::EvaluateNullable(expression) => {
@@ -286,11 +299,11 @@ pub(super) fn lower_conditional_initializer<'a, 'data>(
     let binding = debug_binding(bytecode.owner, local, instructions, &debug, &[], locals, value, opcode, declaration)?;
     let expression = logic::Conditional::new(condition, yes, no, declaration)?;
     let start = span.start;
-    let seed = Statement { instructions: span, kind: Kind::Declare(Rc::clone(&binding), expression) };
+    let seed = Statement { instructions: span, kind: Kind::Declare(binding, expression) };
     let last = instructions.len() - 1;
     let (statements, value) = lower_block(
         bytecode, instructions, start..last, locals, declaration, &[], &debug,
-        Some(Initial::Declaration(seed, binding)),
+        Some(Initial::Declaration(seed)),
     )?;
     closed(statements, value, declaration)
 }
@@ -303,6 +316,21 @@ pub(super) fn lower_range<'a>(
     declaration: &str,
 ) -> Result<Vec<Statement<'a>>, KotlinError> {
     lower_scoped(bytecode, instructions, range, locals, declaration, &[])
+}
+
+pub(super) fn lower_inherited<'a>(
+    bytecode: &Bytecode<'a, '_>,
+    instructions: &[Instruction],
+    range: Range<usize>,
+    locals: &Locals<'_>,
+    declaration: &str,
+    inherited: &[Statement<'a>],
+) -> Result<Vec<Statement<'a>>, KotlinError> {
+    let (statements, value) = lower_block(
+        bytecode, instructions, range, locals, declaration, &[], &DebugLocals::default(),
+        Some(Initial::Scope(inherited)),
+    )?;
+    closed(statements, value, declaration)
 }
 
 pub(super) fn lower_scoped<'a>(
@@ -349,6 +377,55 @@ pub(super) fn lower_open<'a>(
     lower_block(bytecode, instructions, range, locals, declaration, scoped, &DebugLocals::default(), None)
 }
 
+pub(super) struct Prefix<'a> {
+    pub(super) statements: Vec<Statement<'a>>,
+    pub(super) stack: Vec<StackValue<'a>>,
+    pub(super) first: usize,
+}
+
+pub(super) fn lower_prefix<'a, 'data>(
+    bytecode: &Bytecode<'a, 'data>,
+    instructions: &[Instruction],
+    range: Range<usize>,
+    code: &Code<'data>,
+    locals: &Locals<'_>,
+    declaration: &str,
+) -> Result<Prefix<'a>, KotlinError> {
+    let debug = DebugLocals { entries: code.local_variables(&bytecode.class.pool)?, max: code.max_locals };
+    lower_operands(bytecode, instructions, range, locals, declaration, &[], &debug, None)
+}
+
+impl<'a> Statement<'a> {
+    fn binding(&self) -> Option<&Rc<Binding<'a>>> {
+        match &self.kind {
+            Kind::Declare(local, _) => Some(local),
+            _ => None,
+        }
+    }
+}
+
+pub(super) fn read_local<'a, 'scope>(
+    statements: impl Iterator<Item = &'scope Statement<'a>>,
+    instruction: &Instruction,
+) -> Result<Option<Expr<'a>>, ()>
+where 'a: 'scope {
+    let Some((load, slot)) = local_load(instruction) else { return Ok(None); };
+    let Some(local) = live_local(statements, instruction.offset, slot) else { return Ok(None); };
+    if load != load_opcode(&local.value.jvm) {
+        return Err(());
+    }
+    Ok(Some(Expr { kind: ExprKind::Local(Rc::clone(local)), depth: 1 }))
+}
+
+fn live_local<'a, 'scope>(
+    statements: impl Iterator<Item = &'scope Statement<'a>>,
+    offset: u32,
+    slot: u16,
+) -> Option<&'scope Rc<Binding<'a>>>
+where 'a: 'scope {
+    statements.filter_map(Statement::binding).find(|local| local.slot == slot && local.range.contains(&offset))
+}
+
 fn lower_block<'a>(
     bytecode: &Bytecode<'a, '_>,
     instructions: &[Instruction],
@@ -357,25 +434,48 @@ fn lower_block<'a>(
     declaration: &str,
     scoped: &[ScopedLocal<'a>],
     debug: &DebugLocals<'a>,
-    initial: Option<Initial<'a>>,
+    initial: Option<Initial<'a, '_>>,
 ) -> Result<(Vec<Statement<'a>>, Option<TailValue<'a>>), KotlinError> {
+    let Prefix { statements, mut stack, first } = lower_operands(
+        bytecode, instructions, range.clone(), locals, declaration, scoped, debug, initial,
+    )?;
+    let value = if stack.is_empty() {
+        None
+    } else if let [StackValue::Value(_)] = stack.as_slice() {
+        Some(TailValue { expr: pop_value(&mut stack, declaration)?, instructions: first..range.end })
+    } else {
+        return Err(KotlinError::unsupported(declaration, "unsupported Kotlin statement bytecode"));
+    };
+    Ok((statements, value))
+}
+
+fn lower_operands<'a>(
+    bytecode: &Bytecode<'a, '_>,
+    instructions: &[Instruction],
+    range: Range<usize>,
+    locals: &Locals<'_>,
+    declaration: &str,
+    scoped: &[ScopedLocal<'a>],
+    debug: &DebugLocals<'a>,
+    initial: Option<Initial<'a, '_>>,
+) -> Result<Prefix<'a>, KotlinError> {
     let mut statements = Vec::new();
     let mut stack = Vec::new();
-    let mut declared: Vec<Rc<Binding<'a>>> = Vec::new();
     let mut argument_first = false;
     let mut index = range.start;
     let mut first = range.start;
+    let mut inherited = &[][..];
     match initial {
         Some(Initial::Stack(join, value)) => {
             index = join;
             stack.push(StackValue::Value(value));
         }
-        Some(Initial::Declaration(statement, binding)) => {
+        Some(Initial::Declaration(statement)) => {
             index = statement.instructions.end;
             first = index;
             statements.push(statement);
-            declared.push(binding);
         }
+        Some(Initial::Scope(scope)) => inherited = scope,
         None => {}
     }
     let invalid = || KotlinError::unsupported(declaration, "unsupported Kotlin statement bytecode");
@@ -383,6 +483,7 @@ fn lower_block<'a>(
         .fold(locals.next_slot(), u16::max);
     while index < range.end {
         let instruction = &instructions[index];
+        let scope = || statements.iter().rev().chain(inherited.iter().rev());
         if let Some((store, slot)) = local_store(instruction) {
             let after = instruction.offset + instruction.len;
             if slot < first_free {
@@ -398,13 +499,21 @@ fn lower_block<'a>(
                 let ty = debug_value_type(&value, &jvm, locals)
                     .ok_or_else(|| KotlinError::unsupported(declaration, "unproven Kotlin debug local"))?;
                 let binding = debug_binding(
-                    bytecode.owner, local, instructions, debug, &declared, locals, Value { ty, jvm }, store, declaration,
+                    bytecode.owner, local, instructions, debug, &statements, locals, Value { ty, jvm }, store, declaration,
                 )?;
-                declared.push(Rc::clone(&binding));
                 statements.push(Statement { instructions: first..index + 1, kind: Kind::Declare(binding, value) });
                 first = index + 1;
                 index += 1;
                 continue;
+            }
+            if let Some((written, _)) = instruction.local_access()
+                && scope().filter_map(Statement::binding).any(|local| {
+                    let start = u32::from(local.slot);
+                    local.range.contains(&instruction.offset)
+                        && start < written.end && written.start < start + u32::from(local.value.jvm.slots())
+                })
+            {
+                return Err(invalid());
             }
             if let [get, load, print, ..] = &instructions[index + 1..range.end]
                 && local_load(load) == Some((store - 0x21, slot))
@@ -425,13 +534,23 @@ fn lower_block<'a>(
             }
             return Err(invalid());
         }
-        if let Some((load, slot)) = local_load(instruction)
-            && let Some(local) = declared.iter().rev().find(|local| local.slot == slot && local.range.contains(&instruction.offset))
-        {
-            if load != load_opcode(&local.value.jvm) {
+        if let Operand::Increment { index: slot, amount } = instruction.operand {
+            let local = live_local(scope(), instruction.offset, slot).filter(|local| local.mutable).ok_or_else(invalid)?;
+            // A deferred stack expression could read the old value, or
+            // throw before the increment. Emit only at a statement boundary.
+            if !stack.is_empty() {
                 return Err(invalid());
             }
-            stack.push(StackValue::Value(Expr { kind: ExprKind::Local(Rc::clone(local)), depth: 1 }));
+            statements.push(Statement {
+                instructions: first..index + 1,
+                kind: Kind::Increment(Rc::clone(local), amount),
+            });
+            first = index + 1;
+            index += 1;
+            continue;
+        }
+        if let Some(expr) = read_local(scope(), instruction).map_err(|_| invalid())? {
+            stack.push(StackValue::Value(expr));
             index += 1;
             continue;
         }
@@ -458,8 +577,7 @@ fn lower_block<'a>(
                     || locals.templates.properties.iter().any(|property| property.name == "kotlin")
                     || locals.extension.as_ref().is_some_and(|context| {
                         context.parameters.iter().any(|param| param.name == "kotlin")
-                    })
-                    || declared.iter().any(|local| local.name == "kotlin"))
+                    }))
             {
                 return Err(invalid());
             }
@@ -501,14 +619,7 @@ fn lower_block<'a>(
         }
         index += 1;
     }
-    let value = if stack.is_empty() {
-        None
-    } else if let [StackValue::Value(_)] = stack.as_slice() {
-        Some(TailValue { expr: pop_value(&mut stack, declaration)?, instructions: first..range.end })
-    } else {
-        return Err(invalid());
-    };
-    Ok((statements, value))
+    Ok(Prefix { statements, stack, first })
 }
 
 fn debug_binding<'a>(
@@ -516,7 +627,7 @@ fn debug_binding<'a>(
     local: &LocalVariable<'a>,
     instructions: &[Instruction],
     debug: &DebugLocals<'a>,
-    declared: &[Rc<Binding<'a>>],
+    declared: &[Statement<'a>],
     locals: &Locals<'_>,
     value: Value,
     store: u8,
@@ -529,16 +640,13 @@ fn debug_binding<'a>(
     let root = owner.split(['/', '$']).next().unwrap();
     let short = owner.rsplit('/').next().unwrap();
     if *jvm == JvmType::Void || !exact_type(&value.ty, jvm, false)
-        || load_opcode(&jvm) + 0x21 != store
+        || load_opcode(jvm) + 0x21 != store
         || local.index.checked_add(jvm.slots()).is_none_or(|end| end > debug.max)
         || range.is_empty() || range.end > instructions.last().map_or(0, |last| last.offset + last.len)
         || (range.end <= instructions.last().map_or(0, |last| last.offset)
             && instructions.binary_search_by_key(&range.end, |instruction| instruction.offset).is_err())
         || matches!(local.name, "System" | "kotlin") || local.name == root || local.name == short
-        || declared.iter().any(|other| other.name == local.name)
-        || locals.extension.as_ref().is_some_and(|context| {
-            context.parameters.iter().any(|param| param.name == local.name)
-        })
+        || declared.iter().filter_map(Statement::binding).any(|other| other.name == local.name)
     {
         return Err(invalid());
     }
@@ -551,7 +659,32 @@ fn debug_binding<'a>(
             return Err(invalid());
         }
     }
-    Ok(Rc::new(Binding { name: local.name, value, slot: local.index, range }))
+    let tail = &instructions[instructions.binary_search_by_key(&start, |instruction| instruction.offset).map_err(|_| invalid())?..];
+    let mut name = Cow::Borrowed(local.name);
+    if let Some(context) = &locals.extension
+        && let Some(parameter) = context.parameters.iter().position(|param| param.name == local.name)
+        && tail.iter().any(|instruction| {
+            local_load(instruction).is_some_and(|(load, slot)| locals.parameter(slot, load) == Some(parameter))
+        })
+    {
+        // The JVM can still name the original parameter from its own slot,
+        // unlike source code with two live bindings sharing one identifier.
+        let reserved = |candidate: &str| {
+            candidate == root || candidate == short
+                || debug.entries.iter().any(|entry| entry.name == candidate)
+                || context.parameters.iter().any(|param| param.name == candidate)
+                || declared.iter().filter_map(Statement::binding).any(|other| other.name == candidate)
+        };
+        name = (1..=u32::MAX).map(|suffix| format!("{}_{suffix}", local.name))
+            .find(|candidate| !reserved(candidate))
+            .map(Cow::Owned)
+            .ok_or_else(invalid)?;
+    }
+    let mutable = *jvm == JvmType::Primitive(Primitive::Int)
+        && tail.iter().take_while(|instruction| range.contains(&instruction.offset)).any(|instruction| {
+            matches!(instruction.operand, Operand::Increment { index, .. } if index == local.index)
+        });
+    Ok(Rc::new(Binding { name, value, slot: local.index, range, mutable }))
 }
 
 fn debug_value_type(value: &Expr<'_>, jvm: &JvmType, locals: &Locals<'_>) -> Option<Type> {

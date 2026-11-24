@@ -262,6 +262,15 @@ fn subject_alias(instructions: &[Instruction], locals: &Locals<'_>) -> Option<(u
     if slot < locals.next_slot() || store_opcode != opcode + 0x21 || rest.is_empty() {
         return None;
     }
+    let start = u32::from(slot);
+    let end = start + if matches!(opcode, 0x16 | 0x18) { 2 } else { 1 };
+    if rest.iter().any(|instruction| {
+        instruction.local_access().is_some_and(|(slots, read)| {
+            (!read || instruction.opcode == 0x84) && slots.start < end && start < slots.end
+        })
+    }) {
+        return None;
+    }
     Some((slot, opcode, parameter))
 }
 
@@ -466,7 +475,12 @@ impl<'a, 'data> Bytecode<'a, 'data> {
                     }
                 };
             }
-            let instructions = if let Some(alias) = subject_alias(instructions, &locals) {
+            let instructions = if let Some(alias) = subject_alias(instructions, &locals)
+                && !code.local_variables(&self.class.pool)?.iter().any(|entry| {
+                    let store = &instructions[1];
+                    entry.index == alias.0 && u32::from(entry.start_pc) == store.offset + store.len
+                })
+            {
                 locals.alias = Some(alias);
                 start += 2;
                 &instructions[2..]
@@ -1353,7 +1367,7 @@ impl<'a> Expr<'a> {
                 if !local.value.accepts(expected) {
                     return Err(mismatch());
                 }
-                identifier(out, local.name, declaration)?;
+                identifier(out, &local.name, declaration)?;
             }
             ExprKind::Invocation(call) => {
                 if !call.result().accepts(expected) {

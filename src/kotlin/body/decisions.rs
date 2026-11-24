@@ -11,6 +11,7 @@ use super::{
 };
 
 pub(in crate::kotlin) struct DecisionBody<'a> {
+    prologue: Vec<Statement<'a>>,
     arms: Vec<Arm<'a>>,
     end: Vec<Statement<'a>>,
     instructions: Vec<Instruction>,
@@ -140,6 +141,17 @@ pub(super) fn lower<'class, 'data>(
         return Err(invalid());
     }
     let postdominators = cfg.immediate_postdominators();
+    let entry = &cfg.blocks[0].instructions;
+    let before_branch = entry.start..entry.end - 1;
+    let consumed_prefix = matches!(instructions_slice[entry.end - 1].opcode, 0x99..=0xa6 | 0xc6 | 0xc7)
+        && instructions_slice[before_branch.clone()].iter().any(|instruction| local_store(instruction).is_some());
+    let statements::Prefix { statements: prologue, mut stack, first } = if consumed_prefix {
+        statements::lower_prefix(bytecode, instructions_slice, before_branch, code, locals, declaration)?
+    } else {
+        statements::Prefix { statements: Vec::new(), stack: Vec::new(), first: entry.start }
+    };
+    // The CFG is forward-only and the entry dominates every arm. A local
+    // declared in the prologue is visible only at PCs in its debug lifetime.
     let mut lower = Lowering {
         cfg: &cfg,
         postdominators: &postdominators,
@@ -149,16 +161,18 @@ pub(super) fn lower<'class, 'data>(
         parameters,
         declaration,
         cap: cfg.blocks.len().saturating_mul(4),
+        prologue: &prologue,
     };
     let mut arms = Vec::new();
     let mut index = 0;
-    let mut stack = Vec::new();
     let end = loop {
         if index == exit {
             break Vec::new();
         }
-        let guard_start = cfg.blocks[index].instructions.start;
-        let Some((guard, yes, no)) = lower.guard(index, exit, &mut stack)? else {
+        let block_start = cfg.blocks[index].instructions.start;
+        let guard_start = if index == 0 { first } else { block_start };
+        let operands = if index == 0 && consumed_prefix { entry.end - 1 } else { block_start };
+        let Some((guard, yes, no)) = lower.guard(index, operands, exit, &mut stack)? else {
             if !stack.is_empty() {
                 return Err(invalid());
             }
@@ -193,6 +207,7 @@ pub(super) fn lower<'class, 'data>(
         Vec::new()
     };
     Ok(Body::Decision(DecisionBody {
+        prologue,
         arms,
         end,
         instructions,
@@ -210,12 +225,14 @@ struct Lowering<'a, 'class, 'data> {
     parameters: &'a [ValueParameter],
     declaration: &'a str,
     cap: usize,
+    prologue: &'a [Statement<'class>],
 }
 
 impl<'class> Lowering<'_, 'class, '_> {
     fn guard(
         &mut self,
         mut index: usize,
+        first_operand: usize,
         exit: usize,
         stack: &mut Vec<StackValue<'class>>,
     ) -> Result<Option<(Expr<'class>, usize, usize)>, KotlinError> {
@@ -227,9 +244,9 @@ impl<'class> Lowering<'_, 'class, '_> {
             if !matches!(last.opcode, 0x99..=0xa6 | 0xc6 | 0xc7) {
                 return Ok(None);
             }
-            for instruction in before {
-                self.bytecode
-                    .expression(instruction, self.locals, stack, self.declaration)?;
+            let first = first_operand.saturating_sub(block.instructions.start);
+            for instruction in &before[first..] {
+                self.expression(instruction, stack)?;
             }
             let [target, yes] = block.successors[..] else {
                 return Err(self.invalid());
@@ -288,8 +305,7 @@ impl<'class> Lowering<'_, 'class, '_> {
                 .split_last()
                 .unwrap();
             for instruction in before {
-                self.bytecode
-                    .expression(instruction, self.locals, &mut arm, self.declaration)?;
+                self.expression(instruction, &mut arm)?;
             }
             match (last.opcode, &last.operand, block.successors.as_slice()) {
                 (0xa7 | 0xc8, Operand::Branch(_), [next]) => index = *next,
@@ -318,8 +334,7 @@ impl<'class> Lowering<'_, 'class, '_> {
                 }
                 (_, Operand::Branch(_) | Operand::Switch { .. }, _) => return Err(self.invalid()),
                 (_, _, [next]) => {
-                    self.bytecode
-                        .expression(last, self.locals, &mut arm, self.declaration)?;
+                    self.expression(last, &mut arm)?;
                     index = *next;
                 }
                 _ => return Err(self.invalid()),
@@ -337,13 +352,23 @@ impl<'class> Lowering<'_, 'class, '_> {
         if matches!(self.instructions[range.end - 1].opcode, 0xa7 | 0xc8) {
             range.end -= 1;
         }
-        statements::lower_range(
+        statements::lower_inherited(
             self.bytecode,
             self.instructions,
             range,
             self.locals,
             self.declaration,
+            self.prologue,
         )
+    }
+
+    fn expression(&self, instruction: &Instruction, stack: &mut Vec<StackValue<'class>>) -> Result<(), KotlinError> {
+        if let Some(expr) = statements::read_local(self.prologue.iter().rev(), instruction).map_err(|_| self.invalid())? {
+            stack.push(StackValue::Value(expr));
+            Ok(())
+        } else {
+            self.bytecode.expression(instruction, self.locals, stack, self.declaration)
+        }
     }
 
     fn invalid(&self) -> KotlinError {
@@ -364,6 +389,14 @@ impl DecisionBody<'_> {
         let mut line = 1;
         let instructions = &self.instructions[self.start..];
         out.push_str(" {\n");
+        for statement in &self.prologue {
+            out.push_str(indent);
+            out.push_str(unit);
+            statement.write(out, parameters, declaration)?;
+            super::switches::map_statement(instructions, statement, line, &mut map);
+            out.push('\n');
+            line += 1;
+        }
         out.push_str(indent);
         out.push_str(unit);
         out.push_str("when {\n");
