@@ -10,7 +10,7 @@ use crate::lift::Machine;
 use super::StructureError;
 use super::assertions::Sites;
 use super::do_while::PostTest;
-use super::protected::ArmId;
+use super::protected::{ArmId, Exceptions};
 
 #[derive(Clone, Copy)]
 pub(super) struct Region<'r, 'a, 'c> {
@@ -196,14 +196,14 @@ impl Layout {
         instructions: &[Instruction],
         assertions: Option<&Sites>,
     ) -> Result<Self, StructureError> {
-        Self::with_monitor_boundaries(graph, instructions, assertions, |_| None)
+        Self::with_exceptions(graph, instructions, assertions, &Exceptions::default())
     }
 
-    pub(super) fn with_monitor_boundaries(
+    pub(super) fn with_exceptions(
         graph: &ControlFlowGraph,
         instructions: &[Instruction],
         assertions: Option<&Sites>,
-        monitor_boundary: impl Fn(usize) -> Option<usize>,
+        exceptions: &Exceptions,
     ) -> Result<Self, StructureError> {
         let mut immediate_dominators = Some(graph.immediate_dominators());
         let mut natural_loops =
@@ -234,7 +234,7 @@ impl Layout {
             {
                 return Err(unsupported());
             }
-            let monitor_boundary = monitor_boundary(header);
+            let monitor_boundary = exceptions.monitor_finally_boundary(header);
             let outer_transfer = |block| {
                 if monitor_boundary == Some(block) {
                     return true;
@@ -371,6 +371,30 @@ impl Layout {
                     return Err(unsupported());
                 }
             }
+            // If only a catch returns to the test, the tested body is an
+            // exit-only tail in the normal-edge natural loop.
+            let test = test.or_else(|| {
+                let exit = exit?;
+                if !tests_condition
+                    || tails.is_empty()
+                    || !natural_loop
+                        .latches
+                        .contains(&exceptions.handler_latch(header, exit)?)
+                {
+                    return None;
+                }
+                let &[first, second] = graph.blocks[header].successors.as_slice() else {
+                    return None;
+                };
+                let body = if first == exit {
+                    second
+                } else if second == exit {
+                    first
+                } else {
+                    return None;
+                };
+                tails.binary_search(&body).ok().map(|_| While { body, exit })
+            });
             for block in natural_loop.blocks.into_iter().chain(tails) {
                 // Keep the header visible as one node of the parent region,
                 // including while classifying a later sibling loop.

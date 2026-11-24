@@ -56,6 +56,7 @@ pub(super) struct ProtectedRegion {
     pub(super) legacy_resource: Option<Legacy>,
     pub(super) join: Option<usize>,
     pub(super) split_resource_exits: Vec<usize>,
+    loop_departure: Option<LoopDeparture>,
     enclosing: Option<ArmId>,
 }
 
@@ -68,6 +69,12 @@ pub(super) struct Catch {
 pub(super) struct Finally {
     pub(super) arm: ArmId,
     plan: Cleanup,
+}
+
+struct LoopDeparture {
+    header: usize,
+    latch: usize,
+    target: usize,
 }
 
 pub(super) struct Monitor {
@@ -387,6 +394,7 @@ impl Exceptions {
                 }),
                 join: Some(close),
                 split_resource_exits: Vec::new(),
+                loop_departure: None,
                 enclosing: None,
             });
             self.omitted_instructions.extend(plan.null_init);
@@ -432,6 +440,29 @@ impl Exceptions {
 
     pub(super) fn region(&self, id: ExceptionId) -> &ProtectedRegion {
         &self.regions[id.0]
+    }
+
+    pub(super) fn handler_latch(&self, header: usize, target: usize) -> Option<usize> {
+        self.regions.iter().find_map(|region| {
+            let departure = region.loop_departure.as_ref()?;
+            (departure.header == header && departure.target == target).then_some(departure.latch)
+        })
+    }
+
+    pub(super) fn allows_loop_break(
+        &self,
+        arm: Option<ArmId>,
+        enclosing: Option<ArmId>,
+        header: usize,
+        target: usize,
+    ) -> bool {
+        let Some(arm) = arm else { return false };
+        let region = self.region(self.arms[arm.0].region);
+        region.body == arm
+            && region.enclosing == enclosing
+            && region.loop_departure.as_ref().is_some_and(|departure| {
+                departure.header == header && departure.target == target
+            })
     }
 
     pub(super) fn catches_of_finally<'s>(
@@ -582,6 +613,7 @@ impl Exceptions {
             }
         }
         let start = single_entry(graph, &body)?;
+        let only_body_exit = exits.first().copied().filter(|_| exits.len() == 1);
         let mut catches: Vec<Catch> = Vec::new();
         let mut handlers = BTreeSet::new();
         for &route in routes.iter().filter(|route| route.catch_type != 0) {
@@ -627,6 +659,23 @@ impl Exceptions {
             exits.remove(&departure.target);
             monitor.departure = Some(departure);
         }
+        let loop_departure = if exits.len() == 2
+            && finally_route.is_none()
+            && let (Some(target), [catch]) = (only_body_exit, catches.as_slice())
+            && self.arms[catch.arm.0].blocks.len() == 1
+        {
+            LoopDeparture::prove(
+                instructions, graph, dominators, &body, start, catch.start, target,
+            )
+            .filter(|departure| exits.contains(&departure.header))
+        } else {
+            None
+        };
+        if let Some(departure) = &loop_departure {
+            // The handler completes at the loop backedge, but the protected
+            // body must break before it reaches the catch's continuation.
+            exits.remove(&departure.target);
+        }
         if exits.len() > 1 {
             // An ordinary try has one normal continuation. Leave separate
             // edges intact only for a possible resource with inlined closes;
@@ -655,6 +704,7 @@ impl Exceptions {
             legacy_resource: None,
             join: exits.pop_first(),
             split_resource_exits: exits.into_iter().collect(),
+            loop_departure,
             enclosing: None,
         });
         Ok(())
@@ -1084,6 +1134,75 @@ impl Exceptions {
             }
         }
         Ok(())
+    }
+}
+
+impl LoopDeparture {
+    fn prove(
+        instructions: &[Instruction],
+        graph: &ControlFlowGraph,
+        dominators: &Dominance,
+        body: &BTreeSet<usize>,
+        start: usize,
+        latch: usize,
+        target: usize,
+    ) -> Option<Self> {
+        // The bytecode may loop only after the exception edge. Prove that the
+        // actual catch entry is the sole backedge and has only its binding,
+        // optional update and jump, not other operations to move or discard.
+        let handler = &graph.blocks[latch];
+        let &[header] = handler.successors.as_slice() else {
+            return None;
+        };
+        let (jump, prefix) = instructions[handler.instructions.clone()].split_last()?;
+        let (store, rest) = prefix.split_first()?;
+        if reference_store(store).is_none()
+            || !matches!(rest, [] | [Instruction { operand: Operand::Increment { .. }, .. }])
+            || !matches!(jump.opcode, 0xa7 | 0xc8)
+            || !handler.predecessors.is_empty()
+            || !handler.exception_successors.is_empty()
+            || handler.exception_predecessors.is_empty()
+            || handler.exception_predecessors.iter().any(|pred| !body.contains(pred))
+            || body.contains(&header)
+            || !dominators.contains(header, start)
+        {
+            return None;
+        }
+        let head = &graph.blocks[header];
+        let [first, second] = *head.successors.as_slice() else {
+            return None;
+        };
+        let entry = if first == target {
+            second
+        } else if second == target {
+            first
+        } else {
+            return None;
+        };
+        if !matches!(instructions[head.instructions.end - 1].opcode, 0x99..=0xa6 | 0xc6..=0xc7)
+            || !matches!(head.predecessors.as_slice(), [a, b] if *a == latch || *b == latch)
+            || !dominators.contains(entry, start)
+        {
+            return None;
+        }
+        // The only normal edges out of the try must be explicit jumps with
+        // no other effect. In particular do not pull the target into the try.
+        let mut jumps = body
+            .iter()
+            .copied()
+            .filter(|&block| graph.blocks[block].successors.iter().any(|next| !body.contains(next)))
+            .peekable();
+        if jumps.peek().is_none()
+            || !jumps.all(|block| {
+                let node = &graph.blocks[block];
+                node.successors.as_slice() == [target]
+                    && node.exception_successors.is_empty()
+                    && matches!(&instructions[node.instructions.clone()], [op] if matches!(op.opcode, 0xa7 | 0xc8))
+            })
+        {
+            return None;
+        }
+        Some(Self { header, latch, target })
     }
 }
 

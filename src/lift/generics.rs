@@ -1,4 +1,6 @@
 // Based on Vineflower invocation generic binding (Apache-2.0).
+use std::{borrow::Cow, sync::OnceLock};
+
 use crate::descriptor::{GenericType, MethodSignature, Type};
 
 use super::{
@@ -6,7 +8,7 @@ use super::{
     expr::{Category, Expr, Source},
 };
 
-pub(super) struct GenericCall(MethodSignature);
+pub(super) struct GenericCall(Cow<'static, MethodSignature>);
 
 impl GenericCall {
     pub(super) fn argument_fits(
@@ -16,7 +18,11 @@ impl GenericCall {
         erased: &Type,
         machine: &Machine<'_, '_>,
     ) -> bool {
-        matches!(self.0.parameters.get(index), Some(GenericType::Variable(name))
+        let mut formal = self.0.parameters.get(index);
+        if let Some(GenericType::Array { element, .. }) = formal {
+            formal = Some(element);
+        }
+        matches!(formal, Some(GenericType::Variable(name))
             if self.0.type_parameters.iter().any(|parameter| parameter.name == *name))
             && Category::of(&actual.ty) == Some(Category::Ref)
             && !matches!(actual.source, Source::Null)
@@ -96,7 +102,7 @@ impl Machine<'_, '_> {
                 return None;
             }
             let signature = method.signature(pool).ok()??;
-            return MethodSignature::parse(signature).ok().map(GenericCall);
+            return MethodSignature::parse(signature).ok().map(|sig| GenericCall(Cow::Owned(sig)));
         }
         for path in [
             self.options.library_classpath.as_deref(),
@@ -122,7 +128,17 @@ impl Machine<'_, '_> {
                 return None;
             }
             let signature = method.signature.as_deref()?;
-            return MethodSignature::parse(signature).ok().map(GenericCall);
+            return MethodSignature::parse(signature).ok().map(|sig| GenericCall(Cow::Owned(sig)));
+        }
+        // The Java SE API has one asList declaration. A cast to the erased
+        // Object[] prevents inference from a String[] even in fixed arity.
+        if (owner, name, descriptor) == ("java/util/Arrays", "asList", "([Ljava/lang/Object;)Ljava/util/List;") {
+            static SIGNATURE: OnceLock<MethodSignature> = OnceLock::new();
+            let signature = SIGNATURE.get_or_init(|| {
+                MethodSignature::parse("<T:Ljava/lang/Object;>([TT;)Ljava/util/List<TT;>;")
+                    .expect("Java SE Arrays.asList signature")
+            });
+            return Some(GenericCall(Cow::Borrowed(signature)));
         }
         None
     }

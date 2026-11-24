@@ -82,6 +82,7 @@ impl ForLoop {
 struct Seed {
     preheader: usize,
     latch: usize,
+    handler_latch: Option<usize>,
     line: usize,
 }
 
@@ -150,7 +151,7 @@ impl Emitter<'_> {
         {
             return None;
         }
-        let seed = self.for_seed(header, head_line, depth)?;
+        let seed = self.for_seed(header, test.exit, head_line, depth)?;
         let count = self.counting_tail(header, &seed, entry);
         let enhanced = count
             .as_ref()
@@ -158,7 +159,14 @@ impl Emitter<'_> {
             .or_else(|| self.iterator_foreach(header, test.body, &seed, entry));
         if let Some(enhanced) = enhanced
             && entry.supports_enhanced_for()
-            && self.safe_for_body(header, test, &enhanced.helpers, &enhanced.omitted_uses)
+            && self.graph.blocks[test.body].exception_successors.is_empty()
+            && self.safe_for_body(
+                header,
+                test,
+                &enhanced.helpers,
+                &enhanced.omitted_uses,
+                seed.handler_latch,
+            )
             && !(enhanced.element_slot
                 ..enhanced
                     .element_slot
@@ -199,7 +207,7 @@ impl Emitter<'_> {
         }
         let count = count?;
         if self.local_is_live(test.exit, count.slot)
-            || !self.safe_for_body(header, test, &[None; 3], &[count.update])
+            || !self.safe_for_body(header, test, &[None; 3], &[count.update], None)
         {
             return None;
         }
@@ -214,7 +222,7 @@ impl Emitter<'_> {
         })
     }
 
-    fn for_seed(&self, header: usize, line: usize, depth: usize) -> Option<Seed> {
+    fn for_seed(&self, header: usize, exit: usize, line: usize, depth: usize) -> Option<Seed> {
         let node = &self.graph.blocks[header];
         let [first, second] = *node.predecessors.as_slice() else {
             return None;
@@ -224,6 +232,11 @@ impl Emitter<'_> {
             (false, true) => (second, first),
             _ => return None,
         };
+        let handler_latch = if self.graph.blocks[latch].exception_predecessors.is_empty() {
+            None
+        } else {
+            self.exceptions.handler_latch(header, exit).filter(|&handler| handler == latch)
+        };
         if preheader == header
             || latch == header
             || self.graph.blocks[preheader].successors.as_slice() != [header]
@@ -232,7 +245,8 @@ impl Emitter<'_> {
             || self.layout.loops[latch].is_some()
             || [preheader, header, latch].into_iter().any(|block| {
                 !self.graph.blocks[block].exception_successors.is_empty()
-                    || !self.graph.blocks[block].exception_predecessors.is_empty()
+                    || (Some(block) != handler_latch
+                        && !self.graph.blocks[block].exception_predecessors.is_empty())
             })
         {
             return None;
@@ -247,6 +261,7 @@ impl Emitter<'_> {
         self.line_ends_at_store(line, depth, store).then_some(Seed {
             preheader,
             latch,
+            handler_latch,
             line,
         })
     }
@@ -569,6 +584,7 @@ impl Emitter<'_> {
         test: While,
         helpers: &[Option<u16>; 3],
         omitted: &[usize],
+        handler_latch: Option<usize>,
     ) -> bool {
         let graph = self.graph;
         let instructions = self.instructions;
@@ -588,8 +604,11 @@ impl Emitter<'_> {
                 continue;
             }
             let node = &graph.blocks[block];
-            if !node.exception_successors.is_empty() || !node.exception_predecessors.is_empty() {
-                return false;
+            match (node.exception_successors.as_slice(), node.exception_predecessors.as_slice()) {
+                ([], []) => {}
+                ([handler], []) if Some(*handler) == handler_latch => pending.push(*handler),
+                ([], _) if Some(block) == handler_latch => {}
+                _ => return false,
             }
             for index in node.instructions.clone() {
                 let op = &instructions[index];
@@ -611,7 +630,12 @@ impl Emitter<'_> {
                         return false;
                     }
                 }
-                if let Some(Access::Store(kind, slot)) = access(op) {
+                // A handler-only latch is tied to a proven break edge. The
+                // loop emitter checks its merge and requires the false test
+                // edge to need no assignment before converting to a `for`.
+                if handler_latch.is_none()
+                    && let Some(Access::Store(kind, slot)) = access(op)
+                {
                     // A different binding at the surviving exit could
                     // require a synthetic assignment on the false test
                     // edge, something a `for` test cannot render.

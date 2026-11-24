@@ -141,6 +141,39 @@ fn split_rows_of_one_range_can_cross_an_unprotected_goto() {
 }
 
 #[test]
+fn exception_only_backedge_keeps_normal_loop_break_distinct() {
+    let mut bytes = [
+        0x03, 0x3b, // 0: initialize counter
+        0x1a, 0x04, 0xa2, 0, 16, // 2: test; exit to 20
+        0xb8, 0, 1, // 7: invoke inside try
+        0xa7, 0, 10, // 10: goto 20, outside exception coverage
+        0x4c, // 13: catch binding
+        0x84, 0, 1, // 14: update
+        0xa7, 0xff, 0xf1, // 17: goto 2
+        0xb1, 0xb1, // 20: loop continuation; 21: separate return
+    ];
+    let rows = [handler(7, 10, 13, 1)];
+    let (graph, exceptions) = classify(&bytes, &rows);
+    let exceptions = exceptions.unwrap();
+    let block = |pc| graph.block_at(pc).unwrap();
+    let (header, start, latch, exit) = (block(2), block(7), block(13), block(20));
+    let protected = exceptions.region(exceptions.at_start(None, start).unwrap());
+    assert_eq!(protected.join, Some(header));
+    assert_eq!(exceptions.handler_latch(header, exit), Some(latch));
+    assert!(exceptions.allows_loop_break(Some(protected.body), None, header, exit));
+    assert!(!exceptions.allows_loop_break(Some(protected.catches[0].arm), None, header, exit));
+    assert!(!exceptions.contains(Some(protected.body), exit));
+    let layout = super::Layout::with_exceptions(&graph, &decode(&bytes).unwrap(), None, &exceptions)
+        .unwrap();
+    let test = layout.loops[header].unwrap().test.unwrap();
+    assert_eq!((test.body, test.exit), (start, exit));
+
+    // A different normal destination is not the loop's verified break.
+    bytes[12] = 11;
+    assert!(matches!(classify(&bytes, &rows).1, Err(StructureError::ExceptionHandlers)));
+}
+
+#[test]
 fn only_identical_normal_and_exceptional_cleanup_forms_finally() {
     let mut bytes = [
         0xb8, 0, 1, // 0: invokestatic (body)

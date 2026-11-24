@@ -162,9 +162,7 @@ fn structure_regions(
     let mut emitter = Emitter {
         instructions,
         graph,
-        layout: Layout::with_monitor_boundaries(graph, instructions, assertions, |header| {
-            exceptions.monitor_finally_boundary(header)
-        })?,
+        layout: Layout::with_exceptions(graph, instructions, assertions, exceptions)?,
         exceptions,
         exception_redirects: BTreeMap::new(),
         resource_epilogue: None,
@@ -1257,7 +1255,19 @@ impl Emitter<'_> {
         depth: usize,
         offsets: &mut Vec<u32>,
     ) -> Result<(), StructureError> {
-        if region.exception_arm != scope.exception_arm {
+        if region.exception_arm != scope.exception_arm
+            && !(transfer == Transfer::Break
+                && machine.stack_is_empty()
+                && self.exceptions.allows_loop_break(
+                    region.exception_arm,
+                    scope.exception_arm,
+                    scope.header,
+                    target,
+                )
+                && machine.same_live_loop_bindings(&scope.entry, |slot| {
+                    self.local_is_live(target, slot)
+                }))
+        {
             return Err(self.unstructured(target));
         }
         let label = region.loop_header != Some(scope.header)
