@@ -855,10 +855,12 @@ impl Exceptions {
                 !catches.iter().all(|catch| table.nested_finally_departures.contains(&(catch.start, target)))
             });
         }
-        let repeats_at_entry = finally_route.is_none()
+        let repeats_at_entry = finally.as_ref().and_then(Finally::branched).is_some_and(|branch| {
+            branch.repeats_at_entry(instructions, graph, dominators, &body, start)
+        }) || (finally_route.is_none()
             && self.prove_repeating_try(
                 instructions, graph, dominators, &mut body, &mut exits, only_body_exit, start, &catches,
-            );
+            ));
         if let Some(target) = monitor
             .as_ref()
             .and_then(|monitor| self.monitor_finally_targets.get(&monitor.plan.acquisition))

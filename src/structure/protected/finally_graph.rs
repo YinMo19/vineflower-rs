@@ -711,6 +711,41 @@ impl BranchedFinally {
         Some(result)
     }
 
+    pub(super) fn repeats_at_entry(
+        &self,
+        instructions: &[Instruction],
+        graph: &ControlFlowGraph,
+        dominance: &Dominance,
+        body: &BTreeSet<usize>,
+        header: usize,
+    ) -> bool {
+        let Some(latch) = self.continuation else { return false; };
+        if self.tail.is_none()
+            || !self.loop_targets.is_empty()
+            || goto_only(instructions, graph, latch) != Some(header)
+        {
+            return false;
+        }
+        let node = &graph.blocks[latch];
+        if !node.exception_predecessors.is_empty()
+            || !node.exception_successors.is_empty()
+            || node.predecessors.iter().any(|pred| !self.removed.contains(pred))
+        {
+            return false;
+        }
+        let Some(natural) = dominance.natural_loops(graph).iter().find(|shape| shape.header == header)
+        else {
+            return false;
+        };
+        // The normal copy owns the exit-only arms as well as the cycle.
+        // Its overriding return must not become a break out of the loop.
+        let owns = |block| block == latch || body.contains(&block) || self.removed.contains(&block);
+        natural.latches == [latch]
+            && natural.blocks.iter().all(|&block| {
+                owns(block) && graph.blocks[block].successors.iter().copied().all(owns)
+            })
+    }
+
     fn match_copy(
         &self,
         instructions: &[Instruction],
@@ -830,15 +865,24 @@ impl BranchedFinally {
             let (mut expected_code, mut actual_code) = if let Some((expected, actual)) = rethrows {
                 (&instructions[expected], &instructions[actual])
             } else {
-                let start = expected.instructions.start
+                let mut start = expected.instructions.start
                     + usize::from(pattern == handler || nested.is_some());
-                let actual_start = actual.instructions.start
+                let mut actual_start = actual.instructions.start
                     + usize::from(nested.is_some() || (sample == sample_start && sample_binding.is_some()));
                 if matches!(nested, Some(NestedHandler::Catch)) {
                     let left = reference_store(&instructions[expected.instructions.start])?;
                     let right = reference_store(&instructions[actual.instructions.start])?;
                     if left != right {
-                        renamed.extend([left, right]);
+                        // Match only the load of the caught object, not an
+                        // arbitrary use of the sibling's catch-local slot.
+                        if caught_rethrow(instructions, graph, pattern)
+                            && caught_rethrow(instructions, graph, sample)
+                        {
+                            start += 1;
+                            actual_start += 1;
+                        } else {
+                            renamed.extend([left, right]);
+                        }
                     }
                 }
                 let end = if trim { self.tail_code.end } else { expected.instructions.end };
@@ -1099,6 +1143,18 @@ fn same_dispatch(pattern: &[Route], sample: &[Route], monitor: Option<MonitorCop
                 pattern == sample
             }
         })
+}
+
+fn caught_rethrow(instructions: &[Instruction], graph: &ControlFlowGraph, handler: usize) -> bool {
+    let node = &graph.blocks[handler];
+    let [store, load, throw] = &instructions[node.instructions.clone()] else { return false; };
+    cleanup_locals::binding_slot(store).is_some_and(|binding| {
+        reference_store(store) == reference_load(load)
+            && throw.opcode == 0xbf
+            && !cleanup_locals::live_at_any(
+                instructions, graph, node.exception_successors.iter().copied(), binding,
+            )
+    })
 }
 
 fn before_unconditional_jump(code: &[Instruction]) -> &[Instruction] {
