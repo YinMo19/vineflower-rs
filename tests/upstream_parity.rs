@@ -404,7 +404,6 @@ fn run_single(case: &Case, inputs: &mut Inputs) -> Result<(), Failure> {
                         | ("verify-pre-post-merges", "1")
                         | ("verify-anonymous-classes", "1")
                         | ("ternary-in-if", "1")
-                        | ("ignore-invalid-bytecode", "1")
                 ) => {}
             Err(OptionError::Unsupported(_)) => unsupported.push(format!("{name}={value}")),
             Err(error) => return Err(Failure::Execution(error.to_string())),

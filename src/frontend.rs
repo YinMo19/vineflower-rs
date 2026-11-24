@@ -237,6 +237,11 @@ const SETTINGS: &[Setting] = &[
         "Inline legacy subroutines regardless of class version",
     ),
     flag(
+        "ignore-invalid-bytecode",
+        "iib",
+        "Recover supported malformed bytecode when its meaning can be established",
+    ),
+    flag(
         "decompile-kotlin",
         "kt-enable",
         "Recover Kotlin source from Kotlin class files",

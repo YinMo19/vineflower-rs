@@ -237,6 +237,10 @@ impl Machine<'_, '_> {
                     self.invalid_operand("constructor needs a void invokespecial descriptor")
                 );
             }
+            let owner = self
+                .relocated_legacy_constructor(owner, method_type, &descriptor, &args)?
+                .unwrap_or(owner);
+            let member = (owner, name, method_type);
             let omit = self.omit_invocation_casts(owner, member, &descriptor, &args, op.opcode);
             self.coerce_arguments(&mut args, &descriptor, Some(member), None, omit)?;
             return self.construct(owner, method_type, args);

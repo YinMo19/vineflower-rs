@@ -194,7 +194,13 @@ impl<'a, 'c> Machine<'a, 'c> {
             super_class,
             method_name,
             locals,
-            max_stack: code.max_stack.into(),
+            // The bytecode may understate its stack size. Keep the JVM's
+            // absolute slot limit; stack entries are allocated on demand.
+            max_stack: if options.ignore_invalid_bytecode {
+                u16::MAX.into()
+            } else {
+                code.max_stack.into()
+            },
             stack_slots: 0,
             stack: Vec::new(),
             prelude: Vec::new(),

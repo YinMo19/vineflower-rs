@@ -15,7 +15,7 @@ use super::{
     expr::{Category, Expr, PRIMARY, Source},
 };
 
-impl Machine<'_, '_> {
+impl<'a, 'c> Machine<'a, 'c> {
     pub(super) fn lexical_parameter(&self, index: u16) -> Option<Expr> {
         if let Some(capture) = self.captured_parameter(index) {
             return Some(capture);
@@ -173,6 +173,55 @@ impl Machine<'_, '_> {
         Ok((head, visible_args))
     }
 
+    /// Some pre-nestmate ECJ inputs name the enclosing class in the
+    /// Methodref for a synthetic member-class constructor.
+    pub(super) fn relocated_legacy_constructor(
+        &self,
+        symbolic_owner: &str,
+        raw: &str,
+        descriptor: &MethodDescriptor,
+        arguments: &[Expr],
+    ) -> Result<Option<&'c str>, LiftError> {
+        if !self.options.ignore_invalid_bytecode || self.class.major_version >= 55 {
+            return Ok(None);
+        }
+        let Some(group) = self.group.filter(|_| self.options.decompile_inner) else {
+            return Ok(None);
+        };
+        let ([Type::Object(outer), Type::Object(marker)], [enclosing, null]) =
+            (descriptor.parameters.as_slice(), arguments)
+        else {
+            return Ok(None);
+        };
+        let Some(receiver) = self.stack.last() else { return Ok(None) };
+        let Type::Object(allocated) = &receiver.ty else { return Ok(None) };
+        if !matches!(receiver.source, Source::New(_))
+            || !matches!(null.source, Source::Null)
+            || !matches!(&enclosing.ty, Type::Object(actual) if actual == outer)
+            || allocated == symbolic_owner
+            || outer != symbolic_owner
+            || marker != allocated
+            || group.constructor_outer(allocated, raw) != Some(symbolic_owner)
+            || !group.is_attached(allocated)
+        {
+            return Ok(None);
+        }
+        let (Some(original), Some(inner)) = (group.get(symbolic_owner), group.get(allocated)) else {
+            return Ok(None);
+        };
+        for method in &original.methods {
+            if original.pool.utf8(method.name_index)? == "<init>"
+                && original.pool.utf8(method.descriptor_index)? == raw
+            {
+                return Ok(None);
+            }
+        }
+        if self.legacy_constructor_descriptor(allocated, raw)?.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(inner.pool.class_name(inner.this_class)?))
+    }
+
     /// Pre-nestmate javac used a synthetic forwarding constructor with an
     /// extra, unused anonymous marker argument for private nest access.
     fn legacy_constructor_arguments<'args>(
@@ -233,11 +282,14 @@ impl Machine<'_, '_> {
         // Older javac may use an empty synthetic marker or an actual
         // anonymous class already in the nest. The complete trivial bridge
         // body below, not absence of methods on the marker type, is the proof.
-        if group.compilation_root(marker) != group.compilation_root(owner)
-            || !group
-                .nested_class(marker)
-                .is_some_and(|node| matches!(node.kind, NestedKind::Anonymous))
-        {
+        let anonymous_marker = group.compilation_root(marker) == group.compilation_root(owner)
+            && group.nested_class(marker)
+                .is_some_and(|node| matches!(node.kind, NestedKind::Anonymous));
+        let ecj_marker = self.options.ignore_invalid_bytecode
+            && class.major_version < 55
+            && marker == owner
+            && group.constructor_outer(owner, descriptor).is_some();
+        if !anonymous_marker && !ecj_marker {
             return Ok(None);
         }
         let Ok(instructions) = bytecode::decode(code.bytes) else {
