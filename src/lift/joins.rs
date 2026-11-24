@@ -169,6 +169,7 @@ impl Machine<'_, '_> {
             debug_range,
             receiver: false,
             token_index: self.locals.new_local_token_index(slot),
+            int_fits: Default::default(),
         };
         let declaration = self.declared_local_document(slot, &local).ok()?;
         self.locals.slots[index] = Some(local);
@@ -210,6 +211,7 @@ impl Machine<'_, '_> {
         value.text.prepend_str(if amount == 1 { "++" } else { "--" });
         value.precedence = UNARY;
         value.source = Source::Plain;
+        value.int_fits = Default::default();
         value.observable = true;
         value.statement = true;
         value.order = Some(self.join_order(Some(Order::at(increment.offset)), Order::at(load.offset))?);
@@ -449,6 +451,7 @@ impl Machine<'_, '_> {
             // The condition itself may call or throw, even if the result is
             // discarded or neither branch expression has visible effects.
             observable: true,
+            int_fits: yes.int_fits().either(no.int_fits()),
             ..Expr::atom(ty, text)
         })?;
         Ok(Some(ConditionalStackMerge {
@@ -760,6 +763,7 @@ impl Machine<'_, '_> {
                     debug_range,
                     receiver: false,
                     token_index,
+                    int_fits: Default::default(),
                 };
                 let mut declaration = self.declared_local_document(index, &local)?;
                 declaration.push(';');
@@ -1060,6 +1064,7 @@ fn same_value(a: &Expr, b: &Expr) -> bool {
         && a.observable == b.observable
         && a.statement == b.statement
         && a.constant == b.constant
+        && a.int_fits == b.int_fits
         && match (&a.source, &b.source) {
             (Source::Local(a), Source::Local(b)) => a == b,
             (Source::New(a), Source::New(b)) => a == b,

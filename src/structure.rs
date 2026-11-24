@@ -153,6 +153,12 @@ fn structure_regions(
         }
         return Ok(Vec::new());
     }
+    if let [block] = graph.blocks.as_slice()
+        && block.successors.is_empty()
+        && block.exception_successors.is_empty()
+    {
+        machine.track_straight_line_ints();
+    }
     let mut emitter = Emitter {
         instructions,
         graph,

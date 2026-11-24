@@ -22,7 +22,7 @@ use crate::{
 use super::{
     CodeTypeSite, Effect, LiftError, Machine,
     assignment_expr::LocalWrite,
-    expr::{AnonymousOrigin, Category, Expr, INT, Order, Source},
+    expr::{AnonymousOrigin, Category, Expr, INT, IntFits, Order, Source},
 };
 
 #[path = "instanceof_locals.rs"]
@@ -48,6 +48,7 @@ struct Local {
     debug_range: Option<(u16, u16)>,
     receiver: bool,
     token_index: Option<u32>,
+    int_fits: IntFits,
 }
 
 impl PartialEq for Local {
@@ -163,6 +164,7 @@ pub(super) struct Locals<'a> {
     names: Rc<RefCell<Names>>,
     parameter_names: Rc<[String]>,
     tokens: Option<local_tokens::LocalTokens<'a>>,
+    track_int_fits: bool,
 }
 
 impl<'a> Locals<'a> {
@@ -232,6 +234,7 @@ impl<'a> Locals<'a> {
             names: Rc::new(RefCell::new(names)),
             parameter_names: Rc::default(),
             tokens: None,
+            track_int_fits: false,
         };
         let mut index = 0;
         if method.access_flags & 0x0008 == 0 {
@@ -250,6 +253,7 @@ impl<'a> Locals<'a> {
                 debug_range: None,
                 receiver: true,
                 token_index: None,
+                int_fits: IntFits::default(),
             });
             index = 1;
         }
@@ -298,6 +302,7 @@ impl<'a> Locals<'a> {
                 debug_range,
                 receiver: false,
                 token_index: None,
+                int_fits: IntFits::default(),
             });
             index += ty.slots();
         }
@@ -682,6 +687,7 @@ impl<'c> Machine<'_, 'c> {
             debug_range: range,
             receiver: false,
             token_index: self.locals.new_local_token_index(index),
+            int_fits: IntFits::default(),
         };
         let name = self.local_binding_document(index, &local, true);
         self.locals.slots[slot] = Some(local);
@@ -714,6 +720,12 @@ impl<'c> Machine<'_, 'c> {
         ))
     }
 
+    /// Facts from slot assignments are valid without a dataflow merge only
+    /// when the method consists of one straight-line block.
+    pub(crate) fn track_straight_line_ints(&mut self) {
+        self.locals.track_int_fits = true;
+    }
+
     pub(super) fn load(&mut self, op: &Instruction, index: u16, category: Category) -> Result<(), LiftError> {
         let local = self
             .locals
@@ -738,6 +750,7 @@ impl<'c> Machine<'_, 'c> {
         } else {
             expr.source = Source::Local(index);
             expr.order = Some(Order::at(self.offset));
+            expr.int_fits = local.int_fits;
         }
         self.push_leaf(op, expr)
     }
@@ -780,11 +793,14 @@ impl<'c> Machine<'_, 'c> {
         let source = signature.and_then(|_| self.local_source_signature(&value)).map(Rc::as_ref);
         let value = self.coerce_local_assignment(value, &ty, signature, source)?;
         self.before_statement(value.order)?;
-        let local = if same {
+        let mut local = if same {
             self.locals.slots[slot].as_ref().expect("checked active binding").clone()
         } else {
             self.bind_local_store(index, ty, debug, generic, origin)
         };
+        if self.locals.track_int_fits {
+            local.int_fits = value.int_fits();
+        }
         let mut text = if same {
             self.local_binding_document(index, &local, false)
         } else if origin.is_some() {
@@ -843,6 +859,7 @@ impl<'c> Machine<'_, 'c> {
         let index = target.index;
         let slot = usize::from(index);
         if !declaration {
+            self.locals.slots[slot].as_mut().expect("verified local binding").int_fits = IntFits::default();
             let local = self.locals.slots[slot].as_ref().expect("verified local binding");
             return (self.local_binding_document(index, local, false), None);
         }
@@ -1098,14 +1115,16 @@ impl<'c> Machine<'_, 'c> {
             debug_range: debug.map(|entry| (entry.start_pc, entry.length)),
             receiver: false,
             token_index: self.locals.new_local_token_index(index),
+            int_fits: IntFits::default(),
         }
     }
 
     pub(super) fn increment(&mut self, index: u16, amount: i16) -> Result<Effect, LiftError> {
+        let slot = usize::from(index);
         let local = self
             .locals
             .slots
-            .get(usize::from(index))
+            .get(slot)
             .and_then(Option::as_ref)
             .ok_or_else(|| self.invalid_local(index, "increment of an unbound slot"))?;
         if local.ty != INT {
@@ -1118,6 +1137,7 @@ impl<'c> Machine<'_, 'c> {
                     && value.ty == INT
             })
         {
+            self.locals.slots[slot].as_mut().expect("checked binding").int_fits = IntFits::default();
             let mut value = self.pop_category(Category::Int)?;
             value.order = Some(self.join_order(value.order, Order::at(self.offset))?);
             value.text.push_str(if amount == 1 { "++" } else { "--" });
@@ -1137,6 +1157,7 @@ impl<'c> Machine<'_, 'c> {
             2.. => write!(text, " += {amount};").unwrap(),
             _ => write!(text, " -= {};", amount.unsigned_abs()).unwrap(),
         }
+        self.locals.slots[slot].as_mut().expect("checked binding").int_fits = IntFits::default();
         self.before_statement(Some(Order::at(self.offset)))?;
         Ok(Effect::Statement(text))
     }

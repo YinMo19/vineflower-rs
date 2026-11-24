@@ -138,6 +138,7 @@ impl Machine<'_, '_> {
                 debug_range,
                 receiver: false,
                 token_index: self.locals.new_local_token_index(slot),
+                int_fits: Default::default(),
             },
         }))
     }

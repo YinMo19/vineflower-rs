@@ -117,6 +117,8 @@ pub(super) struct Expr {
     pub(super) observable: bool,
     pub(super) statement: bool,
     pub(super) constant: bool,
+    /// Extra JVM int ranges proved without changing the Java expression type.
+    pub(super) int_fits: IntFits,
 }
 
 impl Expr {
@@ -136,6 +138,7 @@ impl Expr {
             observable: false,
             statement: false,
             constant: false,
+            int_fits: IntFits::default(),
         }
     }
 
@@ -164,6 +167,14 @@ impl Expr {
         Self {
             source: Source::Integer(value),
             ..Self::literal(INT, value.to_string().into())
+        }
+    }
+
+    pub(super) fn int_fits(&self) -> IntFits {
+        if let Source::Integer(value) = self.source {
+            IntFits::of_literal(value)
+        } else {
+            self.int_fits.add(IntFits::of_type(&self.ty))
         }
     }
 
@@ -244,6 +255,51 @@ impl Expr {
     pub(super) fn is_uninitialized(&self, this_initialized: bool) -> bool {
         matches!(self.source, Source::New(_))
             || (!this_initialized && matches!(self.source, Source::This))
+    }
+}
+
+/// A compact set of subword types that can represent every possible value.
+/// Retaining only the width facts avoids tracking arbitrary numeric ranges.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct IntFits(u8);
+
+impl IntFits {
+    fn bit(primitive: Primitive) -> u8 {
+        match primitive {
+            Primitive::Boolean => 1,
+            Primitive::Byte => 2,
+            Primitive::Char => 4,
+            Primitive::Short => 8,
+            _ => 0,
+        }
+    }
+
+    fn of_literal(value: i32) -> Self {
+        Self(u8::from(matches!(value, 0 | 1))
+            | (u8::from(i8::try_from(value).is_ok()) << 1)
+            | (u8::from(u16::try_from(value).is_ok()) << 2)
+            | (u8::from(i16::try_from(value).is_ok()) << 3))
+    }
+
+    fn of_type(ty: &Type) -> Self {
+        Self(match ty {
+            Type::Primitive(Primitive::Boolean) => 15,
+            Type::Primitive(Primitive::Byte) => 10,
+            Type::Primitive(primitive) => Self::bit(*primitive),
+            _ => 0,
+        })
+    }
+
+    pub(super) fn either(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+
+    fn add(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    fn fits(self, primitive: Primitive) -> bool {
+        self.0 & Self::bit(primitive) != 0
     }
 }
 
@@ -461,6 +517,7 @@ impl Machine<'_, '_> {
                 ty: INT,
                 precedence: TERNARY,
                 source: Source::Plain,
+                int_fits: IntFits::of_type(&BOOLEAN),
                 statement: false,
                 ..expr
             }
@@ -500,7 +557,7 @@ impl Machine<'_, '_> {
             return Ok(expr);
         }
         if *ty == BOOLEAN {
-            if invocation && !matches!(expr.source, Source::Integer(0 | 1)) {
+            if invocation && !expr.int_fits().fits(Primitive::Boolean) {
                 return Err(self.unsupported("non-boolean JVM int passed as a boolean argument"));
             }
             return Ok(self.boolean_value(expr));
@@ -531,12 +588,9 @@ impl Machine<'_, '_> {
                     Ok(value)
                 };
             }
-            if invocation
-                && !matches!(
-                    (&expr.ty, primitive),
-                    (Type::Primitive(Primitive::Byte), Primitive::Short)
-                )
-            {
+            if invocation && !expr.int_fits().fits(*primitive) {
+                // Invocation does not itself perform JVM subword truncation.
+                // A Java cast is lossless only when the value is proved to fit.
                 return Err(self.unsupported("JVM int passed as a narrow argument"));
             }
             return self.cast(self.as_int(expr), ty.clone(), false);
