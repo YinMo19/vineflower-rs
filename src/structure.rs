@@ -303,7 +303,7 @@ impl Emitter<'_> {
                 .or_else(|| region.for_loop_prefix(self.graph.blocks[block].instructions.start));
             if start.is_none() {
                 if let Some(next) =
-                    self.try_emit_pattern_switch(block, region, machine, depth, pending)?
+                    self.try_emit_pattern_switch(block, region, machine, depth, pending, &mut first_instruction)?
                 {
                     let Some(next) = next else { return Ok(false) };
                     block = next;

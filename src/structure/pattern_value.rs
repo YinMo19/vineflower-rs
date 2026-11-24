@@ -20,8 +20,11 @@ impl Emitter<'_> {
         default: usize,
         join: usize,
         control: &RangeInclusive<u32>,
+        constructor_setup: Option<usize>,
     ) -> bool {
-        if !machine.supports_switch_expressions() || arms.iter().any(|(_, arm)| arm.guard.is_some()) {
+        if !machine.supports_switch_expressions()
+            || constructor_setup.is_none() && arms.iter().any(|(_, arm)| arm.guard.is_some())
+        {
             return false;
         }
         if arms.iter().any(|(target, arm)| {
@@ -29,7 +32,21 @@ impl Emitter<'_> {
         }) {
             return false;
         }
-        let Some(proof) = self.switch_region(header, region, arms.iter().map(|(target, _)| *target), join) else {
+        let consumer_index = self.graph.blocks[join].instructions.start;
+        let consumer = &self.instructions[consumer_index];
+        if constructor_setup.is_some_and(|start| {
+            !self.instructions.get(start..consumer_index)
+                .is_some_and(|body| machine.proves_constructor_switch(body, consumer))
+        }) {
+            return false;
+        }
+        let entries = || arms.iter().map(|(target, arm)| arm.guard.as_ref().map_or(*target, |guard| guard.success));
+        let Some(proof) = self.switch_region_entries(header, region, entries(), join, |entry, pred| {
+            arms.iter().any(|(target, arm)| match &arm.guard {
+                Some(guard) => guard.success == entry && guard.blocks().any(|owned| owned == pred),
+                None => *target == entry && pred == header,
+            })
+        }) else {
             return false;
         };
         let names = machine.local_name_checkpoint();
@@ -43,7 +60,9 @@ impl Emitter<'_> {
                 let mut local = bound.entry.clone();
                 let entry = local.switch_arm_entry(control).ok()?;
                 helpers.push(entry.clone());
-                let path = if let Some((indices, _)) = &arm.binding {
+                let path = if let Some(guard) = &arm.guard {
+                    self.branch_arm(guard.success, arm_region, &entry, depth + 2).ok()?
+                } else if let Some((indices, _)) = &arm.binding {
                     self.pattern_arm(*target, arm_region, entry, depth + 2, indices.end).ok()?
                 } else {
                     self.branch_arm(*target, arm_region, &entry, depth + 2).ok()?
@@ -54,7 +73,11 @@ impl Emitter<'_> {
                 return None;
             }
             let normal: Vec<_> = lifted.iter().filter_map(|arm| arm.exit.as_ref()).collect();
-            let mut value = machine.join_switch_values(&normal, control, proof.last).ok()??;
+            let mut value = if constructor_setup.is_some() {
+                machine.join_constructor_switch_values(&normal, consumer, control, proof.last)?
+            } else {
+                machine.join_switch_values(&normal, control, proof.last).ok()??
+            };
             let mut locals = machine.clone();
             let locals = locals.merge_locals(&normal, self.offset(join), |slot| self.local_is_live(join, slot)).ok()?;
             if !locals.declarations.is_empty() || locals.arms.iter().any(|arm| !arm.is_empty()) {

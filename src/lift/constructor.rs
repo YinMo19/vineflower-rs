@@ -1,11 +1,14 @@
+use std::collections::BTreeSet;
+
 use crate::{
     bytecode::{Instruction, Operand},
-    classfile::find_attribute,
+    classfile::{Constant, VerificationType, find_attribute, initial_stack_map_locals},
+    descriptor::{MethodDescriptor, Type},
 };
 
 use super::{
     Effect, LiftError, Machine,
-    expr::{Expr, Source},
+    expr::{Category, Expr, Source},
 };
 
 impl Machine<'_, '_> {
@@ -140,6 +143,105 @@ impl Machine<'_, '_> {
             Ok((owner, "<init>", _)) => owner == self.owner || Some(owner) == self.super_class,
             Ok(_) => false,
             Err(_) => true,
+        }
+    }
+
+    pub(crate) fn has_constructor_switch_receiver(&self) -> bool {
+        !self.initialized_this && matches!(self.stack.as_slice(), [receiver]
+            if matches!(receiver.source, Source::This) && receiver.order.is_none())
+    }
+
+    /// The synthetic dispatch and the arms must carry the same uninitialized
+    /// receiver underneath their temporary values, never as a Java operand.
+    /// Every real branch target must supply that identity in its verifier frame.
+    pub(crate) fn proves_constructor_switch(
+        &self,
+        instructions: &[Instruction],
+        consumer: &Instruction,
+    ) -> bool {
+        let prove = || {
+            if !self.has_constructor_switch_receiver() || self.normalized.is_some()
+                || consumer.opcode != 0xb7 || self.max_stack < 3
+            {
+                return None;
+            }
+            let Operand::Constant(index) = consumer.operand else { return None };
+            let pool = &self.class.pool;
+            if !matches!(pool.get(index).ok()?, Constant::Methodref { .. }) {
+                return None;
+            }
+            let (owner, "<init>", descriptor) = pool.member_ref(index).ok()? else { return None };
+            self.constructor_invocation_kind(owner, descriptor).ok()?;
+            let descriptor = MethodDescriptor::parse(descriptor).ok()?;
+            let [expected] = descriptor.parameters.as_slice() else { return None };
+            if descriptor.return_type != Type::Void {
+                return None;
+            }
+            let first = instructions.first()?.offset;
+            let end = consumer.offset;
+            let mut targets = BTreeSet::new();
+            for op in instructions {
+                // The actual receiver load preceded the selector. Slot zero
+                // is not used again by the skipped dispatch or any rule.
+                if matches!((op.opcode, &op.operand),
+                    (0x1a | 0x1e | 0x22 | 0x26 | 0x2a | 0x3b | 0x3f | 0x43 | 0x47 | 0x4b, _)
+                    | (0x15..=0x19 | 0x36..=0x3a, Operand::Local(0))
+                    | (0x84, Operand::Increment { index: 0, .. }))
+                {
+                    return None;
+                }
+                match &op.operand {
+                    Operand::Branch(target) => { targets.insert(*target); }
+                    Operand::Switch { default, cases } => {
+                        targets.insert(*default);
+                        targets.extend(cases.iter().map(|&(_, target)| target));
+                    }
+                    _ => {}
+                }
+            }
+            if targets.first().is_none_or(|&target| target < first)
+                || targets.last().is_some_and(|&target| target > end)
+            {
+                return None;
+            }
+            let initial = initial_stack_map_locals(self.class, self.method, self.descriptor).ok()?;
+            let raw = crate::bytecode::decode(self.code.bytes).ok()?;
+            let mut valid = true;
+            self.code.visit_stack_map_frames(pool, &initial, Some(&raw), |frame| {
+                let offset = u32::from(frame.offset);
+                if !(first..=end).contains(&offset) {
+                    return;
+                }
+                targets.remove(&offset);
+                valid &= frame.local(0) == VerificationType::UninitializedThis
+                    && !frame.locals.get(1..).unwrap_or_default().contains(&VerificationType::UninitializedThis)
+                    && match frame.stack {
+                        [VerificationType::UninitializedThis] => offset != end,
+                        [VerificationType::UninitializedThis, value] if offset == end => {
+                            self.constructor_switch_frame_value(*value, expected)
+                        }
+                        _ => false,
+                    };
+            }).ok()?;
+            (valid && targets.is_empty()).then_some(())
+        };
+        prove().is_some()
+    }
+
+    fn constructor_switch_frame_value(&self, value: VerificationType<'_>, expected: &Type) -> bool {
+        match (value, Category::of(expected)) {
+            (VerificationType::Integer, Some(Category::Int))
+            | (VerificationType::Long, Some(Category::Long))
+            | (VerificationType::Float, Some(Category::Float))
+            | (VerificationType::Double, Some(Category::Double))
+            | (VerificationType::Null, Some(Category::Ref)) => true,
+            (VerificationType::Object(index), Some(Category::Ref)) => {
+                self.class_type(index).is_ok_and(|ty| self.known_assignable(&ty, expected))
+            }
+            (VerificationType::DescriptorReference(ty), Some(Category::Ref)) => {
+                self.known_assignable(ty, expected)
+            }
+            _ => false,
         }
     }
 

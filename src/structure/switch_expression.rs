@@ -85,6 +85,21 @@ impl Emitter<'_> {
             return None;
         }
         let target = self.graph.block_at(*default)?;
+        self.try_default_switch_arm(header, target, region, machine, depth, selector, control, None)
+    }
+
+    pub(super) fn try_default_switch_arm<'a, 'c>(
+        &mut self,
+        header: usize,
+        target: usize,
+        region: Region<'_, 'a, 'c>,
+        machine: &mut Machine<'a, 'c>,
+        depth: usize,
+        selector: &Document,
+        control: &RangeInclusive<u32>,
+        constructor_setup: Option<usize>,
+    ) -> Option<(usize, usize)> {
+        let blocks = &self.graph.blocks;
         let body = &blocks[target];
         if !self.private_switch_block(header, region, target)
             || body.predecessors.as_slice() != [header]
@@ -111,8 +126,15 @@ impl Emitter<'_> {
                 if self.lines.len() != start || !arm.same_locals(machine) {
                     return None;
                 }
-                let Some(mut value) = machine.join_default_constructor_value(
-                    &arm, &instructions[split], control, instructions[split - 1].offset,
+                if constructor_setup.is_some_and(|start| {
+                    !machine.proves_constructor_switch(&instructions[start..split], &instructions[split])
+                }) {
+                    cursor = split;
+                    mapped = offsets;
+                    continue;
+                }
+                let Some(mut value) = machine.join_constructor_switch_values(
+                    &[&arm], &instructions[split], control, instructions[split - 1].offset,
                 ) else {
                     // An inner allocation may finish inside the rule. Keep
                     // lifting it as part of the rule, not as its consumer.
@@ -427,6 +449,17 @@ impl Emitter<'_> {
         targets: impl Iterator<Item = usize> + Clone,
         join: usize,
     ) -> Option<SwitchRegion> {
+        self.switch_region_entries(header, region, targets, join, |_, pred| pred == header)
+    }
+
+    pub(super) fn switch_region_entries(
+        &self,
+        header: usize,
+        region: Region<'_, '_, '_>,
+        targets: impl Iterator<Item = usize> + Clone,
+        join: usize,
+        accepts_entry: impl Fn(usize, usize) -> bool,
+    ) -> Option<SwitchRegion> {
         if join <= header
             || self.emitted[join]
             || targets.clone().any(|target| target == join)
@@ -489,7 +522,8 @@ impl Emitter<'_> {
         if !reaches_join
             || owners.iter().any(|(&block, &owner)| {
                 blocks[block].predecessors.iter().any(|pred| {
-                    (*pred != header || block != owner) && owners.get(pred) != Some(&owner)
+                    owners.get(pred) != Some(&owner)
+                        && (block != owner || !accepts_entry(block, *pred))
                 })
             })
             || (region.stop != Some(join)

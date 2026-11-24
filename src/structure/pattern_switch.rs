@@ -177,6 +177,7 @@ impl Emitter<'_> {
         machine: &mut Machine<'a, 'c>,
         depth: usize,
         pending: &mut Vec<u32>,
+        resume: &mut Option<usize>,
     ) -> Result<Option<Option<usize>>, StructureError> {
         let range = self.graph.blocks[block].instructions.clone();
         if range.is_empty()
@@ -463,26 +464,32 @@ impl Emitter<'_> {
         }
         machine.commit_switch_dynamic_helpers(&baseline);
         offsets.extend(switch.offset..switch.offset + switch.len);
-        if restart.is_none()
-            && let Some(join) = join
-            && self.try_pattern_switch_value(
-                dispatch_block, region, machine, depth, &selector, &ordered, &staged, default, join, &control,
+        let constructor_setup = machine.has_constructor_switch_receiver().then_some(head.setup);
+        if let Some(setup) = constructor_setup
+            && restart.is_none() && head.null_check && cases.is_empty()
+            && let Some((target, start)) = self.try_default_switch_arm(
+                dispatch_block, default, region, machine, depth, &selector, &control, Some(setup),
             )
         {
+            *resume = Some(start);
+            *pending = offsets;
+            return Ok(Some(Some(target)));
+        }
+        if (restart.is_none() || constructor_setup.is_some())
+            && let Some(join) = join
+            && self.try_pattern_switch_value(
+                dispatch_block, within, machine, depth, &selector, &ordered, &staged, default, join,
+                &control, constructor_setup,
+            )
+        {
+            self.mark_pattern_dispatch(dispatch_block, &ordered)?;
             *pending = offsets;
             return Ok(Some(Some(join)));
         }
         if !machine.stack_is_empty() {
             return Err(self.unstructured(block));
         }
-        self.emitted[dispatch_block] = true;
-        for arm in ordered.iter().filter_map(|(_, arm)| arm.guard.as_ref()) {
-            for owned in arm.blocks() {
-                if mem::replace(&mut self.emitted[owned], true) {
-                    return Err(self.unstructured(owned));
-                }
-            }
-        }
+        self.mark_pattern_dispatch(dispatch_block, &ordered)?;
         for statement in machine.take_prelude() {
             self.push(depth, statement, mem::take(&mut offsets));
         }
@@ -577,6 +584,22 @@ impl Emitter<'_> {
                 .map(|text| Line::new(depth, text, Vec::new())),
         );
         Ok(Some(Some(join)))
+    }
+
+    fn mark_pattern_dispatch(
+        &mut self,
+        dispatch: usize,
+        arms: &[(usize, Arm)],
+    ) -> Result<(), StructureError> {
+        self.emitted[dispatch] = true;
+        for guard in arms.iter().filter_map(|(_, arm)| arm.guard.as_ref()) {
+            for owned in guard.blocks() {
+                if mem::replace(&mut self.emitted[owned], true) {
+                    return Err(self.unstructured(owned));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn transfer_offsets(&self, target: usize, path: &super::Arm<'_, '_>) -> Vec<u32> {

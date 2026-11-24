@@ -3,6 +3,12 @@ use vineflower_rs::{Options, bytecode::{Operand, decode}, classfile::{ClassFile,
 const CLASS: &[u8] = include_bytes!("fixtures/flexible_constructors/FlexibleConstructor.class");
 const ENUM: &[u8] = include_bytes!("fixtures/flexible_constructors/FlexibleConstructorEnum.class");
 const RECORD: &[u8] = include_bytes!("fixtures/flexible_constructors/FlexibleConstructorRecord.class");
+const PREVIEW_SINGLE: &[u8] = include_bytes!("smoke/java17preview/TestSwitchPatternMatchingConstructor2.class");
+const PREVIEW_GUARDED: [&[u8]; 3] = [
+    include_bytes!("smoke/java17preview/TestSwitchPatternMatchingConstructor1.class"),
+    include_bytes!("smoke/java17preview/TestSwitchPatternMatchingConstructor1$Shape.class"),
+    include_bytes!("smoke/java17preview/TestSwitchPatternMatchingConstructor1$Triangle.class"),
+];
 
 fn assert_order(mut source: &str, needles: &[&str]) {
     let original = source;
@@ -82,4 +88,37 @@ fn refuses_to_delegate_after_writing_a_blank_final_field() {
     invalid[nonfinal_store + 1..nonfinal_store + 3].copy_from_slice(&final_field.to_be_bytes());
     let error = decompile(&invalid, &Options::default()).unwrap_err().to_string();
     assert!(error.contains("alternate constructor invocation after early final field assignment"), "{error}");
+}
+
+#[test]
+fn preview_pattern_values_feed_the_constructor_without_spilling_this() {
+    let single = decompile(PREVIEW_SINGLE, &Options::default()).unwrap().text;
+    assert_eq!(single.matches("this(switch (s)").count(), 2, "{single}");
+    assert_eq!(single.matches("default -> \"Non-triangle\";").count(), 2, "{single}");
+    assert!(single.contains("case null -> \"null\";"), "{single}");
+
+    let guarded = vineflower_rs::ClassGroup::new(PREVIEW_GUARDED).unwrap()
+        .decompile("pkg/TestSwitchPatternMatchingConstructor1", &Options::default()).unwrap().text;
+    assert_order(&guarded, &[
+        "this(switch (", "case null -> \"null\";", " && (", "calculateArea()",
+        "-> \"Large triangle\";", "-> \"Small triangle\";", "default -> \"Non-triangle\";",
+    ]);
+    assert!(!guarded.contains("typeSwitch") && !guarded.contains("while ("), "{guarded}");
+}
+
+#[test]
+fn preview_switch_rejects_a_stack_map_without_the_constructor_receiver() {
+    let class = ClassFile::parse(PREVIEW_SINGLE).unwrap();
+    let code = constructor(&class, "(Ljava/lang/Object;)V");
+    let map = code.attributes.iter().find(|attribute| {
+        class.pool.utf8(attribute.name_index).unwrap() == "StackMapTable"
+    }).unwrap();
+    // The first frame at offset 5 is full: four locals and one stack entry;
+    // the final tag of this frame must be uninitializedThis.
+    let stack = 2 + 1 + 2 + 2 + (1 + 3 + 3 + 1) + 2;
+    assert_eq!(map.data[stack], 6);
+    let base = map.data.as_ptr() as usize - PREVIEW_SINGLE.as_ptr() as usize;
+    let mut invalid = PREVIEW_SINGLE.to_vec();
+    invalid[base + stack] = 5; // Null, a structurally valid but incompatible verifier operand.
+    assert!(decompile(&invalid, &Options::default()).is_err());
 }

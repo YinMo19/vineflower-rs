@@ -4,6 +4,7 @@ use std::{mem, ops::RangeInclusive};
 
 use crate::{
     bytecode::{Instruction, Operand},
+    classfile::Constant,
     descriptor::{MethodDescriptor, Primitive, Type},
     source_text::Document,
 };
@@ -66,14 +67,11 @@ impl<'a, 'c> Machine<'a, 'c> {
         }
     }
 
-    /// The default rule supplies the final argument to a constructor. The
-    /// receiver and earlier arguments must already be on the untouched
-    /// dispatch stack, and the rule's single value must be legal for the JVM
-    /// descriptor. Use the formal Java type in the yield to keep overload
-    /// selection stable, in particular for `null` and narrow primitives.
-    pub(crate) fn join_default_constructor_value(
+    /// These rules supply the final constructor argument. Keep its formal
+    /// Java type to preserve overload selection for null and narrow values.
+    pub(crate) fn join_constructor_switch_values(
         &self,
-        arm: &Self,
+        arms: &[&Self],
         constructor: &Instruction,
         control: &RangeInclusive<u32>,
         last: u32,
@@ -81,11 +79,14 @@ impl<'a, 'c> Machine<'a, 'c> {
         let Operand::Constant(index) = constructor.operand else {
             return None;
         };
-        let (owner, name, descriptor) = self.class.pool.member_ref(index).ok()?;
+        if !matches!(self.class.pool.get(index).ok()?, Constant::Methodref { .. }) {
+            return None;
+        }
+        let (owner, name, descriptor_text) = self.class.pool.member_ref(index).ok()?;
         if constructor.opcode != 0xb7 || name != "<init>" {
             return None;
         }
-        let descriptor = MethodDescriptor::parse(descriptor).ok()?;
+        let descriptor = MethodDescriptor::parse(descriptor_text).ok()?;
         let (expected, prefix) = descriptor.parameters.split_last()?;
         let receiver_index = self.stack.len().checked_sub(prefix.len() + 1)?;
         let receiver = &self.stack[receiver_index];
@@ -93,7 +94,7 @@ impl<'a, 'c> Machine<'a, 'c> {
             Source::This
                 if !self.initialized_this
                     && receiver_index == 0
-                    && (owner == self.owner || self.super_class == Some(owner)) => {}
+                    && self.constructor_invocation_kind(owner, descriptor_text).is_ok() => {}
             Source::New(_) if matches!(&receiver.ty, Type::Object(name) if name == owner) => {}
             _ => return None,
         }
@@ -108,22 +109,23 @@ impl<'a, 'c> Machine<'a, 'c> {
         {
             return None;
         }
-        let value = arm.switch_yield()?;
-        if value
-            .order
-            .is_some_and(|order| order.first <= *control.end() || order.last > last)
-            || (Category::of(expected) == Some(Category::Ref)
-                && !matches!(value.source, Source::Null)
-                && !self.known_assignable(&value.ty, expected))
-        {
-            return None;
-        }
-        let yielded = self.coerce(value.clone(), expected, true).ok()?;
-        if yielded.ty != *expected {
+        let yields = arms.iter().map(|arm| {
+            let value = arm.switch_yield()?;
+            if value.order.is_some_and(|order| order.first <= *control.end() || order.last > last)
+                || (Category::of(expected) == Some(Category::Ref)
+                    && !matches!(value.source, Source::Null)
+                    && !self.known_assignable(&value.ty, expected))
+            {
+                return None;
+            }
+            let yielded = self.coerce(value.clone(), expected, true).ok()?;
+            (yielded.ty == *expected).then_some(yielded.text)
+        }).collect::<Option<Vec<_>>>()?;
+        if yields.is_empty() {
             return None;
         }
         Some(SwitchValue {
-            yields: vec![yielded.text],
+            yields,
             ty: expected.clone(),
             order: Order {
                 first: *control.start(),
