@@ -120,7 +120,7 @@ impl Machine<'_, '_> {
         self.locals.slots[slot].clone_from(&evaluated.locals.slots[slot]);
     }
 
-    pub(crate) fn loop_binding_type(&self, slot: u16) -> Option<&Type> {
+    pub(crate) fn local_binding_type(&self, slot: u16) -> Option<&Type> {
         Some(&self.locals.slots.get(usize::from(slot))?.as_ref()?.ty)
     }
 
@@ -201,7 +201,7 @@ impl Machine<'_, '_> {
         Some(declaration)
     }
 
-    pub(crate) fn forget_loop_binding(&mut self, slot: u16) {
+    pub(crate) fn forget_binding(&mut self, slot: u16) {
         self.locals.slots[usize::from(slot)] = None;
     }
 
@@ -226,7 +226,7 @@ impl Machine<'_, '_> {
             _ => return Ok(false),
         };
         if index != load_index || !self.stack.is_empty() || !self.prelude.is_empty()
-            || self.loop_binding_type(index) != Some(&INT) || self.lexical_parameter(index).is_some()
+            || self.local_binding_type(index) != Some(&INT) || self.lexical_parameter(index).is_some()
         {
             return Ok(false);
         }

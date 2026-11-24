@@ -194,6 +194,20 @@ impl Emitter<'_> {
         if !shape.split_resource_exits.is_empty() {
             return Err(StructureError::ExceptionHandlers);
         }
+        if shape.finally.is_none() {
+            for catch in &shape.catches {
+                let store = &self.instructions[self.graph.blocks[catch.start].instructions.start];
+                if let Some(slot) = reference_store(store)
+                    && machine.local_binding_type(slot).is_some_and(|ty| ty.slots() == 1)
+                    && !self.local_is_live(shape.start, slot)
+                {
+                    // No normal or exceptional successor reads the old
+                    // binding before replacing it. A catch may reuse its
+                    // slot without competing for the same source local.
+                    machine.forget_binding(slot);
+                }
+            }
+        }
         let (clauses, scope) = if let Some(inner) = exceptions.catches_of_finally(shape) {
             (
                 inner,

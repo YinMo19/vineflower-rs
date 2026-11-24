@@ -74,7 +74,7 @@ impl ForLoop {
         line.offsets = offsets;
         lines.drain(self.setup);
         for slot in self.forget {
-            machine.forget_loop_binding(slot);
+            machine.forget_binding(slot);
         }
         removed
     }
@@ -432,7 +432,7 @@ impl Emitter<'_> {
         let Access::Store(kind, element_slot) = access(store)? else {
             return None;
         };
-        let Type::Array(element) = entry.loop_binding_type(holder_slot)? else {
+        let Type::Array(element) = entry.local_binding_type(holder_slot)? else {
             return None;
         };
         let holder = entry.loop_receiver(holder_slot)?;
@@ -496,7 +496,7 @@ impl Emitter<'_> {
         else {
             return None;
         };
-        let holder_type = entry.loop_binding_type(holder_slot)?;
+        let holder_type = entry.local_binding_type(holder_slot)?;
         if holder_slot == iterator_slot
             || !entry.proves_iterable(holder_type, owner)
             || !entry.loop_binding_starts_here(

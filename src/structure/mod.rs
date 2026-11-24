@@ -742,7 +742,12 @@ impl Emitter<'_> {
         let switch_exit = region.switch_exit().is_some_and(|scope| {
             normal_join == Some(scope.target) && machine.stack_is_empty()
         });
-        let join = if switch_exit || (normal_join.is_some() && normal_join == region.post_test_latch()) {
+        let loop_continue = machine.stack_is_empty()
+            && normal_join.is_some_and(|join| {
+                matches!(region.loop_transfer(join), Some((_, Transfer::Continue)))
+            });
+        let post_test = normal_join.is_some() && normal_join == region.post_test_latch();
+        let join = if switch_exit || loop_continue || post_test {
             shared_join().or(normal_join)
         } else {
             normal_join.or_else(shared_join)
