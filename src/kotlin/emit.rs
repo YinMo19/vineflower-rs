@@ -1044,6 +1044,37 @@ fn render_function(
                     trace.finish(map, block.lines);
                 }
             }
+            Body::Switch(block) => {
+                let mut trace = location
+                    .as_ref()
+                    .map(|_| trace::Trace::new(bytecode, method))
+                    .transpose()?;
+                block.write(
+                    out, (&function.returns, &descriptor.return_type), &function.parameters, name,
+                    indent, indent_unit, |instruction, line| {
+                        if let (Some(trace), Some((_, header))) = (&mut trace, &location) {
+                            trace.instruction(instruction, *header + line);
+                        }
+                    },
+                )?;
+                if let (Some(trace), Some((map, _))) = (trace, location) {
+                    trace.finish(map, block.lines);
+                }
+            }
+            Body::Decision(body) => {
+                let mut trace = location
+                    .as_ref()
+                    .map(|_| trace::Trace::new(bytecode, method))
+                    .transpose()?;
+                body.write(out, &function.parameters, name, indent, indent_unit, |instruction, line| {
+                    if let (Some(trace), Some((_, header))) = (&mut trace, &location) {
+                        trace.instruction(instruction, *header + line);
+                    }
+                })?;
+                if let (Some(trace), Some((map, _))) = (trace, location) {
+                    trace.finish(map, body.lines);
+                }
+            }
         }
     }
     out.push('\n');

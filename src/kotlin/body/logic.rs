@@ -11,7 +11,7 @@ pub(super) const UNARY: u8 = 8;
 pub(super) const MULTIPLICATIVE: u8 = 7;
 pub(super) const ADDITIVE: u8 = 6;
 pub(super) const INFIX: u8 = 5;
-const RELATIONAL: u8 = 4;
+pub(super) const RELATIONAL: u8 = 4;
 const EQUALITY: u8 = 3;
 const AND: u8 = 2;
 const OR: u8 = 1;
@@ -180,6 +180,8 @@ fn reference_cast(left: &Expr<'_>, right: &Expr<'_>, parameters: &[ValueParamete
         | (ExprKind::Parameter { index, .. }, ExprKind::Literal(Literal::String(_))) => {
             !any_or_string(ty(*index))
         }
+        (ExprKind::BoxedInt(_), ExprKind::Parameter { index, .. })
+        | (ExprKind::Parameter { index, .. }, ExprKind::BoxedInt(_)) => ty(*index).class_id() != Some("kotlin/Any"),
         (ExprKind::Literal(Literal::String(_)), ExprKind::Literal(Literal::String(_))) => false,
         _ => true,
     }
@@ -290,6 +292,14 @@ fn boolean_constant(expr: &Expr<'_>) -> Option<bool> {
     }
 }
 
+fn boolean_value(expr: &Expr<'_>, parameters: &[ValueParameter]) -> bool {
+    if let ExprKind::Conditional(conditional) = &expr.kind {
+        boolean_value(&conditional.yes, parameters) && boolean_value(&conditional.no, parameters)
+    } else {
+        boolean_constant(expr).is_some() || expr.primitive_hint(parameters) == Some(Primitive::Boolean)
+    }
+}
+
 pub(super) fn require_boolean(
     expected: Expected<'_>,
     declaration: &str,
@@ -318,10 +328,14 @@ pub(super) fn write_negation(
     expr.write_at(out, boolean, parameters, declaration, UNARY)
 }
 
-fn negate<'a>(mut expr: Expr<'a>, declaration: &str) -> Result<Expr<'a>, KotlinError> {
+pub(super) fn negate<'a>(mut expr: Expr<'a>, declaration: &str) -> Result<Expr<'a>, KotlinError> {
     match &mut expr.kind {
         ExprKind::Compare(compare) => {
             compare.relation = compare.relation.complement();
+            Ok(expr)
+        }
+        ExprKind::TypeTest { negative, .. } => {
+            *negative = !*negative;
             Ok(expr)
         }
         _ => {
@@ -363,8 +377,11 @@ pub(super) fn condition<'a>(
                     )
                 }
                 Some(StackValue::Value(expr)) => {
-                    let primitive =
-                        integer_kind(expr.primitive_hint(parameters), None, declaration)?;
+                    let primitive = if relation.equality() && boolean_value(&expr, parameters) {
+                        Primitive::Boolean
+                    } else {
+                        integer_kind(expr.primitive_hint(parameters), None, declaration)?
+                    };
                     if primitive == Primitive::Boolean {
                         match relation {
                             Relation::Ne => Ok(expr),

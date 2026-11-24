@@ -12,13 +12,15 @@ use crate::{
 };
 
 use super::{
-    JvmFieldSignature, JvmMethodSignature, KotlinError, Type, ValueParameter, syntax::identifier,
+    JvmFieldSignature, JvmMethodSignature, KotlinError, Type, ValueParameter, syntax::{identifier, qualified},
 };
 
 mod control;
+mod decisions;
 mod defaults;
 mod logic;
 mod statements;
+mod switches;
 
 pub(super) use defaults::{recover as parameter_defaults, verify_copy, verify_copy_defaults};
 use logic::{Comparison, Conditional, Relation};
@@ -37,6 +39,8 @@ pub(super) enum Body<'a> {
     Empty,
     Expression(Expr<'a>, Option<ExpressionTrace>),
     Statements(statements::StatementBlock<'a>),
+    Switch(switches::SwitchBody<'a>),
+    Decision(decisions::DecisionBody<'a>),
 }
 
 pub(super) struct ExpressionTrace {
@@ -63,6 +67,8 @@ enum ExprKind<'a> {
     Binary(Operator, Primitive, Box<(Expr<'a>, Expr<'a>)>),
     Compare(Box<Comparison<'a>>),
     Not(Box<Expr<'a>>),
+    TypeTest { operand: Box<Expr<'a>>, target: &'a str, negative: bool },
+    BoxedInt(Box<Expr<'a>>),
     Conditional(Box<Conditional<'a>>),
 }
 
@@ -131,6 +137,7 @@ impl Operator {
 struct Locals<'a> {
     slots: Vec<(u16, &'a JvmType)>,
     instance: bool,
+    alias: Option<(u16, u8, usize)>,
 }
 
 impl<'a> Locals<'a> {
@@ -156,15 +163,36 @@ impl<'a> Locals<'a> {
                 (slot, ty)
             })
             .collect();
-        Ok(Self { slots, instance })
+        Ok(Self { slots, instance, alias: None })
+    }
+
+    fn next_slot(&self) -> u16 {
+        let parameters = self.slots.last().map_or(u16::from(self.instance), |(slot, ty)| slot + ty.slots());
+        self.alias.map_or(parameters, |(slot, load, _)| slot.saturating_add(if matches!(load, 0x16 | 0x18) { 2 } else { 1 }))
     }
 
     fn parameter(&self, slot: u16, expected: u8) -> Option<usize> {
+        if let Some((alias, load, parameter)) = self.alias
+            && slot == alias && expected == load
+        {
+            return Some(parameter);
+        }
         self.slots
             .binary_search_by_key(&slot, |&(slot, _)| slot)
             .ok()
             .filter(|&index| load_opcode(self.slots[index].1) == expected)
     }
+}
+
+fn subject_alias(instructions: &[Instruction], locals: &Locals<'_>) -> Option<(u16, u8, usize)> {
+    let [load, store, rest @ ..] = instructions else { return None; };
+    let (opcode, source) = local_load(load)?;
+    let (store_opcode, slot) = local_store(store)?;
+    let parameter = locals.parameter(source, opcode)?;
+    if slot < locals.next_slot() || store_opcode != opcode + 0x21 || rest.is_empty() {
+        return None;
+    }
+    Some((slot, opcode, parameter))
 }
 
 enum StackValue<'a> {
@@ -255,7 +283,7 @@ impl<'a, 'data> Bytecode<'a, 'data> {
         declaration: &str,
         trace: bool,
     ) -> Result<Body<'a>, KotlinError> {
-        let locals = Locals::new(
+        let mut locals = Locals::new(
             descriptor,
             member.access_flags & STATIC == 0,
             parameters,
@@ -264,12 +292,24 @@ impl<'a, 'data> Bytecode<'a, 'data> {
         let code = self.code(member, declaration)?;
         let decoded = bytecode::decode(code.bytes)?;
         let instructions = self.parameter_checks(&decoded, &locals, parameters)?;
-        if instructions.iter().any(|instruction| {
-            matches!(
-                instruction.operand,
-                Operand::Branch(_) | Operand::Switch { .. }
-            )
-        }) {
+        let mut start = decoded.len() - instructions.len();
+        if instructions.iter().any(|instruction| matches!(instruction.operand, Operand::Switch { .. })) {
+            // The switch-specific pass binds its own selector, not a reference alias.
+            let switch = switches::lower(self, decoded, start, &code, &locals, parameters, &descriptor.return_type, declaration, trace)?;
+            return Ok(Body::Switch(switch));
+        }
+        if instructions.iter().any(|instruction| matches!(instruction.operand, Operand::Branch(_))) {
+            let instructions = if let Some(alias) = subject_alias(instructions, &locals) {
+                locals.alias = Some(alias);
+                start += 2;
+                &instructions[2..]
+            } else {
+                instructions
+            };
+            if descriptor.return_type == JvmType::Void {
+                let body = decisions::lower(self, decoded, start, &code, &locals, parameters, declaration, trace)?;
+                return Ok(Body::Decision(body));
+            }
             let (expr, materialized) = control::lower(
                 self,
                 instructions,
@@ -669,6 +709,22 @@ impl<'a, 'data> Bytecode<'a, 'data> {
                 stack.push(StackValue::LongOrder);
                 return Ok(());
             }
+            (0xc1, Operand::Constant(index)) => {
+                let target = self.class.pool.class_name(*index)?;
+                if target.starts_with('[') {
+                    return Err(KotlinError::unsupported(declaration, "array type test"));
+                }
+                let operand = pop_value(stack, declaration)?;
+                let depth = operand.depth + 1;
+                Expr::new(ExprKind::TypeTest { operand: Box::new(operand), target, negative: false }, depth, declaration)?
+            }
+            (0xb8, _) if self.reference(instruction, 0xb8)? == Some(
+                ("java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;")
+            ) => {
+                let operand = pop_value(stack, declaration)?;
+                let depth = operand.depth + 1;
+                Expr::new(ExprKind::BoxedInt(Box::new(operand)), depth, declaration)?
+            }
             (0xb8, _) if self.reference_are_equal(instruction)? => {
                 let rhs = pop_value(stack, declaration)?;
                 let lhs = pop_value(stack, declaration)?;
@@ -810,6 +866,31 @@ impl<'a> Expr<'a> {
         }
     }
 
+    fn infallible(&self) -> bool {
+        match &self.kind {
+            ExprKind::Literal(_) | ExprKind::Parameter { .. } => true,
+            ExprKind::Binary(operator, _, pair) => {
+                !matches!(operator, Operator::Divide | Operator::Remainder)
+                    && pair.0.infallible() && pair.1.infallible()
+            }
+            _ => false,
+        }
+    }
+
+    fn stack_load(&self) -> Option<u8> {
+        match &self.kind {
+            ExprKind::Literal(Literal::Null | Literal::String(_)) => Some(0x19),
+            ExprKind::Literal(Literal::Int(_)) | ExprKind::Compare(_) | ExprKind::Not(_) | ExprKind::TypeTest { .. } => Some(0x15),
+            ExprKind::Literal(Literal::Long(_)) => Some(0x16),
+            ExprKind::Literal(Literal::Float(_)) => Some(0x17),
+            ExprKind::Literal(Literal::Double(_)) => Some(0x18),
+            ExprKind::Parameter { load, .. } => Some(*load),
+            ExprKind::BoxedInt(_) => Some(0x19),
+            ExprKind::Binary(_, primitive, _) => Some(load_opcode(&JvmType::Primitive(*primitive))),
+            ExprKind::Conditional(_) => None,
+        }
+    }
+
     fn primitive_hint(&self, parameters: &[ValueParameter]) -> Option<Primitive> {
         match &self.kind {
             ExprKind::Parameter { index, .. } => logic::primitive_type(&parameters[*index].ty),
@@ -817,7 +898,8 @@ impl<'a> Expr<'a> {
             ExprKind::Literal(Literal::Float(_)) => Some(Primitive::Float),
             ExprKind::Literal(Literal::Double(_)) => Some(Primitive::Double),
             ExprKind::Literal(_) => None,
-            ExprKind::Compare(_) | ExprKind::Not(_) => Some(Primitive::Boolean),
+            ExprKind::Compare(_) | ExprKind::Not(_) | ExprKind::TypeTest { .. } => Some(Primitive::Boolean),
+            ExprKind::BoxedInt(_) => None,
             ExprKind::Conditional(conditional) => conditional.primitive_hint(parameters),
             ExprKind::Binary(operator, primitive, pair) => {
                 if *primitive == Primitive::Int
@@ -921,6 +1003,32 @@ impl<'a> Expr<'a> {
             }
             ExprKind::Conditional(conditional) => {
                 conditional.write(out, expected, parameters, declaration, binding)?
+            }
+            ExprKind::TypeTest { operand, target, negative } => {
+                logic::require_boolean(expected, declaration)?;
+                let target = match *target {
+                    "java/lang/Boolean" => "kotlin/Boolean",
+                    "java/lang/Byte" => "kotlin/Byte",
+                    "java/lang/Character" => "kotlin/Char",
+                    "java/lang/Double" => "kotlin/Double",
+                    "java/lang/Float" => "kotlin/Float",
+                    "java/lang/Integer" => "kotlin/Int",
+                    "java/lang/Long" => "kotlin/Long",
+                    "java/lang/Short" => "kotlin/Short",
+                    "java/lang/String" => "kotlin/String",
+                    "java/lang/Object" => "kotlin/Any",
+                    "kotlin/Unit" | "java/lang/Number" | "java/lang/CharSequence" => target,
+                    _ => return Err(KotlinError::unsupported(declaration, "type test requires a reifiable Kotlin target")),
+                };
+                if binding > logic::RELATIONAL { out.push('('); }
+                operand.write_at(out, Expected::Reference, parameters, declaration, logic::RELATIONAL + 1)?;
+                out.push_str(if *negative { " !is " } else { " is " });
+                qualified(out, target, declaration)?;
+                if binding > logic::RELATIONAL { out.push(')'); }
+            }
+            ExprKind::BoxedInt(operand) => {
+                if !matches!(expected, Expected::Reference) { return Err(mismatch()); }
+                operand.write_at(out, Expected::Primitive(Primitive::Int), parameters, declaration, binding)?;
             }
         }
         Ok(())

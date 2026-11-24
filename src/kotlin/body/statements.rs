@@ -89,28 +89,49 @@ pub(super) fn lower<'a>(
     locals: &Locals<'_>,
     declaration: &str,
 ) -> Result<Vec<Statement<'a>>, KotlinError> {
+    lower_range(bytecode, instructions, start..instructions.len() - 1, locals, declaration)
+}
+
+pub(super) fn lower_range<'a>(
+    bytecode: &Bytecode<'a, '_>,
+    instructions: &[Instruction],
+    range: Range<usize>,
+    locals: &Locals<'_>,
+    declaration: &str,
+) -> Result<Vec<Statement<'a>>, KotlinError> {
     let mut statements = Vec::new();
     let mut stack = Vec::new();
-    let mut first = start;
+    let mut index = range.start;
+    let mut first = index;
     let invalid = || KotlinError::unsupported(declaration, "unsupported Kotlin statement bytecode");
-    for (index, instruction) in instructions
-        .iter()
-        .enumerate()
-        .take(instructions.len() - 1)
-        .skip(start)
-    {
+    while index < range.end {
+        let instruction = &instructions[index];
+        if let Some((store, slot)) = super::local_store(instruction)
+            && slot >= locals.next_slot()
+            && let [get, load, ..] = &instructions[index + 1..range.end]
+            && super::local_load(load) == Some((store - 0x21, slot))
+            && bytecode.reference(get, 0xb2)?
+                == Some(("java/lang/System", "out", "Ljava/io/PrintStream;"))
+            && let [StackValue::Value(argument)] = stack.as_slice()
+            && argument.stack_load() == Some(store - 0x21)
+            && argument.infallible()
+        {
+            // The inline primitive println uses a fresh temporary instead of
+            // swap. Only its proven store/reload is modeled as a stack move.
+            stack.insert(0, StackValue::PrintStream);
+            index += 3;
+            continue;
+        }
         if bytecode.reference(instruction, 0xb2)?
             == Some(("java/lang/System", "out", "Ljava/io/PrintStream;"))
         {
             stack.push(StackValue::PrintStream);
         } else if instruction.opcode == 0x5f {
-            // Kotlin's inline println often evaluates its operand first. Only
-            // reorder a literal or parameter, neither of which has effects.
+            // Reordering the receiver load past an infallible argument
+            // preserves which operations can be observed or fail first.
             if let [StackValue::Value(argument), StackValue::PrintStream] = stack.as_slice()
-                && matches!(
-                    argument.kind,
-                    ExprKind::Literal(_) | ExprKind::Parameter { .. }
-                )
+                && matches!(argument.stack_load(), Some(0x15 | 0x17 | 0x19))
+                && argument.infallible()
             {
                 stack.swap(0, 1);
             } else {
@@ -137,6 +158,7 @@ pub(super) fn lower<'a>(
         } else {
             bytecode.expression(instruction, locals, &mut stack, declaration)?;
         }
+        index += 1;
     }
     if !stack.is_empty() {
         return Err(KotlinError::unsupported(

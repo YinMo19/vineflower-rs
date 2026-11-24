@@ -33,6 +33,8 @@ const DEFAULTS: &str = include_str!("fixtures/Defaults.class.hex");
 const FACADE_DEFAULTS: &str = include_str!("fixtures/DefaultsKt.class.hex");
 const UNSUPPORTED_DEFAULTS: &str = include_str!("fixtures/UnsupportedDefaults.class.hex");
 const DATA_CLASS: &str = include_str!("fixtures/TestDataClass.class.hex");
+const BRANCHES: &str = include_str!("fixtures/Branches.class.hex");
+const WHEN_BOOLEAN: &str = include_str!("fixtures/TestWhenBoolean.class.hex");
 
 fn bytes(hex: &str) -> Vec<u8> {
     assert!(hex.lines().all(|line| line.len() % 2 == 0));
@@ -163,6 +165,61 @@ fn renders_value_joins_early_returns_and_short_circuit() {
             "}\n",
         )
     );
+}
+
+#[test]
+fn recovers_switch_groups_joined_values_and_typed_when_predicates() {
+    let source = render(BRANCHES);
+    assert!(source.contains(concat!(
+        "   public fun lookup(key: Int): String {\n",
+        "      return when (key) {\n",
+        "         -20 -> \"left\"\n",
+        "         7, 1024 -> \"right\"\n",
+        "         else -> \"center\"\n",
+    )), "{source}");
+    assert!(source.contains(concat!(
+        "   public fun table(key: Int) {\n",
+        "      when (key) {\n",
+        "         1 -> System.out.println(\"one\")\n",
+        "         2, 3 -> System.out.println(\"two or three\")\n",
+        "         else -> System.out.println(\"default\")\n",
+    )), "{source}");
+    assert!(source.contains(concat!(
+        "      val text: String = when (key) {\n",
+        "         1 -> \"one\"\n",
+        "         2, 3, 5 -> \"some prime\"\n",
+        "         else -> \"anything else\"\n",
+        "      }\n",
+        "      System.out.println(text)\n",
+    )), "{source}");
+    assert!(source.contains(concat!(
+        "      when {\n",
+        "         value == 7 -> System.out.println(\"seven\")\n",
+        "         value == null -> System.out.println(\"nothing\")\n",
+        "         value is kotlin.String -> System.out.println(\"string\")\n",
+        "         value !is kotlin.Long -> System.out.println(\"not long\")\n",
+        "         else -> System.out.println(\"long\")\n",
+    )), "{source}");
+}
+
+#[test]
+fn recovers_upstream_boolean_decision_graph_with_mapped_call() {
+    let options = crate::Options {
+        decompile_kotlin: true,
+        include_line_mappings: true,
+        ..crate::Options::default()
+    };
+    let source = crate::decompile(&bytes(WHEN_BOOLEAN), &options).unwrap();
+    assert!(source.text.contains("      when {\n"));
+    assert!(source.text.contains(" -> System.out.println(\"hello\")"));
+    assert_eq!(source.text.matches("System.out.println").count(), 1);
+    let map = source.map.unwrap();
+    let [method] = map.methods.as_slice() else { panic!("expected one mapped method"); };
+    assert_eq!(method.name, "testIf");
+    let call_line = source.text.lines().position(|line| line.contains("System.out.println")).unwrap();
+    assert_eq!(method.offsets[&170], call_line);
+    assert_eq!(method.offsets[&172], call_line);
+    assert!(method.offsets[&173] > call_line);
 }
 
 #[test]
