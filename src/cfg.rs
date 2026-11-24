@@ -88,6 +88,17 @@ impl<'a> Transfer<'a> {
 }
 
 impl ControlFlowGraph {
+    /// The caller establishes a void method without exception handlers or
+    /// legacy subroutines. The synthetic return has no original source bytes.
+    pub(crate) fn complete_void_tail(instructions: &mut Vec<Instruction>) {
+        if let Some(last) = instructions.last()
+            && matches!(Transfer::of(last), Ok(Transfer::Next | Transfer::Conditional(_)))
+            && let Some(offset) = last.offset.checked_add(last.len)
+        {
+            instructions.push(Instruction { offset, opcode: 0xb1, operand: Operand::None, len: 0 });
+        }
+    }
+
     pub fn build(
         instructions: &[Instruction],
         handlers: &[ExceptionHandler],

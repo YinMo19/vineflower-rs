@@ -896,6 +896,13 @@ impl<'a, 'c> Writer<'a, 'c> {
             let uses_subroutines = instructions[prefix..]
                 .iter()
                 .any(|op| matches!(op.opcode, 0xa8 | 0xa9 | 0xc9));
+            if self.options.ignore_invalid_bytecode
+                && ty.return_type == Type::Void
+                && !uses_subroutines
+                && code.exceptions.is_empty()
+            {
+                ControlFlowGraph::complete_void_tail(&mut instructions);
+            }
             let normalized;
             let (instructions, handlers) = if self.options.force_jsr_inline || uses_subroutines {
                 if prefix != 0 {
