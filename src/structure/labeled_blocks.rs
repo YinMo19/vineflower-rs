@@ -36,7 +36,13 @@ struct Plan {
 }
 
 impl Emitter<'_> {
-    fn labeled_plan(&self, head: usize, region: Region<'_, '_, '_>, condition: &Condition) -> Option<Plan> {
+    fn labeled_plan(
+        &self,
+        head: usize,
+        region: Region<'_, '_, '_>,
+        condition: &Condition,
+        machine: &Machine<'_, '_>,
+    ) -> Option<Plan> {
         // Bound the lexical scope to an ordinary forward region. A branch
         // into this interval from anywhere other than its head defeats
         // dominance; a transfer out of it before the join defeats ownership.
@@ -60,12 +66,24 @@ impl Emitter<'_> {
         if cfg[tail].successors != [join] || self.explicit_jump(tail, join).is_some() {
             return None;
         }
-        // A direct edge from the head to the normal tail is insufficient:
-        // another test must also reach it. Ordinary if/else diamonds ought
-        // to retain their own representation instead of a gratuitous label.
+        // A nested test must reach the same tail and have an independent
+        // statement in its block. Without a statement, a boolean expression's
+        // true/false materialization can have precisely the same CFG.
         if !cfg[tail].predecessors.iter().any(|&pred| {
             pred > head && pred < tail && cfg[pred].successors.len() == 2
                 && branch(self.instructions[cfg[pred].instructions.end - 1].opcode)
+                && self.instructions[cfg[pred].instructions.start..cfg[pred].instructions.end - 1]
+                    .iter()
+                    .any(|instruction| {
+                        let index = match (instruction.opcode, &instruction.operand) {
+                            (0xb6..=0xb8, Operand::Constant(index))
+                            | (0xb9, Operand::InvokeInterface { index, .. }) => *index,
+                            _ => return false,
+                        };
+                        machine.constant_pool().member_ref(index).is_ok_and(|(_, name, descriptor)| {
+                            !name.starts_with('<') && descriptor.ends_with(")V")
+                        })
+                    })
         }) {
             return None;
         }
@@ -132,7 +150,7 @@ impl Emitter<'_> {
         let plan = if binding.is_none() && machine.this_is_initialized()
             && machine.stack_is_empty() && !self.assertion_starts(head)
         {
-            self.labeled_plan(head, region, &condition)
+            self.labeled_plan(head, region, &condition, machine)
         } else { None };
         let Some(plan) = plan else {
             return self.emit_if(head, region, machine, depth, condition, binding, offsets, control);
