@@ -16,6 +16,8 @@ use crate::{
 
 use super::{DecompileError, FINAL, INTERFACE, MethodMap, STATIC, SYNTHETIC, Writer, parse};
 
+mod boolean;
+
 #[cfg(test)]
 mod tests;
 
@@ -53,6 +55,7 @@ struct Field {
 struct Assignment {
     field: FieldKey,
     instructions: Range<usize>,
+    materialization: Option<Range<u32>>,
     expression: Document,
     helpers: BTreeSet<(u16, u16)>,
 }
@@ -460,8 +463,23 @@ impl<'c> Writer<'_, 'c> {
             Ok(true)
         };
         let mut index = start;
+        let mut materialization = None;
         while index < end {
             let op = &instructions[index];
+            if let Some(tail) = boolean::BooleanTail::read(&instructions[index..end]) {
+                let Operand::Constant(member) = tail.store.operand else {
+                    break;
+                };
+                if tail.store.opcode != expected_store || pool.member_ref(member)?.2 != "Z" {
+                    break;
+                }
+                materialization = tail.lift(&mut machine, instructions[start].offset);
+                if materialization.is_none() {
+                    break;
+                }
+                index += boolean::BooleanTail::STORE_INDEX;
+                continue;
+            }
             if !expression_opcode(op.opcode)
                 || !initializer_local_access(op, mode)
                 || !can_read_fields(op)?
@@ -522,6 +540,7 @@ impl<'c> Writer<'_, 'c> {
                     assignments.push(Assignment {
                         field: field.key,
                         instructions: start..index + 1,
+                        materialization: materialization.take(),
                         expression: value,
                         helpers: std::mem::take(&mut *helpers.borrow_mut()),
                     });
@@ -629,7 +648,14 @@ impl<'c> Writer<'_, 'c> {
                 moved.mappings.push((
                     assignment.field,
                     body.iter()
-                        .filter(|op| op.opcode != 0 && receiver != Some(op.offset))
+                        .filter(|op| {
+                            op.opcode != 0
+                                && receiver != Some(op.offset)
+                                && assignment
+                                    .materialization
+                                    .as_ref()
+                                    .is_none_or(|range| !range.contains(&op.offset))
+                        })
                         .flat_map(|op| op.offset..op.offset + op.len)
                         .collect(),
                 ));
@@ -653,13 +679,20 @@ impl Prefix<'_> {
     fn same_assignment(&self, other: &Self, index: usize) -> bool {
         let left = &self.assignments[index];
         let right = &other.assignments[index];
+        let former = &self.instructions[left.instructions.clone()];
+        let latter = &other.instructions[right.instructions.clone()];
         left.field == right.field
-            && self.instructions[left.instructions.clone()]
-                .iter()
-                .map(|op| (op.opcode, &op.operand))
-                .eq(other.instructions[right.instructions.clone()]
-                    .iter()
-                    .map(|op| (op.opcode, &op.operand)))
+            && former.len() == latter.len()
+            && former.iter().zip(latter).all(|(a, b)| {
+                a.opcode == b.opcode
+                    && match (&a.operand, &b.operand) {
+                        (Operand::Branch(a_target), Operand::Branch(b_target)) => {
+                            i64::from(*a_target) - i64::from(a.offset)
+                                == i64::from(*b_target) - i64::from(b.offset)
+                        }
+                        (left, right) => left == right,
+                    }
+            })
     }
 }
 
@@ -687,10 +720,16 @@ fn initializer_local_access(op: &Instruction, mode: Mode) -> bool {
 }
 
 fn first_boundary(instructions: &[Instruction], code: &Code<'_>) -> Option<u32> {
-    // A removed byte must not be reachable through any path other than this
-    // initial fallthrough, or covered by a <clinit>/constructor catch region.
+    // Only the two edges of a closed boolean materialization are internal.
+    // Any other incoming edge or protected boundary stops prefix removal.
     let mut limit = u32::MAX;
-    for op in instructions {
+    let mut index = 0;
+    while let Some(op) = instructions.get(index) {
+        if boolean::BooleanTail::read(&instructions[index..]).is_some() {
+            index += boolean::BooleanTail::STORE_INDEX;
+            continue;
+        }
+        index += 1;
         // Legacy subroutines have implicit jump targets in addition to the
         // explicit operands. Don't excise any instructions before normalizing.
         if matches!(op.opcode, 0xa8 | 0xa9 | 0xc9) {

@@ -295,6 +295,24 @@ fn common_post_super_assignments_move_once_and_keep_both_constructor_maps() {
 }
 
 #[test]
+fn moves_a_closed_boolean_initializer_with_its_original_source_offsets() {
+    let options = Options {
+        include_line_mappings: true,
+        ..Options::default()
+    };
+    let bytes = include_bytes!("../../../tests/smoke/java8/TestClassVar.class");
+    let source = decompile(bytes, &options).unwrap();
+    let boolean = line_of(&source, "private boolean field_boolean = Math.random() > 0.0;");
+    let integer = line_of(&source, "public int field_int = 0;");
+    assert!(!source.text.contains("TestClassVar()"));
+
+    let map = source.map.unwrap();
+    let offsets = &map.methods.iter().find(|method| method.name == "<init>").unwrap().offsets;
+    let expected = (5..13).map(|offset| (offset, boolean)).chain([(22, integer)]);
+    assert!(offsets.iter().map(|(&offset, &line)| (offset, line)).eq(expected));
+}
+
+#[test]
 fn a_post_super_putfield_on_another_receiver_never_initializes_this() {
     let mut f = Fixture::new();
     let peer = f.field(0x0008, "peer", "Lexample/Fixture;");
