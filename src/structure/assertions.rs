@@ -289,13 +289,18 @@ fn canonical_guard_field(class: &ClassFile<'_>, field: &Member<'_>) -> bool {
 /// Preserve recognizable assertion fields when decompilation is disabled or
 /// the class-wide proof fails, even under generic synthetic-field pruning.
 pub(crate) fn is_guard_field(class: &ClassFile<'_>, field: &Member<'_>) -> bool {
+    has_guard_shape(class, field) && synthetic(&class.pool, field)
+}
+
+/// A recognizable guard can lack the flags needed to replace it with `assert`.
+/// When retained, its assignment belongs to the original class initializer.
+pub(crate) fn has_guard_shape(class: &ClassFile<'_>, field: &Member<'_>) -> bool {
     let pool = &class.pool;
     pool.utf8(field.descriptor_index).ok() == Some("Z")
         && pool.utf8(field.name_index).is_ok_and(|name| {
             name.strip_prefix("$assertionsDisabled")
                 .is_some_and(|suffix| suffix.bytes().all(|byte| byte.is_ascii_digit()))
         })
-        && synthetic(pool, field)
 }
 
 fn package(name: &str) -> &str {

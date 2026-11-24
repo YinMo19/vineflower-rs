@@ -590,6 +590,16 @@ impl Machine<'_, '_> {
             if value.ty == *ty && !matches!(value.source, Source::Null) {
                 continue;
             }
+            // A verified legacy bridge discards its trailing marker. Do not
+            // require a source cast to that deliberately unnameable class.
+            if matches!(value.source, Source::Null)
+                && index + 1 == descriptor.parameters.len()
+                && self.has_anonymous_type(ty)
+                && let Some((owner, "<init>", raw)) = member
+                && self.legacy_constructor_descriptor(owner, raw)?.is_some()
+            {
+                continue;
+            }
             // The core Throwable family exposes one cause-taking overload of
             // each arity. A statically known exception can widen implicitly
             // without risking selection of a different overload.

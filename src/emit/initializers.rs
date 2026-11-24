@@ -49,7 +49,7 @@ struct Field {
     flags: u16,
     visible: bool,
     constant: bool,
-    synthetic: bool,
+    declaration_candidate: bool,
 }
 
 struct Assignment {
@@ -221,6 +221,8 @@ impl<'c> Writer<'_, 'c> {
                         .is_none());
             let synthetic = flags & SYNTHETIC != 0
                 || find_attribute(&field.attributes, pool, "Synthetic")?.is_some();
+            let assertion_scaffold = flags & (STATIC | FINAL) == STATIC | FINAL
+                && crate::structure::assertions::has_guard_shape(class, field);
             fields.insert(
                 (name, descriptor),
                 Field {
@@ -229,7 +231,7 @@ impl<'c> Writer<'_, 'c> {
                     flags,
                     visible,
                     constant,
-                    synthetic,
+                    declaration_candidate: !assertion_scaffold && (is_interface || !synthetic),
                 },
             );
         }
@@ -510,7 +512,7 @@ impl<'c> Writer<'_, 'c> {
                         && field.visible
                         && !field.constant
                         && (field.flags & STATIC != 0) == (mode != Mode::Instance)
-                        && (mode == Mode::Interface || !field.synthetic)
+                        && field.declaration_candidate
                         && previous_field.is_none_or(|previous| field.index > previous)
                 }) else {
                     break;
