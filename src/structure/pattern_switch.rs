@@ -208,17 +208,32 @@ impl Emitter<'_> {
         pending: &mut Vec<u32>,
         resume: &mut Option<usize>,
     ) -> Result<Option<Option<usize>>, StructureError> {
-        let range = self.graph.blocks[block].instructions.clone();
-        if range.is_empty()
-            || region.exception_arm.is_some()
-            || region.protected.is_some()
-            || !self.graph.blocks[block].exception_successors.is_empty()
-        {
-            return Ok(None);
+        let mut range = self.graph.blocks[block].instructions.clone();
+        let protected = region.exception_arm.is_some() || region.protected.is_some()
+            || !self.graph.blocks[block].exception_successors.is_empty();
+        if protected {
+            // The catch parameter has already been lifted. Other exception
+            // block projections can change the dispatch boundaries.
+            if self.exceptions.finally_range(region.exception_arm, block).is_some()
+                || self.exceptions.cleanup_prefix(block) != 0
+                || self.exceptions.return_split(region.exception_arm, block).is_some()
+                || self.exceptions.monitor_acquisition_end(block).is_some()
+                || self.exception_redirects.contains_key(&block)
+            {
+                return Ok(None);
+            }
+            range.start += usize::from(self.exceptions.skips_binding(block));
         }
         let (head, restart) = if let Some(head) = Head::recognize(self.instructions, range.clone(), machine.constant_pool()) {
+            // Selector evaluation and single-shot dispatch share one
+            // handler set. Do not erase any proven cleanup instructions.
+            if protected && (head.setup..range.end).any(|index| self.exceptions.skips_instruction(index)) {
+                return Ok(None);
+            }
             (head, None)
-        } else if let Some((head, proof)) = guards::RestartLoop::recognize(self, block, machine.constant_pool()) {
+        } else if !protected
+            && let Some((head, proof)) = guards::RestartLoop::recognize(self, block, machine.constant_pool())
+        {
             (head, Some(proof))
         } else {
             return Ok(None);
