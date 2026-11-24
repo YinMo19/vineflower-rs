@@ -15,6 +15,7 @@ mod pattern_record;
 mod pattern_switch;
 mod protected;
 mod string_switch;
+mod switch_exit;
 mod switch_expression;
 
 use std::cell::{Cell, RefCell};
@@ -44,6 +45,7 @@ pub(crate) struct Line {
     pub offsets: Vec<u32>,
     pub sequence_boundary: bool,
     loop_break: Option<LoopBreak>,
+    switch_break: Option<usize>,
     labeled_edge: Option<labeled_blocks::EdgeLine>,
     predicate_edge: Option<switch_expression::predicate::Edge>,
     boolean_return: Option<BooleanReturn>,
@@ -58,6 +60,7 @@ impl Line {
             offsets,
             sequence_boundary: false,
             loop_break: None,
+            switch_break: None,
             labeled_edge: None,
             predicate_edge: None,
             boolean_return: None,
@@ -280,6 +283,13 @@ impl Emitter<'_> {
             if !first_header {
                 if region.stop == Some(block) {
                     return Ok(true);
+                }
+                if let Some(scope) = region.switch_exit()
+                    && block == scope.target
+                {
+                    self.require_empty_stack(machine, block)?;
+                    self.lines.push(scope.record(machine, depth, mem::take(pending)));
+                    return Ok(false);
                 }
                 if let Some((scope, transfer)) = region.loop_transfer(block) {
                     self.emit_loop_transfer(
@@ -703,10 +713,12 @@ impl Emitter<'_> {
         }
         let normal_join = self.layout.normal_join(block, region);
         let shared_join = || self.layout.common_join(self.graph, region, [(fallthrough, None), (taken, None)]);
-        // A continue reaches the latch, not the ordinary lexical tail of
-        // this iteration. Prefer a shared body tail when the CFG join
-        // overlooks it because of a continue edge.
-        let join = if normal_join.is_some() && normal_join == region.post_test_latch() {
+        // An enclosing continue or switch break can hide the common tail of
+        // the ordinary paths. Give that tail one owner inside the construct.
+        let switch_exit = region.switch_exit().is_some_and(|scope| {
+            normal_join == Some(scope.target) && machine.stack_is_empty()
+        });
+        let join = if switch_exit || (normal_join.is_some() && normal_join == region.post_test_latch()) {
             shared_join().or(normal_join)
         } else {
             normal_join.or_else(shared_join)
@@ -1466,7 +1478,9 @@ impl Emitter<'_> {
         if machine.has_uninitialized_stack() {
             return Err(self.unstructured(block));
         }
-        let switch_region = region.switch_body(join);
+        let scope = join.filter(|_| labeled_tail.is_none()).map(|target| switch_exit::Scope::new(target, region));
+        let mut switch_region = region.switch_body(join);
+        switch_region.switch_scope = scope.as_ref();
         let has_fallthrough = || {
             let targets = groups.keys().copied();
             targets
@@ -1619,6 +1633,11 @@ impl Emitter<'_> {
             line.depth = depth;
             self.lines.push(line);
         }
+        let normal_count = arms.len();
+        if let Some(scope) = scope {
+            let target_offset = self.offset(scope.target);
+            scope.append_arms(&mut self.lines, start, target_offset, &mut arms)?;
+        }
         if arms.is_empty() {
             return Ok(None);
         }
@@ -1626,7 +1645,7 @@ impl Emitter<'_> {
         let exits = arms.iter().collect::<Vec<_>>();
         let (declarations, assignments) = self.merge_arms(machine, join, &exits)?;
         if let Some((line, trailing_break)) = empty_default
-            && assignments.last().is_some_and(Vec::is_empty)
+            && normal_count.checked_sub(1).and_then(|index| assignments.get(index)).is_some_and(Vec::is_empty)
         {
             // The unmatched selector is a real incoming edge even when it
             // needs no source label. Omit it only after edge-copy analysis.
@@ -1635,18 +1654,7 @@ impl Emitter<'_> {
                 self.lines.remove(line);
             }
         }
-        for (arm, assignments) in arms.into_iter().zip(assignments).rev() {
-            if assignments.is_empty() {
-                continue;
-            }
-            let mut offsets = arm.offsets;
-            self.lines.splice(
-                arm.end..arm.end,
-                assignments
-                    .into_iter()
-                    .map(|text| Line::new(depth + 2, text, mem::take(&mut offsets))),
-            );
-        }
+        switch_exit::write_join_copies(&mut self.lines, arms, assignments, normal_count, depth + 2);
         self.lines.splice(
             start..start,
             declarations

@@ -22,6 +22,7 @@ pub(super) struct Region<'r, 'a, 'c> {
     pub(super) protected: Option<&'r Machine<'a, 'c>>,
     pub(super) exception_arm: Option<ArmId>,
     pub(super) switch_depth: usize,
+    pub(super) switch_scope: Option<&'r super::switch_exit::Scope<'a, 'c>>,
     pub(super) predicate: Option<&'r super::switch_expression::predicate::Scope<'r, 'a, 'c>>,
     loop_scope: Option<&'r LoopScope<'a, 'c>>,
     label_scope: Option<&'r super::labeled_blocks::Scope<'a, 'c>>,
@@ -37,6 +38,7 @@ impl<'r, 'a, 'c> Region<'r, 'a, 'c> {
         exception_arm: None,
         predicate: None,
         switch_depth: 0,
+        switch_scope: None,
         loop_scope: None,
         label_scope: None,
         outer: None,
@@ -76,8 +78,13 @@ impl<'r, 'a, 'c> Region<'r, 'a, 'c> {
     pub(super) fn switch_body(&'r self, stop: Option<usize>) -> Self {
         Self {
             switch_depth: self.switch_depth + 1,
+            switch_scope: None,
             ..self.branch(stop)
         }
+    }
+
+    pub(super) fn switch_exit(self) -> Option<&'r super::switch_exit::Scope<'a, 'c>> {
+        self.switch_scope.filter(|scope| scope.permits(self))
     }
 
     pub(super) fn loop_transfer(&self, block: usize) -> Option<(&'r LoopScope<'a, 'c>, Transfer)> {
