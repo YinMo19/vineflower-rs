@@ -57,12 +57,22 @@ impl ControlFlowGraph {
     /// connected to a virtual exit. A virtual-exit parent or inability to
     /// reach an exit is represented by `None`.
     pub fn immediate_postdominators(&self) -> Vec<Option<usize>> {
+        self.postdominators(|_| false)
+    }
+
+    /// Postdominators after cutting the normal outgoing edges of `terminal`.
+    pub(crate) fn immediate_postdominators_at_cut(&self, terminal: usize) -> Vec<Option<usize>> {
+        self.postdominators(|node| node == terminal)
+    }
+
+    fn postdominators(&self, is_cut: impl Fn(usize) -> bool) -> Vec<Option<usize>> {
+        let is_cut = &is_cut;
         let exit = self.blocks.len();
         let terminals: Vec<_> = self
             .blocks
             .iter()
             .enumerate()
-            .filter_map(|(node, block)| block.successors.is_empty().then_some(node))
+            .filter_map(|(node, block)| (block.successors.is_empty() || is_cut(node)).then_some(node))
             .collect();
         let mut result = dominators(
             exit + 1,
@@ -73,11 +83,11 @@ impl ControlFlowGraph {
                 } else {
                     &self.blocks[node].predecessors
                 };
-                successors.iter().copied()
+                successors.iter().copied().filter(move |&pred| node == exit || !is_cut(pred))
             },
             |node| {
                 let successors = &self.blocks[node].successors;
-                let incoming = if successors.is_empty() {
+                let incoming = if successors.is_empty() || is_cut(node) {
                     std::slice::from_ref(&exit)
                 } else {
                     successors.as_slice()

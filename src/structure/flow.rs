@@ -493,6 +493,26 @@ impl Layout {
         })
     }
 
+    pub(super) fn cut_at_cycle_entry(&mut self, graph: &ControlFlowGraph, header: usize) {
+        self.postdominators = DominanceTree::new(graph.immediate_postdominators_at_cut(header));
+    }
+
+    pub(super) fn install_closed_cycle(&mut self, header: usize, members: &[bool]) {
+        for (block, level) in self.level.iter_mut().enumerate() {
+            if block != header && members[block] {
+                *level = Some(header);
+            }
+        }
+        self.loops[header] = Some(Loop {
+            test: None,
+            post_test: None,
+            exit: None,
+            exception_body: None,
+            wrapped: None,
+            parent: None,
+        });
+    }
+
     pub(super) fn inside(&self, block: usize, region: Region<'_, '_, '_>) -> bool {
         self.containing_loop(block) == region.layout_loop_header && !region.has_stop(block)
     }

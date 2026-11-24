@@ -8,6 +8,7 @@ mod exception_emit;
 mod flow;
 mod for_loops;
 mod instanceof_patterns;
+mod irreducible;
 mod labeled_blocks;
 mod local_joins;
 mod numeric_switch;
@@ -123,21 +124,20 @@ pub(crate) fn structure_with_assertions(
         && let Some((projected, graph, plans)) =
             pattern_record::Plans::prove(instructions, graph, handlers, &mut machine)
     {
-        let exceptions = Exceptions::new(&projected, &graph, &[], Some(&machine))?;
-        return structure_regions(&projected, &graph, machine, &exceptions, None, Some(&plans));
+        return structure_regions(&projected, &graph, machine, &[], None, Some(&plans));
     }
-    let exceptions = Exceptions::new(instructions, graph, handlers, Some(&machine))?;
-    structure_regions(instructions, graph, machine, &exceptions, assertions, None)
+    structure_regions(instructions, graph, machine, handlers, assertions, None)
 }
 
 fn structure_regions(
     instructions: &[Instruction],
     graph: &ControlFlowGraph,
     mut machine: Machine<'_, '_>,
-    exceptions: &Exceptions,
+    handlers: &[ExceptionHandler],
     assertions: Option<&assertions::Sites>,
     record_patterns: Option<&pattern_record::Plans>,
 ) -> Result<Vec<Line>, StructureError> {
+    let exceptions = Exceptions::new(instructions, graph, handlers, Some(&machine))?;
     if graph.blocks.is_empty() {
         if !machine.this_is_initialized() {
             return Err(StructureError::Flow { offset: 0 });
@@ -150,9 +150,9 @@ fn structure_regions(
     {
         machine.track_straight_line_ints();
     }
-    let layout = Layout::with_exceptions(graph, instructions, assertions, exceptions).or_else(|error| {
+    let layout = Layout::with_exceptions(graph, instructions, assertions, &exceptions).or_else(|error| {
         if machine.supports_switch_expressions() {
-            switch_expression::predicate::loop_layout(graph, instructions, assertions, exceptions, error)
+            switch_expression::predicate::loop_layout(graph, instructions, assertions, &exceptions, error)
         } else {
             Err(error)
         }
@@ -161,18 +161,27 @@ fn structure_regions(
         instructions,
         graph,
         layout,
-        exceptions,
+        exceptions: &exceptions,
         exception_redirects: BTreeMap::new(),
         resource_epilogue: None,
         assertions,
         record_patterns,
+        cycle_rollout: None,
         emitted: vec![false; graph.blocks.len()],
         lines: Vec::new(),
     };
     for block in exceptions.synthetic_handler_blocks() {
         emitter.emitted[block] = true;
     }
-    emitter.region(0, Region::METHOD, &mut machine, 0)?;
+    if handlers.is_empty()
+        && assertions.is_none()
+        && record_patterns.is_none()
+        && let Some(cycle) = irreducible::Cycle::prove(instructions, graph, &emitter.layout)
+    {
+        emitter.emit_irreducible_cycle(cycle, &mut machine)?;
+    } else {
+        emitter.region(0, Region::METHOD, &mut machine, 0)?;
+    }
     if !machine.this_is_initialized() {
         return Err(emitter.unstructured(0));
     }
@@ -200,6 +209,7 @@ struct Emitter<'a> {
     resource_epilogue: Option<(usize, u32)>,
     assertions: Option<&'a assertions::Sites>,
     record_patterns: Option<&'a pattern_record::Plans>,
+    cycle_rollout: Option<irreducible::Cycle>,
     emitted: Vec<bool>,
     lines: Vec<Line>,
 }
@@ -297,6 +307,10 @@ impl Emitter<'_> {
                     )?;
                     return Ok(false);
                 }
+            }
+            if let Some(next) = self.try_cycle_rollout(block, region, machine, depth, pending, first_instruction)? {
+                block = next;
+                continue;
             }
             if (!first_header && !self.layout.inside(block, region))
                 || !self.exceptions.contains(region.exception_arm, block)
