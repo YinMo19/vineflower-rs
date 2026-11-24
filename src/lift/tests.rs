@@ -84,6 +84,26 @@ fn implements_every_legal_dup_slot_shape() {
 }
 
 #[test]
+fn binary_promotion_keeps_a_narrower_right_computation_grouped() {
+    let cases: &[(&[u8], &str)] = &[
+        // lconst_1, iconst_1, iconst_2, iadd, i2l, ladd
+        (&[0x0a, 0x04, 0x05, 0x60, 0x85, 0x61], "1L + (1 + 2)"),
+        // Both operands are widened; one explicit long is still necessary.
+        (&[0x04, 0x85, 0x05, 0x85, 0x61], "(long)1 + 2"),
+        // A long shift cannot use its int right operand to promote the left.
+        (&[0x04, 0x85, 0x05, 0x79], "(long)1 << 2"),
+    ];
+    for &(bytes, expected) in cases {
+        with_machine(|mut machine| {
+            for op in decode(bytes).unwrap() {
+                machine.step(&op).unwrap();
+            }
+            assert_eq!(machine.stack[0].text.as_flat(), expected);
+        });
+    }
+}
+
+#[test]
 fn rejects_splitting_a_category_two_value() {
     for opcode in [0x57, 0x59, 0x5a, 0x5b, 0x5f] {
         with_machine(|mut machine| {

@@ -53,13 +53,24 @@ impl Machine<'_, '_> {
                 category.numeric_type(),
             )
         };
-        let left = self.implicit_unboxing(left);
-        let right = self.implicit_unboxing(right);
+        let mut left = self.implicit_unboxing(left);
+        let mut right = self.implicit_unboxing(right);
+        let mut right_promoted = false;
+        if !boolean && category == right_category {
+            // Java binary promotion supplies the widening if the other
+            // operand retains the result type. Prefer keeping the left cast
+            // when both are widened; shifts promote their operands separately.
+            right_promoted = left.ty == ty && right.elide_final_widening(&ty);
+            if !right_promoted && right.ty == ty {
+                left.elide_final_widening(&ty);
+            }
+        }
         // Integral arithmetic at the same width is associative modulo that
         // width; do not regroup a narrower computation or a floating one.
         let reassociate = boolean
             || (matches!(category, Category::Int | Category::Long)
                 && right.ty == ty
+                && !right_promoted
                 && matches!(operator, "+" | "*" | "&" | "|" | "^"));
         let text = left.binary(Infix::new(operator, precedence), &right, reassociate);
         self.push(self.expression(ty, text, precedence, [&left, &right], can_throw)?)
