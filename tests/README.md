@@ -13,9 +13,9 @@ Parity fails on any missing JDK, missing fixture, unsupported capability, source
 
 ### Compiled inputs
 
-`smoke/` contains class files compiled from the corresponding upstream Java 8,
-Java 16 and Jasm inputs with the upstream `testDataClasses` task. The default
-test target compares their emitted source (including source maps where used)
+`smoke/` contains class files from the corresponding upstream Java and Jasm
+inputs. The default target runs focused recovery regressions on these class
+files and, where selected, compares the emitted source and source maps
 against the unchanged goldens, then exercises all six CLI and both bulk cases
 with the checked-in archives.
 
@@ -70,6 +70,7 @@ Exact upstream comparison with all fixture bytecode and required JDKs:
 | Grouped binary layout and Java UTF-16 literal escaping | 127 | 149 | 421 | 0 |
 | Generic local types, assignment widening and Java preview templates | 129 | 146 | 422 | 0 |
 | Constructor argument patterns, record `instanceof`, nested resource returns and Kotlin extensions | 129 | 140 | 428 | 0 |
+| Boolean layout, compact records, nested monitors/resources and typed calls | 135 | 131 | 431 | 0 |
 
 All eight upstream CLI and bulk cases match. The full test remains failing
 until all 697 comparisons match.
