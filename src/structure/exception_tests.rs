@@ -646,6 +646,32 @@ fn primitive_resource_return_can_extend_to_an_exclusive_unprotected_tail() {
         ]
     );
     assert_eq!(lines[1].offsets, [2, 15]);
+
+    // Java 9+ permits the original variable in the resource header when
+    // the copy never appears in the body and its source was not reassigned.
+    let mut frames = [
+        0, 5,
+        255, 0, 14, 0, 3, 7, 0, 9, 7, 0, 9, 1, 0, 0, // 14: normal return
+        255, 0, 1, 0, 2, 7, 0, 9, 7, 0, 9, 0, 1, 7, 0, 15, // 16: primary handler
+        255, 0, 13, 0, 3, 7, 0, 9, 7, 0, 9, 7, 0, 15, 0, 1, 7, 0, 15, // 30: suppression handler
+        255, 0, 5, 0, 3, 7, 0, 9, 7, 0, 9, 7, 0, 15, 0, 0, // 36: rethrow
+        255, 0, 1, 0, 1, 7, 0, 9, 0, 1, 7, 0, 24, // 38: ambient catch
+    ];
+    let descriptor = "(Ljava/lang/AutoCloseable;)I";
+    let lines = test_method_with_descriptor(&bytes, &handlers, &frames, descriptor).unwrap();
+    assert_eq!(lines[0].text, "try (var0) {");
+    assert!(lines[0].offsets.contains(&1));
+
+    let mut reassigned = vec![0x01, 0x4b]; // aconst_null; astore_0
+    reassigned.extend(bytes);
+    frames[4] += 2; // The first stack-map offset moves with the instruction stream.
+    let shifted = handlers.map(|row| {
+        handler(row.start_pc + 2, row.end_pc + 2, row.handler_pc + 2, row.catch_type)
+    });
+    let lines = test_method_with_descriptor(&reassigned, &shifted, &frames, descriptor).unwrap();
+    assert!(
+        lines.iter().any(|line| line.text == "try (java.lang.AutoCloseable var1 = var0) {")
+    );
 }
 
 #[test]

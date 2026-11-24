@@ -438,6 +438,26 @@ impl<'c> Machine<'_, 'c> {
         Some((self.render_type(&local.ty), &local.name))
     }
 
+    pub(crate) fn existing_resource_local(&self, source: u16, alias: u16) -> Option<(&str, bool)> {
+        if source == alias || self.class.major_version < 53 {
+            return None;
+        }
+        let source_binding = self.locals.slots.get(usize::from(source))?.as_ref()?;
+        let alias_binding = self.locals.slots.get(usize::from(alias))?.as_ref()?;
+        let Type::Object(class) = &source_binding.ty else {
+            return None;
+        };
+        if source_binding.receiver
+            || alias_binding.debug_range.is_some()
+            || !self.is_auto_closeable(class)
+        {
+            return None;
+        }
+        let parameter_limit = u16::from(self.method.access_flags & 0x0008 == 0)
+            + self.descriptor.parameters.iter().map(Type::slots).sum::<u16>();
+        Some((&source_binding.name, source < parameter_limit))
+    }
+
     pub(crate) fn forget_resource_local(&mut self, index: u16) {
         if let Some(local) = self.locals.slots.get_mut(usize::from(index)) {
             *local = None;

@@ -14,6 +14,7 @@ use super::{Emitter, Line, Region, StructureError};
 
 struct Resource {
     acquisition: usize,
+    reference_prefix: Option<usize>,
     slot: u16,
     body_stop: usize,
     exit: ResourceExit,
@@ -91,6 +92,7 @@ fn split_resource_declaration(line: &mut Line, depth: usize) {
     line.text.replace_literal_prefix("try (".len(), "");
     line.text.push(';');
     line.depth = depth;
+    line.sequence_boundary = false;
 }
 
 fn merge_nested_resource(lines: &mut Vec<Line>, outer: usize, depth: usize) {
@@ -101,6 +103,7 @@ fn merge_nested_resource(lines: &mut Vec<Line>, outer: usize, depth: usize) {
     // JLS lowering of multiple resources is precisely this nesting:
     // acquire in declaration order, close in reverse, preserving suppression.
     lines.pop();
+    let boundary = lines[outer].sequence_boundary;
     split_resource_declaration(&mut lines[outer], depth + 1);
     let body = if length == 1 {
         split_resource_declaration(&mut lines[inner], depth + 1);
@@ -117,7 +120,9 @@ fn merge_nested_resource(lines: &mut Vec<Line>, outer: usize, depth: usize) {
     for line in &mut lines[body..] {
         line.depth -= 1;
     }
-    lines.insert(outer, Line::new(depth, "try (", Vec::new()));
+    let mut header = Line::new(depth, "try (", Vec::new());
+    header.sequence_boundary = boundary;
+    lines.insert(outer, header);
 }
 
 impl Emitter<'_> {
@@ -409,6 +414,7 @@ impl Emitter<'_> {
             shape,
             Resource {
                 acquisition,
+                reference_prefix: None,
                 slot: legacy.slot,
                 body_stop: shape.join.ok_or(StructureError::ExceptionHandlers)?,
                 exit,
@@ -447,6 +453,40 @@ impl Emitter<'_> {
         .then_some(index)
     }
 
+    fn resource_reference_prefix(
+        &self,
+        shape: &ProtectedRegion,
+        predecessor: usize,
+        alias: u16,
+        declaration: usize,
+        machine: &Machine<'_, '_>,
+    ) -> Option<usize> {
+        let [.., load, _store] = self.block_instructions(predecessor) else {
+            return None;
+        };
+        let source = reference_load(load)?;
+        let (name, parameter) = machine.existing_resource_local(source, alias)?;
+        let text = self.lines[declaration].text.as_flat().strip_suffix(';')?;
+        let (left, right) = text.rsplit_once(" = ")?;
+        if right != name
+            || !self.graph.blocks[shape.start].exception_predecessors.is_empty()
+            || self.exceptions.arm_blocks(shape.body).any(|block| {
+                self.block_instructions(block).iter().any(|op| local_touches(op, alias))
+            })
+        {
+            return None;
+        }
+        // The alias is only a snapshot of the original variable. In source
+        // it can disappear only when that variable is effectively final.
+        let mut stores = self.instructions.iter().filter(|op| is_slot_write(op, source));
+        match (parameter, stores.next()) {
+            (true, None) => {}
+            (false, Some(store)) if store.offset < load.offset && stores.next().is_none() => {}
+            _ => return None,
+        }
+        Some(left.len() + " = ".len())
+    }
+
     fn emit_resource<'a, 'c>(
         &mut self,
         shape: &ProtectedRegion,
@@ -464,6 +504,10 @@ impl Emitter<'_> {
             }
         }
         let line = &mut self.lines[resource.acquisition];
+        if let Some(prefix) = resource.reference_prefix {
+            line.text.replace_literal_prefix(prefix, "");
+            line.sequence_boundary = true;
+        }
         line.text.pop(); // Verified declaration terminator.
         line.text.surround("try (", ") {");
         for block in resource.skipped {
@@ -869,6 +913,9 @@ impl Emitter<'_> {
         }
         Ok(Some(Resource {
             acquisition,
+            reference_prefix: self.resource_reference_prefix(
+                shape, predecessor, slot, acquisition, machine,
+            ),
             slot,
             body_stop,
             exit,
