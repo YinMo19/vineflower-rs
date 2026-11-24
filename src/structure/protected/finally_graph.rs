@@ -6,6 +6,7 @@ use std::ops::Range;
 use crate::bytecode::{Instruction, Operand};
 use crate::cfg::ControlFlowGraph;
 
+use super::monitor::MonitorPlan;
 use super::{Route, local_touches, normal_exits, reference_load, reference_store};
 
 pub(in crate::structure) struct BranchedFinally {
@@ -30,6 +31,7 @@ impl BranchedFinally {
         routes: &[Vec<Route>],
         body: &BTreeSet<usize>,
         handler: usize,
+        monitors: &BTreeMap<usize, &MonitorPlan>,
     ) -> Option<Self> {
         let start = &graph.blocks[handler];
         if handler == 0 || !start.predecessors.is_empty() || body.contains(&handler) {
@@ -47,6 +49,7 @@ impl BranchedFinally {
         } else {
             handler
         };
+        let monitor = monitors.get(&entry).copied();
         let mut cleanup = BTreeSet::new();
         let mut rethrow = None;
         let mut pending = vec![entry];
@@ -84,6 +87,26 @@ impl BranchedFinally {
             return None;
         }
         cleanup.insert(handler);
+        if let Some(monitor) = monitor {
+            for block in monitor.handler_blocks() {
+                if body.contains(&block)
+                    || !cleanup.insert(block)
+                    || instructions[graph.blocks[block].instructions.clone()]
+                        .iter()
+                        .any(|op| local_touches(op, slot))
+                {
+                    return None;
+                }
+            }
+            if monitor.handler_blocks().any(|block| {
+                graph.blocks[block]
+                    .exception_predecessors
+                    .iter()
+                    .any(|pred| !cleanup.contains(pred))
+            }) {
+                return None;
+            }
+        }
         if cleanup.iter().any(|&block| {
             graph.blocks[block]
                 .predecessors
@@ -111,8 +134,13 @@ impl BranchedFinally {
         };
         let mut tails = BTreeSet::new();
         for &sample in &exits {
+            let pair = match (monitor, monitors.get(&sample).copied()) {
+                (Some(pattern), Some(sample)) => Some(MonitorCopy { pattern, sample }),
+                (None, None) => None,
+                _ => return None,
+            };
             let (tail, removed) =
-                result.match_copy(instructions, graph, routes, body, handler, sample)?;
+                result.match_copy(instructions, graph, routes, body, handler, sample, pair)?;
             tails.insert(tail);
             for block in removed {
                 if !result.removed.insert(block) {
@@ -187,6 +215,7 @@ impl BranchedFinally {
         body: &BTreeSet<usize>,
         handler: usize,
         sample_start: usize,
+        monitor: Option<MonitorCopy<'_>>,
     ) -> Option<(usize, BTreeSet<usize>)> {
         let mut paired = BTreeMap::new();
         let mut copies = BTreeSet::new();
@@ -208,7 +237,8 @@ impl BranchedFinally {
             let actual = &graph.blocks[sample];
             let trim = pattern == self.tail;
             if (!trim || !self.tail_code.is_empty())
-                && (routes[sample] != routes[pattern] || !actual.exception_predecessors.is_empty())
+                && (!actual.exception_predecessors.is_empty()
+                    || !same_dispatch(&routes[pattern], &routes[sample], monitor))
             {
                 return None;
             }
@@ -226,6 +256,10 @@ impl BranchedFinally {
                 // successor pairing below proves the corresponding target.
                 expected_code = before_unconditional_jump(expected_code);
                 actual_code = before_unconditional_jump(actual_code);
+            }
+            if let Some(copy) = monitor {
+                (expected_code, actual_code) =
+                    copy.source_code(instructions, pattern, sample, expected_code, actual_code)?;
             }
             if actual_code.len() < expected_code.len()
                 || !actual_code
@@ -253,6 +287,37 @@ impl BranchedFinally {
                 );
             }
         }
+        if let Some(copy) = monitor {
+            if copy.pattern.handler_blocks().count() != copy.sample.handler_blocks().count()
+                || copy.pattern.handler.has_self_protected_prefix()
+                    != copy.sample.handler.has_self_protected_prefix()
+            {
+                return None;
+            }
+            for (pattern, sample) in copy.pattern.handler_blocks().zip(copy.sample.handler_blocks())
+            {
+                let pattern_block = &graph.blocks[pattern];
+                let sample_block = &graph.blocks[sample];
+                if self.blocks.contains(&sample)
+                    || body.contains(&sample)
+                    || !copies.insert(sample)
+                    || !removed.insert(sample)
+                    || !same_dispatch(&routes[pattern], &routes[sample], monitor)
+                    || pattern_block.exception_successors.contains(&copy.pattern.handler.start)
+                        != sample_block.exception_successors.contains(&copy.sample.handler.start)
+                {
+                    return None;
+                }
+            }
+            if copy.sample.handler_blocks().any(|block| {
+                graph.blocks[block]
+                    .exception_predecessors
+                    .iter()
+                    .any(|pred| !removed.contains(pred))
+            }) {
+                return None;
+            }
+        }
         for &sample in &removed {
             if graph.blocks[sample].predecessors.iter().any(|pred| {
                 !removed.contains(pred) && (sample != sample_start || !body.contains(pred))
@@ -262,6 +327,62 @@ impl BranchedFinally {
         }
         Some((continuation?, removed))
     }
+}
+
+#[derive(Clone, Copy)]
+struct MonitorCopy<'a> {
+    pattern: &'a MonitorPlan,
+    sample: &'a MonitorPlan,
+}
+
+impl MonitorCopy<'_> {
+    fn source_code<'a>(
+        self,
+        instructions: &[Instruction],
+        pattern: usize,
+        sample: usize,
+        mut expected: &'a [Instruction],
+        mut actual: &'a [Instruction],
+    ) -> Option<(&'a [Instruction], &'a [Instruction])> {
+        if pattern == self.pattern.acquisition {
+            if sample != self.sample.acquisition {
+                return None;
+            }
+            expected = expected.get(..expected.len().checked_sub(self.pattern.scaffold.len())?)?;
+            actual = actual.get(..actual.len().checked_sub(self.sample.scaffold.len())?)?;
+        } else if sample == self.sample.acquisition {
+            return None;
+        }
+        match (self.pattern.releases.get(&pattern), self.sample.releases.get(&sample)) {
+            (Some(release), Some(copy))
+                if expected.last()?.offset == instructions[release.end - 1].offset
+                    && actual.last()?.offset == instructions[copy.end - 1].offset =>
+            {
+                // Only the confirmed synthetic releases may differ in their
+                // local slot. The acquisition expressions and body stay exact.
+                expected = &expected[..expected.len().checked_sub(release.len())?];
+                actual = &actual[..actual.len().checked_sub(copy.len())?];
+            }
+            (None, None) => {}
+            _ => return None,
+        }
+        Some((expected, actual))
+    }
+}
+
+fn same_dispatch(pattern: &[Route], sample: &[Route], monitor: Option<MonitorCopy<'_>>) -> bool {
+    pattern.len() == sample.len()
+        && pattern.iter().zip(sample).all(|(pattern, sample)| {
+            if let Some(copy) = monitor
+                && pattern.handler == copy.pattern.handler.start
+            {
+                pattern.catch_type == 0
+                    && sample.catch_type == 0
+                    && sample.handler == copy.sample.handler.start
+            } else {
+                pattern == sample
+            }
+        })
 }
 
 fn before_unconditional_jump(code: &[Instruction]) -> &[Instruction] {

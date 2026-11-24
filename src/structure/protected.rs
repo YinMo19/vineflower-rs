@@ -168,50 +168,71 @@ impl Exceptions {
         if let Some(machine) = machine {
             result.classify_legacy_resources(instructions, graph, &mut table, machine)?;
         }
+        let mut monitors = BTreeMap::new();
+        // Prove lock ownership before comparing duplicated finally bodies:
+        // the compiler can allocate different synthetic slots in each copy.
+        for (covered, routes) in &table.by_range {
+            let Some(route) = routes.iter().find(|route| route.catch_type == 0) else {
+                continue;
+            };
+            if Some(route) != routes.last() {
+                return Err(unsupported());
+            }
+            let Some(handler) = table.monitor_handlers.remove(&route.handler) else {
+                continue;
+            };
+            if routes.len() != 1 {
+                return Err(unsupported());
+            }
+            let body = covered.iter().copied().collect();
+            let monitor =
+                MonitorPlan::prove(instructions, graph, &body, handler).ok_or_else(unsupported)?;
+            if result
+                .monitor_acquisitions
+                .insert(monitor.acquisition, monitor.scaffold.start)
+                .is_some()
+            {
+                return Err(unsupported());
+            }
+            for release in monitor.releases.values() {
+                for instruction in release.clone() {
+                    if !result.omitted_instructions.insert(instruction) {
+                        return Err(unsupported());
+                    }
+                }
+            }
+            monitors.insert(route.handler, monitor);
+        }
         let mut cleanups = BTreeMap::new();
+        let by_acquisition = monitors
+            .values()
+            .map(|monitor| (monitor.acquisition, monitor))
+            .collect();
         // Register verified normal copies before classifying bodies. A copy
         // can be an exit of both a finally and its nested typed catch.
         for (covered, routes) in &table.by_range {
-            if let Some(route) = routes.iter().find(|route| route.catch_type == 0) {
-                if Some(route) != routes.last() {
-                    return Err(unsupported());
-                }
+            if let Some(route) = routes.iter().find(|route| route.catch_type == 0)
+                && !monitors.contains_key(&route.handler)
+            {
                 let body = covered.iter().copied().collect();
-                let plan = if let Some(handler) = table.monitor_handlers.remove(&route.handler) {
-                    if routes.len() != 1 {
-                        return Err(unsupported());
-                    }
-                    let monitor = MonitorPlan::prove(instructions, graph, &body, handler)
-                        .ok_or_else(unsupported)?;
-                    if result
-                        .monitor_acquisitions
-                        .insert(monitor.acquisition, monitor.scaffold.start)
-                        .is_some()
-                    {
-                        return Err(unsupported());
-                    }
-                    for release in monitor.releases.values() {
-                        for instruction in release.clone() {
-                            if !result.omitted_instructions.insert(instruction) {
-                                return Err(unsupported());
-                            }
-                        }
-                    }
-                    CleanupPlan::Monitor(monitor)
-                } else {
-                    CleanupPlan::Finally(result.prepare_cleanup(
-                        instructions,
-                        graph,
-                        &table,
-                        &body,
-                        route.handler,
-                    )?)
-                };
-                if cleanups.insert(route.handler, plan).is_some() {
+                let plan = result.prepare_cleanup(
+                    instructions,
+                    graph,
+                    &table,
+                    &body,
+                    route.handler,
+                    &by_acquisition,
+                )?;
+                if cleanups.insert(route.handler, CleanupPlan::Finally(plan)).is_some() {
                     return Err(unsupported());
                 }
             }
         }
+        cleanups.extend(
+            monitors
+                .into_iter()
+                .map(|(handler, plan)| (handler, CleanupPlan::Monitor(plan))),
+        );
         for (covered, routes) in &table.by_range {
             result.classify(
                 instructions,
@@ -616,6 +637,7 @@ impl Exceptions {
         table: &Table,
         body: &BTreeSet<usize>,
         handler: usize,
+        monitors: &BTreeMap<usize, &MonitorPlan>,
     ) -> Result<Cleanup, StructureError> {
         let node = &graph.blocks[handler];
         let head = if node.instructions.len() == 1 {
@@ -632,7 +654,7 @@ impl Exceptions {
             return Ok(plan);
         }
         let mut branch =
-            BranchedFinally::prove(instructions, graph, &table.by_block, body, handler)
+            BranchedFinally::prove(instructions, graph, &table.by_block, body, handler, monitors)
                 .ok_or_else(unsupported)?;
         for &copy in &branch.removed {
             if self.cleanup_prefixes.contains_key(&copy)
@@ -1004,6 +1026,11 @@ impl Table {
                             .get(&handler)
                             .is_some_and(MonitorHandler::has_self_protected_prefix))
                 {
+                    if !own_exception_store && !by_block[block].is_empty() {
+                        // Retrying monitorexit is synthetic only when the
+                        // self-row wins over enclosing exception handlers.
+                        return Err(unsupported());
+                    }
                     continue;
                 }
                 if !by_block[block].contains(&route) {

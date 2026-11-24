@@ -10,7 +10,9 @@ use super::{local_touches, reference_load, reference_store};
 
 pub(super) struct MonitorHandler {
     pub(super) start: usize,
+    release: usize,
     pub(super) rethrow: usize,
+    throwable: Option<u16>,
     slot: u16,
 }
 
@@ -31,32 +33,37 @@ impl MonitorHandler {
         if start == 0 || !entry.predecessors.is_empty() {
             return None;
         }
-        let code = &instructions[entry.instructions.clone()];
-        let (exception, released, suffix) = match code {
-            [store, lock, release, suffix @ ..]
-                if release.opcode == 0xc3 && reference_store(store).is_some() =>
-            {
-                (reference_store(store), reference_load(lock)?, suffix)
-            }
-            [lock, release, suffix @ ..] if release.opcode == 0xc3 => {
-                (None, reference_load(lock)?, suffix)
-            }
-            _ => return None,
+        let mut code = &instructions[entry.instructions.clone()];
+        let (release, exception) = if let [store] = code
+            && let Some(slot) = reference_store(store)
+        {
+            // Kotlin can protect only the handler's initial astore.
+            let next = exclusive_successor(graph, start)?;
+            code = &instructions[graph.blocks[next].instructions.clone()];
+            (next, Some(slot))
+        } else if let [store, rest @ ..] = code
+            && let Some(slot) = reference_store(store)
+        {
+            code = rest;
+            (start, Some(slot))
+        } else {
+            (start, None)
         };
+        let [lock, exit, suffix @ ..] = code else {
+            return None;
+        };
+        if exit.opcode != 0xc3 {
+            return None;
+        }
+        let released = reference_load(lock)?;
         if exception == Some(released) {
             return None;
         }
         let (rethrow, suffix) = if suffix.is_empty() {
-            let &[next] = entry.successors.as_slice() else {
-                return None;
-            };
-            let next_block = &graph.blocks[next];
-            if next_block.predecessors != [start] || !next_block.exception_predecessors.is_empty() {
-                return None;
-            }
-            (next, &instructions[next_block.instructions.clone()])
+            let next = exclusive_successor(graph, release)?;
+            (next, &instructions[graph.blocks[next].instructions.clone()])
         } else {
-            (start, suffix)
+            (release, suffix)
         };
         match (exception, suffix) {
             (Some(exception), [load, throw])
@@ -66,7 +73,9 @@ impl MonitorHandler {
         }
         graph.blocks[rethrow].successors.is_empty().then_some(Self {
             start,
+            release,
             rethrow,
+            throwable: exception,
             slot: released,
         })
     }
@@ -74,8 +83,23 @@ impl MonitorHandler {
     pub(super) fn has_self_protected_prefix(&self) -> bool {
         // The edge retries the release only. Including the rethrow itself
         // would change exception dispatch, not just guard a compiler epilogue.
-        self.start != self.rethrow
+        self.start == self.release && self.start != self.rethrow
     }
+
+    fn blocks(&self) -> impl Iterator<Item = usize> {
+        std::iter::once(self.start)
+            .chain((self.release != self.start).then_some(self.release))
+            .chain((self.rethrow != self.release).then_some(self.rethrow))
+    }
+}
+
+fn exclusive_successor(graph: &ControlFlowGraph, block: usize) -> Option<usize> {
+    let &[next] = graph.blocks[block].successors.as_slice() else {
+        return None;
+    };
+    let next_block = &graph.blocks[next];
+    (next_block.predecessors == [block] && next_block.exception_predecessors.is_empty())
+        .then_some(next)
 }
 
 impl MonitorPlan {
@@ -85,7 +109,7 @@ impl MonitorPlan {
         body: &BTreeSet<usize>,
         handler: MonitorHandler,
     ) -> Option<Self> {
-        if body.contains(&handler.start) || body.contains(&handler.rethrow) {
+        if handler.blocks().any(|block| body.contains(&block)) {
             return None;
         }
         let slot = handler.slot;
@@ -178,7 +202,21 @@ impl MonitorPlan {
                 .iter()
                 .copied(),
         );
-        if escapes(instructions, graph, slot, unlocked) {
+        unlocked.extend(graph.blocks[acquisition].exception_successors.iter().copied());
+        if escapes(instructions, graph, slot, unlocked)
+            || handler.throwable.is_some_and(|throwable| {
+                escapes(
+                    instructions,
+                    graph,
+                    throwable,
+                    graph.blocks[handler.rethrow]
+                        .exception_successors
+                        .iter()
+                        .copied()
+                        .collect(),
+                )
+            })
+        {
             return None;
         }
         Some(Self {
@@ -198,8 +236,7 @@ impl MonitorPlan {
     }
 
     pub(in crate::structure) fn handler_blocks(&self) -> impl Iterator<Item = usize> {
-        std::iter::once(self.handler.start)
-            .chain((self.handler.rethrow != self.handler.start).then_some(self.handler.rethrow))
+        self.handler.blocks()
     }
 }
 

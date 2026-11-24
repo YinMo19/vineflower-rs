@@ -953,6 +953,80 @@ fn synchronized_owns_the_same_monitor_on_both_exit_paths() {
 }
 
 #[test]
+fn synchronized_finally_copies_can_use_distinct_synthetic_slots() {
+    // javac's TestSynchronizedTry.test1 layout, with C.work() in each body
+    // and a second parameter to exercise genuinely different lock objects.
+    let mut bytes = [
+        0x2a, 0x59, 0x4d, 0xc2, // 0: acquire the try-body monitor
+        0x00, 0xb8, 0, 22, // 4: work
+        0x2c, 0xc3, // 8: release
+        0xa7, 0, 8, // 10: goto 18
+        0x4e, 0x2c, 0xc3, // 13: exception and release
+        0x2d, 0xbf, // 16: rethrow
+        0x2a, 0x59, 0x4d, 0xc2, // 18: acquire the normal cleanup monitor
+        0x00, 0xb8, 0, 22, // 22: work
+        0x2c, 0xc3, // 26: release
+        0xa7, 0, 8, // 28: goto 36
+        0x4e, 0x2c, 0xc3, // 31: exception and release
+        0x2d, 0xbf, // 34: rethrow
+        0xa7, 0, 31, // 36: goto 67
+        0x3a, 4, // 39: finally handler saves the throwable
+        0x2a, 0x59, 0x3a, 5, 0xc2, // 41: acquire the exceptional cleanup monitor
+        0x00, 0xb8, 0, 22, // 46: work
+        0x19, 5, 0xc3, // 50: release
+        0xa7, 0, 11, // 53: goto 64
+        0x3a, 3, 0x19, 5, 0xc3, // 56: exception and release
+        0x19, 3, 0xbf, // 61: rethrow failure from synchronized
+        0x19, 4, 0xbf, // 64: rethrow original failure
+        0xb1, // 67: return
+    ];
+    let mut handlers = [
+        handler(4, 10, 13, 0),
+        handler(13, 16, 13, 0),
+        handler(22, 28, 31, 0),
+        handler(31, 34, 31, 0),
+        handler(0, 18, 39, 0),
+        handler(46, 53, 56, 0),
+        handler(56, 61, 56, 0),
+        handler(39, 41, 39, 0),
+    ];
+    let descriptor = "(Ljava/lang/Object;Ljava/lang/Object;)V";
+    let lines = test_method_with_descriptor(&bytes, &handlers, &[], descriptor).unwrap();
+    assert_eq!(
+        lines
+            .iter()
+            .map(|line| (line.depth, line.text.as_flat()))
+            .collect::<Vec<_>>(),
+        [
+            (0, "try {"),
+            (1, "synchronized (var0) {"),
+            (2, "work();"),
+            (1, "}"),
+            (0, "} finally {"),
+            (1, "synchronized (var0) {"),
+            (2, "work();"),
+            (1, "}"),
+            (0, "}"),
+            (0, "return;"),
+        ]
+    );
+
+    // The exceptional copy must evaluate the same lock expression.
+    bytes[41] = 0x2b; // aload_1
+    assert!(matches!(classify(&bytes, &handlers).1, Err(StructureError::ExceptionHandlers)));
+    bytes[41] = 0x2a;
+
+    // A different reference on just one release is not synthetic.
+    bytes[51] = 1; // aload 1
+    assert!(matches!(classify(&bytes, &handlers).1, Err(StructureError::ExceptionHandlers)));
+    bytes[51] = 5;
+
+    // An enclosing catch-all must not intercept the inner monitor retry.
+    handlers.swap(1, 4);
+    assert!(matches!(classify(&bytes, &handlers).1, Err(StructureError::ExceptionHandlers)));
+}
+
+#[test]
 fn synchronized_can_release_outside_an_older_protected_range() {
     let bytes = [
         0x2a, 0x4c, 0x2b, 0xc2, // 0: aload_0; astore_1; aload_1; monitorenter
@@ -963,6 +1037,24 @@ fn synchronized_can_release_outside_an_older_protected_range() {
         0xb1, // 15: return
     ];
     let handlers = [handler(4, 7, 12, 0)];
+    let lines = test_method(&bytes, &handlers, &[]).unwrap();
+    assert_eq!(lines[0].text, "synchronized (var0) {");
+    assert_eq!(lines[1].text, "work();");
+    assert_eq!(lines[3].text, "return;");
+}
+
+#[test]
+fn synchronized_handler_may_protect_only_its_exception_store() {
+    let bytes = [
+        0x2a, 0x4c, 0x2b, 0xc2, // 0: aload_0; astore_1; aload_1; monitorenter
+        0xb8, 0, 22, // 4: work
+        0x2b, 0xc3, // 7: release outside the protected range
+        0xa7, 0, 8, // 9: goto 17
+        0x4d, // 12: isolated, self-protected throwable store
+        0x2b, 0xc3, 0x2c, 0xbf, // 13: release and rethrow
+        0xb1, // 17: return
+    ];
+    let handlers = [handler(4, 7, 12, 0), handler(12, 13, 12, 0)];
     let lines = test_method(&bytes, &handlers, &[]).unwrap();
     assert_eq!(lines[0].text, "synchronized (var0) {");
     assert_eq!(lines[1].text, "work();");
