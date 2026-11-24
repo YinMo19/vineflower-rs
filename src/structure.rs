@@ -12,6 +12,7 @@ mod for_loops;
 mod instanceof_patterns;
 #[cfg(test)]
 mod join_tests;
+mod labeled_blocks;
 mod local_joins;
 mod pattern_switch;
 mod protected;
@@ -46,6 +47,7 @@ pub(crate) struct Line {
     pub offsets: Vec<u32>,
     pub sequence_boundary: bool,
     loop_break: Option<LoopBreak>,
+    labeled_edge: Option<labeled_blocks::EdgeLine>,
     boolean_return: Option<BooleanReturn>,
     detached_declaration: bool,
 }
@@ -58,6 +60,7 @@ impl Line {
             offsets,
             sequence_boundary: false,
             loop_break: None,
+            labeled_edge: None,
             boolean_return: None,
             detached_declaration: false,
         }
@@ -292,6 +295,7 @@ impl Emitter<'_> {
                 }
             }
             self.emitted[block] = true;
+            let first_line = self.lines.len();
             let (tail, binding) = if let Some(start) = start {
                 (
                     self.lift_if_arm_start(
@@ -322,6 +326,9 @@ impl Emitter<'_> {
                     if self.graph.block_at(target) != Some(next) {
                         return Err(self.unstructured(block));
                     }
+                    if self.record_labeled_break(block, next, region, machine, depth, first_line, &mut offsets)? {
+                        return Ok(false);
+                    }
                     block = next;
                     *pending = offsets;
                 }
@@ -338,7 +345,7 @@ impl Emitter<'_> {
                         when_false,
                     };
                     let control = control.expect("conditional control schedule");
-                    let Some(next) = self.emit_if(
+                    let Some(next) = self.emit_if_or_labeled(
                         block,
                         region,
                         machine,
@@ -548,6 +555,7 @@ impl Emitter<'_> {
         let condition_facts = machine.last_boolean_condition();
         let held = machine.hold_control_stack(&control)?;
         let prelude = machine.take_prelude();
+        let labeled_tail = region.label_scope().and_then(|scope| scope.head_tail(block));
         if let Some(local) = &mut binding {
             if !self.collapse_instanceof_guard(
                 block,
@@ -561,7 +569,7 @@ impl Emitter<'_> {
             )? {
                 binding = None;
             }
-        } else if let Some(proof) = self.collapse_instanceof_prefix(
+        } else if labeled_tail.is_none() && let Some(proof) = self.collapse_instanceof_prefix(
             block,
             region,
             machine,
@@ -571,7 +579,7 @@ impl Emitter<'_> {
             &mut control,
         )? {
             binding = proof;
-        } else {
+        } else if labeled_tail.is_none() {
             self.collapse_condition(
                 block,
                 region,
@@ -631,6 +639,7 @@ impl Emitter<'_> {
                 (region.stop == Some(next) || self.layout.inside(next, region)).then_some(next)
             })
             .or(region.stop);
+        let join = labeled_tail.or(join);
         let guard_clause = binding
             .as_ref()
             .is_some_and(|binding| join.is_some_and(|next| binding.succeeds_at(next)));

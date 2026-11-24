@@ -23,6 +23,7 @@ pub(super) struct Region<'r, 'a, 'c> {
     pub(super) exception_arm: Option<ArmId>,
     pub(super) switch_depth: usize,
     loop_scope: Option<&'r LoopScope<'a, 'c>>,
+    label_scope: Option<&'r super::labeled_blocks::Scope<'a, 'c>>,
     outer: Option<&'r Region<'r, 'a, 'c>>,
 }
 
@@ -35,6 +36,7 @@ impl<'r, 'a, 'c> Region<'r, 'a, 'c> {
         exception_arm: None,
         switch_depth: 0,
         loop_scope: None,
+        label_scope: None,
         outer: None,
     };
 
@@ -44,6 +46,14 @@ impl<'r, 'a, 'c> Region<'r, 'a, 'c> {
             outer: Some(self),
             ..*self
         }
+    }
+
+    pub(super) fn label_body(&'r self, scope: &'r super::labeled_blocks::Scope<'a, 'c>, stop: Option<usize>) -> Self {
+        Self { label_scope: Some(scope), ..self.branch(stop) }
+    }
+
+    pub(super) fn label_scope(&self) -> Option<&'r super::labeled_blocks::Scope<'a, 'c>> {
+        self.label_scope
     }
 
     pub(super) fn loop_body(&'r self, scope: &'r LoopScope<'a, 'c>) -> Self {
