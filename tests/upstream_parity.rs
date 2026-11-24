@@ -236,6 +236,11 @@ fn upstream_source_goldens_without_jdk() {
             true,
         ),
         (
+            "TestCompoundAssignment",
+            include_bytes!("smoke/java8/TestCompoundAssignment.class"),
+            true,
+        ),
+        (
             "TestPrimitiveTypeClasses",
             include_bytes!("smoke/java8/TestPrimitiveTypeClasses.class"),
             true,

@@ -12,6 +12,7 @@ use super::{
         ADDITIVE, BIT_AND, BIT_OR, BIT_XOR, BOOLEAN, Category, Expr, INT, MULTIPLICATIVE,
         Order, PRIMARY, SHIFT, Source, UNARY,
     },
+    operations::array_store_opcode,
 };
 
 #[cfg(test)]
@@ -208,6 +209,7 @@ impl Access {
 enum Target {
     Local(LocalWrite),
     Access(Access),
+    ArrayAssignment,
 }
 
 impl Target {
@@ -215,6 +217,7 @@ impl Target {
         match self {
             Self::Local(_) => 0,
             Self::Access(access) => access.address_values(),
+            Self::ArrayAssignment => 2,
         }
     }
 
@@ -352,9 +355,16 @@ impl Machine<'_, '_> {
         if operands == 3 {
             self.pop_raw()?;
         }
-        for _ in 0..target.address_values() {
-            self.pop_raw()?;
-        }
+        let array_target = if matches!(target, Target::ArrayAssignment) {
+            let index = self.pop_raw()?;
+            let array = self.pop_raw()?;
+            Some(self.array_write_target(array, index))
+        } else {
+            for _ in 0..target.address_values() {
+                self.pop_raw()?;
+            }
+            None
+        };
         let ty = left.as_ref().unwrap_or(&right).ty.clone();
         self.offset = store.offset;
         self.opcode = store.opcode;
@@ -364,6 +374,7 @@ impl Machine<'_, '_> {
         }
         let (access, declaration) = match target {
             Target::Local(target) => self.commit_assignment_local(store, target, &ty, declaration),
+            Target::ArrayAssignment => (array_target.expect("verified array address"), None),
             // Keep the exact target spelling, layout, and symbol reference.
             // The saved address must not be reevaluated as a second access.
             Target::Access(_) => (left.map_or_else(|| std::mem::take(&mut right.text), |left| left.text), None),
@@ -399,6 +410,30 @@ impl Machine<'_, '_> {
             return None;
         }
         let second = ops.get(1)?;
+        if (0x4f..=0x56).contains(&second.opcode) {
+            let [.., array, index] = prefix else { return None };
+            let Type::Array(component) = &array.ty else { return None };
+            let target = Target::ArrayAssignment;
+            // A JVM duplicate keeps the pre-store value. If the source
+            // assignment narrows it or changes its Java type, the surviving
+            // value cannot be substituted by the assignment expression.
+            if !matches!(**component, Type::Primitive(_))
+                || **component != value.ty
+                || second.opcode != array_store_opcode(component)
+                || Category::of(&index.ty) != Some(Category::Int)
+                || matches!(index.source, Source::Comparison(_))
+                || ops[0].opcode != target.dup_opcode(&value.ty)
+                || self.stack_slots + u32::from(value.ty.slots()) > self.max_stack
+            {
+                return None;
+            }
+            let order = self.order_of([array, index, value], false).ok()?;
+            let order = self.join_order(order, Order::at(second.offset)).ok()?;
+            return Some((2, Candidate {
+                store: second, target, form: Form::Assign, order: Some(order),
+                operands: 1, leaves_value: true, declaration: false,
+            }));
+        }
         if let Some(target) = LocalWrite::of(second) {
             if ops[0].opcode != target.dup_opcode() || Category::of(&value.ty) != Some(target.category)
                 || self.stack_slots + u32::from(value.ty.slots()) > self.max_stack

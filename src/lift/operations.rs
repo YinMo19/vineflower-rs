@@ -312,7 +312,6 @@ impl Machine<'_, '_> {
         };
         let value = self.pop_category(category)?;
         let index = self.pop_category(Category::Int)?;
-        let index = self.as_int(self.implicit_unboxing(index));
         let (mut array, component) = self.array_operand(kind)?;
         let value = if kind == 4 {
             if !matches!(value.source, Source::Null)
@@ -329,13 +328,20 @@ impl Machine<'_, '_> {
         };
         let order = self.order_of([&array, &index, &value], true)?;
         self.before_statement(order)?;
-        let mut text = array.into_at(PRIMARY);
-        text.push('[');
-        text.append(index.text);
-        text.push_str("] = ");
+        let mut text = self.array_write_target(array, index);
+        text.push_str(" = ");
         text.append(value.text);
         text.push(';');
         Ok(Effect::Statement(text))
+    }
+
+    pub(super) fn array_write_target(&self, array: Expr, index: Expr) -> Document {
+        let index = self.as_int(self.implicit_unboxing(index));
+        let mut text = array.into_at(PRIMARY);
+        text.push('[');
+        text.append(index.text);
+        text.push(']');
+        text
     }
 
     fn array_operand(&mut self, kind: u8) -> Result<(Expr, Type), LiftError> {
@@ -502,5 +508,20 @@ impl Machine<'_, '_> {
             text.append(name);
             self.push(self.expression(BOOLEAN, text, RELATIONAL, [&value], true)?)
         }
+    }
+}
+
+pub(super) fn array_store_opcode(component: &Type) -> u8 {
+    use Primitive::*;
+    match component {
+        Type::Primitive(Int) => 0x4f,
+        Type::Primitive(Long) => 0x50,
+        Type::Primitive(Float) => 0x51,
+        Type::Primitive(Double) => 0x52,
+        Type::Object(_) | Type::Array(_) => 0x53,
+        Type::Primitive(Boolean | Byte) => 0x54,
+        Type::Primitive(Char) => 0x55,
+        Type::Primitive(Short) => 0x56,
+        Type::Void => unreachable!("JVM array components are nonvoid"),
     }
 }

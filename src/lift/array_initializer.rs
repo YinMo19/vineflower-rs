@@ -12,6 +12,7 @@ use crate::{
 use super::{
     Effect, LiftError, Machine,
     expr::{Category, Expr, INT, Order, Source, UNARY},
+    operations::array_store_opcode,
 };
 
 #[cfg(test)]
@@ -253,7 +254,7 @@ impl Machine<'_, '_> {
         if rank > 255 {
             return None;
         }
-        let store = store_opcode(component);
+        let store = array_store_opcode(component);
         let local_receiver = temporary.filter(|_| start == 0);
         let first_receiver = start + 1 + usize::from(local_receiver.is_some());
         if local_receiver.is_some() && !permits(start + 1, instructions.get(start + 1)?) {
@@ -544,21 +545,6 @@ fn local_load(op: &Instruction) -> Option<(u16, Category)> {
         _ => return None,
     };
     Some((slot, Category::for_local(kind)))
-}
-
-fn store_opcode(component: &Type) -> u8 {
-    use Primitive::*;
-    match component {
-        Type::Primitive(Int) => 0x4f,
-        Type::Primitive(Long) => 0x50,
-        Type::Primitive(Float) => 0x51,
-        Type::Primitive(Double) => 0x52,
-        Type::Object(_) | Type::Array(_) => 0x53,
-        Type::Primitive(Boolean | Byte) => 0x54,
-        Type::Primitive(Char) => 0x55,
-        Type::Primitive(Short) => 0x56,
-        Type::Void => unreachable!("JVM array components are nonvoid"),
-    }
 }
 
 fn allows_contiguous(instructions: &[Instruction], index: usize, op: &Instruction) -> bool {

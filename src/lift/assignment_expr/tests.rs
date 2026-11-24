@@ -163,6 +163,25 @@ fn receiver_and_index_effects_stay_single_and_ordered() {
 }
 
 #[test]
+fn array_store_as_an_expression_preserves_order_width_and_the_unconverted_value() {
+    let ints = [0xb8, 0, 28, 0xb8, 0, 24, 0x1a, 0x5b, 0x4f, 0xac];
+    let lines = lift(&ints, "(I)I", true);
+    assert_eq!(texts(&lines), ["return Example.getArray()[Example.index()] = var0;"]);
+
+    let longs = [0x2a, 0x1b, 0x20, 0x5e, 0x50, 0xad];
+    let lines = lift(&longs, "([JIJ)J", true);
+    assert_eq!(texts(&lines), ["return var0[var1] = var2;"]);
+
+    let narrowing = [0x2a, 0x1b, 0x1c, 0x5b, 0x54, 0xac];
+    with_machine(&narrowing, "([BII)I", true, |mut machine| {
+        let ops = decode(&narrowing).unwrap();
+        for op in &ops[..3] { machine.step(op).unwrap(); }
+        // The JVM keeps the original int, not the resulting byte.
+        assert!(machine.step_assignment(&ops[3..], |_, _| true).unwrap().is_none());
+    });
+}
+
+#[test]
 fn rejected_inline_store_does_not_mutate_the_pending_constructor_arguments() {
     let bytes = [0xbb, 0, 2, 0x59, 0x1a, 0x59, 0x3c, 0xb7, 0, 16, 0xb0];
     with_machine(&bytes, "(I)LExample;", true, |mut machine| {
