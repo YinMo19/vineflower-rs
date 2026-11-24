@@ -8,6 +8,8 @@ use crate::{
     source_text::Document,
 };
 
+mod field_accessor;
+
 use super::{
     Effect, LiftError, Machine,
     expr::{Category, Expr, PRIMARY, Source},
@@ -293,9 +295,7 @@ impl Machine<'_, '_> {
         let Some(group) = self.group.filter(|_| self.options.decompile_inner) else {
             return Ok(None);
         };
-        if !name.starts_with("access$")
-            || group.compilation_root(owner) != group.compilation_root(self.owner)
-        {
+        if !name.starts_with("access$") {
             return Ok(None);
         }
         let Some(class) = group.get(owner) else {
@@ -310,29 +310,47 @@ impl Machine<'_, '_> {
                 && (method.access_flags & 0x1000 != 0
                     || find_attribute(&method.attributes, pool, "Synthetic")?.is_some())
             {
-                accessor = method.code(pool)?;
+                accessor = Some(method);
                 break;
             }
         }
-        let Some(code) = accessor else {
+        let Some(accessor) = accessor else {
             return Ok(None);
         };
-        let fail = || self.unsupported("synthetic nest accessor is not a direct forwarding member");
-        if !code.exceptions.is_empty() {
+        let fail = || self.unsupported("unproven synthetic nest accessor");
+        if group.compilation_root(owner) != group.compilation_root(self.owner)
+            || accessor.access_flags & 0x0020 != 0
+        {
+            return Err(fail());
+        }
+        let code = accessor.code(pool)?.ok_or_else(fail)?;
+        if !code.exceptions.is_empty()
+            || signature.parameters.iter().map(Type::slots).sum::<u16>() > code.max_locals
+        {
             return Err(fail());
         }
         let instructions = bytecode::decode(code.bytes).map_err(|_| fail())?;
-        let Some((before_return, ret)) = instructions.split_last().map(|(ret, body)| (body, ret))
-        else {
+        let Some((ret, before_return)) = instructions.split_last() else {
             return Err(fail());
         };
+        if return_opcode(&signature.return_type) != ret.opcode {
+            return Err(fail());
+        }
         let Some((member, loads)) = before_return.split_last() else {
             return Err(fail());
         };
-        if return_opcode(&signature.return_type) != ret.opcode
-            || loads.len() != signature.parameters.len()
-            || !matches!(member.opcode, 0xb2..=0xb9)
-        {
+        if matches!(member.opcode, 0xb2..=0xb5) {
+            let field = field_accessor::FieldAccessor::recognize(
+                class,
+                owner,
+                signature,
+                before_return,
+                code.max_stack,
+            )?
+            .ok_or_else(fail)?;
+            return self.emit_field_accessor(owner, signature, args, field).map(Some);
+        }
+        if loads.len() != signature.parameters.len() || !matches!(member.opcode, 0xb6..=0xb9) {
             return Err(fail());
         }
         let mut slot = 0;
@@ -352,7 +370,7 @@ impl Machine<'_, '_> {
         if target_owner != owner || name.starts_with('<') {
             return Err(fail());
         }
-        let is_static = matches!(member.opcode, 0xb2 | 0xb3 | 0xb8);
+        let is_static = member.opcode == 0xb8;
         let skip = usize::from(!is_static);
         let (mut qualifier, passed) = if is_static {
             (self.class_reference(owner), args)
@@ -365,31 +383,6 @@ impl Machine<'_, '_> {
             }
             (receiver.at(PRIMARY).into_owned(), passed)
         };
-        if member.opcode < 0xb6 {
-            let field_type = Type::parse(target_descriptor)?;
-            let source = self.source_field_name(owner, name, target_descriptor);
-            qualifier.push('.');
-            self.append_field_reference(&mut qualifier, source, owner, name, target_descriptor);
-            if matches!(member.opcode, 0xb3 | 0xb5) {
-                if signature.parameters[skip..] != [field_type]
-                    || signature.return_type != Type::Void
-                {
-                    return Err(fail());
-                }
-                let [value] = passed else { return Err(fail()) };
-                let order = self.order_of(args, true)?;
-                self.before_statement(order)?;
-                return Ok(Some(Effect::FieldAssignment {
-                    target: qualifier,
-                    value: value.text.clone(),
-                }));
-            }
-            if !passed.is_empty() || signature.return_type != field_type {
-                return Err(fail());
-            }
-            self.push(self.expression(field_type, qualifier, PRIMARY, args, true)?)?;
-            return Ok(Some(Effect::None));
-        }
         let target = MethodDescriptor::parse(target_descriptor)?;
         if signature.parameters[skip..] != target.parameters
             || signature.return_type != target.return_type

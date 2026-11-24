@@ -1,7 +1,7 @@
 // Based on Vineflower SecondaryFunctionsHelper and PPandMMHelper (Apache-2.0).
 use crate::{
     bytecode::{Instruction, Operand},
-    classfile::Constant,
+    classfile::{Constant, ConstantPool},
     descriptor::{Primitive, Type},
     source_text::Document,
 };
@@ -54,7 +54,7 @@ impl Binary {
         Some(Self { left, right, operator, precedence, can_throw })
     }
 
-    fn increment(self) -> Option<&'static str> {
+    pub(super) fn increment(self) -> Option<&'static str> {
         match self.operator {
             "+" => Some("++"),
             "-" => Some("--"),
@@ -62,7 +62,7 @@ impl Binary {
         }
     }
 
-    fn assignment_conversion(self, left: &Type, right: &Type, narrow: Option<u8>) -> bool {
+    pub(super) fn assignment_conversion(self, left: &Type, right: &Type, narrow: Option<u8>) -> bool {
         let Type::Primitive(left) = left else { return false };
         let Type::Primitive(right) = right else { return false };
         if *left == Primitive::Boolean || *right == Primitive::Boolean {
@@ -205,8 +205,12 @@ impl Target {
     }
 
     fn dup_opcode(self, ty: &Type) -> u8 {
-        0x59 + (if ty.slots() == 2 { 3 } else { 0 }) + self.address_values() as u8
+        store_dup_opcode(ty, self.address_values() as u8)
     }
+}
+
+pub(super) fn store_dup_opcode(ty: &Type, address_slots: u8) -> u8 {
+    0x59 + (if ty.slots() == 2 { 3 } else { 0 }) + address_slots
 }
 
 pub(crate) struct AssignmentStep {
@@ -217,25 +221,25 @@ pub(crate) struct AssignmentStep {
 }
 
 #[derive(Clone, Copy)]
-enum Form {
+pub(super) enum Form {
     Assign,
     Compound(Binary),
     Increment { text: &'static str, postfix: bool },
 }
 
 impl Form {
-    fn render(self, mut target: Document, right: Option<Expr>) -> (Document, u8) {
+    pub(super) fn render(self, mut target: Document, right: Option<Document>) -> (Document, u8) {
         match self {
             Self::Assign => {
                 target.push_str(" = ");
-                target.append(right.expect("plain assignment has a RHS").text);
+                target.append(right.expect("plain assignment has a RHS"));
                 (target, 0)
             }
             Self::Compound(binary) => {
                 target.push(' ');
                 target.push_str(binary.operator);
                 target.push_str("= ");
-                target.append(right.expect("compound assignment has a RHS").text);
+                target.append(right.expect("compound assignment has a RHS"));
                 (target, 0)
             }
             Self::Increment { text, postfix: true } => {
@@ -319,7 +323,7 @@ impl Machine<'_, '_> {
         if matches!(form, Form::Compound(_)) && ty == BOOLEAN && right.ty == INT {
             right = self.boolean_value(right);
         }
-        let (mut text, precedence) = form.render(access, Some(right));
+        let (mut text, precedence) = form.render(access, Some(right.text));
         if leaves_value {
             self.push(Expr {
                 order,
@@ -361,7 +365,7 @@ impl Machine<'_, '_> {
         let operation = ops.get(2)?;
         let binary = Binary::of(operation.opcode)?;
         let increment = binary.increment()?;
-        let one = self.one_instruction(second, binary.right)?;
+        let one = one_instruction(&self.class.pool, second, binary.right)?;
         let (store, consumed, narrow) = find_store(ops, 3, false)?;
         let target = self.update_destination(store, prefix, value)?;
         if ops[0].opcode != target.dup_opcode(&value.ty)
@@ -451,25 +455,29 @@ impl Machine<'_, '_> {
                 && pool.utf8(field.descriptor_index).is_ok_and(|ty| ty == field_ty)
         })
     }
+}
 
-    fn one_instruction(&self, op: &Instruction, category: Category) -> Option<Type> {
-        use Constant::*;
-        let ty = match (op.opcode, &op.operand) {
-            (0x04 | 0x10 | 0x11, _) if op.opcode == 0x04 || op.operand == Operand::Immediate(1) => INT,
-            (0x0a, _) => Type::Primitive(Primitive::Long),
-            (0x0c, _) => Type::Primitive(Primitive::Float),
-            (0x0f, _) => Type::Primitive(Primitive::Double),
-            (0x12..=0x14, Operand::Constant(index)) => match self.class.pool.get(*index).ok()? {
-                Integer(1) if op.opcode != 0x14 => INT,
-                Long(1) if op.opcode == 0x14 => Type::Primitive(Primitive::Long),
-                Float(value) if op.opcode != 0x14 && *value == 1.0 => Type::Primitive(Primitive::Float),
-                Double(value) if op.opcode == 0x14 && *value == 1.0 => Type::Primitive(Primitive::Double),
-                _ => return None,
-            },
+pub(super) fn one_instruction(
+    pool: &ConstantPool<'_>,
+    op: &Instruction,
+    category: Category,
+) -> Option<Type> {
+    use Constant::*;
+    let ty = match (op.opcode, &op.operand) {
+        (0x04 | 0x10 | 0x11, _) if op.opcode == 0x04 || op.operand == Operand::Immediate(1) => INT,
+        (0x0a, _) => Type::Primitive(Primitive::Long),
+        (0x0c, _) => Type::Primitive(Primitive::Float),
+        (0x0f, _) => Type::Primitive(Primitive::Double),
+        (0x12..=0x14, Operand::Constant(index)) => match pool.get(*index).ok()? {
+            Integer(1) if op.opcode != 0x14 => INT,
+            Long(1) if op.opcode == 0x14 => Type::Primitive(Primitive::Long),
+            Float(value) if op.opcode != 0x14 && *value == 1.0 => Type::Primitive(Primitive::Float),
+            Double(value) if op.opcode == 0x14 && *value == 1.0 => Type::Primitive(Primitive::Double),
             _ => return None,
-        };
-        (Category::of(&ty) == Some(category)).then_some(ty)
-    }
+        },
+        _ => return None,
+    };
+    (Category::of(&ty) == Some(category)).then_some(ty)
 }
 
 fn find_store(
