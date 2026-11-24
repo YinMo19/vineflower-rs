@@ -329,7 +329,6 @@ impl LoopBody<'_> {
         indent: &str, unit: &str, mut map: impl FnMut(&Instruction, usize),
     ) -> Result<(), KotlinError> {
         let instructions = &self.instructions[self.start..];
-        out.push_str(" {\n");
         out.push_str(indent);
         out.push_str(unit);
         out.push_str("for (");

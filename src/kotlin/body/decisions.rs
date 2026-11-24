@@ -388,7 +388,6 @@ impl DecisionBody<'_> {
     ) -> Result<(), KotlinError> {
         let mut line = 1;
         let instructions = &self.instructions[self.start..];
-        out.push_str(" {\n");
         for statement in &self.prologue {
             out.push_str(indent);
             out.push_str(unit);

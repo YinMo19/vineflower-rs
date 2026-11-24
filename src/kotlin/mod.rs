@@ -14,7 +14,8 @@ mod syntax;
 pub use metadata::{Metadata, MetadataHeader, has_metadata, read_metadata};
 pub(crate) use metadata::metadata_kind;
 pub use model::{
-    ClassDeclaration, ClassKind, ClassName, Classifier, Constructor, Declaration, Flags, Function,
+    ClassDeclaration, ClassKind, ClassName, Classifier, Constructor, ContractConstant,
+    ContractEffect, ContractExpression, ContractReference, Declaration, Flags, Function, InvocationKind,
     JvmFieldSignature, JvmMethodSignature, JvmPropertySignature, MemberKind, Modality,
     PackageDeclaration, Property, Type, TypeAlias, TypeArgument, TypeParameter, ValueParameter,
     Variance, Visibility,

@@ -19,6 +19,7 @@ use super::{
 };
 
 mod constructors;
+mod contracts;
 mod data;
 mod multifile;
 mod nesting;
@@ -1243,7 +1244,7 @@ fn render_function<'a, 'data>(
         || flags.modality() == Modality::Sealed
         || !function.context_receivers.is_empty()
         || !function.context_parameters.is_empty()
-        || function.has_contract
+        || !function.contract.is_empty() && (abstract_function || external)
         || (facade
             && (flags.modality() != Modality::Final
                 || flags.visibility()? == Visibility::Protected))
@@ -1299,6 +1300,22 @@ fn render_function<'a, 'data>(
     }
     let show_return =
         !unit || function.returns.abbreviated.is_some() || !function.returns.annotations.is_empty();
+    let has_contract = !function.contract.is_empty();
+    if has_contract {
+        out.push_str(indent);
+        out.push_str("@kotlin.OptIn(kotlin.contracts.ExperimentalContracts::class)\n");
+        if let Some((_, header)) = &mut location {
+            *header += 1;
+        }
+    }
+    let open_body = |out: &mut String, location: &mut Location<'_>| -> Result<(), KotlinError> {
+        out.push_str(" {\n");
+        let lines = contracts::write(out, function, &types, indent, indent_unit)?;
+        if let Some((_, header)) = location {
+            *header += lines;
+        }
+        Ok(())
+    };
     if jvm_static {
         out.push_str(indent);
         out.push_str("@kotlin.jvm.JvmStatic\n");
@@ -1383,7 +1400,7 @@ fn render_function<'a, 'data>(
             }) {
                 return Err(types.unsupported("singleton update does not name a mutable Int property"));
             }
-            out.push_str(" {\n");
+            open_body(out, &mut location)?;
             out.push_str(indent);
             out.push_str(indent_unit);
             identifier(out, update.field, name)?;
@@ -1424,11 +1441,19 @@ fn render_function<'a, 'data>(
         if !local_functions.is_empty() && !matches!(body, Body::Expression(..) | Body::Statements(_)) {
             return Err(types.unsupported("unproven scope for Kotlin local extensions"));
         }
+        if matches!(body, Body::Switch(_) | Body::Decision(_) | Body::Loop(_) | Body::Try(_)) {
+            open_body(out, &mut location)?;
+        }
         match body {
+            Body::Empty if has_contract => {
+                open_body(out, &mut location)?;
+                out.push_str(indent);
+                out.push('}');
+            }
             Body::Empty => out.push_str(" {}"),
             Body::Expression(expr, expression_trace) => {
-                if expression_trace.is_some() || !local_functions.is_empty() {
-                    out.push_str(" {\n");
+                if has_contract || expression_trace.is_some() || !local_functions.is_empty() {
+                    open_body(out, &mut location)?;
                     let line = render_local_extensions(out, bytecode, &types, style, local_functions, &mut location)?;
                     out.push_str(indent);
                     out.push_str(indent_unit);
@@ -1460,7 +1485,7 @@ fn render_function<'a, 'data>(
                 }
             }
             Body::Statements(block) => {
-                out.push_str(" {\n");
+                open_body(out, &mut location)?;
                 let mut trace = location
                     .as_ref()
                     .map(|_| trace::Trace::new(bytecode, method))

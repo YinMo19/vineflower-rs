@@ -17,7 +17,6 @@ impl TryBody<'_> {
         unit: &str,
         map: impl FnMut(&Instruction, usize),
     ) -> Result<(), KotlinError> {
-        out.push_str(" {\n");
         let mut writer = Writer {
             out, returns, parameters, declaration, indent, unit, instructions: &self.instructions,
             line: 1, map,

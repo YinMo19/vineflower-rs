@@ -609,6 +609,7 @@ impl<'strings> Reader<'_, 'strings> {
             Some(&returns),
             flags.has(13),
         )?;
+        let contract = reader.contract(function.contract.as_ref(), parameters.len(), receiver.is_some())?;
         Ok(Function {
             name,
             returns,
@@ -620,8 +621,97 @@ impl<'strings> Reader<'_, 'strings> {
             context_parameters: reader.parameters(&function.context_parameters)?,
             type_parameters: reader.type_parameters(&function.type_parameters)?,
             flags,
-            has_contract: function.contract.is_some(),
+            contract,
         })
+    }
+
+    fn contract(
+        &self, contract: Option<&proto::Contract>, parameters: usize, receiver: bool,
+    ) -> Result<Vec<ContractEffect>, KotlinError> {
+        let Some(contract) = contract else { return Ok(Vec::new()); };
+        contract.effects.iter().map(|effect| {
+            let invalid = || KotlinError::Metadata("invalid contract effect");
+            let implies = effect.conclusion.as_ref().map(|condition| {
+                self.contract_expression(condition, parameters, receiver, 0)
+            }).transpose()?;
+            match (effect.kind, effect.arguments.as_slice(), effect.invocation) {
+                (Some(0), [], None) => Ok(ContractEffect::Returns { value: None, implies }),
+                (Some(0), [arg], None) => {
+                    let ContractExpression::Constant(value) =
+                        self.contract_expression(arg, parameters, receiver, 0)?
+                    else { return Err(invalid()); };
+                    Ok(ContractEffect::Returns { value: Some(value), implies })
+                }
+                (Some(2), [], None) => Ok(ContractEffect::ReturnsNotNull { implies }),
+                (Some(1), [arg], invocation) if implies.is_none() => {
+                    let ContractExpression::Boolean {
+                        reference: ContractReference::Parameter(parameter), negated: false,
+                    } = self.contract_expression(arg, parameters, receiver, 0)?
+                    else { return Err(invalid()); };
+                    let kind = match invocation {
+                        None => None,
+                        Some(0) => Some(InvocationKind::AtMostOnce),
+                        Some(1) => Some(InvocationKind::ExactlyOnce),
+                        Some(2) => Some(InvocationKind::AtLeastOnce),
+                        _ => return Err(invalid()),
+                    };
+                    Ok(ContractEffect::CallsInPlace { parameter, kind })
+                }
+                _ => Err(invalid()),
+            }
+        }).collect()
+    }
+
+    fn contract_expression(
+        &self, expression: &proto::ContractExpression, parameters: usize, receiver: bool, depth: usize,
+    ) -> Result<ContractExpression, KotlinError> {
+        let invalid = || KotlinError::Metadata("invalid contract expression");
+        let flags = expression.flags.unwrap_or_default();
+        if depth > 64 || flags & !3 != 0 || !expression.and.is_empty() && !expression.or.is_empty() {
+            return Err(invalid());
+        }
+        let negated = flags & 1 != 0;
+        let null_test = flags & 2 != 0;
+        let ty = self.ty(expression.instance.as_ref(), expression.instance_id, depth + 1)?;
+        let head = match (expression.reference, expression.constant, ty) {
+            (Some(raw), None, ty) => {
+                let reference = if raw == 0 && receiver {
+                    ContractReference::Receiver
+                } else {
+                    let index = usize::try_from(raw.checked_sub(1).ok_or_else(invalid)?)
+                        .map_err(|_| invalid())?;
+                    if index >= parameters { return Err(invalid()); }
+                    ContractReference::Parameter(index)
+                };
+                Some(match ty {
+                    Some(ty) if !null_test => ContractExpression::IsInstance { reference, ty: Box::new(ty), negated },
+                    Some(_) => return Err(invalid()),
+                    None if null_test => ContractExpression::IsNull { reference, negated },
+                    None => ContractExpression::Boolean { reference, negated },
+                })
+            }
+            (None, Some(value), None) if flags == 0 => Some(ContractExpression::Constant(match value {
+                0 => ContractConstant::True,
+                1 => ContractConstant::False,
+                2 => ContractConstant::Null,
+                _ => return Err(invalid()),
+            })),
+            (None, None, None) if flags == 0 => None,
+            _ => return Err(invalid()),
+        };
+        let (arguments, conjunction) = if !expression.and.is_empty() {
+            (&expression.and, true)
+        } else if !expression.or.is_empty() {
+            (&expression.or, false)
+        } else {
+            return head.ok_or_else(invalid);
+        };
+        let mut terms = Vec::with_capacity(arguments.len() + usize::from(head.is_some()));
+        terms.extend(head);
+        for child in arguments {
+            terms.push(self.contract_expression(child, parameters, receiver, depth + 1)?);
+        }
+        Ok(if conjunction { ContractExpression::All(terms) } else { ContractExpression::Any(terms) })
     }
 
     fn constructor(&self, con: &proto::Constructor) -> Result<Constructor, KotlinError> {

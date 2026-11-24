@@ -188,10 +188,47 @@ pub(super) struct Function {
     pub context_parameters: Vec<ValueParameter>,
     #[prost(message, optional, tag = "30")]
     pub type_table: Option<TypeTable>,
-    #[prost(bytes = "vec", optional, tag = "32")]
-    pub contract: Option<Vec<u8>>,
+    #[prost(message, optional, tag = "32")]
+    pub contract: Option<Contract>,
     #[prost(message, optional, tag = "100")]
     pub signature: Option<JvmSignature>,
+}
+
+// org.jetbrains.kotlin.metadata: Contract, Effect and Expression.
+#[derive(Message)]
+pub(super) struct Contract {
+    #[prost(message, repeated, tag = "1")]
+    pub effects: Vec<ContractEffect>,
+}
+
+#[derive(Message)]
+pub(super) struct ContractEffect {
+    #[prost(int32, optional, tag = "1")]
+    pub kind: Option<i32>,
+    #[prost(message, repeated, tag = "2")]
+    pub arguments: Vec<ContractExpression>,
+    #[prost(message, optional, tag = "3")]
+    pub conclusion: Option<ContractExpression>,
+    #[prost(int32, optional, tag = "4")]
+    pub invocation: Option<i32>,
+}
+
+#[derive(Message)]
+pub(super) struct ContractExpression {
+    #[prost(int32, optional, tag = "1")]
+    pub flags: Option<i32>,
+    #[prost(int32, optional, tag = "2")]
+    pub reference: Option<i32>,
+    #[prost(int32, optional, tag = "3")]
+    pub constant: Option<i32>,
+    #[prost(message, optional, tag = "4")]
+    pub instance: Option<Type>,
+    #[prost(int32, optional, tag = "5")]
+    pub instance_id: Option<i32>,
+    #[prost(message, repeated, tag = "6")]
+    pub and: Vec<ContractExpression>,
+    #[prost(message, repeated, tag = "7")]
+    pub or: Vec<ContractExpression>,
 }
 
 #[derive(Message)]

@@ -300,13 +300,50 @@ pub struct Function {
     pub context_parameters: Vec<ValueParameter>,
     pub flags: Flags,
     pub signature: Option<JvmMethodSignature>,
-    pub has_contract: bool,
+    pub contract: Vec<ContractEffect>,
 }
 
 impl Function {
     pub(super) fn is_suspend(&self) -> bool {
         self.flags.has(13)
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ContractEffect {
+    Returns { value: Option<ContractConstant>, implies: Option<ContractExpression> },
+    ReturnsNotNull { implies: Option<ContractExpression> },
+    CallsInPlace { parameter: usize, kind: Option<InvocationKind> },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContractConstant {
+    True,
+    False,
+    Null,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InvocationKind {
+    AtMostOnce,
+    ExactlyOnce,
+    AtLeastOnce,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContractReference {
+    Receiver,
+    Parameter(usize),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ContractExpression {
+    Constant(ContractConstant),
+    Boolean { reference: ContractReference, negated: bool },
+    IsNull { reference: ContractReference, negated: bool },
+    IsInstance { reference: ContractReference, ty: Box<Type>, negated: bool },
+    All(Vec<ContractExpression>),
+    Any(Vec<ContractExpression>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

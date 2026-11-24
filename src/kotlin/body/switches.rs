@@ -286,7 +286,6 @@ impl SwitchBody<'_> {
     ) -> Result<(), KotlinError> {
         let decoded = &self.instructions[self.start..];
         let mut line = 1;
-        out.push_str(" {\n");
         out.push_str(indent);
         out.push_str(unit);
         let binding = if let Continuation::Bind { name, slot, .. } = self.continuation {

@@ -149,7 +149,7 @@ impl<'a, 'data> Bytecode<'a, 'data> {
         }
         let metadata = read_metadata(self.class)?.ok_or_else(invalid)?;
         let Declaration::Synthetic(Some(function)) = &metadata.declaration else { return Err(invalid()); };
-        if function.name != "<anonymous>" || function.returns != *returns || function.has_contract
+        if function.name != "<anonymous>" || function.returns != *returns || !function.contract.is_empty()
             || function.receiver.is_some() || !function.parameters.is_empty()
             || !function.type_parameters.is_empty() || !function.context_receivers.is_empty()
             || !function.context_parameters.is_empty()

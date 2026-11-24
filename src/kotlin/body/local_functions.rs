@@ -110,7 +110,7 @@ pub(in crate::kotlin) fn recover<'a, 'data>(
             // checked independently when the original call is lowered.
             flags: Flags((5 << 1) | (1 << 9)),
             signature: Some(signature),
-            has_contract: false,
+            contract: Vec::new(),
         };
         let signature = function.signature.as_ref().unwrap();
         let context = Extension::new(&function, signature, method, members, group)?;
