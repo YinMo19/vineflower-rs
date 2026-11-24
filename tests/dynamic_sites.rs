@@ -113,16 +113,38 @@ impl Class {
     }
 
     fn method(&mut self, flags: u16, name: &str, descriptor: &str, instructions: &[u8]) {
+        self.method_with_metadata(flags, name, descriptor, instructions, &[], &[]);
+    }
+
+    fn method_with_metadata(
+        &mut self,
+        flags: u16,
+        name: &str,
+        descriptor: &str,
+        instructions: &[u8],
+        code_attributes: &[Vec<u8>],
+        method_attributes: &[Vec<u8>],
+    ) {
         let name = self.utf8(name);
         let descriptor = self.utf8(descriptor);
         let code = self.utf8("Code");
         let mut body = words(&[8, 8]);
         body.extend((instructions.len() as u32).to_be_bytes());
         body.extend_from_slice(instructions);
-        body.extend(words(&[0, 0]));
-        let mut method = words(&[flags, name, descriptor, 1]);
+        body.extend(words(&[0, code_attributes.len() as u16]));
+        body.extend(code_attributes.iter().flatten());
+        let mut method = words(&[flags, name, descriptor, 1 + method_attributes.len() as u16]);
         method.extend(attribute(code, &body));
+        method.extend(method_attributes.iter().flatten());
         self.methods.push(method);
+    }
+
+    fn local_table(&mut self, attribute_name: &str, start: u16, length: u16, slot: u16,
+        name: &str, ty: &str) -> Vec<u8> {
+        let tag = self.utf8(attribute_name);
+        let name = self.utf8(name);
+        let ty = self.utf8(ty);
+        attribute(tag, &words(&[1, start, length, name, ty, slot]))
     }
 
     fn finish(self) -> Vec<u8> {
@@ -640,4 +662,141 @@ fn rejects_intersection_lambdas_that_an_anonymous_class_cannot_implement() {
     options.lambda_to_anonymous_class = true;
     let error = decompile(&class.finish(), &options).unwrap_err();
     assert!(format!("{error:#?}").contains("additional interfaces"), "{error:#?}");
+}
+
+#[test]
+fn debug_local_type_supplies_the_method_reference_target_and_annotation_path() {
+    let mut class = Class::default();
+    let handle = class.handle(6, SAMPLE, "useString", "(Ljava/lang/String;)V");
+    let consumer = "Ljava/util/function/Consumer;";
+    let indy = class.lambda(handle, "accept", &format!("(){consumer}"),
+        "(Ljava/lang/Object;)V", "(Ljava/lang/String;)V", None);
+    let instructions = &[indy.as_slice(), &[0x4b, 0xb1]].concat();
+    let locals = class.local_table("LocalVariableTable", 6, 1, 0, "action", consumer);
+    let types = class.local_table("LocalVariableTypeTable", 6, 1, 0, "action",
+        "Ljava/util/function/Consumer<Ljava/lang/String;>;");
+    let mark = class.utf8("Lexample/OnType;");
+    let mut annotation = words(&[1]); // one annotation on the first type argument
+    annotation.push(0x40);
+    annotation.extend(words(&[1, 6, 1, 0]));
+    annotation.extend([1, 3, 0]);
+    annotation.extend(words(&[mark, 0]));
+    let annotation = attribute(class.utf8("RuntimeInvisibleTypeAnnotations"), &annotation);
+    class.method_with_metadata(9, "test", "()V", instructions, &[locals, types, annotation], &[]);
+    class.method(0x000a, "useString", "(Ljava/lang/String;)V", &[0xb1]);
+    let bytes = class.finish();
+
+    let text = decompile(&bytes, &Options::default()).unwrap().text;
+    assert!(text.contains("Consumer<@OnType String> action = DynamicSites::useString;"), "{text}");
+    assert_eq!(text.matches("@OnType").count(), 1, "{text}");
+    assert!(!text.contains("(Consumer<String>)"), "{text}");
+
+    let mut options = Options::default();
+    options.decompile_generics = false;
+    let erased = decompile(&bytes, &options).unwrap().text;
+    assert!(erased.contains("Consumer action = (Consumer<String>)DynamicSites::useString;"), "{erased}");
+    assert!(!erased.contains("@OnType"), "{erased}");
+
+    options.decompile_generics = true;
+    options.use_debug_names = false;
+    let unnamed = decompile(&bytes, &options).unwrap().text;
+    assert!(unnamed.contains("Consumer<@OnType String> var0 = DynamicSites::useString;"), "{unnamed}");
+}
+
+#[test]
+fn generic_local_lifetime_and_erasure_are_checked_before_using_debug_types() {
+    let mut class = Class::default();
+    let list = "Ljava/util/List;";
+    for (method, (start, length, slot, name), signature) in [
+        ("accepted", (2, 1, 0, "items"), "Ljava/util/List<Ljava/lang/String;>;"),
+        ("badStart", (1, 1, 0, "items"), "Ljava/util/List<Ljava/lang/String;>;"),
+        ("badLength", (2, 2, 0, "items"), "Ljava/util/List<Ljava/lang/String;>;"),
+        ("badSlot", (2, 1, 1, "items"), "Ljava/util/List<Ljava/lang/String;>;"),
+        ("badName", (2, 1, 0, "other"), "Ljava/util/List<Ljava/lang/String;>;"),
+        ("badErasure", (2, 1, 0, "items"), "Ljava/util/Set<Ljava/lang/String;>;"),
+        ("unknownVariable", (2, 1, 0, "items"), "Ljava/util/List<TUnknown;>;"),
+        ("malformed", (2, 1, 0, "items"), "Ljava/util/List<;"),
+    ] {
+        let locals = class.local_table("LocalVariableTable", 2, 1, 0, "items", list);
+        let types = class.local_table("LocalVariableTypeTable", start, length, slot, name, signature);
+        class.method_with_metadata(9, method, "()V", &[0x01, 0x4b, 0xb1], &[locals, types], &[]);
+    }
+    let source = class.source();
+    assert_eq!(source.matches("List<String> items = null;").count(), 1, "{source}");
+    assert_eq!(source.matches("List items = null;").count(), 7, "{source}");
+}
+
+#[test]
+fn recovered_intersection_local_preserves_the_linked_overload() {
+    let mut class = Class::default();
+    let number = "Ljava/lang/Number;";
+    let pick_number = class.method_ref(SAMPLE, "pick", "(Ljava/lang/Number;)V");
+    let [high, low] = pick_number.to_be_bytes();
+    let locals = class.local_table("LocalVariableTable", 2, 5, 0, "value", number);
+    let types = class.local_table("LocalVariableTypeTable", 2, 5, 0, "value", "TT;");
+    let signature = class.utf8("<T:Ljava/lang/Number;:Ljava/lang/Runnable;>()V");
+    let signature = attribute(class.utf8("Signature"), &signature.to_be_bytes());
+    class.method_with_metadata(9, "test", "()V",
+        &[0x01, 0x4b, 0x2a, 0xb8, high, low, 0xb1], &[locals, types], &[signature]);
+    class.method(0x000a, "pick", "(Ljava/lang/Number;)V", &[0xb1]);
+    class.method(0x000a, "pick", "(Ljava/lang/Runnable;)V", &[0xb1]);
+    let text = class.source();
+    assert!(text.contains("T value = null;"), "{text}");
+    assert!(text.contains("pick((Number)value);"), "{text}");
+    assert!(!text.contains("pick(value);"), "{text}");
+}
+
+#[test]
+fn class_parameter_is_available_to_instance_locals_but_not_static_locals() {
+    let mut class = Class::default();
+    let bound_array = "[Ljava/lang/CharSequence;";
+    for (flags, name, slot) in [(1, "instanceScope", 1), (9, "staticScope", 0)] {
+        let locals = class.local_table("LocalVariableTable", 2, 1, slot, "values", bound_array);
+        let types = class.local_table("LocalVariableTypeTable", 2, 1, slot, "values", "[TE;");
+        class.method_with_metadata(flags, name, "()V", &[0x01, 0x4b + slot as u8, 0xb1],
+            &[locals, types], &[]);
+    }
+    let bytes = class.finish_as(SAMPLE, 0x0021, &[],
+        Some("<E::Ljava/lang/CharSequence;>Ljava/lang/Object;"));
+    let text = decompile(&bytes, &Options::default()).unwrap().text;
+    assert_eq!(text.matches("E[] values = null;").count(), 1, "{text}");
+    assert_eq!(text.matches("CharSequence[] values = null;").count(), 1, "{text}");
+}
+
+#[test]
+fn mismatched_local_type_arguments_use_a_legal_erased_assignment() {
+    let mut class = Class::default();
+    let list = "Ljava/util/List;";
+    let first = class.local_table("LocalVariableTable", 2, 3, 0, "strings", list);
+    let second = class.local_table("LocalVariableTable", 4, 1, 1, "integers", list);
+    let first_type = class.local_table("LocalVariableTypeTable", 2, 3, 0, "strings",
+        "Ljava/util/List<Ljava/lang/String;>;");
+    let second_type = class.local_table("LocalVariableTypeTable", 4, 1, 1, "integers",
+        "Ljava/util/List<Ljava/lang/Integer;>;");
+    class.method_with_metadata(9, "test", "()V", &[0x01, 0x4b, 0x2a, 0x4c, 0xb1],
+        &[first, second, first_type, second_type], &[]);
+    let text = class.source();
+    assert!(text.contains("List<String> strings = null;"), "{text}");
+    assert!(text.contains("List<Integer> integers = (List)strings;"), "{text}");
+}
+
+#[test]
+fn recovered_parameterized_receiver_keeps_the_erased_invocation_applicable() {
+    let mut class = Class::default();
+    let owner = "Lexample/DynamicSites;";
+    let put = class.method_ref(SAMPLE, "put", "(Ljava/lang/Object;)V");
+    let [high, low] = put.to_be_bytes();
+    let locals = class.local_table("LocalVariableTable", 2, 6, 1, "box", owner);
+    let types = class.local_table("LocalVariableTypeTable", 2, 6, 1, "box",
+        "Lexample/DynamicSites<Ljava/lang/String;>;");
+    class.method_with_metadata(9, "test", "(Ljava/lang/Object;)V",
+        &[0x01, 0x4c, 0x2b, 0x2a, 0xb6, high, low, 0xb1], &[locals, types], &[]);
+    let signature = class.utf8("(TE;)V");
+    let signature = attribute(class.utf8("Signature"), &signature.to_be_bytes());
+    class.method_with_metadata(1, "put", "(Ljava/lang/Object;)V", &[0xb1], &[], &[signature]);
+    class.method(1, "put", "(Ljava/lang/CharSequence;)V", &[0xb1]);
+    let bytes = class.finish_as(SAMPLE, 0x0021, &[], Some("<E:Ljava/lang/Object;>Ljava/lang/Object;"));
+    let text = decompile(&bytes, &Options::default()).unwrap().text;
+    assert!(text.contains("DynamicSites<String> box = null;"), "{text}");
+    assert!(text.contains("((DynamicSites)box).put(var0);"), "{text}");
 }

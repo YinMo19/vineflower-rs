@@ -261,7 +261,16 @@ impl Machine<'_, '_> {
                         "nonvirtual invokespecial of a nonprivate current-class method",
                     ));
                 }
-                let expr = self.member_receiver(expr, owner, true)?;
+                let expr = if matches!(&expr.ty, Type::Object(actual) if actual == owner)
+                    && self.local_receiver_needs_erasure(&expr, member, &descriptor)
+                {
+                    // Erased descriptor arguments may not match the Java
+                    // signature specialized by this parameterized receiver.
+                    let erased = expr.ty.clone();
+                    self.cast(expr, erased, false)?
+                } else {
+                    self.member_receiver(expr, owner, true)?
+                };
                 receiver = Some(expr);
             }
         }
@@ -564,6 +573,16 @@ impl Machine<'_, '_> {
         omit_widening: bool,
     ) -> Result<(), LiftError> {
         for (index, (value, ty)) in args.iter_mut().zip(&descriptor.parameters).enumerate() {
+            if member.is_some() && self.local_argument_needs_erasure(value)
+                && Category::of(ty) == Some(Category::Ref)
+                && !generic.is_some_and(|call| call.argument_fits(index, value, ty, self))
+            {
+                // Secondary bounds must not participate in source overload
+                // resolution when the bytecode selected the erased formal.
+                let operand = std::mem::replace(value, Expr::atom(Type::Void, Document::new()));
+                *value = self.reference_cast(operand, ty.clone(), false)?;
+                continue;
+            }
             if value.ty == *ty && !matches!(value.source, Source::Null) {
                 continue;
             }
@@ -708,6 +727,12 @@ impl Machine<'_, '_> {
         if owner == "java/lang/invoke/LambdaMetafactory" {
             let site = LambdaSite::read(self, name, bootstrap_descriptor, sam_name, method)?;
             return self.lower_lambda(site, MethodDescriptor::parse(method_descriptor)?);
+        }
+        if owner == super::java_templates::RUNTIME {
+            return self.lower_string_template(
+                op, bootstrap_index, reference_index, (name, bootstrap_descriptor),
+                (sam_name, method_descriptor),
+            );
         }
         if owner != "java/lang/invoke/StringConcatFactory"
             || !matches!(name, "makeConcat" | "makeConcatWithConstants")

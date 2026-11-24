@@ -16,6 +16,7 @@ mod enum_constants;
 pub(crate) mod enum_switch;
 mod expr;
 mod generics;
+mod java_templates;
 mod literal;
 mod locals;
 mod members;
@@ -43,9 +44,10 @@ use crate::{
     bytecode::{Instruction, Operand},
     classfile::{
         BootstrapMethod, ClassError, ClassFile, Code, Constant, ConstantPool, Member,
-        StackMapError, TypeTarget, VerificationType, initial_stack_map_locals,
+        LocalTypeRange, StackMapError, TypeTarget, VerificationType, initial_stack_map_locals,
     },
     descriptor::{DescriptorError, MethodDescriptor, Primitive, Type},
+    emit::type_annotations::RenderType,
     legacy::NormalizedCode,
     naming::MemberRenames,
     options::Options,
@@ -108,7 +110,24 @@ pub(crate) enum Effect {
 }
 
 pub(crate) type DynamicHelpers = Rc<RefCell<BTreeSet<(u16, u16)>>>;
-type CodeTypeRenderer<'c> = dyn Fn(&Type, TypeTarget) -> Result<Option<Document>, LiftError> + 'c;
+type CodeTypeRenderer<'c> =
+    dyn Fn(RenderType<'_>, CodeTypeSite) -> Result<Option<Document>, LiftError> + 'c;
+
+pub(crate) enum CodeTypeSite {
+    Exact(TypeTarget),
+    Local(LocalTypeRange),
+}
+
+impl CodeTypeSite {
+    pub(crate) fn matches(&self, target: &TypeTarget) -> bool {
+        match (self, target) {
+            (Self::Exact(expected), actual) => expected == actual,
+            (Self::Local(range), TypeTarget::LocalVariable(ranges) | TypeTarget::ResourceVariable(ranges)) =>
+                ranges.contains(range),
+            _ => false,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct Machine<'a, 'c> {
@@ -869,8 +888,15 @@ impl<'a, 'c> Machine<'a, 'c> {
         ty: &Type,
         target: TypeTarget,
     ) -> Result<Option<Document>, LiftError> {
-        self.code_type_renderer
-            .map_or(Ok(None), |render| render(ty, target))
+        self.render_code_type_at(ty.into(), CodeTypeSite::Exact(target))
+    }
+
+    fn render_code_type_at(
+        &self,
+        ty: RenderType<'_>,
+        site: CodeTypeSite,
+    ) -> Result<Option<Document>, LiftError> {
+        self.code_type_renderer.map_or(Ok(None), |render| render(ty, site))
     }
 
     fn known_assignable(&self, from: &Type, to: &Type) -> bool {

@@ -51,8 +51,13 @@ pub(super) enum Source {
     Local(u16),
     CapturedLocal,
     Plain,
+    /// The exact literal cast prefix of an invokedynamic lambda or reference.
+    FunctionalCast(usize),
     Integer(i32),
     NumericOne,
+    /// A JVM numeric widening whose final conversion can be supplied by
+    /// an assignment context, but not by an arbitrary operator or overload.
+    WidenedPrimitive { operand_precedence: u8 },
     Access(Access),
     Null,
     This,

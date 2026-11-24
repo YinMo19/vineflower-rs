@@ -115,28 +115,31 @@ pub(crate) fn string_literal(units: &[u16], ascii: bool) -> String {
 fn quoted(units: &[u16], quote: char, ascii: bool) -> String {
     let mut result = String::with_capacity(units.len() + 2);
     result.push(quote);
-    for &unit in units {
-        match char::from_u32(u32::from(unit)) {
-            Some('\u{8}') => result.push_str("\\b"),
-            Some('\t') => result.push_str("\\t"),
-            Some('\n') => result.push_str("\\n"),
-            Some('\u{c}') => result.push_str("\\f"),
-            Some('\r') => result.push_str("\\r"),
-            Some('\\') => result.push_str("\\\\"),
-            Some(ch) if ch == quote => {
-                result.push('\\');
-                result.push(ch);
-            }
-            Some(ch) if java_printable(ch, ascii) => result.push(ch),
-            _ => {
-                // Escape code units, including either half of a surrogate
-                // pair. The Java lexer restores the original UTF-16 input.
-                let _ = write!(result, "\\u{unit:04x}");
-            }
-        }
-    }
+    write_quoted_contents(units, quote, ascii, &mut result);
     result.push(quote);
     result
+}
+
+pub(super) fn write_string_contents(units: &[u16], ascii: bool, result: &mut impl Write) {
+    write_quoted_contents(units, '"', ascii, result);
+}
+
+fn write_quoted_contents(units: &[u16], quote: char, ascii: bool, result: &mut impl Write) {
+    for &unit in units {
+        let _ = match char::from_u32(u32::from(unit)) {
+            Some('\u{8}') => result.write_str("\\b"),
+            Some('\t') => result.write_str("\\t"),
+            Some('\n') => result.write_str("\\n"),
+            Some('\u{c}') => result.write_str("\\f"),
+            Some('\r') => result.write_str("\\r"),
+            Some('\\') => result.write_str("\\\\"),
+            Some(ch) if ch == quote => write!(result, "\\{ch}"),
+            Some(ch) if java_printable(ch, ascii) => result.write_char(ch),
+            // Escape code units, including either half of a surrogate
+            // pair. The Java lexer restores the original UTF-16 input.
+            _ => write!(result, "\\u{unit:04x}"),
+        };
+    }
 }
 
 fn java_printable(ch: char, ascii: bool) -> bool {

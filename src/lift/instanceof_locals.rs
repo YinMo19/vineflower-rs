@@ -97,6 +97,7 @@ impl Machine<'_, '_> {
             local: Local {
                 name,
                 ty: ty.clone(),
+                generic: None,
                 debug_range,
                 receiver: false,
                 token_index: self.locals.new_local_token_index(slot),

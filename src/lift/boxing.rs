@@ -124,7 +124,20 @@ impl Machine<'_, '_> {
     // In particular, do not use this for operands of a conditional expression,
     // where removing a wrapper changes the conditional's standalone type.
     pub(super) fn coerce_assignment(&self, value: Expr, expected: &Type) -> Result<Expr, LiftError> {
-        let value = self.coerce(value, expected, false)?;
+        let mut value = self.coerce(value, expected, false)?;
+        if let Source::WidenedPrimitive { operand_precedence } = value.source
+            && let Type::Primitive(target) = expected
+        {
+            let enclosed = operand_precedence < super::expr::UNARY;
+            let prefix_len = target.java_name().len() + 2 + usize::from(enclosed);
+            value.text.replace_literal_prefix(prefix_len, "");
+            if enclosed {
+                value.text.pop();
+            }
+            value.precedence = operand_precedence;
+            value.source = Source::Plain;
+            return Ok(value);
+        }
         Ok(match (&value.source, expected) {
             (Source::Boxing(_), Type::Object(_)) if self.known_assignable(&value.ty, expected) => {
                 self.implicit_conversion(value, Conversion::Box)
@@ -248,6 +261,26 @@ mod tests {
             call.source = machine.invocation_source(0xb8, owner, "valueOf", &descriptor, None, vec![Expr::integer(3)]);
             assert_eq!(machine.coerce_assignment(call.clone(), &descriptor.return_type).unwrap().text, "3");
             assert_eq!(machine.coerce(call, &descriptor.return_type, true).unwrap().text, "Integer.valueOf(3)");
+        });
+    }
+
+    #[test]
+    fn final_widening_uses_assignment_context_without_changing_rounding_or_overloads() {
+        with_machine(|mut machine| {
+            let double = Type::Primitive(Primitive::Double);
+            machine.push(Expr::integer(16_777_217)).unwrap();
+            machine.convert(1).unwrap(); // i2f rounds before f2d.
+            machine.convert(8).unwrap();
+            let value = machine.pop_raw().unwrap();
+            assert_eq!(machine.coerce(value.clone(), &double, true).unwrap().text, "(double)(float)16777217");
+            assert_eq!(machine.coerce_assignment(value, &double).unwrap().text, "(float)16777217");
+
+            let mut product = Expr::atom(Type::Primitive(Primitive::Float), "a * b".into());
+            product.precedence = super::super::expr::MULTIPLICATIVE;
+            machine.push(product).unwrap();
+            machine.convert(8).unwrap();
+            let value = machine.pop_raw().unwrap();
+            assert_eq!(machine.coerce_assignment(value, &double).unwrap().text, "a * b");
         });
     }
 }

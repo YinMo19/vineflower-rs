@@ -41,7 +41,7 @@ impl<'a> TypeNesting<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub(super) enum RenderType<'a> {
+pub(crate) enum RenderType<'a> {
     Erased(&'a Type),
     Generic(&'a GenericType),
 }
@@ -118,6 +118,19 @@ pub(super) fn render<'a, 'b, E>(
     };
     renderer.write_type(ty, varargs)?;
     Ok(renderer.out)
+}
+
+pub(crate) fn render_generic_type(
+    ty: &GenericType,
+    map_class: impl FnMut(&str) -> String,
+    marked: bool,
+) -> Document {
+    if !marked {
+        return ty.render(map_class).into();
+    }
+    render(&TypeNesting::default(), ty, [], map_class, |_| {
+        Ok::<_, std::convert::Infallible>(Document::new())
+    }, false, true).unwrap()
 }
 
 struct Renderer<'f, 'b, 'n, E> {

@@ -12,7 +12,7 @@ mod options_support;
 mod record;
 pub(crate) mod symbols;
 pub(crate) mod synthetic_marks;
-mod type_annotations;
+pub(crate) mod type_annotations;
 
 pub use mapping::{MethodMap, SourceMap};
 
@@ -902,10 +902,10 @@ impl<'a, 'c> Writer<'a, 'c> {
             }
             let mut code_annotations = code.type_annotations(pool, true)?;
             code_annotations.extend(code.type_annotations(pool, false)?);
-            let render_code_annotation = |ty: &Type, target: TypeTarget| {
+            let render_code_annotation = |ty: type_annotations::RenderType<'_>, site: crate::lift::CodeTypeSite| {
                 let mut matching = code_annotations
                     .iter()
-                    .filter(|entry| entry.target == target)
+                    .filter(|entry| site.matches(&entry.target))
                     .peekable();
                 if matching.peek().is_none() {
                     return Ok(None);

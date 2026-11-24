@@ -86,7 +86,13 @@ impl Machine<'_, '_> {
             (I, Short),
         ][usize::from(index)];
         let value = self.pop_category(from)?;
-        self.push(self.cast(self.as_int(value), Type::Primitive(to), false)?)
+        let value = self.as_int(value);
+        let operand_precedence = value.precedence;
+        let mut converted = self.cast(value, Type::Primitive(to), false)?;
+        if matches!(index, 0..=2 | 4..=5 | 8) {
+            converted.source = Source::WidenedPrimitive { operand_precedence };
+        }
+        self.push(converted)
     }
 
     pub(super) fn compare(&mut self, index: u8) -> Result<(), LiftError> {

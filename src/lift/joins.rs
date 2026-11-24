@@ -2,7 +2,7 @@
 
 use std::{borrow::Cow, ops::RangeInclusive, rc::Rc};
 
-use super::Local;
+use super::{Local, is_variable_type};
 use crate::lift::{
     BooleanCondition, BooleanFact, BooleanSelection, Effect, LiftError, Machine,
     expr::{BOOLEAN, Category, Expr, INT, Order, Source, TERNARY, UNARY},
@@ -57,7 +57,7 @@ pub(crate) struct LocalCopy {
 }
 
 struct DirectLocalCopy {
-    source: String,
+    source: Document,
     target: String,
     token: Option<Rc<Token>>,
 }
@@ -69,7 +69,7 @@ impl LocalCopy {
         let Some(copy) = &self.direct else {
             return false;
         };
-        if !line.starts_with(&copy.source) {
+        if !line.starts_with(copy.source.as_flat()) {
             return false;
         }
         rewrite_local_binding(line, copy.source.len(), &copy.target, copy.token.as_ref());
@@ -155,17 +155,21 @@ impl Machine<'_, '_> {
             // foreach declaration introduce a different binding type.
             return None;
         }
+        let generic = self.locals.declaration_signature(&ty, debug);
+        if generic.as_ref().is_some_and(|signature| is_variable_type(&signature.ty)) {
+            // An enhanced-for binding cannot cast a raw element to a type variable.
+            return None;
+        }
         let name = self.locals.local_name(slot, &ty, debug);
-        let mut declaration = self.local_type_document(&ty);
-        declaration.push(' ');
         let local = Local {
             name,
             ty,
+            generic,
             debug_range,
             receiver: false,
             token_index: self.locals.new_local_token_index(slot),
         };
-        self.append_local_binding(&mut declaration, slot, &local, true);
+        let declaration = self.declared_local_document(slot, &local).ok()?;
         self.locals.slots[index] = Some(local);
         Some(declaration)
     }
@@ -245,9 +249,11 @@ impl Machine<'_, '_> {
     }
 
     pub(crate) fn loop_receiver_has_element(&self, slot: u16, ty: &Type, owner: &str) -> bool {
-        // Local declarations currently render erased JVM types. A matching
-        // parameter signature is already printed with its type arguments.
-        self.loop_parameter_element(slot, owner).as_ref() == Some(ty)
+        self.locals.slots.get(usize::from(slot)).and_then(Option::as_ref)
+            .and_then(|local| local.generic.as_ref())
+            .and_then(|signature| iterable_argument(&signature.ty, owner))
+            .or_else(|| self.loop_parameter_element(slot, owner))
+            .as_ref() == Some(ty)
     }
 
     fn loop_parameter_element(&self, slot: u16, owner: &str) -> Option<Type> {
@@ -265,10 +271,8 @@ impl Machine<'_, '_> {
             matches
         })?;
         let signature = self.method.signature(&self.class.pool).ok()??;
-        let mut method = MethodSignature::parse(signature).ok()?;
-        (ordinal < method.parameters.len())
-            .then(|| method.parameters.swap_remove(ordinal))
-            .and_then(|ty| iterable_argument(ty, owner))
+        let method = MethodSignature::parse(signature).ok()?;
+        iterable_argument(method.parameters.get(ordinal)?, owner)
     }
 
     pub(crate) fn control_order(
@@ -692,8 +696,8 @@ impl Machine<'_, '_> {
                 && let Some(owner) = self.debug_join_owner(arms, slot, debug, &ty)
             {
                 let binding = arms[owner].locals.slots[slot].as_ref().expect("proved owner");
-                let declaration = format!("{} {}", self.render_type(&ty), binding.name);
-                prove(owner, &declaration, &binding.name, false).map(|sites| (binding, sites))
+                let declaration = arms[owner].declared_local_document(index, binding)?;
+                prove(owner, declaration.as_flat(), &binding.name, false).map(|sites| (binding, sites))
             } else {
                 None
             };
@@ -709,16 +713,15 @@ impl Machine<'_, '_> {
                 } else {
                     (self.locals.local_name(index, &ty, debug), self.locals.new_local_token_index(index))
                 };
-                let mut declaration = self.local_type_document(&ty);
-                declaration.push(' ');
                 let local = Local {
                     name,
+                    generic: self.locals.declaration_signature(&ty, debug),
                     ty,
                     debug_range,
                     receiver: false,
                     token_index,
                 };
-                self.append_local_binding(&mut declaration, index, &local, true);
+                let mut declaration = self.declared_local_document(index, &local)?;
                 declaration.push(';');
                 code.declarations.push(declaration);
                 local
@@ -731,19 +734,20 @@ impl Machine<'_, '_> {
                     if let (Some(sites), Some(prove)) = (&mut move_sites, &mut prove_move)
                         && arm.stack_is_empty()
                     {
-                        let declaration = format!("{} {}", self.render_type(&value.ty), value.name);
-                        if let Some(moved) = prove(position, &declaration, &value.name, true) {
+                        let declaration = arm.declared_local_document(index, value)?;
+                        if let Some(moved) = prove(position, declaration.as_flat(), &value.name, true) {
                             sites.extend(moved);
                             continue;
                         }
                     }
-                    let expr = arm.coerce(
+                    let expr = arm.coerce_local_assignment(
                         Expr::atom(
                             value.ty.clone(),
                             arm.local_binding_document(index, value, false),
                         ),
                         &local.ty,
-                        false,
+                        local.generic.as_deref(),
+                        value.generic.as_deref(),
                     )?;
                     let token = self.local_binding_token(index, &local, false);
                     let mut target = Document::new();
@@ -752,14 +756,22 @@ impl Machine<'_, '_> {
                     } else {
                         target.push_str(&local.name);
                     }
-                    assignments.push(LocalCopy {
-                        statement: local_assignment(target, expr.text),
-                        direct: (value.ty == local.ty).then(|| DirectLocalCopy {
-                            source: format!("{} {} = ", self.render_type(&value.ty), value.name),
+                    let direct = if value.ty == local.ty
+                        && value.generic == local.generic
+                        && (self.code_type_renderer.is_none()
+                            || arm.declared_local_type(index, value)? == self.declared_local_type(index, &local)?)
+                    {
+                        let mut source = arm.declared_local_document(index, value)?;
+                        source.push_str(" = ");
+                        Some(DirectLocalCopy {
+                            source,
                             target: format!("{} = ", local.name),
                             token,
-                        }),
-                    });
+                        })
+                    } else {
+                        None
+                    };
+                    assignments.push(LocalCopy { statement: local_assignment(target, expr.text), direct });
                 }
             }
             if let Some(sites) = move_sites {
@@ -796,6 +808,9 @@ impl Machine<'_, '_> {
         {
             return None;
         }
+        let generic = self.locals.declaration_signature(ty, Some(debug));
+        let render = generic.as_ref().map_or_else(|| ty.into(), |signature| (&signature.ty).into());
+        let annotation = self.annotated_local_type(debug.index, (debug.start_pc, debug.length), render).ok()?;
         // javac splits one source lifetime into LVT fragments at reaching
         // definitions and at the continuation. All fragments must describe
         // the same slot, spelling and exact Java type. The shared registry
@@ -805,6 +820,8 @@ impl Machine<'_, '_> {
             let binding = arm.locals.slots[slot].as_ref()?;
             let range = binding.debug_range?;
             if binding.receiver || binding.ty != *ty
+                || binding.generic != generic
+                || arm.annotated_local_type(debug.index, range, render).ok()? != annotation
                 || !Rc::ptr_eq(&self.locals.names, &arm.locals.names)
                 || !self.locals.debug.iter().any(|entry| {
                     entry.index == debug.index && (entry.start_pc, entry.length) == range
@@ -847,13 +864,14 @@ impl Machine<'_, '_> {
             {
                 return Err(invalid());
             }
-            let value = self.coerce(
+            let value = self.coerce_local_assignment(
                 Expr::atom(
                     from.ty.clone(),
                     self.local_binding_document(slot as u16, from, false),
                 ),
                 &to.ty,
-                false,
+                to.generic.as_deref(),
+                from.generic.as_deref(),
             )?;
             assignments.push(local_assignment(
                 entry.local_binding_document(slot as u16, to, false),
@@ -932,36 +950,36 @@ fn platform_iterable(name: &str) -> bool {
     )
 }
 
-fn iterable_argument(ty: GenericType, owner: &str) -> Option<Type> {
+fn iterable_argument(ty: &GenericType, owner: &str) -> Option<Type> {
     let GenericType::Class(class) = ty else {
         return None;
     };
     if class.internal_name != owner || !class.nested.is_empty() || !platform_iterable(owner) {
         return None;
     }
-    let [argument]: [TypeArgument; 1] = class.arguments.try_into().ok()?;
+    let [argument] = class.arguments.as_slice() else { return None };
     match argument {
         TypeArgument::Exact(ty) | TypeArgument::Extends(ty) => generic_erasure(ty),
         _ => None,
     }
 }
 
-fn generic_erasure(ty: GenericType) -> Option<Type> {
+fn generic_erasure(ty: &GenericType) -> Option<Type> {
     match ty {
         GenericType::Class(class) if class.nested.is_empty() => {
-            Some(Type::Object(class.internal_name))
+            Some(Type::Object(class.internal_name.clone()))
         }
         GenericType::Array {
             dimensions,
             element,
         } => {
-            let mut ty = generic_erasure(*element)?;
-            for _ in 0..dimensions {
+            let mut ty = generic_erasure(element)?;
+            for _ in 0..*dimensions {
                 ty = Type::Array(Box::new(ty));
             }
             Some(ty)
         }
-        GenericType::Primitive(primitive) => Some(Type::Primitive(primitive)),
+        GenericType::Primitive(primitive) => Some(Type::Primitive(*primitive)),
         _ => None,
     }
 }

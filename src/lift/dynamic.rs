@@ -318,7 +318,7 @@ impl<'a, 'c> Machine<'a, 'c> {
                         .constructor_outer(site.owner, site.implementation_descriptor)
                         .is_some()
                 }));
-        let expression = if direct {
+        let mut expression = if direct {
             let qualifier = if let Some(qualifier) = super_qualifier {
                 qualifier
             } else if bound {
@@ -359,9 +359,12 @@ impl<'a, 'c> Machine<'a, 'c> {
                     helper, &site, &captures, &target, anonymous.as_ref(),
                 )?
             {
-                let expression = self.lambda_expression(
+                let mut expression = self.lambda_expression(
                     factory.return_type, text, &captures, anonymous.is_some(),
                 )?;
+                if anonymous.is_none() {
+                    expression.source = Source::FunctionalCast(target.len() + 2);
+                }
                 self.push(expression)?;
                 return Ok(Effect::None);
             }
@@ -472,6 +475,9 @@ impl<'a, 'c> Machine<'a, 'c> {
             }
             expression
         };
+        if anonymous.is_none() {
+            expression.source = Source::FunctionalCast(target.len() + 2);
+        }
         self.push(expression)?;
         Ok(Effect::None)
     }

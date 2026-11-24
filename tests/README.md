@@ -29,6 +29,12 @@ Alternatively, set `VINEFLOWER_RS_CLASS_ROOT` to a tree with the upstream layout
 
 Point `VINEFLOWER_RS_CLASS_ROOT` at that checkout. Prebuilt outputs are also needed for Jasm, Kotlin (including `ktold` with upstream's old compiler flags), Groovy and Scala. The Scala plugin is not an included Gradle project at this upstream revision; its plugin classes must be built separately using its `testDataClasses` task from a checkout with that plugin enabled. These tasks only prepare inputs; parity testing never invokes the Java decompiler.
 
+`cargo test --test java_templates` uses three checked-in Java 21 preview
+processor classes to check valid Java source independently of the upstream
+pseudocode goldens. With `VINEFLOWER_JDK_21` set, run
+`cargo test --test java_templates -- --ignored` to also recompile the output
+and check that escaped template fragments survive the round trip.
+
 ### Native scope
 
 The Rust runtime does not require a JVM. `cargo run -- input.class` writes source
@@ -61,6 +67,7 @@ Exact upstream comparison with all fixture bytecode and required JDKs:
 | Guarded patterns, local joins, post-test loops and anonymous SAMs | 120 | 161 | 416 | 0 |
 | Record patterns, resource exits and Kotlin template/member recovery | 124 | 149 | 423 | 1 |
 | Instance initializer maps, float literals and optional method signatures | 126 | 149 | 422 | 0 |
+| Grouped binary layout and Java UTF-16 literal escaping | 127 | 149 | 421 | 0 |
 
 All eight upstream CLI and bulk cases match. The full test remains failing
 until all 697 comparisons match.

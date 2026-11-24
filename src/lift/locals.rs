@@ -9,15 +9,18 @@ use std::{
 
 use crate::{
     bytecode::Instruction,
-    classfile::{ClassFile, Code, Constant, LocalVariable, Member},
-    descriptor::{FieldSignature, GenericType, MethodDescriptor, Type},
+    classfile::{ClassFile, Code, Constant, LocalTypeRange, LocalVariable, Member},
+    descriptor::{
+        ClassSignature, FieldSignature, GenericType, MethodDescriptor, MethodSignature, Type,
+        TypeArgument, TypeParameter,
+    },
     naming::{VariableNamer, VariableRenamer, is_valid_local_identifier},
     options::Options,
     source_text::Document,
 };
 
 use super::{
-    Effect, LiftError, Machine,
+    CodeTypeSite, Effect, LiftError, Machine,
     assignment_expr::LocalWrite,
     expr::{Category, Expr, INT, Order, Source},
 };
@@ -39,6 +42,7 @@ use local_tokens::LocalTokenIndices;
 struct Local {
     name: String,
     ty: Type,
+    generic: Option<Rc<LocalSignature>>,
     debug_range: Option<(u16, u16)>,
     receiver: bool,
     token_index: Option<u32>,
@@ -50,6 +54,7 @@ impl PartialEq for Local {
         // represented by the same declaration at a control-flow join.
         self.name == other.name
             && self.ty == other.ty
+            && self.generic == other.generic
             && self.debug_range == other.debug_range
             && self.receiver == other.receiver
     }
@@ -131,13 +136,26 @@ impl Names {
     }
 }
 
-type GenericSignatures<'a> = HashMap<(u16, u16, u16), &'a str>;
+type LocalKey<'a> = (u16, u16, u16, &'a str);
+type GenericSignatures<'a> = HashMap<LocalKey<'a>, Rc<LocalSignature>>;
+
+#[derive(Debug, Eq, PartialEq)]
+struct LocalSignature {
+    erased: Type,
+    ty: GenericType,
+    intersection: bool,
+}
+
+fn local_key<'a>(entry: &LocalVariable<'a>) -> LocalKey<'a> {
+    (entry.index, entry.start_pc, entry.length, entry.name)
+}
 
 #[derive(Clone)]
 pub(super) struct Locals<'a> {
     slots: Vec<Option<Local>>,
     debug: Rc<[LocalVariable<'a>]>,
     generic: Option<Rc<GenericSignatures<'a>>>,
+    decompile_generics: bool,
     use_debug_names: bool,
     names: Rc<RefCell<Names>>,
     parameter_names: Rc<[String]>,
@@ -197,32 +215,15 @@ impl<'a> Locals<'a> {
                     .insert(class.pool.utf8(field.name_index)?.into(), NameUse::Reserved);
             }
         }
-        let debug = if options.use_debug_names || custom_names {
-            code.local_variables(&class.pool)?
-        } else {
-            Vec::new()
-        };
-        let generic = if custom_names && !debug.is_empty() {
-            let entries = code.local_variable_types(&class.pool)?;
-            (!entries.is_empty()).then(|| {
-                Rc::new(
-                    entries
-                        .into_iter()
-                        .map(|entry| {
-                            (
-                                (entry.index, entry.start_pc, entry.length),
-                                entry.descriptor,
-                            )
-                        })
-                        .collect(),
-                )
-            })
-        } else {
-            None
-        };
+        let debug = code.local_variables(&class.pool)?;
+        let (generic, signature) = (options.decompile_generics || custom_names)
+            .then(|| local_signatures(class, method, code, descriptor, &debug))
+            .flatten()
+            .map_or((None, None), |(locals, signature)| (Some(Rc::new(locals)), signature));
         let mut result = Self {
             slots: vec![None; usize::from(code.max_locals)],
             debug: debug.into(),
+            decompile_generics: options.decompile_generics,
             generic,
             use_debug_names: options.use_debug_names,
             names: Rc::new(RefCell::new(names)),
@@ -241,6 +242,7 @@ impl<'a> Locals<'a> {
             result.slots[0] = Some(Local {
                 name: "this".into(),
                 ty: Type::Object(owner.into()),
+                generic: None,
                 debug_range: None,
                 receiver: true,
                 token_index: None,
@@ -276,7 +278,7 @@ impl<'a> Locals<'a> {
                 index,
                 ty,
                 [marked_name, result.debug_name(debug)],
-                || result.generic_cast(debug),
+                || result.generic_cast(ty, debug),
                 || format!("var{index}"),
             );
             let debug_range = debug.map(|entry| (entry.start_pc, entry.length));
@@ -284,6 +286,10 @@ impl<'a> Locals<'a> {
             result.slots[usize::from(index)] = Some(Local {
                 name,
                 ty: ty.clone(),
+                generic: result.declaration_signature(ty, debug).filter(|generic| {
+                    signature.as_ref().and_then(|sig| sig.parameters.get(ordinal))
+                        == Some(&generic.ty)
+                }),
                 debug_range,
                 receiver: false,
                 token_index: None,
@@ -369,14 +375,20 @@ impl<'a> Locals<'a> {
         self.use_debug_names.then_some(debug?.name)
     }
 
-    fn generic_cast(&self, debug: Option<&LocalVariable<'a>>) -> Option<String> {
-        let entry = debug?;
-        let signature = self
-            .generic
-            .as_ref()?
-            .get(&(entry.index, entry.start_pc, entry.length))?;
-        let signature = FieldSignature::parse(signature).ok()?;
-        Some(generic_cast_name(signature.field_type))
+    fn generic_signature(&self, ty: &Type, debug: Option<&LocalVariable<'a>>) -> Option<&Rc<LocalSignature>> {
+        let signature = self.generic.as_ref()?.get(&local_key(debug?))?;
+        (signature.erased == *ty).then_some(signature)
+    }
+
+    fn declaration_signature(&self, ty: &Type, debug: Option<&LocalVariable<'a>>) -> Option<Rc<LocalSignature>> {
+        if !self.decompile_generics {
+            return None;
+        }
+        self.generic_signature(ty, debug).cloned()
+    }
+
+    fn generic_cast(&self, ty: &Type, debug: Option<&LocalVariable<'a>>) -> Option<String> {
+        Some(generic_cast_name(&self.generic_signature(ty, debug)?.ty))
     }
 
     fn local_name(&self, index: u16, ty: &Type, debug: Option<&LocalVariable<'a>>) -> String {
@@ -385,41 +397,188 @@ impl<'a> Locals<'a> {
             index,
             ty,
             [self.debug_name(debug), None],
-            || self.generic_cast(debug),
+            || self.generic_cast(ty, debug),
             || format!("var{index}"),
         )
     }
 }
 
+fn local_signatures<'a, 'input>(
+    class: &'a ClassFile<'input>,
+    method: &Member<'input>,
+    code: &Code<'input>,
+    descriptor: &MethodDescriptor,
+    debug: &[LocalVariable<'a>],
+) -> Option<(GenericSignatures<'a>, Option<MethodSignature>)> {
+    if debug.is_empty() {
+        return None;
+    }
+    let mut exact = HashMap::new();
+    for entry in code.local_variable_types(&class.pool).ok()? {
+        if entry.length == 0 || entry.index >= code.max_locals
+            || usize::from(entry.start_pc) + usize::from(entry.length) > code.bytes.len()
+        {
+            continue;
+        }
+        exact.entry(local_key(&entry))
+            .and_modify(|prior| {
+                if *prior != Some(entry.descriptor) {
+                    *prior = None;
+                }
+            })
+            .or_insert(Some(entry.descriptor));
+    }
+    if exact.is_empty() {
+        return None;
+    }
+    let class_parameters = (method.access_flags & 0x0008 == 0)
+        .then(|| class.signature().ok().flatten())
+        .flatten()
+        .and_then(|signature| ClassSignature::parse(signature).ok())
+        .map_or_else(Vec::new, |signature| signature.type_parameters);
+    let method_signature = method.signature(&class.pool).ok().flatten()
+        .and_then(|signature| MethodSignature::parse(signature).ok())
+        .filter(|signature| signature.parameters.len() == descriptor.parameters.len());
+    let scope = SignatureScope {
+        class: &class_parameters,
+        method: method_signature.as_ref().map_or(&[], |signature| signature.type_parameters.as_slice()),
+        version: class.major_version,
+    };
+    let signatures: GenericSignatures<'a> = debug.iter().filter_map(|entry| {
+        let key = local_key(entry);
+        let signature = FieldSignature::parse((*exact.get(&key)?)?).ok()?.field_type;
+        let erasure = Type::parse(entry.descriptor).ok()?;
+        (is_generic_type(&signature) && scope.resolves(&signature)
+            && scope.matches_erasure(&signature, &erasure))
+            .then(|| (key, Rc::new(LocalSignature {
+                erased: erasure,
+                intersection: match &signature {
+                    GenericType::Variable(name) => scope.variable_erasure(name)
+                        .is_some_and(|(_, intersection)| intersection),
+                    _ => false,
+                },
+                ty: signature,
+            })))
+    }).collect();
+    (!signatures.is_empty()).then_some((signatures, method_signature))
+}
+
+struct SignatureScope<'a> {
+    class: &'a [TypeParameter],
+    method: &'a [TypeParameter],
+    version: u16,
+}
+
+impl SignatureScope<'_> {
+    fn resolves(&self, ty: &GenericType) -> bool {
+        match ty {
+            GenericType::Variable(name) => self.variable_erasure(name).is_some(),
+            GenericType::Array { element, .. } => self.resolves(element),
+            GenericType::Class(class) => class.arguments.iter()
+                .chain(class.nested.iter().flat_map(|part| &part.arguments))
+                .all(|argument| match argument {
+                    TypeArgument::Any => true,
+                    TypeArgument::Exact(ty) | TypeArgument::Extends(ty) | TypeArgument::Super(ty) =>
+                        self.resolves(ty),
+                }),
+            GenericType::Primitive(_) => true,
+            GenericType::Void => false,
+        }
+    }
+
+    fn matches_erasure(&self, generic: &GenericType, erased: &Type) -> bool {
+        match generic {
+            GenericType::Variable(name) => {
+                matches!(erased, Type::Object(actual)
+                    if self.variable_erasure(name).is_some_and(|(bound, _)| bound.as_ref() == actual.as_str()))
+            }
+            GenericType::Class(class) => {
+                matches!(erased, Type::Object(actual) if class.binary_name().as_ref() == actual.as_str())
+            }
+            GenericType::Array { dimensions, element } => {
+                let mut component = erased;
+                for _ in 0..*dimensions {
+                    let Type::Array(next) = component else { return false };
+                    component = next;
+                }
+                self.matches_erasure(element, component)
+            }
+            GenericType::Primitive(kind) => matches!(erased, Type::Primitive(actual) if kind == actual),
+            GenericType::Void => false,
+        }
+    }
+
+    fn variable_erasure<'a>(&'a self, mut name: &'a str) -> Option<(std::borrow::Cow<'a, str>, bool)> {
+        let mut methods = self.method;
+        let mut intersection = false;
+        for _ in 0..self.method.len() + self.class.len() {
+            if !is_valid_local_identifier(name, self.version) {
+                return None;
+            }
+            let parameter = if let Some(parameter) = methods.iter().find(|param| param.name == name) {
+                parameter
+            } else {
+                // A class bound's variables are not shadowed by the method.
+                methods = &[];
+                self.class.iter().find(|param| param.name == name)?
+            };
+            intersection |= parameter.interface_bounds.len() > usize::from(parameter.class_bound.is_none());
+            match parameter.class_bound.as_ref().or_else(|| parameter.interface_bounds.first()) {
+                Some(GenericType::Class(class)) => return Some((class.binary_name(), intersection)),
+                Some(GenericType::Variable(next)) => name = next,
+                None => return Some(("java/lang/Object".into(), intersection)),
+                _ => return None,
+            }
+        }
+        None // cyclic formal bounds
+    }
+}
+
+fn is_generic_type(ty: &GenericType) -> bool {
+    match ty {
+        GenericType::Variable(_) => true,
+        GenericType::Array { element, .. } => is_generic_type(element),
+        GenericType::Class(class) => !class.arguments.is_empty()
+            || class.nested.iter().any(|part| !part.arguments.is_empty()),
+        GenericType::Primitive(_) | GenericType::Void => false,
+    }
+}
+
+fn is_variable_type(ty: &GenericType) -> bool {
+    match ty {
+        GenericType::Variable(_) => true,
+        GenericType::Array { element, .. } => is_variable_type(element),
+        _ => false,
+    }
+}
+
 // Both providers discard the type arguments before looking for the leaf name.
 // Avoid rendering generic arguments that do not contribute to the name.
-fn generic_cast_name(ty: GenericType) -> String {
+fn generic_cast_name(ty: &GenericType) -> String {
     let (element, array) = match ty {
-        GenericType::Array { element, .. } => (*element, true),
+        GenericType::Array { element, .. } => (element.as_ref(), true),
         _ => (ty, false),
     };
-    let (mut name, has_arguments) = match element {
+    let (name, has_arguments) = match element {
         GenericType::Class(class) => {
-            let mut leaf = class.internal_name;
+            let mut leaf = class.internal_name.rsplit('/').next().unwrap_or(&class.internal_name);
             let mut has_arguments = !class.arguments.is_empty();
-            for nested in class.nested {
+            for nested in &class.nested {
                 if has_arguments {
                     break;
                 }
-                leaf = nested.name;
+                leaf = &nested.name;
                 has_arguments = !nested.arguments.is_empty();
-            }
-            if let Some(index) = leaf.rfind('/') {
-                leaf.drain(..=index);
             }
             (leaf, has_arguments)
         }
-        GenericType::Variable(name) => (name, false),
-        GenericType::Primitive(primitive) => (primitive.java_name().into(), false),
+        GenericType::Variable(name) => (name.as_str(), false),
+        GenericType::Primitive(primitive) => (primitive.java_name(), false),
         GenericType::Void | GenericType::Array { .. } => {
             unreachable!("parsed field signatures have one array node and no void")
         }
     };
+    let mut name = name.to_owned();
     if array && !has_arguments {
         name.push_str("[]");
     }
@@ -435,7 +594,7 @@ impl<'c> Machine<'_, 'c> {
         if local.receiver || !self.is_auto_closeable(class) {
             return None;
         }
-        Some((self.render_type(&local.ty), &local.name))
+        Some((self.declared_local_type(index, local).ok()?.to_string(), &local.name))
     }
 
     pub(crate) fn existing_resource_local(&self, source: u16, alias: u16) -> Option<(&str, bool)> {
@@ -513,6 +672,7 @@ impl<'c> Machine<'_, 'c> {
         let local = Local {
             name,
             ty,
+            generic: None,
             debug_range: range,
             receiver: false,
             token_index: self.locals.new_local_token_index(index),
@@ -585,15 +745,27 @@ impl<'c> Machine<'_, 'c> {
         let value = self.pop_category(category)?;
         let target = LocalWrite { index, category };
         let (ty, debug, same) = self.resolve_local_store(op, target, &value)?;
-        let value = self.coerce_assignment(value, &ty)?;
+        let slot = usize::from(index);
+        let generic = if same { None } else { self.locals.declaration_signature(&ty, debug.as_ref()) };
+        let signature = if same {
+            self.locals.slots[slot].as_ref().and_then(|local| local.generic.as_deref())
+        } else {
+            generic.as_deref()
+        };
+        let source = signature.and_then(|_| self.local_source_signature(&value)).map(Rc::as_ref);
+        let value = self.coerce_local_assignment(value, &ty, signature, source)?;
         self.before_statement(value.order)?;
-        let local = self.bind_local_store(index, ty, debug, same);
+        let local = if same {
+            self.locals.slots[slot].as_ref().expect("checked active binding").clone()
+        } else {
+            self.bind_local_store(index, ty, debug, generic)
+        };
         let mut text = if same {
             self.local_binding_document(index, &local, false)
         } else {
-            self.declared_local_document(index, &local)
+            self.declared_local_document(index, &local)?
         };
-        self.locals.slots[usize::from(index)] = Some(local);
+        self.locals.slots[slot] = Some(local);
         text.push_str(" = ");
         text.append(value.text);
         text.push(';');
@@ -606,7 +778,22 @@ impl<'c> Machine<'_, 'c> {
         target: LocalWrite,
         value: &Expr,
     ) -> Option<bool> {
-        let (ty, _, same) = self.resolve_local_store(op, target, value).ok()?;
+        let (ty, debug, same) = self.resolve_local_store(op, target, value).ok()?;
+        if same {
+            if self.locals.slots[usize::from(target.index)].as_ref()?.generic.is_some() {
+                return None;
+            }
+        } else if self.locals.declaration_signature(&ty, debug.as_ref()).is_some()
+            || debug.is_some_and(|entry| {
+                !matches!(self.annotated_local_type(
+                    target.index, (entry.start_pc, entry.length), (&ty).into(),
+                ), Ok(None))
+            })
+        {
+            // A source assignment expression would have the refined type,
+            // not the type of the JVM's duplicated value.
+            return None;
+        }
         // The duplicated JVM value's type also controls overload resolution
         // and numeric promotion in its enclosing Java expression.
         (ty == value.ty).then_some(!same)
@@ -626,19 +813,137 @@ impl<'c> Machine<'_, 'c> {
             return (self.local_binding_document(index, local, false), None);
         }
         let debug = self.store_debug(op, index);
-        let local = self.bind_local_store(index, ty.clone(), debug, false);
-        let mut blank = self.declared_local_document(index, &local);
+        let local = self.bind_local_store(index, ty.clone(), debug, None);
+        let mut blank = self.local_type_document(&local.ty);
+        blank.push(' ');
+        self.append_local_binding(&mut blank, index, &local, true);
         blank.push(';');
         let access = self.local_binding_document(index, &local, false);
         self.locals.slots[slot] = Some(local);
         (access, Some(blank))
     }
 
-    fn declared_local_document(&self, index: u16, local: &Local) -> Document {
-        let mut text = self.local_type_document(&local.ty);
+    fn declared_local_document(&self, index: u16, local: &Local) -> Result<Document, LiftError> {
+        let mut text = self.declared_local_type(index, local)?;
         text.push(' ');
         self.append_local_binding(&mut text, index, local, true);
-        text
+        Ok(text)
+    }
+
+    fn declared_local_type(&self, index: u16, local: &Local) -> Result<Document, LiftError> {
+        let generic = local.generic.as_ref().map(|signature| &signature.ty);
+        if let Some(range) = local.debug_range
+            && let Some(annotated) = self.annotated_local_type(
+                index, range, generic.map_or_else(|| (&local.ty).into(), Into::into),
+            )?
+        {
+            return Ok(annotated);
+        }
+        Ok(generic.map_or_else(|| self.local_type_document(&local.ty), |ty| self.generic_type_document(ty)))
+    }
+
+    fn generic_type_document(&self, ty: &GenericType) -> Document {
+        crate::emit::type_annotations::render_generic_type(ty, self.class_name, self.options.dump_text_tokens)
+    }
+
+    fn annotated_local_type(
+        &self,
+        index: u16,
+        (start_pc, length): (u16, u16),
+        ty: crate::emit::type_annotations::RenderType<'_>,
+    ) -> Result<Option<Document>, LiftError> {
+        self.render_code_type_at(ty, CodeTypeSite::Local(LocalTypeRange { start_pc, length, index }))
+    }
+
+    fn source_local(&self, value: &Expr) -> Option<&Local> {
+        let Source::Local(slot) = value.source else { return None };
+        let local = self.locals.slots.get(usize::from(slot))?.as_ref()?;
+        (value.ty == local.ty && value.text == local.name).then_some(local)
+    }
+
+    fn local_source_signature(&self, value: &Expr) -> Option<&Rc<LocalSignature>> {
+        self.source_local(value)?.generic.as_ref()
+    }
+
+    pub(super) fn local_argument_needs_erasure(&self, value: &Expr) -> bool {
+        self.local_source_signature(value).is_some_and(|signature| signature.intersection)
+    }
+
+    pub(super) fn local_receiver_needs_erasure(
+        &self,
+        value: &Expr,
+        (owner, name, raw): (&str, &str, &str),
+        descriptor: &MethodDescriptor,
+    ) -> bool {
+        self.source_local(value).is_some_and(|local| {
+            local.generic.as_ref().is_some_and(|signature| {
+                !self.locals.parameters().contains(&local.name)
+                    && (signature.intersection || (descriptor.parameters.iter()
+                        .chain([&descriptor.return_type])
+                        .any(|ty| Category::of(ty) == Some(Category::Ref))
+                        && !self.local_receiver_member_is_erased(owner, name, raw)))
+            })
+        })
+    }
+
+    fn local_receiver_member_is_erased(&self, owner: &str, name: &str, raw: &str) -> bool {
+        let class = (owner == self.owner).then_some(self.class)
+            .or_else(|| self.group.and_then(|group| group.get(owner)));
+        if let Some(class) = class
+            && class.interfaces.is_empty()
+            && class.pool.class_name(class.super_class).ok() == Some("java/lang/Object")
+        {
+            let mut methods = class.methods.iter().filter(|method| {
+                class.pool.utf8(method.name_index).ok() == Some(name)
+            });
+            return methods.next().is_some_and(|method| {
+                methods.next().is_none()
+                    && class.pool.utf8(method.descriptor_index).ok() == Some(raw)
+                    && matches!(method.signature(&class.pool), Ok(None))
+            });
+        }
+        false
+    }
+
+    fn coerce_local_assignment(
+        &self,
+        value: Expr,
+        ty: &Type,
+        signature: Option<&LocalSignature>,
+        source: Option<&LocalSignature>,
+    ) -> Result<Expr, LiftError> {
+        let Some(signature) = signature else { return self.coerce_assignment(value, ty) };
+        if matches!(value.source, Source::Null)
+            || source.is_some_and(|source| source.ty == signature.ty)
+        {
+            return self.coerce_assignment(value, ty);
+        }
+        if is_variable_type(&signature.ty) {
+            return self.reference_cast_with_name(
+                value, ty.clone(), false, Some(self.generic_type_document(&signature.ty)),
+            );
+        }
+        let erase_rhs = (source.is_some()
+            || value.observable && !value.text.starts_with("new "))
+            && self.known_assignable(&value.ty, ty);
+        let mut value = self.coerce_assignment(value, ty)?;
+        if let Source::FunctionalCast(prefix) = value.source
+            && let Some(cast) = value.text.as_flat().get(1..prefix - 1)
+        {
+            let rendered = signature.ty.render(self.class_name);
+            if cast == rendered {
+                // The initializer's exact target already comes from the declaration.
+                value.text.replace_literal_prefix(prefix, "");
+                value.source = Source::Plain;
+                return Ok(value);
+            }
+        }
+        if erase_rhs || matches!(value.source, Source::FunctionalCast(_)) {
+            // Parameterized references of the same erasure can be provably
+            // distinct in Java. Assignment through the erased type is legal.
+            return self.cast(value, ty.clone(), false);
+        }
+        Ok(value)
     }
 
     fn store_debug(&self, op: &Instruction, index: u16) -> Option<LocalVariable<'c>> {
@@ -693,13 +998,10 @@ impl<'c> Machine<'_, 'c> {
         index: u16,
         ty: Type,
         debug: Option<LocalVariable<'c>>,
-        same: bool,
+        generic: Option<Rc<LocalSignature>>,
     ) -> Local {
         let slot = usize::from(index);
         let width = usize::from(ty.slots());
-        if same {
-            return self.locals.slots[slot].as_ref().expect("checked active binding").clone();
-        }
         if slot > 0
             && self.locals.slots[slot - 1]
                 .as_ref()
@@ -712,6 +1014,7 @@ impl<'c> Machine<'_, 'c> {
         }
         Local {
             name: self.locals.local_name(index, &ty, debug.as_ref()),
+            generic,
             ty,
             debug_range: debug.map(|entry| (entry.start_pc, entry.length)),
             receiver: false,
@@ -833,7 +1136,7 @@ mod tests {
             ("Lpkg/Outer.Inner<TT;>;", "Inner"),
         ] {
             let ty = FieldSignature::parse(signature).unwrap().field_type;
-            assert_eq!(generic_cast_name(ty), name);
+            assert_eq!(generic_cast_name(&ty), name);
         }
     }
 }
