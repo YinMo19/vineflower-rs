@@ -18,28 +18,45 @@ pub(super) struct CaseLabel {
     pub(super) offsets: Vec<u32>,
 }
 
-struct SwitchRegion {
-    owners: BTreeMap<usize, usize>,
-    last: u32,
+pub(super) struct SwitchRegion {
+    pub(super) owners: BTreeMap<usize, usize>,
+    pub(super) last: u32,
 }
 
-struct Rule<'a> {
-    labels: &'a [CaseLabel],
-    default: bool,
-    statements: Vec<Line>,
-    trailing_offsets: Vec<u32>,
-    result: RuleResult,
+pub(super) struct Rule<'a> {
+    pub(super) labels: &'a [CaseLabel],
+    pub(super) default: DefaultLabel,
+    pub(super) statements: Vec<Line>,
+    pub(super) trailing_offsets: Vec<u32>,
+    pub(super) result: RuleResult,
 }
 
-enum RuleResult {
+#[derive(Clone, Copy)]
+pub(super) enum DefaultLabel {
+    Absent,
+    Default,
+    NullDefault,
+}
+
+impl From<bool> for DefaultLabel {
+    fn from(value: bool) -> Self {
+        if value {
+            Self::Default
+        } else {
+            Self::Absent
+        }
+    }
+}
+
+pub(super) enum RuleResult {
     Yield(Document),
     Abrupt { inline_throw: bool },
 }
 
-struct SwitchExpression<'a> {
-    selector: &'a Document,
-    rules: Vec<Rule<'a>>,
-    depth: usize,
+pub(super) struct SwitchExpression<'a> {
+    pub(super) selector: &'a Document,
+    pub(super) rules: Vec<Rule<'a>>,
+    pub(super) depth: usize,
 }
 
 impl Emitter<'_> {
@@ -107,7 +124,7 @@ impl Emitter<'_> {
                     selector,
                     rules: vec![Rule {
                         labels: &[],
-                        default: true,
+                        default: DefaultLabel::Default,
                         statements: Vec::new(),
                         trailing_offsets: offsets,
                         result: RuleResult::Yield(value.yields.pop().expect("one default value")),
@@ -144,7 +161,7 @@ impl Emitter<'_> {
         if !machine.supports_switch_expressions() {
             return false;
         }
-        let Some(proof) = self.switch_region(header, region, groups, join) else {
+        let Some(proof) = self.switch_region(header, region, groups.keys().copied(), join) else {
             return false;
         };
         let Ok(mut entry) = machine.switch_arm_entry(control) else {
@@ -206,7 +223,7 @@ impl Emitter<'_> {
                     };
                     Rule {
                         labels,
-                        default: target == default,
+                        default: (target == default).into(),
                         statements,
                         trailing_offsets: arm.offsets,
                         result,
@@ -327,7 +344,7 @@ impl Emitter<'_> {
                 }
                 rules.push(Rule {
                     labels,
-                    default: head == default,
+                    default: (head == default).into(),
                     statements: Vec::new(),
                     trailing_offsets: offsets,
                     result: RuleResult::Yield(if takes_fallthrough { when_false } else { when_true }),
@@ -403,16 +420,16 @@ impl Emitter<'_> {
         Some(destination)
     }
 
-    fn switch_region(
+    pub(super) fn switch_region(
         &self,
         header: usize,
         region: Region<'_, '_, '_>,
-        groups: &BTreeMap<usize, Vec<CaseLabel>>,
+        targets: impl Iterator<Item = usize> + Clone,
         join: usize,
     ) -> Option<SwitchRegion> {
         if join <= header
             || self.emitted[join]
-            || groups.contains_key(&join)
+            || targets.clone().any(|target| target == join)
             || region.loop_transfer(join).is_some()
         {
             return None;
@@ -421,9 +438,7 @@ impl Emitter<'_> {
         let blocks = &self.graph.blocks;
         if !blocks[join].exception_predecessors.is_empty()
             || blocks[join].exception_successors != blocks[header].exception_successors
-            || groups
-                .keys()
-                .any(|&target| !self.layout.inside(target, switch_region))
+            || targets.clone().any(|target| !self.layout.inside(target, switch_region))
         {
             return None;
         }
@@ -431,7 +446,7 @@ impl Emitter<'_> {
         let mut pending = Vec::new();
         let mut reaches_join = false;
         let mut last = self.offset(header);
-        for &target in groups.keys() {
+        for target in targets {
             pending.push(target);
             while let Some(block) = pending.pop() {
                 match owners.entry(block) {
@@ -490,7 +505,7 @@ impl Emitter<'_> {
 }
 
 impl SwitchExpression<'_> {
-    fn render(self) -> Document {
+    pub(super) fn render(self) -> Document {
         let mut document = Document::from("switch (");
         document.append_ref(self.selector);
         document.push_str(") {");
@@ -508,17 +523,19 @@ impl SwitchExpression<'_> {
                     .iter()
                     .flat_map(|label| label.offsets.iter().copied()),
             );
-            if default {
-                // Explicit labels sharing this target are already covered
-                // by default; Java does not allow `case k, default`.
-                document.push_str("default");
-            } else {
-                document.push_str("case ");
-                for (index, label) in labels.iter().enumerate() {
-                    if index != 0 {
-                        document.push_str(", ");
+            match default {
+                // Ordinary integer keys sharing the default target are
+                // covered by default; null is distinct in a pattern switch.
+                DefaultLabel::Default => document.push_str("default"),
+                DefaultLabel::NullDefault => document.push_str("case null, default"),
+                DefaultLabel::Absent => {
+                    document.push_str("case ");
+                    for (index, label) in labels.iter().enumerate() {
+                        if index != 0 {
+                            document.push_str(", ");
+                        }
+                        document.append_ref(&label.text);
                     }
-                    document.append_ref(&label.text);
                 }
             }
             document.push_str(" -> ");

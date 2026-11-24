@@ -1,16 +1,17 @@
 // Copyright 2000-2024 JetBrains s.r.o. Use of this source code is governed by the Apache 2.0 license that can be found in the LICENSE file.
 
-use std::collections::HashSet;
+use std::ops::RangeInclusive;
 
 use crate::{
     bytecode::{Instruction, Operand},
-    classfile::Constant,
+    classfile::{Constant, TypeArgumentTarget, TypeTarget},
     descriptor::{MethodDescriptor, Primitive, Type},
     source_text::Document,
 };
 
 use super::{
-    Effect, LiftError, Machine,
+    LiftError, Machine,
+    assignment_expr::LocalWrite,
     expr::{Category, Expr, INT, Source},
 };
 
@@ -32,7 +33,7 @@ impl Machine<'_, '_> {
         &mut self,
         op: &Instruction,
     ) -> Result<Option<PatternDispatch>, LiftError> {
-        if op.opcode != 0xba {
+        if op.opcode != 0xba || !self.supports_pattern_switch() {
             return Ok(None);
         }
         let Operand::Constant(index) = op.operand else {
@@ -75,7 +76,10 @@ impl Machine<'_, '_> {
             "enumSwitch" => true,
             _ => return Ok(None),
         };
-        let (_, descriptor) = pool.name_and_type(name_and_type_index)?;
+        let (call_name, descriptor) = pool.name_and_type(name_and_type_index)?;
+        if call_name != name {
+            return Ok(None);
+        }
         let descriptor = MethodDescriptor::parse(descriptor)?;
         let [selector, restart] = descriptor.parameters.as_slice() else {
             return Ok(None);
@@ -140,10 +144,6 @@ impl Machine<'_, '_> {
             };
             labels.push(label);
         }
-        if labels.iter().collect::<HashSet<_>>().len() != labels.len() {
-            // Repeated labels normally need guards and a restart edge.
-            return Ok(None);
-        }
         Ok(Some(PatternDispatch {
             selector: selector.clone(),
             labels,
@@ -176,6 +176,39 @@ impl Machine<'_, '_> {
                     && group.get(b).is_some_and(|c| c.access_flags & 0x0200 != 0)))
     }
 
+    fn supports_pattern_switch(&self) -> bool {
+        self.class.major_version >= 65
+            || (61..=64).contains(&self.class.major_version) && self.class.minor_version == u16::MAX
+    }
+
+    pub(crate) fn supports_null_default(&self) -> bool {
+        self.class.major_version >= 65
+    }
+
+    pub(crate) fn pattern_guard_keyword(&self) -> Option<&'static str> {
+        self.supports_pattern_switch().then_some(if self.class.major_version <= 62 { " && " } else { " when " })
+    }
+
+    pub(crate) fn pattern_guard_switch_type(&self, instruction: &Instruction) -> Option<Type> {
+        if !matches!(instruction.operand, Operand::Switch { .. }) {
+            return None;
+        }
+        let Type::Primitive(ty @ (Primitive::Byte | Primitive::Short | Primitive::Char | Primitive::Int)) = &self.stack.last()?.ty
+        else { return None };
+        Some(Type::Primitive(*ty))
+    }
+
+    pub(crate) fn pattern_guard_case(&self, key: i32, ty: &Type) -> Option<String> {
+        match ty {
+            Type::Primitive(Primitive::Int) => {}
+            Type::Primitive(Primitive::Byte) if i8::try_from(key).is_ok() => {}
+            Type::Primitive(Primitive::Short) if i16::try_from(key).is_ok() => {}
+            Type::Primitive(Primitive::Char) if u16::try_from(key).is_ok() => {}
+            _ => return None,
+        }
+        Some(super::literal::integer_literal(key, Some(ty), self.options.ascii_strings))
+    }
+
     pub(crate) fn pattern_class(&self, index: u16) -> Result<Type, LiftError> {
         self.class_type(index)
     }
@@ -189,72 +222,59 @@ impl Machine<'_, '_> {
         op: &Instruction,
         selector: &Type,
         has_type_labels: bool,
-        null_check: bool,
-    ) -> Result<Document, LiftError> {
-        let mut value = self.take_region_reference(op)?;
+        end: u32,
+    ) -> Result<(Document, RangeInclusive<u32>), LiftError> {
+        self.offset = op.offset;
+        self.opcode = op.opcode;
+        self.lower_pending_comparison()?;
+        let value = self.pop_category(Category::Ref)?;
+        let control = value.order.map_or(op.offset, |order| order.first)..=end;
         if !has_type_labels {
-            // A traditional enum/String/integral switch has its own null
-            // check. A default-only reference switch needs an explicit one.
-            let traditional = matches!(selector, Type::Object(name) if matches!(name.as_str(),
-                "java/lang/String" | "java/lang/Integer" | "java/lang/Byte" | "java/lang/Short" | "java/lang/Character")
-                || self.pattern_is_enum(name));
-            if null_check && !traditional {
-                let objects = (self.class_name)("java/util/Objects");
-                value
-                    .text
-                    .surround(&format!("{objects}.requireNonNull("), ")");
-                return Ok(value.text);
-            }
-            return Ok(if matches!(value.source, Source::Null) {
+            let text = if matches!(value.source, Source::Null) {
                 self.cast(value, selector.clone(), false)?.text
             } else {
                 self.coerce(value, selector, false)?.text
-            });
+            };
+            return Ok((text, control));
         }
         // For pattern labels, use the descriptor type, rather than a narrower
         // local type that could make a legal case unconditional or disjoint.
-        Ok(
-            if value.ty != *selector || matches!(value.source, Source::Null) {
-                self.reference_cast(value, selector.clone(), false)?.text
-            } else {
-                value.text
-            },
-        )
+        let text = if value.ty != *selector || matches!(value.source, Source::Null) {
+            self.reference_cast(value, selector.clone(), false)?.text
+        } else {
+            value.text
+        };
+        Ok((text, control))
     }
 
     pub(crate) fn pattern_binding(
         &mut self,
         ty: &Type,
-        store: Option<(&Instruction, u16)>,
+        store: Option<(&Instruction, Option<&Instruction>, u16)>,
         offset: u32,
-    ) -> Result<String, LiftError> {
-        let display = self.render_type(ty);
-        let name = if let Some((store, slot)) = store {
+    ) -> Result<Document, LiftError> {
+        if let Some((store, cast, slot)) = store {
             self.offset = store.offset;
             self.opcode = store.opcode;
-            // Reuse the ordinary local binding rules without evaluating any
-            // cast: selection has already established the pattern type.
-            const PLACEHOLDER: &str = "$pattern";
-            self.push(Expr::atom(ty.clone(), PLACEHOLDER.into()))?;
-            let Effect::Statement(declaration) = self.store(store, slot, Category::Ref)? else {
-                return Err(self.invalid_operand("invalid pattern binding store"));
-            };
-            declaration
-                .strip_prefix(&display)
-                .and_then(|rest| rest.strip_prefix(' '))
-                .and_then(|rest| rest.strip_suffix(" = $pattern;"))
-                .filter(|name| {
-                    crate::naming::is_valid_local_identifier(name, self.class.major_version)
-                })
-                .ok_or_else(|| {
-                    self.unsupported(
-                        "pattern store does not declare a fresh local of the tested type",
-                    )
-                })?
-                .to_owned()
+            if let Some(cast) = cast
+                && let Ok(offset) = u16::try_from(self.debug_offset(cast.offset))
+                && self.render_code_type(ty, TypeTarget::TypeArgument {
+                    kind: TypeArgumentTarget::Cast, offset, argument: 0,
+                })?.is_some()
+            {
+                return Err(self.unsupported("annotated pattern backing cast"));
+            }
+            let target = LocalWrite { index: slot, category: Category::Ref };
+            let value = Expr::atom(ty.clone(), Document::new());
+            if self.assignment_local_destination(store, target, &value) != Some(true) {
+                return Err(self.unsupported("pattern store does not declare a fresh local of the tested type"));
+            }
+            let (_, declaration) = self.commit_assignment_local(store, target, ty, true);
+            let mut declaration = declaration.expect("a fresh local has a declaration");
+            declaration.pop();
+            Ok(declaration)
         } else {
-            self.locals.temporary(offset)
-        };
-        Ok(format!("{display} {name}"))
+            Ok(format!("{} {}", self.render_type(ty), self.locals.temporary(offset)).into())
+        }
     }
 }

@@ -13,13 +13,24 @@ use crate::{
     source_text::Document,
 };
 
-use super::{Emitter, Line, Region, StructureError};
+use super::{Emitter, Line, Region, StructureError, switch_expression::CaseLabel};
+
+#[path = "pattern_guard.rs"]
+mod guards;
+
+#[path = "pattern_value.rs"]
+mod values;
+
+#[cfg(test)]
+#[path = "pattern_guard_tests.rs"]
+mod regressions;
 
 struct Head {
     /// The suffix replaced by the source switch, excluding selector evaluation.
     setup: usize,
     restart: u16,
     restart_store: Option<usize>,
+    alias_store: usize,
     alias: u16,
     null_check: bool,
 }
@@ -72,6 +83,7 @@ impl Head {
         Some(Self {
             setup,
             restart,
+            alias_store: dyn_index - if restart_store.is_some() { 5 } else { 3 },
             restart_store,
             alias,
             null_check,
@@ -144,6 +156,12 @@ struct Arm {
     keys: Vec<i32>,
     /// The recognized `aload alias; [checkcast T;] astore local` prologue.
     binding: Option<(Range<usize>, u16)>,
+    guard: Option<guards::Guard>,
+}
+
+struct BoundArm<'a, 'c> {
+    entry: Machine<'a, 'c>,
+    labels: Vec<CaseLabel>,
 }
 
 impl Emitter<'_> {
@@ -163,15 +181,23 @@ impl Emitter<'_> {
         {
             return Ok(None);
         }
-        let Some(head) = Head::recognize(self.instructions, range.clone(), machine.constant_pool())
-        else {
+        let (head, restart) = if let Some(head) = Head::recognize(self.instructions, range.clone(), machine.constant_pool()) {
+            (head, None)
+        } else if let Some((head, proof)) = guards::RestartLoop::recognize(self, block, machine.constant_pool()) {
+            (head, Some(proof))
+        } else {
             return Ok(None);
         };
-        let indy = range.end - 2;
+        let dispatch_block = restart.as_ref().map_or(block, |proof| proof.dispatch);
+        let indy = self.graph.blocks[dispatch_block].instructions.end - 2;
         let switch = &self.instructions[indy + 1];
         let Some(dispatch) = machine.read_pattern_dispatch(&self.instructions[indy])? else {
             return Ok(None);
         };
+        let mut constants = BTreeSet::new();
+        if dispatch.labels.iter().any(|label| matches!(label, PatternLabel::Constant(text) if !constants.insert(text))) {
+            return Ok(None);
+        }
         let Operand::Switch { default, cases } = &switch.operand else {
             unreachable!()
         };
@@ -209,18 +235,15 @@ impl Emitter<'_> {
             return Ok(None);
         }
 
-        let mut alias_uses = BTreeSet::from([
-            indy - 2,
-            if head.restart_store.is_some() {
-                indy - 5
-            } else {
-                indy - 3
-            },
-        ]);
+        let mut alias_uses = BTreeSet::from([indy - 2, head.alias_store]);
+        let targets: BTreeSet<_> = groups.keys().copied().collect();
         let mut pattern_types = Vec::new();
         for (&target, arm) in &mut groups {
             let cfg = &self.graph.blocks[target];
-            if cfg.predecessors != [block] || !cfg.exception_predecessors.is_empty() {
+            if !cfg.exception_predecessors.is_empty()
+                || !cfg.predecessors.contains(&dispatch_block)
+                || target != default && cfg.predecessors != [dispatch_block]
+            {
                 return Ok(None);
             }
             let [key] = arm.keys.as_slice() else {
@@ -238,12 +261,7 @@ impl Emitter<'_> {
             let PatternLabel::Type(ty) = &dispatch.labels[*key as usize] else {
                 continue;
             };
-            // The implicit match order must not introduce a dominated case or
-            // an unconditional type pattern next to a default arm.
-            if machine.pattern_covers(ty, &dispatch.selector) {
-                return Ok(None);
-            }
-            pattern_types.push((*key, ty));
+            let mut body_start = cfg.instructions.start;
             let body = &self.instructions[cfg.instructions.clone()];
             if body
                 .first()
@@ -269,41 +287,66 @@ impl Emitter<'_> {
                 }
                 alias_uses.insert(cfg.instructions.start);
                 arm.binding = Some((cfg.instructions.start..cfg.instructions.start + width, slot));
+                body_start += width;
+            }
+            if let Some(proof) = &restart {
+                let Some(guard) = proof.arm(self, target, body_start, *key, &targets) else {
+                    return Ok(None);
+                };
+                arm.guard = guard;
+            }
+            // Only a genuinely unconditional pattern can dominate later
+            // labels or conflict with default.
+            if arm.guard.is_none() {
+                if machine.pattern_covers(ty, &dispatch.selector) {
+                    return Ok(None);
+                }
+                pattern_types.push((*key, ty));
             }
         }
-        pattern_types.sort_by_key(|&(key, _)| key);
-        for (i, &(_, ty)) in pattern_types.iter().enumerate() {
-            if pattern_types[..i]
-                .iter()
-                .any(|&(_, prior)| machine.pattern_covers(prior, ty))
-            {
-                return Ok(None);
+        for arm in groups.values() {
+            for &key in &arm.keys {
+                if key != NULL_KEY
+                    && let PatternLabel::Type(ty) = &dispatch.labels[key as usize]
+                    && pattern_types.iter().any(|&(earlier, prior)| earlier < key && machine.pattern_covers(prior, ty))
+                {
+                    return Ok(None);
+                }
             }
+        }
+        if restart.as_ref().is_some_and(|proof| !proof.owns_all_retries(groups.values().filter_map(|arm| arm.guard.as_ref()))) {
+            return Ok(None);
         }
         if self.instructions.iter().enumerate().any(|(index, op)| {
             touches_slot(op, head.alias) && !alias_uses.contains(&index)
                 || head.restart_store.is_some_and(|store| {
                     touches_slot(op, head.restart) && index != store && index != indy - 1
+                        && !restart.as_ref().is_some_and(|proof| proof.restart_store(self, index))
                 })
         }) {
             return Ok(None);
         }
 
-        let join = self
-            .layout
-            .normal_join(block, region)
-            .or_else(|| {
-                self.layout.common_join(
-                    self.graph,
-                    region,
-                    groups.keys().copied().map(|target| (target, None)),
-                )
-            })
+        // The bytecode retry loop owns these blocks in the CFG, but the
+        // source switch must still see only the real enclosing loop.
+        let within = if restart.is_some() {
+            region.with_exception_layout(Some(dispatch_block))
+        } else {
+            region
+        };
+        let join = restart.as_ref().and_then(|_| self.layout.loops[dispatch_block].and_then(|shape| shape.exit))
+            .or_else(|| self.layout.normal_join(dispatch_block, within))
+            .or_else(|| self.layout.common_join(
+                self.graph, within,
+                groups.iter().map(|(&target, arm)| (arm.guard.as_ref().map_or(target, |guard| guard.success), None)),
+            ))
             .or(region.stop);
-        if groups.keys().any(|&target| Some(target) == join) {
+        if groups.keys().any(|&target| Some(target) == join && target != default)
+            || join != Some(default) && self.graph.blocks[default].predecessors != [dispatch_block]
+        {
             return Ok(None);
         }
-        let switch_region = region.switch_body(join);
+        let switch_region = within.switch_body(join);
         let mut ordered: Vec<_> = groups.into_iter().collect();
         // Preserve the bootstrap matching order even if the bytecode lays
         // the switch blocks out differently. Null never competes with a type.
@@ -330,16 +373,88 @@ impl Emitter<'_> {
             return Err(self.unstructured(block));
         }
         let mut offsets = tail.offsets;
-        let selector = machine.take_pattern_selector(
+        let (selector, control) = machine.take_pattern_selector(
             &self.instructions[head.setup],
             &dispatch.selector,
-            !pattern_types.is_empty(),
-            head.null_check,
+            dispatch.labels.iter().any(|label| matches!(label, PatternLabel::Type(_))),
+            switch.offset + switch.len - 1,
         )?;
+        let guard_keyword = machine.pattern_guard_keyword().ok_or_else(|| self.unstructured(block))?;
+        let mut staged = Vec::with_capacity(ordered.len());
+        let names = machine.local_name_checkpoint();
+        let anonymous = machine.switch_anonymous_checkpoint();
+        let baseline = machine.switch_arm_entry(&control)?;
+        let trial = (|| {
+            for (target, arm) in &ordered {
+                let mut entry = baseline.clone();
+                let mut binding_offsets = Vec::new();
+                let mut labels = Vec::with_capacity(arm.keys.len());
+                if let Some((indices, _)) = &arm.binding {
+                    let store = &self.instructions[indices.end - 1];
+                    binding_offsets.extend(store.offset..store.offset + store.len);
+                }
+                for &key in &arm.keys {
+                    let mut label: Document = if key == NULL_KEY {
+                        "null".into()
+                    } else {
+                        match &dispatch.labels[key as usize] {
+                            PatternLabel::Constant(text) => text.as_str().into(),
+                            PatternLabel::Type(ty) => entry.pattern_binding(
+                                ty,
+                                arm.binding.as_ref().map(|(indices, slot)| {
+                                    (&self.instructions[indices.end - 1], Some(&self.instructions[indices.start + 1]), *slot)
+                                }),
+                                self.offset(*target),
+                            )?,
+                        }
+                    };
+                    if let Some(guard) = &arm.guard {
+                        let first = arm.binding.as_ref().map_or(
+                            self.graph.blocks[*target].instructions.start, |(indices, _)| indices.end,
+                        );
+                        let mut predicate = guard.document(self, first, &entry).ok_or_else(|| self.unstructured(*target))?;
+                        if guard_keyword == " && " {
+                            predicate.surround("(", ")");
+                        }
+                        label.push_str(guard_keyword);
+                        label.append(predicate);
+                    }
+                    labels.push(CaseLabel { text: label, offsets: mem::take(&mut binding_offsets) });
+                }
+                staged.push(BoundArm { entry, labels });
+            }
+            Ok::<(), StructureError>(())
+        })();
+        if let Err(error) = trial {
+            machine.restore_local_names(names);
+            machine.restore_switch_anonymous_sites(anonymous);
+            return Err(error);
+        }
+        machine.commit_switch_dynamic_helpers(&baseline);
+        offsets.extend(switch.offset..switch.offset + switch.len);
+        if restart.is_none()
+            && let Some(join) = join
+            && self.try_pattern_switch_value(
+                dispatch_block, region, machine, depth, &selector, &ordered, &staged, default, join, &control,
+            )
+        {
+            *pending = offsets;
+            return Ok(Some(Some(join)));
+        }
+        if !machine.stack_is_empty() {
+            return Err(self.unstructured(block));
+        }
+        self.emitted[dispatch_block] = true;
+        for arm in ordered.iter().filter_map(|(_, arm)| arm.guard.as_ref()) {
+            for owned in arm.blocks() {
+                if mem::replace(&mut self.emitted[owned], true) {
+                    return Err(self.unstructured(owned));
+                }
+            }
+        }
         for statement in machine.take_prelude() {
             self.push(depth, statement, mem::take(&mut offsets));
         }
-        offsets.extend(switch.offset..switch.offset + switch.len);
         let start = self.lines.len();
         self.push(
             depth,
@@ -355,40 +470,28 @@ impl Emitter<'_> {
             // return. Its goto supplies the local source location.
             groups_can_own_return(self, &ordered, join, region.stop)
         });
-        for (ordinal, (target, arm)) in ordered.iter().enumerate() {
-            let mut entry = machine.clone();
-            let mut binding_offsets = Vec::new();
-            if let Some((indices, _)) = &arm.binding {
-                // The cast itself is the proven type test; the store's
-                // original line belongs to the new source binding.
-                let store = &self.instructions[indices.end - 1];
-                binding_offsets.extend(store.offset..store.offset + store.len);
+        for (ordinal, ((target, arm), BoundArm { entry, labels })) in
+            ordered.iter().zip(staged).enumerate()
+        {
+            let combined_null_default = *target == default && arm.keys == [NULL_KEY]
+                && machine.supports_null_default();
+            if combined_null_default {
+                self.syntax(depth + 1, "case null, default:");
+            } else {
+                for CaseLabel { mut text, offsets } in labels {
+                    text.surround("case ", ":");
+                    self.push(depth + 1, text, offsets);
+                }
+                if *target == default {
+                    self.syntax(depth + 1, "default:");
+                }
             }
-            for &key in &arm.keys {
-                let label = if key == NULL_KEY {
-                    String::from("null")
-                } else {
-                    match &dispatch.labels[key as usize] {
-                        PatternLabel::Constant(text) => text.clone(),
-                        PatternLabel::Type(ty) => entry.pattern_binding(
-                            ty,
-                            arm.binding.as_ref().map(|(indices, slot)| {
-                                (&self.instructions[indices.end - 1], *slot)
-                            }),
-                            self.offset(*target),
-                        )?,
-                    }
-                };
-                self.push(
-                    depth + 1,
-                    format!("case {label}:"),
-                    mem::take(&mut binding_offsets),
-                );
+            if join == Some(*target) {
+                continue;
             }
-            if *target == default {
-                self.syntax(depth + 1, "default:");
-            }
-            let path = if let Some((indices, _)) = &arm.binding {
+            let path = if let Some(guard) = &arm.guard {
+                self.branch_arm(guard.success, switch_region, &entry, depth + 2)?
+            } else if let Some((indices, _)) = &arm.binding {
                 self.pattern_arm(*target, switch_region, entry, depth + 2, indices.end)?
             } else {
                 self.branch_arm(*target, switch_region, &entry, depth + 2)?
@@ -407,6 +510,14 @@ impl Emitter<'_> {
         if let Some(join) = return_join {
             self.emitted[join] = true;
             return Ok(Some(None));
+        }
+        if join == Some(default) {
+            // A dispatch directly to the continuation has no arm body. Its
+            // unchanged state still participates in the stack/local join.
+            live.push((super::Arm {
+                exit: Some(machine.clone()), offsets: Vec::new(),
+                start: self.lines.len() - 1, end: self.lines.len() - 1,
+            }, false, Vec::new()));
         }
         if live.is_empty() {
             return Ok(Some(None));
