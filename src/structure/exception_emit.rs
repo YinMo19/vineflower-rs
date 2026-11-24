@@ -282,6 +282,12 @@ impl Emitter<'_> {
             let mut body = machine.clone();
             let mut offsets = Vec::new();
             if let Some(branch) = finally.branched() {
+                if let Some(exit) = branch.shared_return
+                    && !self.exceptions.contains(region.exception_arm, exit.block)
+                {
+                    return Err(self.unstructured(exit.block));
+                }
+                let cleanup_start = self.lines.len();
                 if finally.start() != branch.entry
                     && mem::replace(&mut self.emitted[finally.start()], true)
                 {
@@ -297,6 +303,36 @@ impl Emitter<'_> {
                     &mut offsets,
                 )? {
                     return Err(self.unstructured(branch.entry));
+                }
+                if let Some(exit) = branch.shared_return {
+                    let block = &self.graph.blocks[exit.block];
+                    let start = self.offset(exit.block);
+                    let last = &self.instructions[block.instructions.end - 1];
+                    let range = start..last.offset + last.len;
+                    let Some(line) = self.lines[cleanup_start..]
+                        .iter_mut()
+                        .find(|line| line.offsets.iter().any(|offset| range.contains(offset)))
+                    else {
+                        return Err(self.unstructured(exit.block));
+                    };
+                    // The folded transfer belongs to the first statement of
+                    // the return path, not to the preceding case statement.
+                    let jump = &self.instructions[exit.jump];
+                    line.offsets.splice(..0, jump.offset..jump.offset + jump.len);
+                    if reaches_join
+                        && let Some(next) = branch.continuation
+                    {
+                        let tail = &self.graph.blocks[next].instructions;
+                        let prefix = self.exceptions.cleanup_prefix(next);
+                        if prefix > 0
+                            && let [jump] = &self.instructions[tail.start + prefix..tail.end]
+                            && matches!(jump.opcode, 0xa7 | 0xc8)
+                        {
+                            // The normal copy's transfer maps to the
+                            // statement following the finally.
+                            pending.extend(jump.offset..jump.offset + jump.len);
+                        }
+                    }
                 }
                 for &copy in &branch.removed {
                     if !self.exceptions.contains(region.exception_arm, copy)

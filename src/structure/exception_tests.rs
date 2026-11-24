@@ -417,6 +417,73 @@ fn branched_finally_matches_fallthrough_to_an_explicit_jump() {
 }
 
 #[test]
+fn switch_finally_folds_only_a_mirrored_shared_return() {
+    let bytes = [
+        0xb8, 0, 22, // 0: protected call
+        0xb8, 0, 22, 0x1a, // 3: normal cleanup prefix and selector
+        0xab, 0, 0, 0, 37, 0, 0, 0, 2, // 7: lookupswitch, default 44
+        0, 0, 0, 0, 0, 0, 0, 25, // case 0: 32
+        0, 0, 0, 1, 0, 0, 0, 31, // case 1: 38
+        0xb8, 0, 22, 0xa7, 0, 12, // 32: case 0 prints, then goto 47
+        0xb8, 0, 22, 0xa7, 0, 68, // 38: case 1 prints, then goto shared return at 109
+        0xb8, 0, 22, // 44: default prints and falls through
+        0xb8, 0, 22, 0xa7, 0, 54, // 47: cleanup tail, then goto normal return at 104
+        0x4c, 0xb8, 0, 22, 0x1a, // 53: save throwable, cleanup prefix and selector
+        0xab, 0, 0, 0, 0, 38, 0, 0, 0, 2, // 58: lookupswitch, default 96
+        0, 0, 0, 0, 0, 0, 0, 26, // case 0: 84
+        0, 0, 0, 1, 0, 0, 0, 32, // case 1: 90
+        0xb8, 0, 22, 0xa7, 0, 12, // 84: case 0 prints, then goto 99
+        0xb8, 0, 22, 0xa7, 0, 16, // 90: case 1 prints, then goto 109
+        0xb8, 0, 22, // 96: default prints and falls through
+        0xb8, 0, 22, 0x2b, 0xbf, // 99: cleanup tail, then rethrow saved exception
+        0xb8, 0, 22, 0x04, 0xac, // 104: normal continuation
+        0xb8, 0, 22, 0x03, 0xac, // 109: shared overriding continuation
+    ];
+    let handlers = [handler(0, 3, 53, 0)];
+    let lines = test_method_with_descriptor(&bytes, &handlers, &[], "(I)I").unwrap();
+    assert_eq!(
+        lines
+            .iter()
+            .map(|line| (line.depth, line.text.as_flat()))
+            .collect::<Vec<_>>(),
+        [
+            (0, "try {"),
+            (1, "work();"),
+            (0, "} finally {"),
+            (1, "work();"),
+            (1, "switch (var0) {"),
+            (2, "case 0:"),
+            (3, "work();"),
+            (3, "break;"),
+            (2, "case 1:"),
+            (3, "work();"),
+            (3, "work();"),
+            (3, "return 0;"),
+            (2, "default:"),
+            (3, "work();"),
+            (1, "}"),
+            (1, "work();"),
+            (0, "}"),
+            (0, "work();"),
+            (0, "return 1;"),
+        ]
+    );
+    assert_eq!(lines[10].offsets, [93, 94, 95, 109, 110, 111]);
+    assert_eq!(lines[17].offsets, [50, 51, 52, 104, 105, 106]);
+
+    for (offset, displacement) in [(43, 63), (95, 11), (52, 59)] {
+        // Redirect either case-1 copy or give the shared return a third
+        // incoming path from the normal cleanup tail.
+        let mut mismatch = bytes;
+        mismatch[offset] = displacement;
+        assert!(matches!(
+            classify(&mismatch, &handlers).1,
+            Err(StructureError::ExceptionHandlers),
+        ));
+    }
+}
+
+#[test]
 fn exceptional_finally_copy_can_be_detached_from_the_enclosing_loop_cfg() {
     let bytes = [
         0x03, 0x3c, // 0: int induction = 0

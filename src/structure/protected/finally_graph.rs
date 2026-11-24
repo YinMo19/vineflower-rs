@@ -20,12 +20,19 @@ pub(in crate::structure) struct BranchedFinally {
     pub(super) tail: usize,
     pub(super) tail_code: Range<usize>,
     pub(in crate::structure) monitor_exit: Option<FinallyMonitorExit>,
+    pub(in crate::structure) shared_return: Option<SharedReturn>,
 }
 
 pub(in crate::structure) struct FinallyMonitorExit {
     pub(in crate::structure) acquisition: usize,
     pub(in crate::structure) edge: MonitorDeparture,
     pub(super) copy: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(in crate::structure) struct SharedReturn {
+    pub(in crate::structure) block: usize,
+    pub(in crate::structure) jump: usize,
 }
 
 impl BranchedFinally {
@@ -134,12 +141,39 @@ impl BranchedFinally {
                 return None;
             }
         }
-        if cleanup.iter().any(|&block| {
-            graph.blocks[block]
-                .predecessors
-                .iter()
-                .any(|pred| !cleanup.contains(pred))
-        }) || body.iter().any(|&block| {
+        let mut shared_return = None;
+        for &block in &cleanup {
+            let node = &graph.blocks[block];
+            if node.predecessors.iter().all(|pred| cleanup.contains(pred)) {
+                continue;
+            }
+            // A forward labeled departure can be rendered where it occurs
+            // if both copies alone reach the same terminal return block.
+            // Do not move code across a handler or monitor boundary.
+            let &[sample, source] = node.predecessors.as_slice() else {
+                return None;
+            };
+            if shared_return.is_some()
+                || monitor.is_some()
+                || enclosing.is_some()
+                || block <= tail
+                || sample >= handler
+                || cleanup.contains(&sample)
+                || !cleanup.contains(&source)
+                || source >= block
+                || !routes[block].is_empty()
+                || !matches!(instructions[node.instructions.end - 1].opcode, 0xac..=0xb1)
+            {
+                return None;
+            }
+            let jump = explicit_jump(instructions, graph, source, block)?;
+            explicit_jump(instructions, graph, sample, block)?;
+            if !routes[source].is_empty() || !routes[sample].is_empty() {
+                return None;
+            }
+            shared_return = Some(SharedReturn { block, jump });
+        }
+        if body.iter().any(|&block| {
             matches!(
                 instructions[graph.blocks[block].instructions.end - 1].opcode,
                 0xac..=0xb1
@@ -148,6 +182,9 @@ impl BranchedFinally {
             return None;
         }
         let exits: BTreeSet<_> = normal_exits(graph, body).collect();
+        if shared_return.is_some() && exits.len() != 1 {
+            return None;
+        }
         let projection = monitor_exit.zip(enclosing.map(|(owner, _)| owner));
         if let Some((edge, _)) = projection
             && (exits.len() != 1
@@ -168,6 +205,7 @@ impl BranchedFinally {
             tail,
             tail_code,
             monitor_exit: None,
+            shared_return,
         };
         let mut tails = BTreeSet::new();
         for &sample in &exits {
@@ -268,6 +306,12 @@ impl BranchedFinally {
         let mut continuation = None;
         let mut pending = vec![(self.entry, sample_start)];
         while let Some((pattern, sample)) = pending.pop() {
+            if self.shared_return.is_some_and(|exit| exit.block == pattern) {
+                if pattern != sample {
+                    return None;
+                }
+                continue;
+            }
             if let Some(&previous) = paired.get(&pattern) {
                 if previous != sample {
                     return None;
@@ -446,6 +490,18 @@ fn before_unconditional_jump(code: &[Instruction]) -> &[Instruction] {
         [body @ .., last] if matches!(last.opcode, 0xa7 | 0xc8) => body,
         _ => code,
     }
+}
+
+fn explicit_jump(
+    instructions: &[Instruction],
+    graph: &ControlFlowGraph,
+    source: usize,
+    target: usize,
+) -> Option<usize> {
+    let node = &graph.blocks[source];
+    let jump = node.instructions.end - 1;
+    (node.successors == [target] && matches!(instructions[jump].opcode, 0xa7 | 0xc8))
+        .then_some(jump)
 }
 
 fn same_instruction(sample: &Instruction, pattern: &Instruction) -> bool {
