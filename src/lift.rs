@@ -10,6 +10,7 @@ mod concat;
 mod condy;
 mod booleans;
 mod boxing;
+mod constructor;
 mod dynamic;
 mod enum_constants;
 pub(crate) mod enum_switch;
@@ -35,7 +36,7 @@ pub(crate) use locals::IfPatternLocal;
 #[cfg(test)]
 mod tests;
 
-use std::{cell::RefCell, collections::BTreeSet, rc::Rc};
+use std::{cell::RefCell, collections::{BTreeMap, BTreeSet}, rc::Rc};
 
 use crate::{
     ClassGroup,
@@ -137,6 +138,7 @@ pub(crate) struct Machine<'a, 'c> {
     lambda_depth: u8,
     array_probe_depth: u8,
     initialized_this: bool,
+    early_final_fields: BTreeMap<usize, bool>,
     instruction_has_source: bool,
     boolean_condition: BooleanCondition,
     boolean_return: Option<BooleanFact>,
@@ -186,6 +188,7 @@ impl<'a, 'c> Machine<'a, 'c> {
             lambda_depth: 0,
             array_probe_depth: 0,
             initialized_this: method_name != "<init>" || super_class.is_none(),
+            early_final_fields: BTreeMap::new(),
             instruction_has_source: false,
             boolean_condition: BooleanCondition::UNKNOWN,
             boolean_return: None,
@@ -281,13 +284,16 @@ impl<'a, 'c> Machine<'a, 'c> {
     }
 
     pub(crate) fn same_locals(&self, other: &Self) -> bool {
-        self.initialized_this == other.initialized_this && self.locals.same_as(&other.locals)
+        self.initialized_this == other.initialized_this
+            && self.early_final_fields == other.early_final_fields
+            && self.locals.same_as(&other.locals)
     }
 
     pub(crate) fn discard_branch_locals(&mut self, baseline: &Self) -> bool {
         self.stack_is_empty()
             && baseline.stack_is_empty()
             && self.initialized_this == baseline.initialized_this
+            && self.early_final_fields == baseline.early_final_fields
             && self.locals.discard_branch_only(&baseline.locals)
     }
 
@@ -625,6 +631,9 @@ impl<'a, 'c> Machine<'a, 'c> {
         if !self.initialized_this {
             return Err(self.invalid_stack("constructor returns before initializing this"));
         }
+        if self.early_final_fields.values().any(|definite| !definite) {
+            return Err(self.invalid_stack("early final field is not assigned on every path"));
+        }
         let expected = &self.descriptor.return_type;
         self.boolean_return = None;
         let value = if opcode == 0xb1 {
@@ -783,12 +792,13 @@ impl<'a, 'c> Machine<'a, 'c> {
         if self.array_probe_depth != 0 {
             return Err(self.unsupported("array initializer element requires a spill"));
         }
-        if self
-            .stack
-            .iter()
-            .any(|value| value.is_uninitialized(self.initialized_this))
-            || !self.initialized_this
-        {
+        if self.stack.iter().any(|value| {
+            // The raw constructor receiver is just an unordered marker for a
+            // later putfield or invokespecial. Never materialize it, nor
+            // move an open, potentially throwing allocation across a spill.
+            value.is_uninitialized(self.initialized_this)
+                && (!matches!(value.source, Source::This) || value.order.is_some())
+        }) {
             return Err(self.unsupported("stack spills across an unfinished constructor call"));
         }
         let prior = self.order_of(&self.stack, false)?;

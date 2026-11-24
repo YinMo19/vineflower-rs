@@ -32,9 +32,10 @@ impl Machine<'_, '_> {
             .renames
             .map_or(name, |renames| renames.field_name(owner, name, descriptor));
         let ty = Type::parse(descriptor)?;
+        let category = Category::of(&ty).ok_or_else(|| self.invalid_operand("void field descriptor"))?;
         let write = matches!(op.opcode, 0xb3 | 0xb5);
         let value = if write {
-            let value = self.pop_category(Category::of(&ty).expect("field type is not void"))?;
+            let value = self.pop_category(category)?;
             Some(self.coerce_assignment(value, &ty)?)
         } else {
             None
@@ -61,9 +62,7 @@ impl Machine<'_, '_> {
             {
                 return Ok(effect);
             }
-            if expr.is_uninitialized(self.initialized_this) {
-                return Err(self.invalid_stack("uninitialized receiver used before invokespecial"));
-            }
+            self.check_instance_field_receiver(&expr, owner, name, descriptor, write)?;
             if !write {
                 place = AddressPart::receiver(&expr).map(|address| Access::Field(index, address));
             }
@@ -606,44 +605,7 @@ impl Machine<'_, '_> {
     ) -> Result<Effect, LiftError> {
         let receiver = self.pop_raw()?;
         match receiver.source {
-            Source::This if !self.initialized_this => {
-                if !self.stack_is_empty() || !self.prelude.is_empty() {
-                    return Err(self.unsupported("constructor chaining with pending stack values"));
-                }
-                self.order_of(&args, true)?;
-                let target = if owner == self.owner {
-                    "this"
-                } else if self.super_class == Some(owner) {
-                    "super"
-                } else {
-                    return Err(self.invalid_operand(
-                        "constructor must target this class or its direct superclass",
-                    ));
-                };
-                let (target, visible_args) =
-                    self.constructor_target(owner, method_type, &args, Some(target))?;
-                let visible_args = if self.class.access_flags & 0x4000 != 0 && owner == self.owner {
-                    let [label, ordinal, visible @ ..] = visible_args else {
-                        return Err(
-                            self.invalid_operand("missing implicit enum constructor arguments")
-                        );
-                    };
-                    if !matches!(label.source, Source::Local(1))
-                        || !matches!(ordinal.source, Source::Local(2))
-                        || !method_type.starts_with("(Ljava/lang/String;I")
-                    {
-                        return Err(self.unsupported("noncanonical enum constructor delegation"));
-                    }
-                    visible
-                } else {
-                    visible_args
-                };
-                self.initialized_this = true;
-                let mut text = target;
-                text.append_relative_arguments(visible_args.iter().map(|argument| &argument.text));
-                text.push(';');
-                Ok(Effect::Statement(text))
-            }
+            Source::This if !self.initialized_this => self.invoke_constructor(owner, method_type, args),
             Source::New(allocation) => {
                 if !matches!(&receiver.ty, Type::Object(name) if name == owner) {
                     return Err(self.invalid_operand("constructor owner does not match new"));

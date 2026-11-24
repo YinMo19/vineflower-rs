@@ -295,49 +295,28 @@ impl<'a> Enumeration<'a> {
         match name {
             "<clinit>" => Ok(self.skip_initializer),
             "<init>" if desc.starts_with(CONSTRUCTOR_PREFIX) => {
-                let Some(([receiver, label, position], tail)) =
-                    instructions.split_first_chunk::<3>()
-                else {
-                    return Err(pattern());
-                };
-                if !local(receiver, 0x19, 0)
+                // The only legal direct Enum invocation is javac's implicit
+                // prefix. An alternate constructor may have a Java 25
+                // prologue before the hidden label and ordinal are loaded.
+                let mut hidden = instructions.iter().enumerate()
+                    .filter(|(_, op)| matches!(subclasses::local_slot(op), Some(1 | 2)));
+                let Some((label_at, label)) = hidden.next() else { return Err(pattern()) };
+                let Some((ordinal_at, ordinal)) = hidden.next() else { return Err(pattern()) };
+                if ordinal_at != label_at + 1
                     || !local(label, 0x19, 1)
-                    || !local(position, 0x15, 2)
-                    || tail
-                        .iter()
-                        .any(|op| matches!(subclasses::local_slot(op), Some(1 | 2)))
+                    || !local(ordinal, 0x15, 2)
+                    || hidden.next().is_some()
                 {
-                    return Err(unsupported(
-                        "explicit use of JVM enum constructor parameters",
-                    ));
+                    return Err(unsupported("explicit use of JVM enum constructor parameters"));
                 }
-                let owner = class.pool.class_name(class.this_class)?;
-                for (at, op) in tail.iter().enumerate() {
-                    let Some((target, "<init>", raw)) = member(class, op, 0xb7)? else {
-                        continue;
-                    };
-                    if target == "java/lang/Enum" {
-                        return if at == 0 && raw == "(Ljava/lang/String;I)V" && tail.len() > 1 {
-                            Ok(4)
-                        } else {
-                            Err(pattern())
-                        };
-                    }
-                    if target == owner {
-                        let target =
-                            subclasses::find_constructor(class, raw)?.ok_or_else(pattern)?;
-                        return if raw != desc
-                            && raw.starts_with(CONSTRUCTOR_PREFIX)
-                            && target.access_flags & SYNTHETIC == 0
-                            && at + 1 < tail.len()
-                        {
-                            Ok(0)
-                        } else {
-                            Err(pattern())
-                        };
-                    }
+                if let [receiver, _, _, call, _rest @ ..] = instructions
+                    && label_at == 1
+                    && local(receiver, 0x19, 0)
+                    && matches!(member(class, call, 0xb7)?, Some(("java/lang/Enum", "<init>", "(Ljava/lang/String;I)V")))
+                {
+                    return if instructions.len() > 4 { Ok(4) } else { Err(pattern()) };
                 }
-                Err(unsupported("enum constructor without verified delegation"))
+                Ok(0)
             }
             "<init>" => Err(pattern()),
             _ => Ok(0),

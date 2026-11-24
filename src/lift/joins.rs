@@ -317,11 +317,7 @@ impl Machine<'_, '_> {
     }
 
     pub(crate) fn has_uninitialized_stack(&self) -> bool {
-        !self.initialized_this
-            || self
-                .stack
-                .iter()
-                .any(|value| value.is_uninitialized(self.initialized_this))
+        self.stack.iter().any(|value| value.is_uninitialized(self.initialized_this))
     }
 
     /// Join two expression-only arms without evaluating either arm eagerly.
@@ -671,6 +667,7 @@ impl Machine<'_, '_> {
                 self.invalid_stack("receiver initialization differs across control-flow join")
             );
         }
+        self.merge_early_final_fields(arms);
         for slot in 0..self.locals.slots.len() {
             let index = slot as u16;
             let before = self.locals.slots[slot].as_ref();

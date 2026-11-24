@@ -970,9 +970,11 @@ impl<'a, 'c> Writer<'a, 'c> {
         if parameters.len() != ty.parameters.len() || parameters.len() < implicit_parameters {
             return Err(DecompileError::InvalidAttribute("method parameters"));
         }
+        // A no-argument superclass call after prologue statements is the
+        // explicit delimiter: dropping it would execute those statements late.
         if constructor
             && enumeration.is_none()
-            && self.options.hide_empty_super
+            && (self.options.hide_empty_super || components.is_some())
             && lines
                 .first()
                 .is_some_and(|line| line.depth == 0 && line.text == "super();")

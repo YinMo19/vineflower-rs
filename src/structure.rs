@@ -147,6 +147,9 @@ fn structure_regions(
     record_patterns: Option<&pattern_record::Plans>,
 ) -> Result<Vec<Line>, StructureError> {
     if graph.blocks.is_empty() {
+        if !machine.this_is_initialized() {
+            return Err(StructureError::Flow { offset: 0 });
+        }
         return Ok(Vec::new());
     }
     let mut emitter = Emitter {
@@ -161,6 +164,9 @@ fn structure_regions(
         lines: Vec::new(),
     };
     emitter.region(0, Region::METHOD, &mut machine, 0)?;
+    if !machine.this_is_initialized() {
+        return Err(emitter.unstructured(0));
+    }
     if assertions.is_some_and(|sites| !sites.all_emitted(&emitter.emitted)) {
         return Err(StructureError::Assertion);
     }
@@ -277,9 +283,6 @@ impl Emitter<'_> {
                 continue;
             }
             if !first_header && let Some(loop_shape) = self.layout.loops[block] {
-                if !machine.this_is_initialized() {
-                    return Err(self.unstructured(block));
-                }
                 let Some((exit, resume)) =
                     self.emit_loop(block, loop_shape, region, machine, depth, pending)?
                 else {
@@ -488,6 +491,7 @@ impl Emitter<'_> {
                 index += consumed;
                 continue;
             }
+            let initialized_this = machine.this_is_initialized();
             let folded = if matches!(instruction.opcode, 0x59..=0x73 | 0x78..=0x83) {
                 machine.step_assignment(&self.instructions[index..range.end], |relative, _| {
                     let index = index + relative;
@@ -511,6 +515,13 @@ impl Emitter<'_> {
                 }
                 (index + 1, machine.step(instruction)?, instruction)
             };
+            if !initialized_this && machine.this_is_initialized()
+                && (depth != 0
+                    || (matches!(&effect, Effect::Statement(text) if text == "super();")
+                        && !self.lines.is_empty() && machine.requires_implicit_record_super()?))
+            {
+                return Err(self.unstructured(block));
+            }
             if let Some(baseline) = region.protected
                 && matches!(instruction.opcode, 0x36..=0x4e)
                 && !machine.keeps_locals_of(baseline)
@@ -638,7 +649,12 @@ impl Emitter<'_> {
             normal_join.or_else(shared_join)
         }
             .or_else(|| {
-                let abrupt = |arm| self.is_terminal(arm) || region.loop_transfer(arm).is_some();
+                let abrupt = |arm| {
+                    region.loop_transfer(arm).is_some()
+                        || self.is_terminal(arm)
+                            && (machine.this_is_initialized()
+                                || self.is_prologue_throw(arm, machine))
+                };
                 let next = match (abrupt(taken), abrupt(fallthrough)) {
                     (true, false) => fallthrough,
                     (false, true) => taken,
@@ -1546,6 +1562,18 @@ impl Emitter<'_> {
             return Err(StructureError::LocalJoin { offset });
         }
         Ok(())
+    }
+
+    fn is_prologue_throw(&self, block: usize, machine: &Machine<'_, '_>) -> bool {
+        let Some((last, body)) = self.instructions[self.graph.blocks[block].instructions.clone()]
+            .split_last()
+        else {
+            return false;
+        };
+        // Both sides of a fail-fast check may be terminal in the JVM graph:
+        // the other arm can initialize this and then return or throw. Keep
+        // that arm at the enclosing depth so its constructor call is legal.
+        last.opcode == 0xbf && !body.iter().any(|op| machine.may_chain_constructor(op))
     }
 
     fn is_terminal(&self, block: usize) -> bool {
