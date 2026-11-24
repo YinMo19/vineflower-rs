@@ -12,7 +12,7 @@ use crate::{
 use super::{
     Assignment, Bytecode, Constant, Expr, ExprKind, FINAL, Instruction, JvmType, KotlinError,
     Locals, Member, MethodDescriptor, Operand, Property, STATIC, Type, bytecode, local_load,
-    statements, templates,
+    statements,
 };
 
 pub(super) const FUNCTION1: &str = "kotlin/jvm/functions/Function1";
@@ -219,14 +219,7 @@ impl<'a, 'data> Bytecode<'a, 'data> {
         {
             return Err(invalid());
         }
-        let mut locals = Locals {
-            slots: Vec::new(),
-            instance: false,
-            alias: None,
-            dispatch_alias: None,
-            templates: templates::Context::default(),
-            extension: None,
-        };
+        let mut locals = Locals::with_slots(&[], false, None);
         locals.templates.member = Some(member);
         locals.templates.properties = properties;
         statements::lower_debug_range(self, &instructions, first..default - 2, &code, &locals, declaration)

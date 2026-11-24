@@ -1,8 +1,8 @@
 // Copyright 2026 Vineflower contributors. Licensed under the Apache License, Version 2.0.
 
-use std::{borrow::Cow, cell::OnceCell, ops::Range};
+use std::{borrow::Cow, ops::Range};
 
-use crate::classfile::{BootstrapMethod, Member, find_attribute};
+use crate::classfile::{Member, find_attribute};
 
 use super::{
     Bytecode, Constant, Expected, Expr, ExprKind, FINAL, Instruction, JvmType, KotlinError,
@@ -17,15 +17,11 @@ const STRING: &str = "java/lang/String";
 const OBJECT: &str = "java/lang/Object";
 const CLASS: &str = "java/lang/Class";
 const KCLASS: &str = "kotlin/reflect/KClass";
-const FACTORY: &str = "java/lang/invoke/StringConcatFactory";
-const CONCAT: &str = "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/CallSite;";
-const WITH_CONSTANTS: &str = "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/invoke/CallSite;";
 
 #[derive(Default)]
 pub(super) struct Context<'a> {
     pub(super) member: Option<&'a Member<'a>>,
     pub(super) properties: &'a [Property],
-    bootstraps: OnceCell<Vec<BootstrapMethod>>,
 }
 
 #[derive(Debug)]
@@ -34,6 +30,7 @@ pub(super) struct Template<'a> {
     recipe: Cow<'a, [u16]>,
     parts: Vec<Part<'a>>,
     infallible: bool,
+    snapshot: bool,
     depth: u8,
 }
 
@@ -59,7 +56,7 @@ pub(super) enum Builder<'a> {
 
 impl<'a> Template<'a> {
     fn new() -> Self {
-        Self { recipe: Cow::Borrowed(&[]), parts: Vec::new(), infallible: true, depth: 1 }
+        Self { recipe: Cow::Borrowed(&[]), parts: Vec::new(), infallible: true, snapshot: false, depth: 1 }
     }
 
     fn push_value(&mut self, argument: Argument<'a>, infallible: bool) {
@@ -94,15 +91,37 @@ impl<'a> Template<'a> {
         parameters: &[ValueParameter],
         declaration: &str,
     ) -> Result<(), KotlinError> {
+        use std::fmt::Write;
+        if self.snapshot {
+            // Evaluate all indy operands before invoking a user toString.
+            out.push_str("kotlin.run { ");
+            for (index, part) in self.parts.iter().enumerate() {
+                let Part::Value(argument) = part else { continue; };
+                write!(out, "val lambdaConcat{index}").unwrap();
+                if argument.primitive.is_none() {
+                    out.push_str(": kotlin.Any?");
+                }
+                out.push_str(" = ");
+                argument.expr.write_at(
+                    out, argument.primitive.map_or(Expected::Reference, Expected::Primitive),
+                    parameters, declaration, 0,
+                )?;
+                out.push_str("; ");
+            }
+        }
         out.push('"');
-        let mut parts = self.parts.iter().peekable();
-        while let Some(part) = parts.next() {
+        let mut parts = self.parts.iter().enumerate().peekable();
+        while let Some((index, part)) = parts.next() {
             match part {
                 Part::Recipe(range) => write_string_contents(out, self.recipe[range.clone()].iter().copied()),
                 Part::Text(text) => write_string_contents(out, text.iter().copied()),
                 Part::Char(unit) => write_string_contents(out, std::iter::once(*unit)),
                 Part::Value(argument) => {
-                    let next = parts.peek().and_then(|part| match part {
+                    if self.snapshot {
+                        write!(out, "${{lambdaConcat{index}}}").unwrap();
+                        continue;
+                    }
+                    let next = parts.peek().and_then(|(_, part)| match part {
                         Part::Recipe(range) => self.recipe[range.clone()].first().copied(),
                         Part::Text(text) => text.first().copied(),
                         Part::Char(unit) => Some(*unit),
@@ -129,6 +148,9 @@ impl<'a> Template<'a> {
             }
         }
         out.push('"');
+        if self.snapshot {
+            out.push_str(" }");
+        }
         Ok(())
     }
 }
@@ -157,7 +179,6 @@ pub(super) fn lower<'a>(
         }
     }
     let expression = match (instruction.opcode, &instruction.operand) {
-        (0xba, Operand::Constant(index)) => indy(bytecode, *index, locals, stack, declaration)?,
         (0xbb, Operand::Constant(index)) if pool.class_name(*index)? == BUILDER => {
             stack.push(StackValue::StringBuilder(Builder::New));
             return Ok(true);
@@ -289,31 +310,17 @@ fn append_parameter(descriptor: &str) -> Option<Shape<'static>> {
     })
 }
 
-fn indy<'a>(
+pub(super) fn indy<'a>(
     bytecode: &Bytecode<'a, '_>,
-    index: u16,
+    descriptor: &str,
+    bootstrap_arguments: &[u16],
+    with_constants: bool,
     locals: &Locals<'_>,
     stack: &mut Vec<StackValue<'a>>,
     declaration: &str,
 ) -> Result<Expr<'a>, KotlinError> {
     let invalid = || KotlinError::unsupported(declaration, "invalid Kotlin string concatenation site");
     let pool = &bytecode.class.pool;
-    let Constant::InvokeDynamic { bootstrap_index, name_and_type_index } = *pool.get(index)? else {
-        return Err(invalid());
-    };
-    if locals.templates.bootstraps.get().is_none() {
-        let _ = locals.templates.bootstraps.set(bytecode.class.bootstrap_methods()?);
-    }
-    let bootstrap = locals.templates.bootstraps.get().expect("loaded bootstrap methods")
-        .get(usize::from(bootstrap_index)).ok_or_else(invalid)?;
-    let Constant::MethodHandle { reference_kind: 6, reference_index } = *pool.get(bootstrap.method_ref)? else {
-        return Err(invalid());
-    };
-    if !matches!(pool.get(reference_index)?, Constant::Methodref { .. }) {
-        return Err(invalid());
-    }
-    let (site, descriptor) = pool.name_and_type(name_and_type_index)?;
-    let factory = pool.member_ref(reference_index)?;
     let descriptor = MethodDescriptor::parse(descriptor)?;
     if !matches!(&descriptor.return_type, JvmType::Object(name) if name == STRING)
         || descriptor.parameters.iter().map(JvmType::slots).sum::<u16>() > 200
@@ -334,19 +341,22 @@ fn indy<'a>(
         // A template interleaves evaluation and conversion; indy evaluates every
         // operand before the first conversion that might invoke user toString.
         if can_call_user_code && !infallible {
-            return Err(KotlinError::unsupported(declaration, "Kotlin string concatenation would reorder argument evaluation"));
+            if !locals.closure_body || super::lambdas::namespace_shadowed(locals) {
+                return Err(KotlinError::unsupported(declaration, "Kotlin string concatenation would reorder argument evaluation"));
+            }
+            template.snapshot = true;
         }
         can_call_user_code |= !safe;
         template.push_value(argument, safe && infallible);
         Ok(())
     };
-    match (site, factory, bootstrap.arguments.as_slice()) {
-        ("makeConcat", (FACTORY, "makeConcat", CONCAT), []) => {
+    match (with_constants, bootstrap_arguments) {
+        (false, []) => {
             for _ in &descriptor.parameters {
                 next(&mut template)?;
             }
         }
-        ("makeConcatWithConstants", (FACTORY, "makeConcatWithConstants", WITH_CONSTANTS), [recipe, constants @ ..]) => {
+        (true, [recipe, constants @ ..]) => {
             let Constant::String(text) = *pool.get(*recipe)? else { return Err(invalid()); };
             let recipe = pool.utf16(text)?;
             let mut constants = constants.iter();
@@ -440,7 +450,10 @@ fn actual<'a>(expr: &'a Expr<'_>, locals: &'a Locals<'_>) -> Shape<'a> {
         ExprKind::ValueBlock(block) => actual(&block.value, locals),
         ExprKind::BoxedInt(_) => Shape::Object("java/lang/Integer"),
         ExprKind::ClassLiteral(_) => Shape::Object(CLASS),
-        ExprKind::Conditional(_) | ExprKind::Nullable(_) | ExprKind::SuspendClosure(_) => Shape::Unknown,
+        ExprKind::Capture(capture) => shape(&capture.value.jvm),
+        ExprKind::Field(field) => shape(&field.value.jvm),
+        ExprKind::Cast(cast) => shape(&cast.value.jvm),
+        ExprKind::Conditional(_) | ExprKind::Nullable(_) | ExprKind::SuspendClosure(_) | ExprKind::Closure(_) => Shape::Unknown,
     }
 }
 

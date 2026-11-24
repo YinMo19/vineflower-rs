@@ -106,6 +106,7 @@ pub(super) fn lower<'a, 'data>(bytecode: &Bytecode<'a, 'data>, instructions: Vec
         local.index == template.slot && local.descriptor == template.element.descriptor()
             && u32::from(local.start_pc) == first && u32::from(local.length) == end - first
             && !parameters.iter().any(|parameter| parameter.name == local.name)
+            && (!locals.closure_body || !super::lambdas::reserved(local.name))
     }).map(|local| local.name);
     let mut suffix = 0;
     if name.is_none() {

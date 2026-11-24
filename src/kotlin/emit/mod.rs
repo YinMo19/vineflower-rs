@@ -89,9 +89,16 @@ pub(super) fn render<'a, 'data>(
         out.push_str("\n\n");
     }
     let nested = if options.is_none_or(|options| options.decompile_inner) { group } else { None };
-    if imports_repeat(class, owner, nested, 0)? {
-        // An explicit import beats a same-package `repeat` extension.
-        out.push_str("import kotlin.text.repeat\n\n");
+    let imports = text_imports(class, owner, nested, 0)?;
+    if imports != 0 {
+        for (index, import) in body::TEXT_IMPORTS.iter().enumerate() {
+            if imports & (1 << index) != 0 {
+                out.push_str("import ");
+                out.push_str(import);
+                out.push('\n');
+            }
+        }
+        out.push('\n');
     }
     let unit = options.map_or(INDENT, |options| options.indent.as_str());
     let mut mapping = options
@@ -1615,30 +1622,27 @@ fn render_local_extensions(
     Ok(line)
 }
 
-fn imports_repeat(
+fn text_imports(
     class: &ClassFile<'_>,
     owner: &str,
     group: Option<&ClassGroup<'_>>,
     depth: u8,
-) -> Result<bool, KotlinError> {
+) -> Result<u8, KotlinError> {
     if depth >= MAX_NESTING_DEPTH {
-        return Ok(false);
+        return Ok(0);
     }
-    if body::uses_stdlib_repeat(class)? {
-        return Ok(true);
-    }
+    let mut imports = body::text_imports(class)?;
     if let Some(group) = group {
         for (name, nesting) in group.children(owner) {
             if matches!(nesting.kind, crate::context::NestedKind::Member(_))
                 && name.strip_prefix(owner).is_some_and(|suffix| suffix.starts_with('$'))
                 && let Some(child) = group.get(name)
-                && imports_repeat(child, name, Some(group), depth + 1)?
             {
-                return Ok(true);
+                imports |= text_imports(child, name, Some(group), depth + 1)?;
             }
         }
     }
-    Ok(false)
+    Ok(imports)
 }
 
 fn overrides_any(name: &str, descriptor: &MethodDescriptor) -> bool {

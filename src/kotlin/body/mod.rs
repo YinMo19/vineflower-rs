@@ -23,6 +23,8 @@ mod decisions;
 mod defaults;
 mod extensions;
 mod invocations;
+mod dynamics;
+mod lambdas;
 mod local_functions;
 mod logic;
 mod loops;
@@ -37,7 +39,7 @@ mod try_regions;
 
 pub(super) use defaults::{recover as parameter_defaults, verify_copy, verify_copy_defaults};
 pub(super) use extensions::Context as Extension;
-pub(super) use invocations::uses_stdlib_repeat;
+pub(super) use invocations::{TEXT_IMPORTS, text_imports};
 pub(super) use local_functions::{Definition as LocalFunction, recover as local_extensions};
 pub(super) use named_suspend::source_return as suspend_source_return;
 use logic::{Comparison, Conditional, Relation};
@@ -147,6 +149,10 @@ enum ExprKind<'a> {
     ValueBlock(Box<statements::ValueBlock<'a>>),
     Nullable(Box<nullable::Expression<'a>>),
     SuspendClosure(Vec<statements::Statement<'a>>),
+    Closure(Box<lambdas::Closure<'a>>),
+    Capture(std::rc::Rc<lambdas::Capture>),
+    Field(Box<lambdas::Field<'a>>),
+    Cast(Box<lambdas::Cast<'a>>),
 }
 
 #[derive(Debug)]
@@ -217,6 +223,9 @@ struct Locals<'a> {
     alias: Option<(u16, u8, usize)>,
     dispatch_alias: Option<u16>,
     templates: templates::Context<'a>,
+    bootstraps: std::cell::OnceCell<Vec<crate::classfile::BootstrapMethod>>,
+    captures: Option<&'a [std::rc::Rc<lambdas::Capture>]>,
+    closure_body: bool,
     extension: Option<Extension<'a>>,
 }
 
@@ -254,6 +263,11 @@ impl<'a> Locals<'a> {
                 "JVM parameters do not match Kotlin parameters",
             ));
         }
+        Ok(Self::with_slots(jvm_parameters, instance, extension))
+    }
+
+    fn with_slots(jvm_parameters: &'a [JvmType], instance: bool, extension: Option<Extension<'a>>) -> Self {
+        let receiver = usize::from(extension.as_ref().is_some_and(Extension::has_receiver));
         let mut next = u16::from(instance) + extension.as_ref().map_or(0, Extension::slots);
         let slots = jvm_parameters
             .iter()
@@ -264,14 +278,17 @@ impl<'a> Locals<'a> {
                 (slot, ty)
             })
             .collect();
-        Ok(Self {
+        Self {
             slots,
             instance,
             alias: None,
             dispatch_alias: None,
             templates: templates::Context::default(),
+            bootstraps: std::cell::OnceCell::new(),
+            captures: None,
+            closure_body: false,
             extension,
-        })
+        }
     }
 
     fn next_slot(&self) -> u16 {
@@ -449,6 +466,7 @@ impl<'a, 'data> Bytecode<'a, 'data> {
             self.parameter_checks(&decoded, &locals, parameters)?
         };
         let mut start = decoded.len() - instructions.len();
+        locals.closure_body = dynamics::has_lambda(self, instructions, &locals, declaration)?;
         if !code.exceptions.is_empty() {
             return try_regions::lower(
                 self,
@@ -700,14 +718,7 @@ impl<'a, 'data> Bytecode<'a, 'data> {
         instructions: &[Instruction],
         declaration: &str,
     ) -> Result<Vec<Assignment<'a>>, KotlinError> {
-        let locals = Locals {
-            slots: Vec::new(),
-            instance: false,
-            alias: None,
-            dispatch_alias: None,
-            templates: templates::Context::default(),
-            extension: None,
-        };
+        let locals = Locals::with_slots(&[], false, None);
         self.assignment_slice(instructions, &locals, declaration)
     }
 
@@ -955,6 +966,11 @@ impl<'a> Bytecode<'a, '_> {
         declaration: &str,
         scoped: &[ScopedLocal<'a>],
     ) -> Result<(), KotlinError> {
+        if dynamics::lower(self, instruction, locals, stack, declaration)?
+            || lambdas::expression(self, instruction, locals, stack, declaration)?
+        {
+            return Ok(());
+        }
         if templates::lower(self, instruction, locals, stack, declaration)? {
             return Ok(());
         }
@@ -986,13 +1002,12 @@ impl<'a> Bytecode<'a, '_> {
                 let param = locals.parameter(slot, opcode).ok_or_else(|| {
                     KotlinError::unsupported(declaration, "load of non-parameter local")
                 })?;
-                stack.push(StackValue::Value(Expr {
-                    kind: ExprKind::Parameter {
-                        index: param,
-                        load: opcode,
-                    },
-                    depth: 1,
-                }));
+                let kind = if let Some(captures) = locals.captures {
+                    ExprKind::Capture(std::rc::Rc::clone(&captures[param]))
+                } else {
+                    ExprKind::Parameter { index: param, load: opcode }
+                };
+                stack.push(StackValue::Value(Expr { kind, depth: 1 }));
             }
             return Ok(());
         }
@@ -1280,6 +1295,7 @@ impl<'a> Expr<'a> {
             | ExprKind::LoopLocal(_) | ExprKind::CatchLocal(_) | ExprKind::ThisProperty { .. }
             | ExprKind::ClassLiteral(_) => true,
             ExprKind::Local(_) => true,
+            ExprKind::Capture(_) => true,
             ExprKind::Template(template) => template.infallible(),
             ExprKind::Binary(operator, _, pair) => {
                 !matches!(operator, Operator::Divide | Operator::Remainder)
@@ -1311,7 +1327,9 @@ impl<'a> Expr<'a> {
             ExprKind::Invocation(call) => Some(load_opcode(&call.result().jvm)),
             ExprKind::BoxedInt(_) => Some(0x19),
             ExprKind::Template(_) | ExprKind::ClassLiteral(_) | ExprKind::SmartString(_)
-            | ExprKind::SuspendClosure(_) => Some(0x19),
+            | ExprKind::SuspendClosure(_) | ExprKind::Closure(_) | ExprKind::Cast(_) => Some(0x19),
+            ExprKind::Capture(capture) => Some(load_opcode(&capture.value.jvm)),
+            ExprKind::Field(field) => Some(load_opcode(&field.value.jvm)),
             ExprKind::ThisProperty { primitive, .. } => Some(load_opcode(&JvmType::Primitive(*primitive))),
             ExprKind::Binary(_, primitive, _) => Some(load_opcode(&JvmType::Primitive(*primitive))),
             ExprKind::Nullable(expression) if expression.result().jvm != JvmType::Void => {
@@ -1332,6 +1350,10 @@ impl<'a> Expr<'a> {
             ExprKind::Local(local) => &local.value,
             ExprKind::Invocation(call) => call.result(),
             ExprKind::Nullable(expression) => expression.result(),
+            ExprKind::Closure(closure) => &closure.value,
+            ExprKind::Capture(capture) => &capture.value,
+            ExprKind::Field(field) => &field.value,
+            ExprKind::Cast(cast) => &cast.value,
             _ => return None,
         };
         Some((&value.ty, &value.jvm))
@@ -1356,7 +1378,10 @@ impl<'a> Expr<'a> {
             ExprKind::ValueBlock(block) => block.value.primitive_hint(parameters),
             ExprKind::SmartString(_) => None,
             ExprKind::BoxedInt(_) => None,
-            ExprKind::Template(_) | ExprKind::ClassLiteral(_) | ExprKind::SuspendClosure(_) => None,
+            ExprKind::Template(_) | ExprKind::ClassLiteral(_) | ExprKind::SuspendClosure(_)
+            | ExprKind::Closure(_) | ExprKind::Cast(_) => None,
+            ExprKind::Capture(capture) => capture.value.primitive(),
+            ExprKind::Field(field) => field.value.primitive(),
             ExprKind::ThisProperty { primitive, .. } => Some(*primitive),
             ExprKind::Nullable(expression) => expression.result().primitive(),
             ExprKind::Conditional(conditional) => conditional.primitive_hint(parameters),
@@ -1456,6 +1481,10 @@ impl<'a> Expr<'a> {
                 }
                 out.push('}');
             }
+            ExprKind::Closure(closure) => closure.write(out, expected, parameters, declaration)?,
+            ExprKind::Capture(capture) => capture.write(out, expected, parameters, declaration)?,
+            ExprKind::Field(field) => field.write(out, expected, parameters, declaration)?,
+            ExprKind::Cast(cast) => cast.write(out, expected, parameters, declaration)?,
             ExprKind::ExtensionReceiver(receiver) => {
                 if !receiver.accepts(expected) {
                     return Err(mismatch());

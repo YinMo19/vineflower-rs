@@ -36,6 +36,7 @@ enum Kind<'a> {
     Evaluate(Box<Call<'a>>),
     EvaluateNullable(Box<nullable::Expression<'a>>),
     Return(Expr<'a>, Value),
+    AssignField(Box<super::lambdas::Field<'a>>, Expr<'a>),
 }
 
 #[derive(Debug)]
@@ -44,7 +45,7 @@ pub(super) struct Binding<'a> {
     pub(super) value: Value,
     slot: u16,
     range: Range<u32>,
-    mutable: bool,
+    pub(super) mutable: bool,
 }
 
 pub(super) struct ConditionalInitializer<'a> {
@@ -204,6 +205,7 @@ impl Statement<'_> {
                 out.push_str("return ");
                 return value.write(out, &result.ty, &result.jvm, parameters, declaration);
             }
+            Kind::AssignField(field, value) => return field.assignment(out, value, parameters, declaration),
         };
         let argument_first = matches!(order, PrintOrder::ArgumentFirstRequired)
             || exact_print_overload && matches!(order, PrintOrder::ArgumentFirst);
@@ -626,6 +628,35 @@ fn lower_operands<'a>(
             {
                 return Err(invalid());
             }
+            if locals.closure_body
+                && let [StackValue::Value(value)] = stack.as_slice()
+                && let Some((ty, jvm)) = value.source_type(locals)
+                && load_opcode(jvm) + 0x21 == store
+                && let Some((written, _)) = instruction.local_access()
+                && written.end <= u32::from(debug.max)
+            {
+                let end = instructions[index + 1..range.end].iter().find(|next| {
+                    next.local_access().is_some_and(|(slots, read)| {
+                        (!read || next.opcode == 0x84) && written.start < slots.end && slots.start < written.end
+                    })
+                }).map_or_else(|| instructions[range.end - 1].offset + instructions[range.end - 1].len, |next| next.offset);
+                if !debug.entries.iter().any(|local| {
+                    let start = u32::from(local.start_pc);
+                    let width = if matches!(local.descriptor, "J" | "D") { 2 } else { 1 };
+                    after < start + u32::from(local.length) && start < end
+                        && written.start < u32::from(local.index) + width && u32::from(local.index) < written.end
+                }) {
+                    let local = Rc::new(Binding {
+                        name: Cow::Owned(format!("lambdaLocal{slot}_{}", instruction.offset)),
+                        slot, range: after..end, mutable: false, value: Value { ty: ty.clone(), jvm: jvm.clone() },
+                    });
+                    let value = pop_value(&mut stack, declaration)?;
+                    statements.push(Statement { instructions: first..index + 1, kind: Kind::Declare(local, value) });
+                    first = index + 1;
+                    index += 1;
+                    continue;
+                }
+            }
             if let [get, load, print, ..] = &instructions[index + 1..range.end]
                 && local_load(load) == Some((store - 0x21, slot))
                 && bytecode.reference(get, 0xb2)? == Some(("java/lang/System", "out", "Ljava/io/PrintStream;"))
@@ -765,6 +796,9 @@ fn lower_operands<'a>(
             }
             statements.push(Statement { instructions: first..index + 1, kind: Kind::Evaluate(call) });
             first = index + 1;
+        } else if let Some((field, value)) = super::lambdas::store(bytecode, instruction, locals, &mut stack, declaration)? {
+            statements.push(Statement { instructions: first..index + 1, kind: Kind::AssignField(Box::new(field), value) });
+            first = index + 1;
         } else {
             bytecode.expression_with_locals(instruction, locals, &mut stack, declaration, scoped)?;
             if matches!(stack.as_slice(), [StackValue::UnitCall(_)]) {
@@ -802,6 +836,7 @@ fn debug_binding<'a>(
         || (range.end <= instructions.last().map_or(0, |last| last.offset)
             && instructions.binary_search_by_key(&range.end, |instruction| instruction.offset).is_err())
         || matches!(local.name, "System" | "kotlin") || local.name == root || local.name == short
+        || locals.closure_body && super::lambdas::reserved(local.name)
         || declared.iter().filter_map(Statement::binding).any(|other| other.name == local.name)
     {
         return Err(invalid());
@@ -817,6 +852,9 @@ fn debug_binding<'a>(
     }
     let tail = &instructions[instructions.binary_search_by_key(&start, |instruction| instruction.offset).map_err(|_| invalid())?..];
     let mut name = Cow::Borrowed(local.name);
+    if locals.captures.is_some() {
+        name = Cow::Owned(format!("lambdaLocal{}_{}", local.index, start));
+    }
     if let Some(context) = &locals.extension
         && let Some(parameter) = context.parameters.iter().position(|param| param.name == local.name)
         && tail.iter().any(|instruction| {

@@ -32,6 +32,7 @@ pub(super) struct Call<'a> {
 #[derive(Debug)]
 enum Target<'a> {
     Constructor,
+    RefConstructor,
     Member { name: String },
     Extension { name: String, receiver: Argument<'a>, widen: bool, infix: bool },
     Function { name: String },
@@ -88,6 +89,12 @@ impl Call<'_> {
     ) -> Result<(), KotlinError> {
         match &self.target {
             Target::Constructor => qualified(out, self.result.ty.class_id().unwrap(), declaration)?,
+            Target::RefConstructor => {
+                qualified(out, self.result.ty.class_id().unwrap(), declaration)?;
+                if !self.result.ty.arguments.is_empty() {
+                    out.push_str("<kotlin.Any?>");
+                }
+            }
             Target::Member { name } => {
                 out.push_str("this.");
                 identifier(out, name, declaration)?;
@@ -185,6 +192,16 @@ impl<'a> Argument<'a> {
 }
 
 const REPEAT: (&str, &str, &str) = ("kotlin/text/StringsKt", "repeat", "(Ljava/lang/CharSequence;I)Ljava/lang/String;");
+const IS_BLANK: (&str, &str, &str) = ("kotlin/text/StringsKt", "isBlank", "(Ljava/lang/CharSequence;)Z");
+const DROP: (&str, &str, &str) = ("kotlin/text/StringsKt", "drop", "(Ljava/lang/String;I)Ljava/lang/String;");
+const IS_BLANK_ALIAS: &str = "lambdaTextIsBlank";
+const DROP_ALIAS: &str = "lambdaTextDrop";
+
+pub(in crate::kotlin) const TEXT_IMPORTS: [&str; 3] = [
+    "kotlin.text.repeat",
+    "kotlin.text.isBlank as lambdaTextIsBlank",
+    "kotlin.text.drop as lambdaTextDrop",
+];
 const COPY_OF: (&str, &str, &str) = ("java/util/Arrays", "copyOf", "([Ljava/lang/Object;I)[Ljava/lang/Object;");
 const STRING: &str = "java/lang/String";
 
@@ -287,17 +304,59 @@ pub(super) fn packed<'a>(
     Ok((Vararg::Packed(elements), index, scratch))
 }
 
-pub(in crate::kotlin) fn uses_stdlib_repeat(class: &ClassFile<'_>) -> Result<bool, KotlinError> {
+pub(in crate::kotlin) fn text_imports(class: &ClassFile<'_>) -> Result<u8, KotlinError> {
     let pool = &class.pool;
+    let mut mask = 0;
     for entry in pool.iter() {
         if let Constant::Methodref { class_index, name_and_type_index } = entry
             && pool.class_name(*class_index)? == REPEAT.0
-            && pool.name_and_type(*name_and_type_index)? == (REPEAT.1, REPEAT.2)
         {
-            return Ok(true);
+            mask |= match pool.name_and_type(*name_and_type_index)? {
+                (name, descriptor) if (name, descriptor) == (REPEAT.1, REPEAT.2) => 1,
+                (name, descriptor) if (name, descriptor) == (IS_BLANK.1, IS_BLANK.2) => 2,
+                (name, descriptor) if (name, descriptor) == (DROP.1, DROP.2) => 4,
+                _ => 0,
+            };
         }
     }
-    Ok(false)
+    Ok(mask)
+}
+
+pub(super) fn lambda_text<'a>(
+    bytecode: &Bytecode<'a, '_>, instruction: &Instruction, locals: &Locals<'_>,
+    stack: &mut Vec<StackValue<'a>>, declaration: &str,
+) -> Result<bool, KotlinError> {
+    let (name, source, result, arguments) = match bytecode.reference(instruction, 0xb8)? {
+        Some(IS_BLANK) => (
+            IS_BLANK_ALIAS, "kotlin/CharSequence",
+            Value { ty: kotlin_type("kotlin/Boolean"), jvm: JvmType::Primitive(Primitive::Boolean) }, Vec::new(),
+        ),
+        Some(DROP) => {
+            let count = super::pop_value(stack, declaration)?;
+            if count.primitive_hint(&[]) != Some(Primitive::Int)
+                && !matches!(count.kind, ExprKind::Literal(Literal::Int(_)))
+            {
+                return Err(invalid(declaration));
+            }
+            (
+                DROP_ALIAS, "kotlin/String",
+                Value { ty: kotlin_type("kotlin/String"), jvm: JvmType::Object(STRING.into()) },
+                vec![Argument::single(count, kotlin_type("kotlin/Int"), JvmType::Primitive(Primitive::Int), None)],
+            )
+        }
+        _ => return Ok(false),
+    };
+    let receiver = super::pop_value(stack, declaration)?;
+    let (ty, jvm) = receiver.source_type(locals).filter(|(ty, jvm)| {
+        ty.simple_class(source) && !ty.nullable && exact_type(ty, jvm, false)
+    }).ok_or_else(|| invalid(declaration))?;
+    let (ty, jvm) = (ty.clone(), jvm.clone());
+    let call = Box::new(Call {
+        target: Target::Extension { name: name.into(), receiver: Argument::single(receiver, ty, jvm, None), widen: false, infix: false },
+        arguments, result,
+    });
+    stack.push(StackValue::Value(call_expression(call, declaration)?));
+    Ok(true)
 }
 
 pub(super) fn lower<'a>(
@@ -489,6 +548,17 @@ fn constructor<'a>(
                 ty: class_type(ClassName { id: "kotlin/Exception".into(), local: false }),
                 jvm: JvmType::Object(owner.into()),
             },
+        });
+    }
+    if locals.closure_body && descriptor.return_type == JvmType::Void && descriptor.parameters.is_empty()
+        && let Some(ty) = super::lambdas::ref_type(owner)
+        && !super::lambdas::namespace_shadowed(locals)
+    {
+        stack.truncate(base);
+        return Ok(Call {
+            target: Target::RefConstructor,
+            arguments: Vec::new(),
+            result: Value { ty, jvm: JvmType::Object(owner.into()) },
         });
     }
     let class = if owner == bytecode.owner { bytecode.class } else {
