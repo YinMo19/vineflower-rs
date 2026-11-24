@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Arg, ArgMatches, Args, Command, FromArgMatches, error::ErrorKind};
 
-use crate::Options;
+use crate::{LogLevel, Options};
 
 mod files;
 #[cfg(test)]
@@ -272,6 +272,7 @@ const SETTINGS: &[Setting] = &[
         "WIDTH",
         "Preferred maximum line length before wrapping",
     ),
+    text("log-level", "log", "LEVEL", "Minimum diagnostic severity: trace, info, warn, error"),
     text(
         "include-runtime",
         "jrt",
@@ -416,6 +417,9 @@ impl Cli {
                 options.set(setting.name, value)?;
             }
         }
+        if self.silent {
+            options.log_level = LogLevel::Error;
+        }
         Ok(options)
     }
 
@@ -534,7 +538,6 @@ fn run_with_output(
         files::Selection {
             libraries: cli.add_external,
             only: cli.only,
-            silent: cli.silent,
             skip_extra_files,
         },
         stdout,

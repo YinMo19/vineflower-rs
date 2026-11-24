@@ -83,6 +83,7 @@ Exact upstream comparison with all fixture bytecode and required JDKs:
 | Legacy bytecode recovery, subword calls, protected foreach, Kotlin tail calls and preview guards | 138 | 117 | 442 | 0 |
 | Primitive class literals, enum/switch edge maps, predicate loops, array assignments and Kotlin infix | 146 | 113 | 438 | 0 |
 | Typed preview switches, mirrored loop cleanup, constructor joins, nested classes, and Kotlin locals | 147 | 105 | 445 | 0 |
+| Labeled `finally`, array mappings, local classes, string switches, Scala bridges and Kotlin spread | 154 | 100 | 443 | 0 |
 
 All eight upstream CLI and bulk cases match. The full test remains failing
 until all 697 comparisons match.

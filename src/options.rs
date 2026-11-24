@@ -9,6 +9,24 @@ use crate::{
     javadoc::JavadocProvider,
 };
 
+/// Minimum severity of diagnostic messages emitted by the frontend.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub enum LogLevel {
+    Trace,
+    #[default]
+    Info,
+    Warn,
+    Error,
+}
+
+impl LogLevel {
+    fn parse(value: &str) -> Option<Self> {
+        [("trace", Self::Trace), ("info", Self::Info), ("warn", Self::Warn), ("error", Self::Error)]
+            .into_iter()
+            .find_map(|(name, level)| value.eq_ignore_ascii_case(name).then_some(level))
+    }
+}
+
 /// Settings controlling JVM names, source formatting and source maps.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -53,6 +71,7 @@ pub struct Options {
     pub rename_members: bool,
     pub library_classpath: Option<Arc<ClassPath>>,
     pub runtime_classpath: Option<Arc<ClassPath>>,
+    pub log_level: LogLevel,
 }
 
 impl Default for Options {
@@ -98,6 +117,7 @@ impl Default for Options {
             rename_members: false,
             library_classpath: None,
             runtime_classpath: None,
+            log_level: LogLevel::default(),
         }
     }
 }
@@ -137,6 +157,13 @@ impl Options {
                 self.indent = value.into();
             }
             "banner" => self.banner = value.into(),
+            "log-level" => {
+                // The upstream preferences leave the logger unchanged for
+                // unrecognized levels.
+                if let Some(level) = LogLevel::parse(value) {
+                    self.log_level = level;
+                }
+            }
             "use-lvt-names" => self.use_debug_names = flag()?,
             "use-method-parameters" => self.use_method_parameters = flag()?,
             "remove-synthetic" => self.remove_synthetic = flag()?,

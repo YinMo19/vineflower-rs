@@ -521,6 +521,29 @@ fn multi_release_classes_do_not_shadow_base_and_resources_keep_physical_names() 
 }
 
 #[test]
+fn log_level_filters_missing_library_diagnostics_without_losing_output() {
+    let work = tempdir().unwrap();
+    let input = work.path().join("Example.class");
+    let missing = work.path().join("missing.jar");
+    fs::write(&input, CLASS).unwrap();
+    for (args, warns) in [
+        (&["-log=WaRn"][..], true),
+        (&["--log-level=ERROR"][..], false),
+        (&["--log-level=trace", "--silent"][..], false),
+    ] {
+        let mut output = Vec::new();
+        run_with_output(
+            args.iter().map(OsString::from)
+                .chain([format!("-e={}", missing.display()).into(), input.as_os_str().to_owned()]),
+            &mut output,
+        ).unwrap();
+        let output = std::str::from_utf8(&output).unwrap();
+        assert_eq!(output.contains("warn: missing"), warns, "{output}");
+        assert!(output.contains("return 4;"), "{output}");
+    }
+}
+
+#[test]
 fn skip_extra_files_keeps_source_files_without_copying_resources() {
     let work = tempdir().unwrap();
     let source = work.path().join("with-resource.jar");

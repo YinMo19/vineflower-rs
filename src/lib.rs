@@ -22,4 +22,4 @@ mod structure;
 pub use context::{ClassGroup, ClassGroupBuilder};
 pub use emit::{DecompileError, MethodMap, Source, SourceMap, decompile, decompile_group};
 pub use javadoc::{Javadoc, JavadocProvider, JavadocStyle, JavadocTarget};
-pub use options::{OptionError, Options};
+pub use options::{LogLevel, OptionError, Options};

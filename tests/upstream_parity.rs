@@ -405,8 +405,7 @@ fn run_single(case: &Case, inputs: &mut Inputs) -> Result<(), Failure> {
             Err(OptionError::Unsupported(_))
                 if matches!(
                     (name, value),
-                    ("log-level", "warn")
-                        | ("error-message", "")
+                    ("error-message", "")
                         | ("dump-exception-on-error", "0")
                         | ("include-runtime", "")
                         | ("include-classpath", "0")

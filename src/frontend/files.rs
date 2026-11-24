@@ -16,7 +16,7 @@ use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter};
 
 use super::{Destination, is_archive};
 use crate::{
-    ClassGroup, ClassGroupBuilder, DecompileError, Options, classfile::ClassError,
+    ClassGroup, ClassGroupBuilder, DecompileError, LogLevel, Options, classfile::ClassError,
     naming::MemberRenames,
 };
 
@@ -191,7 +191,6 @@ struct ClassInput {
 pub(super) struct Selection {
     pub libraries: Vec<PathBuf>,
     pub only: Vec<String>,
-    pub silent: bool,
     pub skip_extra_files: bool,
 }
 
@@ -803,7 +802,7 @@ pub(super) fn decompile_paths(
         match fs::metadata(&path) {
             Ok(metadata) => inputs.add(path, metadata, false)?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                if !selection.silent {
+                if options.log_level <= LogLevel::Warn {
                     writeln!(stdout, "warn: missing '{}', ignored", path.display())
                         .map_err(|error| io_error("write", Path::new("<stdout>"), error))?;
                 }
