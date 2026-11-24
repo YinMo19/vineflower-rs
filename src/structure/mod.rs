@@ -1468,20 +1468,30 @@ impl Emitter<'_> {
         {
             return Ok(next);
         }
-        let join = labeled_tail.or_else(|| self.layout.normal_join(block, region))
-            .or_else(|| {
-                let mut targets = groups.keys().copied().peekable();
-                let arms = std::iter::from_fn(|| {
-                    let target = targets.next()?;
-                    let fallthrough = targets
-                        .peek()
-                        .copied()
-                        .filter(|&next| self.layout.can_fall_through(target, next, None));
-                    Some((target, fallthrough))
-                });
-                self.layout.common_join(self.graph, region, arms)
-            })
-            .or(region.stop);
+        let shared_join = || {
+            let mut targets = groups.keys().copied().peekable();
+            let arms = std::iter::from_fn(|| {
+                let target = targets.next()?;
+                let fallthrough = targets
+                    .peek()
+                    .copied()
+                    .filter(|&next| self.layout.can_fall_through(target, next, None));
+                Some((target, fallthrough))
+            });
+            self.layout.common_join(self.graph, region, arms)
+        };
+        let join = labeled_tail.or_else(|| {
+            let normal = self.layout.normal_join(block, region);
+            // A continue can jump past the remainder of the loop body.
+            // Keep that remainder outside the switch when its cases share it.
+            if normal.is_some_and(|next| {
+                matches!(region.loop_transfer(next), Some((_, Transfer::Continue)))
+            }) {
+                shared_join().or(normal)
+            } else {
+                normal.or_else(shared_join)
+            }
+        }).or(region.stop);
         if labeled_tail.is_none() && let Some(join) = join
             && self.try_switch_expression(
                 block, region, machine, depth, &selector, &groups, default, join, &control,
