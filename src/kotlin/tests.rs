@@ -18,6 +18,8 @@ use super::{
 // The Test* class files are upstream's Kotlin 2.0.0 Gradle fixtures, from
 // tests/upstream/plugins/kotlin/testData/src/kt/pkg. The other class files
 // come from this module's Kotlin sources (Kotlin 2.2.20, -jvm-target 1.8).
+// ForLoops uses -jvm-target 17; TestForRange also requires the JVM 17
+// fixture to exercise Kotlin's invokedynamic message on invalid step values.
 // Hex keeps the test class files usable without a JVM or an upstream build.
 const CLASS: &str = include_str!("fixtures/Declaration.class.hex");
 const FACADE: &str = include_str!("fixtures/DeclarationsKt.class.hex");
@@ -35,6 +37,8 @@ const UNSUPPORTED_DEFAULTS: &str = include_str!("fixtures/UnsupportedDefaults.cl
 const DATA_CLASS: &str = include_str!("fixtures/TestDataClass.class.hex");
 const BRANCHES: &str = include_str!("fixtures/Branches.class.hex");
 const WHEN_BOOLEAN: &str = include_str!("fixtures/TestWhenBoolean.class.hex");
+const FOR_RANGE: &str = include_str!("fixtures/TestForRange.class.hex");
+const FOR_LOOPS: &str = include_str!("fixtures/ForLoops.class.hex");
 
 fn bytes(hex: &str) -> Vec<u8> {
     assert!(hex.lines().all(|line| line.len() % 2 == 0));
@@ -170,36 +174,48 @@ fn renders_value_joins_early_returns_and_short_circuit() {
 #[test]
 fn recovers_switch_groups_joined_values_and_typed_when_predicates() {
     let source = render(BRANCHES);
-    assert!(source.contains(concat!(
-        "   public fun lookup(key: Int): String {\n",
-        "      return when (key) {\n",
-        "         -20 -> \"left\"\n",
-        "         7, 1024 -> \"right\"\n",
-        "         else -> \"center\"\n",
-    )), "{source}");
-    assert!(source.contains(concat!(
-        "   public fun table(key: Int) {\n",
-        "      when (key) {\n",
-        "         1 -> System.out.println(\"one\")\n",
-        "         2, 3 -> System.out.println(\"two or three\")\n",
-        "         else -> System.out.println(\"default\")\n",
-    )), "{source}");
-    assert!(source.contains(concat!(
-        "      val text: String = when (key) {\n",
-        "         1 -> \"one\"\n",
-        "         2, 3, 5 -> \"some prime\"\n",
-        "         else -> \"anything else\"\n",
-        "      }\n",
-        "      System.out.println(text)\n",
-    )), "{source}");
-    assert!(source.contains(concat!(
-        "      when {\n",
-        "         value == 7 -> System.out.println(\"seven\")\n",
-        "         value == null -> System.out.println(\"nothing\")\n",
-        "         value is kotlin.String -> System.out.println(\"string\")\n",
-        "         value !is kotlin.Long -> System.out.println(\"not long\")\n",
-        "         else -> System.out.println(\"long\")\n",
-    )), "{source}");
+    assert!(
+        source.contains(concat!(
+            "   public fun lookup(key: Int): String {\n",
+            "      return when (key) {\n",
+            "         -20 -> \"left\"\n",
+            "         7, 1024 -> \"right\"\n",
+            "         else -> \"center\"\n",
+        )),
+        "{source}"
+    );
+    assert!(
+        source.contains(concat!(
+            "   public fun table(key: Int) {\n",
+            "      when (key) {\n",
+            "         1 -> System.out.println(\"one\")\n",
+            "         2, 3 -> System.out.println(\"two or three\")\n",
+            "         else -> System.out.println(\"default\")\n",
+        )),
+        "{source}"
+    );
+    assert!(
+        source.contains(concat!(
+            "      val text: String = when (key) {\n",
+            "         1 -> \"one\"\n",
+            "         2, 3, 5 -> \"some prime\"\n",
+            "         else -> \"anything else\"\n",
+            "      }\n",
+            "      System.out.println(text)\n",
+        )),
+        "{source}"
+    );
+    assert!(
+        source.contains(concat!(
+            "      when {\n",
+            "         value == 7 -> System.out.println(\"seven\")\n",
+            "         value == null -> System.out.println(\"nothing\")\n",
+            "         value is kotlin.String -> System.out.println(\"string\")\n",
+            "         value !is kotlin.Long -> System.out.println(\"not long\")\n",
+            "         else -> System.out.println(\"long\")\n",
+        )),
+        "{source}"
+    );
 }
 
 #[test]
@@ -214,12 +230,111 @@ fn recovers_upstream_boolean_decision_graph_with_mapped_call() {
     assert!(source.text.contains(" -> System.out.println(\"hello\")"));
     assert_eq!(source.text.matches("System.out.println").count(), 1);
     let map = source.map.unwrap();
-    let [method] = map.methods.as_slice() else { panic!("expected one mapped method"); };
+    let [method] = map.methods.as_slice() else {
+        panic!("expected one mapped method");
+    };
     assert_eq!(method.name, "testIf");
-    let call_line = source.text.lines().position(|line| line.contains("System.out.println")).unwrap();
+    let call_line = source
+        .text
+        .lines()
+        .position(|line| line.contains("System.out.println"))
+        .unwrap();
     assert_eq!(method.offsets[&170], call_line);
     assert_eq!(method.offsets[&172], call_line);
     assert!(method.offsets[&173] > call_line);
+}
+
+#[test]
+fn renders_counted_ranges_and_stepped_progressions() {
+    let options = crate::Options {
+        decompile_kotlin: true,
+        include_line_mappings: true,
+        ..crate::Options::default()
+    };
+    let source = crate::decompile(&bytes(FOR_RANGE), &options).unwrap();
+    for (signature, binding, range) in [
+        ("testInt()", "i", "1..10"),
+        ("testChar()", "c", "'a'..'z'"),
+        ("testIntStep()", "i", "1..10 step 2"),
+        ("testIntStepX(x: Int)", "i", "1..100 step x"),
+        ("testIntDownTo()", "i", "10 downTo 1"),
+        ("testIntDownToStep()", "i", "10 downTo 1 step 2"),
+        ("testIntDownToStepX(x: Int)", "i", "100 downTo 1 step x"),
+        ("testUntil()", "i", "1..9"),
+        ("testUntilStep()", "i", "1 until 100 step 2"),
+        ("testUntilStepX(x: Int)", "i", "1 until 100 step x"),
+        ("testIntY(x: Int, y: Int)", "i", "x..y"),
+        ("testIntYStep(x: Int, y: Int)", "i", "x..y step 2"),
+        ("testIntYStepX(x: Int, y: Int, z: Int)", "i", "x..y step z"),
+    ] {
+        assert!(
+            source.text.contains(&format!(
+                "   public fun {signature} {{\n      for ({binding} in {range}) {{\n         System.out.println({binding})\n      }}\n   }}"
+            )),
+            "{signature} in {}",
+            source.text
+        );
+    }
+    assert_eq!(source.text.matches("      for (").count(), 13);
+    let map = source.map.unwrap();
+    let method = map.methods.iter().find(|method| method.name == "testInt").unwrap();
+    let mut lines = source.text.lines();
+    assert_eq!(lines.nth(method.offsets[&5]), Some("      for (i in 1..10) {"));
+    assert_eq!(lines.next(), Some("         System.out.println(i)"));
+    assert_eq!(method.offsets[&12], method.offsets[&5] + 1);
+    assert_eq!(method.offsets[&17], method.offsets[&5]);
+    assert_eq!(method.offsets[&21], method.offsets[&5] + 3);
+}
+
+#[test]
+fn renders_generic_iterator_elements_and_variable_exclusive_bound() {
+    assert_eq!(
+        render(FOR_LOOPS),
+        concat!(
+            "package parity.kotlin\n\n",
+            "public class ForLoops {\n",
+            "   public fun list(words: List<String>) {\n",
+            "      for (word in words) {\n",
+            "         System.out.println(word as kotlin.Any?)\n",
+            "      }\n",
+            "   }\n\n",
+            "   public fun numbers(values: Iterable<Int>) {\n",
+            "      for (value in values) {\n",
+            "         System.out.println(value + 1)\n",
+            "      }\n",
+            "   }\n\n",
+            "   public fun untilBound(end: Int) {\n",
+            "      for (index in 0 until end) {\n",
+            "         System.out.println(index)\n",
+            "      }\n",
+            "   }\n",
+            "}\n",
+        )
+    );
+}
+
+#[test]
+fn rejects_wrong_progression_exit_and_iterator_slot_alias() {
+    for (fixture, name, offset, from, to) in [
+        (FOR_RANGE, "testIntY", 4, 0xa3, 0xa2),
+        (FOR_LOOPS, "list", 31, 0x4e, 0x4d),
+    ] {
+        let mut class_bytes = bytes(fixture);
+        let start = {
+            let class = ClassFile::parse(&class_bytes).unwrap();
+            let method = class.methods.iter().find(|method| {
+                class.pool.utf8(method.name_index).unwrap() == name
+            }).unwrap();
+            let code = method.code(&class.pool).unwrap().unwrap();
+            assert_eq!(code.bytes[offset], from);
+            code.bytes.as_ptr() as usize - class_bytes.as_ptr() as usize
+        };
+        class_bytes[start + offset] = to;
+        let class = ClassFile::parse(&class_bytes).unwrap();
+        assert!(matches!(decompile_class(&class), Err(KotlinError::Unsupported {
+            declaration, feature: "loop or backward control transfer"
+        }) if declaration == name));
+    }
 }
 
 #[test]

@@ -181,7 +181,9 @@ fn reference_cast(left: &Expr<'_>, right: &Expr<'_>, parameters: &[ValueParamete
             !any_or_string(ty(*index))
         }
         (ExprKind::BoxedInt(_), ExprKind::Parameter { index, .. })
-        | (ExprKind::Parameter { index, .. }, ExprKind::BoxedInt(_)) => ty(*index).class_id() != Some("kotlin/Any"),
+        | (ExprKind::Parameter { index, .. }, ExprKind::BoxedInt(_)) => {
+            ty(*index).class_id() != Some("kotlin/Any")
+        }
         (ExprKind::Literal(Literal::String(_)), ExprKind::Literal(Literal::String(_))) => false,
         _ => true,
     }
@@ -296,7 +298,8 @@ fn boolean_value(expr: &Expr<'_>, parameters: &[ValueParameter]) -> bool {
     if let ExprKind::Conditional(conditional) = &expr.kind {
         boolean_value(&conditional.yes, parameters) && boolean_value(&conditional.no, parameters)
     } else {
-        boolean_constant(expr).is_some() || expr.primitive_hint(parameters) == Some(Primitive::Boolean)
+        boolean_constant(expr).is_some()
+            || expr.primitive_hint(parameters) == Some(Primitive::Boolean)
     }
 }
 

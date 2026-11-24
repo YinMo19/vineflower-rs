@@ -51,6 +51,11 @@ impl Statement<'_> {
                         {
                             ""
                         }
+                        ExprKind::LoopLocal(local)
+                            if matches!(local.element, super::loops::Element::Object) =>
+                        {
+                            ""
+                        }
                         _ => " as kotlin.Any?",
                     };
                     (Expected::Reference, cast)
@@ -61,6 +66,11 @@ impl Statement<'_> {
                         ExprKind::Literal(Literal::Null) => " as kotlin.String?",
                         ExprKind::Parameter { index, .. }
                             if parameters[*index].ty.class_id() == Some("kotlin/String") =>
+                        {
+                            ""
+                        }
+                        ExprKind::LoopLocal(local)
+                            if matches!(local.element, super::loops::Element::String) =>
                         {
                             ""
                         }
@@ -89,7 +99,13 @@ pub(super) fn lower<'a>(
     locals: &Locals<'_>,
     declaration: &str,
 ) -> Result<Vec<Statement<'a>>, KotlinError> {
-    lower_range(bytecode, instructions, start..instructions.len() - 1, locals, declaration)
+    lower_range(
+        bytecode,
+        instructions,
+        start..instructions.len() - 1,
+        locals,
+        declaration,
+    )
 }
 
 pub(super) fn lower_range<'a>(
@@ -99,15 +115,27 @@ pub(super) fn lower_range<'a>(
     locals: &Locals<'_>,
     declaration: &str,
 ) -> Result<Vec<Statement<'a>>, KotlinError> {
+    lower_scoped(bytecode, instructions, range, locals, declaration, None)
+}
+
+pub(super) fn lower_scoped<'a>(
+    bytecode: &Bytecode<'a, '_>,
+    instructions: &[Instruction],
+    range: Range<usize>,
+    locals: &Locals<'_>,
+    declaration: &str,
+    scoped: Option<super::loops::Binding<'a>>,
+) -> Result<Vec<Statement<'a>>, KotlinError> {
     let mut statements = Vec::new();
     let mut stack = Vec::new();
     let mut index = range.start;
     let mut first = index;
     let invalid = || KotlinError::unsupported(declaration, "unsupported Kotlin statement bytecode");
+    let first_free = scoped.map_or_else(|| locals.next_slot(), |local| local.first_free);
     while index < range.end {
         let instruction = &instructions[index];
         if let Some((store, slot)) = super::local_store(instruction)
-            && slot >= locals.next_slot()
+            && slot >= first_free
             && let [get, load, ..] = &instructions[index + 1..range.end]
             && super::local_load(load) == Some((store - 0x21, slot))
             && bytecode.reference(get, 0xb2)?
@@ -156,7 +184,7 @@ pub(super) fn lower_range<'a>(
             });
             first = index + 1;
         } else {
-            bytecode.expression(instruction, locals, &mut stack, declaration)?;
+            bytecode.expression_with_local(instruction, locals, &mut stack, declaration, scoped)?;
         }
         index += 1;
     }

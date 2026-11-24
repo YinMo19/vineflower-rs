@@ -1050,8 +1050,13 @@ fn render_function(
                     .map(|_| trace::Trace::new(bytecode, method))
                     .transpose()?;
                 block.write(
-                    out, (&function.returns, &descriptor.return_type), &function.parameters, name,
-                    indent, indent_unit, |instruction, line| {
+                    out,
+                    (&function.returns, &descriptor.return_type),
+                    &function.parameters,
+                    name,
+                    indent,
+                    indent_unit,
+                    |instruction, line| {
                         if let (Some(trace), Some((_, header))) = (&mut trace, &location) {
                             trace.instruction(instruction, *header + line);
                         }
@@ -1066,11 +1071,39 @@ fn render_function(
                     .as_ref()
                     .map(|_| trace::Trace::new(bytecode, method))
                     .transpose()?;
-                body.write(out, &function.parameters, name, indent, indent_unit, |instruction, line| {
-                    if let (Some(trace), Some((_, header))) = (&mut trace, &location) {
-                        trace.instruction(instruction, *header + line);
-                    }
-                })?;
+                body.write(
+                    out,
+                    &function.parameters,
+                    name,
+                    indent,
+                    indent_unit,
+                    |instruction, line| {
+                        if let (Some(trace), Some((_, header))) = (&mut trace, &location) {
+                            trace.instruction(instruction, *header + line);
+                        }
+                    },
+                )?;
+                if let (Some(trace), Some((map, _))) = (trace, location) {
+                    trace.finish(map, body.lines);
+                }
+            }
+            Body::Loop(body) => {
+                let mut trace = location
+                    .as_ref()
+                    .map(|_| trace::Trace::new(bytecode, method))
+                    .transpose()?;
+                body.write(
+                    out,
+                    &function.parameters,
+                    name,
+                    indent,
+                    indent_unit,
+                    |instruction, line| {
+                        if let (Some(trace), Some((_, header))) = (&mut trace, &location) {
+                            trace.instruction(instruction, *header + line);
+                        }
+                    },
+                )?;
                 if let (Some(trace), Some((map, _))) = (trace, location) {
                     trace.finish(map, body.lines);
                 }
