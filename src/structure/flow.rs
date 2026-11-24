@@ -12,6 +12,7 @@ use super::StructureError;
 use super::assertions::Sites;
 use super::do_while::PostTest;
 use super::labeled_blocks::conditional_case::{ConditionalCase, ConditionalCaseScope};
+use super::labeled_blocks::loop_exit::LoopExitLabel;
 use super::protected::{ArmId, Exceptions};
 
 #[derive(Clone, Copy)]
@@ -224,6 +225,7 @@ pub(super) struct Layout {
     level: Vec<Option<usize>>,
     postdominators: DominanceTree,
     conditional_cases: BTreeMap<usize, Rc<ConditionalCase>>,
+    loop_exit_labels: BTreeMap<usize, LoopExitLabel>,
     locals: Option<LocalLiveness>,
 }
 
@@ -258,6 +260,7 @@ impl Layout {
         let mut level: Vec<Option<usize>> = vec![None; graph.blocks.len()];
         let postdominators = DominanceTree::new(graph.immediate_postdominators());
         let mut conditional_cases = BTreeMap::new();
+        let mut loop_exit_labels = BTreeMap::new();
         let mut seen_tail = Vec::new();
         let mut pending = Vec::new();
         for natural_loop in natural_loops {
@@ -356,7 +359,17 @@ impl Layout {
             } else {
                 None
             };
-            let case_boundary = |block| conditional_case.as_ref().is_some_and(|case| case.loop_boundary(block));
+            let exit_label = if conditional_case.is_none() && parent.is_none() && predicate.is_none()
+                && post_test.is_none() && exits.len() > 1
+            {
+                test.and_then(|test| LoopExitLabel::prove(graph, instructions, &natural_loop, test.exit, &exits))
+            } else {
+                None
+            };
+            let external_boundary = |block| {
+                conditional_case.as_ref().is_some_and(|case| case.loop_boundary(block))
+                    || exit_label.is_some_and(|label| block == label.join)
+            };
             // A header that already executes body code can branch to an
             // early method exit. Keep such abrupt tails in the body when
             // the unique conditional latch supplies the normal continuation.
@@ -401,7 +414,7 @@ impl Layout {
             // A natural loop contains only blocks that can return to its
             // header. Include dominated exit-only tails in the same source
             // loop, stopping at its continuation or an enclosing transfer.
-            pending.extend(exits.iter().copied().filter(|&target| Some(target) != exit && !case_boundary(target)));
+            pending.extend(exits.iter().copied().filter(|&target| Some(target) != exit && !external_boundary(target)));
             if !pending.is_empty() && seen_tail.is_empty() {
                 seen_tail.resize(graph.blocks.len(), usize::MAX);
             }
@@ -411,7 +424,7 @@ impl Layout {
                 if Some(block) == exit
                     || inside(block)
                     || outer_transfer(block)
-                    || case_boundary(block)
+                    || external_boundary(block)
                     || std::mem::replace(&mut seen_tail[block], header) == header
                 {
                     continue;
@@ -499,6 +512,9 @@ impl Layout {
             if let Some(case) = conditional_case {
                 conditional_cases.insert(case.head, Rc::new(case));
             }
+            if let Some(label) = exit_label {
+                loop_exit_labels.insert(header, label);
+            }
         }
         // An abrupt arm can put only part of an exceptional cleanup in
         // the natural loop. All its arms are lexically at the try's level.
@@ -520,6 +536,7 @@ impl Layout {
             level,
             postdominators,
             conditional_cases,
+            loop_exit_labels,
             locals: None,
         })
     }
@@ -530,6 +547,10 @@ impl Layout {
 
     pub(super) fn conditional_case(&self, block: usize) -> Option<Rc<ConditionalCase>> {
         self.conditional_cases.get(&block).cloned()
+    }
+
+    pub(super) fn loop_exit_label(&self, block: usize) -> Option<LoopExitLabel> {
+        self.loop_exit_labels.get(&block).copied()
     }
 
     pub(super) fn install_closed_cycle(&mut self, header: usize, members: &[bool]) {

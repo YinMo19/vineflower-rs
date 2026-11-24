@@ -9,6 +9,7 @@ use super::{
 };
 
 pub(super) mod conditional_case;
+pub(super) mod loop_exit;
 mod resource_switch;
 
 pub(super) struct Scope<'a, 'c> {
@@ -62,11 +63,38 @@ enum Edges {
 }
 
 enum Head {
-    If(Condition),
-    Switch(Document),
+    If(Condition, RangeInclusive<u32>),
+    Switch(Document, RangeInclusive<u32>),
+    Loop(Loop),
 }
 
 impl Emitter<'_> {
+    pub(super) fn emit_loop_with_exit_label<'a, 'c>(
+        &mut self,
+        head: usize,
+        loop_shape: Loop,
+        region: Region<'_, 'a, 'c>,
+        machine: &mut Machine<'a, 'c>,
+        depth: usize,
+        offsets: &mut Vec<u32>,
+    ) -> Result<Option<usize>, StructureError> {
+        let Some(label) = self.layout.loop_exit_label(head) else { return Ok(None); };
+        if region.label_scope().is_some()
+            || !self.layout.inside(label.join, region)
+            || loop_shape.exit != Some(label.tail)
+        {
+            return Err(self.unstructured(head));
+        }
+        self.require_empty_stack(machine, head)?;
+        let plan = Plan {
+            tail: label.tail,
+            join: label.join,
+            break_count: label.break_count,
+            edges: Edges::Explicit,
+        };
+        self.emit_labeled(head, region, machine, depth, Head::Loop(loop_shape), offsets, plan)
+    }
+
     pub(super) fn emit_loop_with_finally_label<'a, 'c>(
         &mut self,
         header: usize,
@@ -293,7 +321,7 @@ impl Emitter<'_> {
         let Some(plan) = plan else {
             return self.emit_if(head, region, machine, depth, condition, binding, offsets, control);
         };
-        self.emit_labeled(head, region, machine, depth, Head::If(condition), offsets, control, plan)
+        self.emit_labeled(head, region, machine, depth, Head::If(condition, control), offsets, plan)
     }
 
     pub(super) fn emit_switch_or_labeled<'a, 'c>(
@@ -319,7 +347,7 @@ impl Emitter<'_> {
         let Some(plan) = plan else {
             return self.emit_switch(head, region, machine, depth, selector, offsets, control, None);
         };
-        self.emit_labeled(head, region, machine, depth, Head::Switch(selector), offsets, control, plan)
+        self.emit_labeled(head, region, machine, depth, Head::Switch(selector, control), offsets, plan)
     }
 
     fn emit_labeled<'a, 'c>(
@@ -330,7 +358,6 @@ impl Emitter<'_> {
         depth: usize,
         kind: Head,
         offsets: &mut Vec<u32>,
-        control: RangeInclusive<u32>,
         plan: Plan,
     ) -> Result<Option<usize>, StructureError> {
         let scope = Scope {
@@ -345,8 +372,12 @@ impl Emitter<'_> {
         let start = self.lines.len();
         let mut body = machine.clone();
         let next = match kind {
-            Head::If(condition) => self.emit_if(head, label_region, &mut body, depth + 1, condition, None, offsets, control)?,
-            Head::Switch(selector) => self.emit_switch(head, label_region, &mut body, depth + 1, selector, offsets, control, None)?,
+            Head::If(condition, control) => self.emit_if(head, label_region, &mut body, depth + 1, condition, None, offsets, control)?,
+            Head::Switch(selector, control) => self.emit_switch(head, label_region, &mut body, depth + 1, selector, offsets, control, None)?,
+            Head::Loop(shape) => match self.emit_loop(head, shape, label_region, &mut body, depth + 1, offsets)? {
+                Some((next, None)) => Some(next),
+                _ => return Err(self.unstructured(head)),
+            },
         };
         if next != Some(plan.tail) { return Err(self.unstructured(head)); }
         let boundary = self.lines.len();

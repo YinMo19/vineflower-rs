@@ -344,6 +344,10 @@ impl Emitter<'_> {
                 continue;
             }
             if !first_header && let Some(loop_shape) = self.layout.loops[block] {
+                if let Some(next) = self.emit_loop_with_exit_label(block, loop_shape, region, machine, depth, pending)? {
+                    block = next;
+                    continue;
+                }
                 if let Some(next) = self.emit_loop_with_finally_label(block, loop_shape, region, machine, depth)? {
                     block = next;
                     pending.clear();
