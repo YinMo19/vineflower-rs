@@ -562,6 +562,16 @@ fn is_variable_type(ty: &GenericType) -> bool {
     }
 }
 
+fn unbounded_generic(ty: &GenericType) -> bool {
+    match ty {
+        GenericType::Array { element, .. } => unbounded_generic(element),
+        GenericType::Class(class) => class.nested.is_empty()
+            && !class.arguments.is_empty()
+            && class.arguments.iter().all(|argument| matches!(argument, TypeArgument::Any)),
+        _ => false,
+    }
+}
+
 // Both providers discard the type arguments before looking for the leaf name.
 // Avoid rendering generic arguments that do not contribute to the name.
 fn generic_cast_name(ty: &GenericType) -> String {
@@ -1009,6 +1019,7 @@ impl<'c> Machine<'_, 'c> {
         let Some(signature) = signature else { return self.coerce_assignment(value, ty) };
         if matches!(value.source, Source::Null)
             || source.is_some_and(|source| source.ty == signature.ty)
+            || unbounded_generic(&signature.ty)
         {
             return self.coerce_assignment(value, ty);
         }

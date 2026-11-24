@@ -236,6 +236,11 @@ fn upstream_source_goldens_without_jdk() {
             true,
         ),
         (
+            "TestPrimitiveTypeClasses",
+            include_bytes!("smoke/java8/TestPrimitiveTypeClasses.class"),
+            true,
+        ),
+        (
             "TestConstantUninlining",
             include_bytes!("smoke/java8/TestConstantUninlining.class"),
             false,

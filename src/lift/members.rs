@@ -32,6 +32,17 @@ impl Machine<'_, '_> {
             .renames
             .map_or(name, |renames| renames.field_name(owner, name, descriptor));
         let ty = Type::parse(descriptor)?;
+        if op.opcode == 0xb2 && name == "TYPE" && descriptor == "Ljava/lang/Class;"
+            && let Some(primitive) = super::boxing::unboxed(owner).map(|primitive| primitive.java_name())
+                .or_else(|| (owner == "java/lang/Void").then_some("void"))
+        {
+            // javac emits the very same wrapper field access for a primitive
+            // class literal. Preserve its loading/initialization order.
+            self.instruction_has_source = false;
+            let value = self.expression(ty, format!("{primitive}.class").into(), PRIMARY, [], true)?;
+            self.push(value)?;
+            return Ok(Effect::None);
+        }
         let category = Category::of(&ty).ok_or_else(|| self.invalid_operand("void field descriptor"))?;
         let write = matches!(op.opcode, 0xb3 | 0xb5);
         let value = if write {

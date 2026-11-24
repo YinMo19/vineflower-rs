@@ -15,6 +15,7 @@ use super::{
 
 const OBJECT: &str = "java/lang/Object";
 const STRING: &str = "java/lang/String";
+const PRINT_STREAM: &str = "java/io/PrintStream";
 const EQUALS: &str = "(Ljava/lang/Object;)Z";
 const PRIVATE: u16 = 0x0002;
 const STATIC: u16 = 0x0008;
@@ -210,6 +211,15 @@ impl<'a, 'c> Machine<'a, 'c> {
             && descriptor == "(Ljava/lang/Object;)Ljava/lang/String;"
             && matches!(call.arguments, ArgumentForm::Fixed([argument])
                 if matches!(argument.ty, Type::Object(_)) && !matches!(argument.source, Source::Null));
+        let platform_print_object = owner == PRINT_STREAM
+            && lookup_owner == PRINT_STREAM
+            && call.opcode == 0xb6
+            && matches!(name, "print" | "println")
+            && name == source_name
+            && descriptor == "(Ljava/lang/Object;)V"
+            && matches!(call.arguments, ArgumentForm::Fixed([argument])
+                if matches!(&argument.ty, Type::Object(name) if name != STRING)
+                    && matches!(argument.source, Source::Local(_) | Source::This | Source::OuterThis));
         let mut pending = vec![Cow::Borrowed(lookup_owner)];
         let mut visited = HashSet::new();
         while let Some(declaring) = pending.pop() {
@@ -231,6 +241,13 @@ impl<'a, 'c> Machine<'a, 'c> {
                 Ok(None)
                     if declaring == STRING && (platform_string_equals || platform_value_of) =>
                 {
+                    call.found = true;
+                    pending.push(Cow::Borrowed(OBJECT));
+                    continue;
+                }
+                // A non-String reference cannot use the String or char[]
+                // overload. Primitive overloads only enter the loose phase.
+                Ok(None) if declaring == PRINT_STREAM && platform_print_object => {
                     call.found = true;
                     pending.push(Cow::Borrowed(OBJECT));
                     continue;
