@@ -7,7 +7,7 @@ use crate::{
     source_text::Document,
 };
 
-use super::{LiftError, Machine};
+use super::{LiftError, Machine, assignment_expr::{Access, StackAlias}};
 
 pub(super) const TERNARY: u8 = 1;
 pub(super) const BIT_OR: u8 = 4;
@@ -52,6 +52,8 @@ pub(super) enum Source {
     CapturedLocal,
     Plain,
     Integer(i32),
+    NumericOne,
+    Access(Access),
     Null,
     This,
     OuterThis,
@@ -59,6 +61,8 @@ pub(super) enum Source {
     Comparison(Box<Comparison>),
     StringBuilder(std::sync::Arc<Vec<super::concat::Operand>>),
     StringConversion(Box<Expr>),
+    Boxing(Box<super::boxing::ReducedOperand>),
+    Unboxing(Box<super::boxing::ReducedOperand>),
 }
 
 #[derive(Clone)]
@@ -74,6 +78,7 @@ pub(super) struct Expr {
     pub(super) ty: Type,
     pub(super) text: Document,
     pub(super) source: Source,
+    pub(super) alias: Option<StackAlias>,
     pub(super) precedence: u8,
     pub(super) order: Option<Order>,
     pub(super) observable: bool,
@@ -92,6 +97,7 @@ impl Expr {
             },
             text,
             source: Source::Plain,
+            alias: None,
             order: None,
             observable: false,
             statement: false,
@@ -104,6 +110,14 @@ impl Expr {
             constant: true,
             ..Self::atom(ty, text)
         }
+    }
+
+    pub(super) fn numeric_literal(ty: Primitive, text: Document, is_one: bool) -> Self {
+        let mut value = Self::literal(Type::Primitive(ty), text);
+        if is_one {
+            value.source = Source::NumericOne;
+        }
+        value
     }
 
     pub(super) fn integer(value: i32) -> Self {

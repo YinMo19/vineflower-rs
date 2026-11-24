@@ -1,6 +1,7 @@
 // Copyright 2000-2020 JetBrains s.r.o. Use of this source code is governed by the Apache 2.0 license that can be found in the LICENSE file.
 
 pub(crate) mod assertions;
+mod boolean_returns;
 mod exception_emit;
 #[cfg(test)]
 mod exception_tests;
@@ -26,9 +27,10 @@ use thiserror::Error;
 use crate::bytecode::{Instruction, Operand};
 use crate::cfg::ControlFlowGraph;
 use crate::classfile::ExceptionHandler;
-use crate::lift::{Effect, LiftError, Machine};
+use crate::lift::{BooleanCondition, Effect, LiftError, Machine};
 use crate::source_text::Document;
 
+use self::boolean_returns::BooleanReturn;
 use self::flow::{Layout, Loop, LoopScope, Region, Transfer, While};
 use self::protected::Exceptions;
 use self::switch_expression::CaseLabel;
@@ -39,6 +41,7 @@ pub(crate) struct Line {
     pub text: Document,
     pub offsets: Vec<u32>,
     loop_break: Option<LoopBreak>,
+    boolean_return: Option<BooleanReturn>,
 }
 
 impl Line {
@@ -48,6 +51,7 @@ impl Line {
             text: text.into(),
             offsets,
             loop_break: None,
+            boolean_return: None,
         }
     }
 }
@@ -130,6 +134,7 @@ fn structure_regions(
         graph,
         layout: Layout::new(graph, instructions, assertions)?,
         exceptions,
+        exception_redirects: BTreeMap::new(),
         assertions,
         emitted: vec![false; graph.blocks.len()],
         lines: Vec::new(),
@@ -151,6 +156,7 @@ struct Emitter<'a> {
     graph: &'a ControlFlowGraph,
     layout: Layout,
     exceptions: &'a Exceptions,
+    exception_redirects: BTreeMap<usize, usize>,
     assertions: Option<&'a assertions::Sites>,
     emitted: Vec<bool>,
     lines: Vec<Line>,
@@ -217,6 +223,7 @@ impl Emitter<'_> {
         }
         loop {
             block = self.exceptions.bypass_cleanup(block);
+            block = self.exception_redirects.get(&block).copied().unwrap_or(block);
             let first_header = mem::take(&mut enter_loop);
             if !first_header {
                 if region.stop == Some(block) {
@@ -247,11 +254,12 @@ impl Emitter<'_> {
                 if !machine.this_is_initialized() {
                     return Err(self.unstructured(block));
                 }
-                let Some(exit) =
+                let Some((exit, resume)) =
                     self.emit_loop(block, loop_shape, region, machine, depth, pending)?
                 else {
                     return Ok(false);
                 };
+                first_instruction = resume;
                 block = exit;
                 continue;
             }
@@ -368,7 +376,11 @@ impl Emitter<'_> {
                         || Document::from("return;"),
                         |value| surrounded(value, "return ", ";"),
                     );
-                    self.push(depth, text, offsets);
+                    let mut line = Line::new(depth, text, offsets);
+                    line.boolean_return = machine.last_boolean_return().map(|(fact, offset)| {
+                        BooleanReturn::direct(fact, offset)
+                    });
+                    self.lines.push(line);
                     return Ok(false);
                 }
                 Effect::Throw(value) => {
@@ -407,8 +419,10 @@ impl Emitter<'_> {
         let mut tail = Effect::None;
         let mut control = None;
         let mut index = range.start;
+        machine.forget_assignment_aliases();
         while index < range.end {
             if self.exceptions.skips_instruction(index) || region.for_loop_omits(index) {
+                machine.forget_assignment_aliases();
                 index += 1;
                 continue;
             }
@@ -431,10 +445,29 @@ impl Emitter<'_> {
                 index += consumed;
                 continue;
             }
-            if index + 1 == range.end {
-                control = machine.control_order(instruction)?;
-            }
-            let effect = machine.step(instruction)?;
+            let folded = if matches!(instruction.opcode, 0x59..=0x73 | 0x78..=0x83) {
+                machine.step_assignment(&self.instructions[index..range.end], |relative, _| {
+                    let index = index + relative;
+                    !self.exceptions.skips_instruction(index) && !region.for_loop_omits(index)
+                })?
+            } else {
+                None
+            };
+            let (end, effect, instruction) = if let Some(step) = folded {
+                if let Some(declaration) = step.declaration {
+                    self.push(depth, declaration, Vec::new());
+                }
+                let end = index + step.consumed;
+                offsets.extend(self.instructions[index..end].iter()
+                    .filter(|op| !matches!(op.opcode, 0x59..=0x5e))
+                    .flat_map(|op| op.offset..op.offset + op.len));
+                (end, step.effect, &self.instructions[end - 1])
+            } else {
+                if index + 1 == range.end {
+                    control = machine.control_order(instruction)?;
+                }
+                (index + 1, machine.step(instruction)?, instruction)
+            };
             if let Some(baseline) = region.protected
                 && matches!(instruction.opcode, 0x36..=0x4e)
                 && !machine.keeps_locals_of(baseline)
@@ -444,7 +477,7 @@ impl Emitter<'_> {
                 });
             }
             let prelude = machine.take_prelude();
-            if machine.instruction_has_source()
+            if end == index + 1 && machine.instruction_has_source()
                 && (!prelude.is_empty() || !matches!(effect, Effect::Jump(_)))
             {
                 offsets.extend(instruction.offset..instruction.offset + instruction.len);
@@ -463,10 +496,10 @@ impl Emitter<'_> {
                     target.push(';');
                     self.push(depth, target, mem::take(&mut offsets));
                 }
-                transfer if index + 1 == range.end => tail = transfer,
+                transfer if end == range.end => tail = transfer,
                 _ => return Err(self.unstructured(block)),
             }
-            index += 1;
+            index = end;
         }
         Ok(Tail {
             effect: tail,
@@ -489,19 +522,23 @@ impl Emitter<'_> {
         if self.assertion_starts(block) {
             return self.emit_assertion(block, region, machine, depth, offsets);
         }
+        let condition_end = *control.end();
+        let condition_facts = machine.last_boolean_condition();
         let held = machine.hold_control_stack(&control)?;
         let prelude = machine.take_prelude();
-        if let Some(binding) = &mut binding {
-            self.collapse_instanceof_guard(
+        if let Some(local) = &mut binding {
+            if !self.collapse_instanceof_guard(
                 block,
                 region,
                 machine,
                 depth,
                 &mut condition,
-                binding,
+                local,
                 offsets,
                 &mut control,
-            )?;
+            )? {
+                binding = None;
+            }
         } else if let Some(proof) = self.collapse_instanceof_prefix(
             block,
             region,
@@ -559,6 +596,12 @@ impl Emitter<'_> {
                     (false, true) => taken,
                     _ => return None,
                 };
+                if binding.is_none()
+                    && machine.simplify_boolean_returns()
+                    && self.pair_boolean_terminal_paths(region, [fallthrough, taken])
+                {
+                    return None;
+                }
                 (region.stop == Some(next) || self.layout.inside(next, region)).then_some(next)
             })
             .or(region.stop);
@@ -584,6 +627,12 @@ impl Emitter<'_> {
             (fallthrough, taken, when_false, when_true)
         };
         let skip_else = if negate { skip_fallthrough } else { skip_taken };
+        let condition_facts = if condition_end == *control.end() && binding.is_none() {
+            condition_facts.orient(negate)
+        } else {
+            BooleanCondition::UNKNOWN
+        };
+        let test = (&condition, &inverse, condition_facts);
 
         let start = self.lines.len();
         let then =
@@ -598,20 +647,35 @@ impl Emitter<'_> {
             && let (Some(yes), Some(no)) = (&then.exit, &otherwise.exit)
             && yes.same_locals(machine)
             && no.same_locals(machine)
-            && let Some(restored) =
-                machine.merge_conditional_stack(yes, no, &condition, &inverse, &control, held)?
+            && let Some(merge) = machine.merge_conditional_stack(yes, no, test, &control, held)?
         {
-            if !restored {
+            if !merge.restored {
                 for statement in prelude {
                     self.push(depth, statement, mem::take(offsets));
                 }
             }
-            offsets.extend(then.offsets);
-            offsets.extend(otherwise.offsets);
+            if merge.uses_yes {
+                offsets.extend(then.offsets);
+            }
+            if merge.uses_no {
+                offsets.extend(otherwise.offsets);
+            }
             return Ok(join);
         }
         if machine.has_uninitialized_stack() {
             return Err(self.unstructured(block));
+        }
+        if binding.is_none()
+            && let Some(mut line) = self.combine_boolean_returns([&then, &otherwise], depth, test)
+        {
+            for statement in prelude {
+                self.push(depth, statement, mem::take(offsets));
+            }
+            let mut mapped = mem::take(offsets);
+            mapped.append(&mut line.offsets);
+            line.offsets = mapped;
+            self.lines.push(line);
+            return Ok(None);
         }
 
         let exits = [&then, &otherwise]
@@ -764,12 +828,19 @@ impl Emitter<'_> {
         region: Region<'_, 'a, 'c>,
         iteration: &mut Machine<'a, 'c>,
         depth: usize,
+        allow_inverted: bool,
     ) -> Result<(usize, usize, Document, Option<instanceof_patterns::Binding>), StructureError>
     {
         let header = scope.header;
         self.emitted[header] = true;
-        let (tail, mut binding) =
-            self.lift_instanceof_head(header, iteration, region, depth, Vec::new())?;
+        let (tail, mut binding) = if allow_inverted
+            && let Some((tail, binding)) =
+                self.lift_inverted_instanceof_loop_head(header, test.exit, iteration, region, depth)
+        {
+            (tail, Some(binding))
+        } else {
+            self.lift_instanceof_head(header, iteration, region, depth, Vec::new())?
+        };
         let Tail {
             effect,
             mut offsets,
@@ -800,17 +871,21 @@ impl Emitter<'_> {
             when_true,
             when_false,
         };
-        if let Some(binding) = &mut binding {
-            self.collapse_instanceof_guard(
-                header,
-                region,
-                iteration,
-                depth,
-                &mut condition,
-                binding,
-                &mut offsets,
-                &mut control,
-            )?;
+        if let Some(local) = &mut binding {
+            if !local.succeeds_at(test.exit)
+                && !self.collapse_instanceof_guard(
+                    header,
+                    region,
+                    iteration,
+                    depth,
+                    &mut condition,
+                    local,
+                    &mut offsets,
+                    &mut control,
+                )?
+            {
+                binding = None;
+            }
         } else {
             self.collapse_condition(
                 header,
@@ -847,7 +922,7 @@ impl Emitter<'_> {
         self.syntax(depth, "}");
         if binding
             .as_ref()
-            .is_some_and(|binding| !binding.succeeds_at(body))
+            .is_some_and(|binding| !binding.succeeds_at(body) && !binding.succeeds_at(test.exit))
         {
             return Err(self.unstructured(header));
         }
@@ -862,7 +937,7 @@ impl Emitter<'_> {
         machine: &mut Machine<'a, 'c>,
         depth: usize,
         pending: &mut Vec<u32>,
-    ) -> Result<Option<usize>, StructureError> {
+    ) -> Result<Option<(usize, Option<usize>)>, StructureError> {
         for statement in machine.bind_edge_stack(self.offset(header), None)? {
             self.push(depth, statement, mem::take(pending));
         }
@@ -872,10 +947,13 @@ impl Emitter<'_> {
         self.syntax(depth, "while (true) {");
         let mut iteration = machine.clone();
         let mut for_loop = None;
+        let mut exit_binding = None;
         let body_region = region.loop_body(&scope);
         let (repeats, guard) = if let Some(test) = shape.test {
             let (body, guard, condition, binding) =
-                self.emit_loop_test(&scope, test, body_region, &mut iteration, depth + 1)?;
+                self.emit_loop_test(
+                    &scope, test, body_region, &mut iteration, depth + 1, self.layout.inside(test.exit, region),
+                )?;
             let body_region = if guard == head_line + 1
                 && body == test.body
                 && binding.is_none()
@@ -901,7 +979,13 @@ impl Emitter<'_> {
             } else {
                 body_region
             };
-            let first_instruction = binding.and_then(|binding| binding.enter(&mut iteration));
+            let first_instruction = match binding {
+                Some(binding) if binding.succeeds_at(body) => binding.enter(&mut iteration),
+                other => {
+                    exit_binding = other;
+                    None
+                }
+            };
             let repeats = self.run_region(
                 body,
                 body_region,
@@ -950,6 +1034,12 @@ impl Emitter<'_> {
                 stack
             })
             .collect::<Vec<_>>();
+        if exit_binding.is_some()
+            && (breaks.len() != 1 || !assignments[0].is_empty()
+                || guard.as_ref().is_none_or(|(line, _)| *line != head_line + 1))
+        {
+            return Err(self.unstructured(header));
+        }
         let mut recovered_condition = None;
         if let Some((guard_line, condition)) = guard
             && guard_line == head_line + 1
@@ -1008,7 +1098,7 @@ impl Emitter<'_> {
                 .chain(locals.declarations)
                 .map(|text| Line::new(depth, text, Vec::new())),
         );
-        Ok(Some(exit))
+        Ok(Some((exit, exit_binding.and_then(|binding| binding.enter(machine)))))
     }
 
     fn loop_scope<'a, 'c>(

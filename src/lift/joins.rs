@@ -1,10 +1,10 @@
 // Copyright 2000-2018 JetBrains s.r.o. Use of this source code is governed by the Apache 2.0 license that can be found in the LICENSE file.
 
-use std::{ops::RangeInclusive, rc::Rc};
+use std::{borrow::Cow, ops::RangeInclusive, rc::Rc};
 
 use super::Local;
 use crate::lift::{
-    LiftError, Machine,
+    BooleanCondition, BooleanFact, BooleanSelection, LiftError, Machine,
     expr::{BOOLEAN, Category, Expr, INT, Order, Source, TERNARY},
 };
 use crate::{
@@ -63,6 +63,12 @@ impl LocalCopy {
 
 pub(crate) struct HeldStack {
     original: Vec<(usize, Expr)>,
+}
+
+pub(crate) struct ConditionalStackMerge {
+    pub(crate) restored: bool,
+    pub(crate) uses_yes: bool,
+    pub(crate) uses_no: bool,
 }
 
 impl Machine<'_, '_> {
@@ -263,11 +269,10 @@ impl Machine<'_, '_> {
         &mut self,
         yes: &Self,
         no: &Self,
-        condition: &Document,
-        inverse: &Document,
+        condition: (&Document, &Document, BooleanCondition),
         control: &RangeInclusive<u32>,
         held: Option<HeldStack>,
-    ) -> Result<Option<bool>, LiftError> {
+    ) -> Result<Option<ConditionalStackMerge>, LiftError> {
         let Some(prefix) = yes.stack.len().checked_sub(1) else {
             return Ok(None);
         };
@@ -305,32 +310,37 @@ impl Machine<'_, '_> {
         let Some(mut ty) = self.common_value_type(yes, no) else {
             return Ok(None);
         };
-        let (text, precedence) = match (&yes.source, &no.source) {
-            (Source::Integer(1), Source::Integer(0)) => {
-                ty = BOOLEAN;
-                (condition.clone(), TERNARY)
+        let (condition, inverse, facts) = condition;
+        let simplify = self.simplify_boolean_ternaries();
+        let mut uses = [true, true];
+        let (text, precedence) = if let (Some(yes_fact), Some(no_fact)) =
+            (BooleanFact::operand(yes), BooleanFact::operand(no))
+            && (ty == BOOLEAN || matches!((yes_fact.literal(), no_fact.literal()),
+                (Some(left), Some(right)) if left != right || simplify))
+        {
+            ty = BOOLEAN;
+            let selection = BooleanSelection::of(facts, yes_fact, no_fact, simplify);
+            if simplify {
+                uses = [selection.uses(true), selection.uses(false)];
             }
-            (Source::Integer(0), Source::Integer(1)) => {
-                ty = BOOLEAN;
-                (inverse.clone(), TERNARY)
+            let (result, text) = selection.render(
+                (facts, [Cow::Borrowed(condition), Cow::Borrowed(inverse)]),
+                (yes_fact, boolean_document(yes, yes_fact, selection.uses(true))),
+                (no_fact, boolean_document(no, no_fact, selection.uses(false))),
+            );
+            (text, result.precedence())
+        } else {
+            let yes = self.conditional_operand(yes, &ty, &no.ty)?;
+            let no = self.conditional_operand(no, &ty, &yes.ty)?;
+            let mut text = condition.clone();
+            if text.contains('?') {
+                text.surround("(", ")");
             }
-            (_, Source::Integer(0)) if yes.ty == BOOLEAN => boolean_arm(condition, yes, true),
-            (_, Source::Integer(1)) if yes.ty == BOOLEAN => boolean_arm(inverse, yes, false),
-            (Source::Integer(0), _) if no.ty == BOOLEAN => boolean_arm(inverse, no, true),
-            (Source::Integer(1), _) if no.ty == BOOLEAN => boolean_arm(condition, no, false),
-            _ => {
-                let yes = self.conditional_operand(yes, &ty, &no.ty)?;
-                let no = self.conditional_operand(no, &ty, &yes.ty)?;
-                let mut text = condition.clone();
-                if text.contains('?') {
-                    text.surround("(", ")");
-                }
-                text.push_str(" ? ");
-                text.append(yes.text);
-                text.push_str(" : ");
-                text.append(no.text);
-                (text, TERNARY)
-            }
+            text.push_str(" ? ");
+            text.append(yes.text);
+            text.push_str(" : ");
+            text.append(no.text);
+            (text, TERNARY)
         };
         let mut original = held.filter(|held| {
             held.original.iter().all(|&(index, _)| {
@@ -361,7 +371,11 @@ impl Machine<'_, '_> {
             observable: true,
             ..Expr::atom(ty, text)
         })?;
-        Ok(Some(original.is_some()))
+        Ok(Some(ConditionalStackMerge {
+            restored: original.is_some(),
+            uses_yes: uses[0],
+            uses_no: uses[1],
+        }))
     }
 
     pub(in crate::lift) fn conditional_operand(
@@ -826,15 +840,11 @@ fn local_assignment(mut target: Document, value: Document) -> Document {
     target
 }
 
-fn boolean_arm(condition: &Document, value: &Expr, and: bool) -> (Document, u8) {
-    let (operator, precedence) = if and { (" && ", 3) } else { (" || ", 2) };
-    let mut text = condition.clone();
-    if text.contains('?') || (and && text.contains(" || ")) {
-        text.surround("(", ")");
+fn boolean_document(value: &Expr, fact: BooleanFact, used: bool) -> Cow<'_, Document> {
+    if used && value.ty != BOOLEAN && let Some(literal) = fact.literal() {
+        return Cow::Owned(Document::from(if literal { "true" } else { "false" }));
     }
-    text.push_str(operator);
-    value.append_at(precedence, &mut text);
-    (text, precedence)
+    Cow::Borrowed(&value.text)
 }
 
 fn same_value(a: &Expr, b: &Expr) -> bool {
@@ -850,6 +860,7 @@ fn same_value(a: &Expr, b: &Expr) -> bool {
             (Source::Local(a), Source::Local(b)) => a == b,
             (Source::New(a), Source::New(b)) => a == b,
             (Source::Integer(a), Source::Integer(b)) => a == b,
+            (Source::Boxing(a), Source::Boxing(b)) | (Source::Unboxing(a), Source::Unboxing(b)) => a == b,
             (Source::Plain, Source::Plain)
             | (Source::CapturedLocal, Source::CapturedLocal)
             | (Source::Null, Source::Null)

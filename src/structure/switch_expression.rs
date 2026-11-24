@@ -286,14 +286,20 @@ impl Emitter<'_> {
         }
         let (fallthrough, taken) = exits?;
         let last_owned = owned.last().copied()?;
+        // In a one-sided `if`, its bypass target is also the common
+        // continuation: the other branch legitimately flows into it after
+        // executing its body. emit_if stops both arms at that postdominator;
+        // only a target that will become an arm entry needs exclusive inputs.
+        let join = self.layout.normal_join(header, region).or(region.stop);
         for branch in [taken, fallthrough] {
             let node = &blocks[branch];
             if branch <= last_owned || self.emitted[branch]
                 || region.loop_transfer(branch).is_some()
                 || !node.exception_predecessors.is_empty()
-                || (region.stop != Some(branch) && (!self.layout.inside(branch, region)
-                    || !self.exceptions.contains(region.exception_arm, branch)
-                    || node.predecessors.iter().any(|pred| !owned.contains(pred))))
+                || (region.stop != Some(branch)
+                    && (!self.layout.inside(branch, region)
+                        || !self.exceptions.contains(region.exception_arm, branch)))
+                || (join != Some(branch) && node.predecessors.iter().any(|pred| !owned.contains(pred)))
             {
                 return None;
             }

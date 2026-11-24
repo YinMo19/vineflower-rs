@@ -13,7 +13,8 @@ use crate::{
 
 use super::{
     Effect, LiftError, Machine,
-    concat::{builder_constructor, call_source, inline_value_of, is_string, push_joined},
+    assignment_expr::{Access, AddressPart},
+    concat::{builder_constructor, inline_value_of, is_string, push_joined},
     dynamic::LambdaSite,
     expr::{ADDITIVE, Category, Expr, Order, PRIMARY, Source},
     string_literal,
@@ -34,10 +35,11 @@ impl Machine<'_, '_> {
         let write = matches!(op.opcode, 0xb3 | 0xb5);
         let value = if write {
             let value = self.pop_category(Category::of(&ty).expect("field type is not void"))?;
-            Some(self.coerce(value, &ty, false)?)
+            Some(self.coerce_assignment(value, &ty)?)
         } else {
             None
         };
+        let mut place = (op.opcode == 0xb2).then_some(Access::Static(index));
         let mut receiver = None;
         let mut access = if matches!(op.opcode, 0xb4 | 0xb5) {
             let expr = if write {
@@ -61,6 +63,9 @@ impl Machine<'_, '_> {
             }
             if expr.is_uninitialized(self.initialized_this) {
                 return Err(self.invalid_stack("uninitialized receiver used before invokespecial"));
+            }
+            if !write {
+                place = AddressPart::receiver(&expr).map(|address| Access::Field(index, address));
             }
             if matches!(expr.source, Source::This) && self.super_class == Some(owner) {
                 Document::from("super.")
@@ -106,7 +111,11 @@ impl Machine<'_, '_> {
                 value: value.text,
             })
         } else {
-            self.push(self.expression(ty, access, PRIMARY, receiver.iter(), true)?)?;
+            let mut value = self.expression(ty, access, PRIMARY, receiver.iter(), true)?;
+            if let Some(place) = place.filter(|_| matches!(value.ty, Type::Primitive(_))) {
+                value.source = Source::Access(place);
+            }
+            self.push(value)?;
             Ok(Effect::None)
         }
     }
@@ -267,7 +276,7 @@ impl Machine<'_, '_> {
                 .filter(|result| self.known_assignable(result, &descriptor.return_type))
                 .unwrap_or_else(|| descriptor.return_type.clone());
             let mut expression = self.expression(result, text, PRIMARY, operands, true)?;
-            expression.source = call_source(owner, name, &descriptor, receiver, args);
+            expression.source = self.invocation_source(op.opcode, owner, name, &descriptor, receiver, args);
             if owner == "java/lang/invoke/MethodHandle" && matches!(name, "invoke" | "invokeExact")
                 || owner == "java/lang/invoke/VarHandle"
                     && matches!(

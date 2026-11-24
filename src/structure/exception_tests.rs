@@ -350,6 +350,36 @@ fn branched_finally_matches_fallthrough_to_an_explicit_jump() {
 }
 
 #[test]
+fn exceptional_finally_copy_can_be_detached_from_the_enclosing_loop_cfg() {
+    let bytes = [
+        0x03, 0x3c, // 0: int induction = 0
+        0x1b, 0x10, 10, 0xa2, 0, 32, // 2: loop test; if_icmpge 37
+        0xb8, 0, 22,   // 8: work in the protected body
+        0x2a, 0xc6, 0, 19, // 11: normal cleanup; ifnull 31
+        0xb8, 0, 22,   // 15: work in the normal cleanup
+        0xa7, 0, 13,   // 18: goto loop latch
+        0x4d, 0x2a, 0xc6, 0, 6, // 21: exceptional cleanup; ifnull 29
+        0xb8, 0, 22,   // 26: work in the exceptional cleanup
+        0x2c, 0xbf,   // 29: exceptional rethrow
+        0x84, 1, 1, // 31: induction++
+        0xa7, 0xff, 0xe0, // 34: goto 2
+        0xb1, // 37: normal exit
+    ];
+    let handlers = [handler(8, 11, 21, 0)];
+    let lines = test_method(&bytes, &handlers, &[]).unwrap();
+    let cleanup = lines
+        .iter()
+        .position(|line| line.text == "} finally {")
+        .unwrap();
+    assert_eq!(lines[cleanup].depth, 1);
+    assert_eq!(
+        lines.iter().filter(|line| line.text == "C.work();").count(),
+        2
+    );
+    assert!(!lines.iter().any(|line| line.text.starts_with("throw ")));
+}
+
+#[test]
 fn each_branched_finally_copy_projects_to_one_proven_continuation() {
     let mut bytes = vec![
         0x2a, // 0: aload_0
@@ -603,6 +633,54 @@ fn catchless_nested_resources_share_one_header_and_keep_acquisition_offsets() {
     assert!(lines[1].offsets.contains(&1));
     assert!(lines[2].offsets.contains(&3));
     assert_eq!(lines[1].depth, lines[4].depth);
+}
+
+#[test]
+fn split_normal_resource_copies_must_rejoin_at_the_same_continuation() {
+    let mut bytes = [
+        0x2a, 0x4d, // 0: acquire resource
+        0x1b, 0x99, 0, 19, // 2: branch to 22
+        0xb8, 0, 22, // 6: first work path
+        0x2c, 0xc6, 0, 52, // 9: first null guard
+        0x2c, 0xb9, 0, 13, 1, 0, // 13: first close copy
+        0xa7, 0, 43, // 19: go to 62
+        0xb8, 0, 22, // 22: second work path
+        0x2c, 0xc6, 0, 36, // 25: second null guard
+        0x2c, 0xb9, 0, 13, 1, 0, // 29: second close copy
+        0xa7, 0, 27, // 35: go to 62
+        0x4e, 0x2c, 0xc6, 0, 20, // 38: save throwable; ifnull 60
+        0x2c, 0xb9, 0, 13, 1, 0, // 43: exceptional close
+        0xa7, 0, 11, // 49: go to 60
+        0x3a, 4, 0x2d, 0x19, 4, 0xb6, 0, 19, // 52: addSuppressed
+        0x2d, 0xbf, // 60: rethrow
+        0xb1, // 62: normal continuation
+    ];
+    let handlers = [
+        handler(2, 9, 38, 15),
+        handler(22, 25, 38, 15),
+        handler(43, 49, 52, 15),
+    ];
+    let descriptor = "(Ljava/lang/AutoCloseable;Z)V";
+    let lines = test_method_with_descriptor(&bytes, &handlers, &[], descriptor).unwrap();
+    assert_eq!(
+        lines[0].text,
+        "try (java.lang.AutoCloseable var2 = var0) {"
+    );
+    assert_eq!(
+        lines.iter().filter(|line| line.text == "C.work();").count(),
+        2
+    );
+    assert!(!lines.iter().any(|line| line.text.as_flat().contains("close()")));
+
+    bytes[28] = 37;
+    bytes[37] = 28;
+    // Both branches of the second close now agree on a different return.
+    let mut bytes = bytes.to_vec();
+    bytes.push(0xb1);
+    assert!(matches!(
+        test_method_with_descriptor(&bytes, &handlers, &[], descriptor),
+        Err(StructureError::ExceptionHandlers)
+    ));
 }
 
 #[test]

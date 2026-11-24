@@ -22,6 +22,22 @@ fn local_class_captures_parameter_and_local_through_delegating_constructor() {
 }
 
 #[test]
+fn local_class_marks_its_declaration_without_changing_captured_names() {
+    let (outer, local) = inputs(false);
+    let options = Options {
+        mark_corresponding_synthetics: true,
+        dump_text_tokens: true,
+        ..Options::default()
+    };
+    let text = decompile_group(&outer, [&local[..]], &options).unwrap().text;
+    assert!(text.contains("class Local /* CaptureLocal$1Local */ {"), "{text}");
+    assert!(text.contains("return base + extra;"), "{text}");
+    assert!(text.contains("return new Local().value();"), "{text}");
+    assert_eq!(text.matches("/* CaptureLocal$1Local */").count(), 1, "{text}");
+    assert!(text.contains("class [declaration] CaptureLocal$1Local\n"), "{text}");
+}
+
+#[test]
 fn local_class_cannot_recover_a_capture_from_a_mutating_slot() {
     let (outer, local) = inputs(true);
     let error = decompile_group(&outer, [&local[..]], &Options::default()).unwrap_err();
@@ -39,7 +55,7 @@ fn qualified_new_checks_receiver_before_evaluating_explicit_arguments() {
 
 #[test]
 fn qualified_new_proof_does_not_cross_an_exception_boundary_or_a_receiver_replacement() {
-    use crate::{ClassGroup, bytecode::{Operand, decode}, classfile::ExceptionHandler};
+    use crate::{ClassGroup, bytecode::decode, classfile::ExceptionHandler};
     use crate::lift::qualified_new::mask_guards;
     let (outer, inner) = qualified_inputs();
     let group = ClassGroup::new([&outer[..], &inner[..]]).unwrap();
@@ -55,10 +71,14 @@ fn qualified_new_proof_does_not_cross_an_exception_boundary_or_a_receiver_replac
     mask_guards(class, method, &group, &mut protected, &handlers).unwrap();
     assert_eq!(protected, original);
 
-    // A discarded qualifier is no longer the argument of this constructor.
-    let mut changed = original;
-    changed[6].opcode = 0x57;
-    changed[6].operand = Operand::None;
+    // Pop the checked qualifier and replace it independently. The method's
+    // constructor still has a well-formed operand stack, but its guard is
+    // independent of the actual enclosing instance.
+    let replaced_at = original[6].offset as usize;
+    let mut bytes = code.bytes[..replaced_at].to_vec();
+    bytes.extend([0x57, 0x01]); // pop; aconst_null
+    bytes.extend(&code.bytes[replaced_at..]);
+    let mut changed = decode(&bytes).unwrap();
     mask_guards(class, method, &group, &mut changed, &[]).unwrap();
     assert_eq!(changed[3].opcode, 0x59);
     assert_eq!(changed[4].opcode, 0xb8);

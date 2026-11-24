@@ -160,3 +160,37 @@ fn keeps_a_pattern_in_a_compound_loop_test() {
     );
     assert_eq!(lines[1].text, "var0 = var1;");
 }
+
+#[test]
+fn merges_a_fallback_after_a_guard_without_exporting_the_binding() {
+    let lines = lift(&[
+        0x2a, 0xc1, 0, 8, 0x99, 0, 12,
+        0x2a, 0xc0, 0, 8, 0x4d, 0x2c, 0xc7, 0, 11,
+        0x1b, 0x9a, 0, 7, 0x03, 0xa7, 0, 4, 0x04, 0xac,
+    ], "(Ljava/lang/Object;Z)Z");
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0].text, "return var0 instanceof String var2 && var2 != null || var1;");
+}
+
+#[test]
+fn binds_after_an_inverted_loop_that_only_exits_through_the_match() {
+    let lines = lift(&[
+        0x2a, 0xc1, 0, 8, 0x99, 0, 10,
+        0x2a, 0xc0, 0, 8, 0x4c, 0x2b, 0xb0,
+        0x01, 0x4b, 0xa7, 0xff, 0xf0,
+    ], "(Ljava/lang/Object;)Ljava/lang/String;");
+    assert_eq!(lines[0].text, "while (!(var0 instanceof String var1)) {");
+    assert_eq!(lines[3].text, "return var1;");
+    assert_eq!(lines[3].depth, 0);
+}
+
+#[test]
+fn an_inverted_loop_break_cannot_introduce_the_binding() {
+    let lines = lift(&[
+        0x2a, 0xc1, 0, 8, 0x99, 0, 10,
+        0x2a, 0xc0, 0, 8, 0x4d, 0x2c, 0xb0,
+        0x1b, 0x9a, 0xff, 0xf8, 0x01, 0x4b, 0xa7, 0xff, 0xec,
+    ], "(Ljava/lang/Object;Z)Ljava/lang/String;");
+    assert!(lines.iter().any(|line| line.text.contains("instanceof String)")));
+    assert!(lines.iter().any(|line| line.text == "String var2 = (String)var0;"));
+}

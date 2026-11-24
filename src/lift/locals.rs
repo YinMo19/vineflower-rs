@@ -18,6 +18,7 @@ use crate::{
 
 use super::{
     Effect, LiftError, Machine,
+    assignment_expr::LocalWrite,
     expr::{Category, Expr, INT, Order, Source},
 };
 
@@ -393,7 +394,7 @@ fn generic_cast_name(ty: GenericType) -> String {
     name
 }
 
-impl Machine<'_, '_> {
+impl<'c> Machine<'_, 'c> {
     pub(crate) fn resource_local(&self, index: u16) -> Option<(String, &str)> {
         let local = self.locals.slots.get(usize::from(index))?.as_ref()?;
         let Type::Object(class) = &local.ty else {
@@ -530,16 +531,82 @@ impl Machine<'_, '_> {
         category: Category,
     ) -> Result<Effect, LiftError> {
         let value = self.pop_category(category)?;
+        let target = LocalWrite { index, category };
+        let (ty, debug, same) = self.resolve_local_store(op, target, &value)?;
+        let value = self.coerce_assignment(value, &ty)?;
+        self.before_statement(value.order)?;
+        let local = self.bind_local_store(index, ty, debug, same);
+        let mut text = if same {
+            self.local_binding_document(index, &local, false)
+        } else {
+            self.declared_local_document(index, &local)
+        };
+        self.locals.slots[usize::from(index)] = Some(local);
+        text.push_str(" = ");
+        text.append(value.text);
+        text.push(';');
+        Ok(Effect::Statement(text))
+    }
+
+    pub(super) fn assignment_local_destination(
+        &self,
+        op: &Instruction,
+        target: LocalWrite,
+        value: &Expr,
+    ) -> Option<bool> {
+        let (ty, _, same) = self.resolve_local_store(op, target, value).ok()?;
+        // The duplicated JVM value's type also controls overload resolution
+        // and numeric promotion in its enclosing Java expression.
+        (ty == value.ty).then_some(!same)
+    }
+
+    pub(super) fn commit_assignment_local(
+        &mut self,
+        op: &Instruction,
+        target: LocalWrite,
+        ty: &Type,
+        declaration: bool,
+    ) -> (Document, Option<Document>) {
+        let index = target.index;
         let slot = usize::from(index);
-        let width = usize::from(value.ty.slots());
-        if slot + width > self.locals.slots.len() {
+        if !declaration {
+            let local = self.locals.slots[slot].as_ref().expect("verified local binding");
+            return (self.local_binding_document(index, local, false), None);
+        }
+        let debug = self.store_debug(op, index);
+        let local = self.bind_local_store(index, ty.clone(), debug, false);
+        let mut blank = self.declared_local_document(index, &local);
+        blank.push(';');
+        let access = self.local_binding_document(index, &local, false);
+        self.locals.slots[slot] = Some(local);
+        (access, Some(blank))
+    }
+
+    fn declared_local_document(&self, index: u16, local: &Local) -> Document {
+        let mut text = self.local_type_document(&local.ty);
+        text.push(' ');
+        self.append_local_binding(&mut text, index, local, true);
+        text
+    }
+
+    fn store_debug(&self, op: &Instruction, index: u16) -> Option<LocalVariable<'c>> {
+        let end = self.debug_offset(op.offset + op.len - 1) + 1;
+        self.locals.debug_at(index, end)
+            .or_else(|| self.locals.debug_at(index, self.debug_offset(op.offset)))
+            .copied()
+    }
+
+    fn resolve_local_store(
+        &self,
+        op: &Instruction,
+        LocalWrite { index, category }: LocalWrite,
+        value: &Expr,
+    ) -> Result<(Type, Option<LocalVariable<'c>>, bool), LiftError> {
+        let slot = usize::from(index);
+        if slot + usize::from(value.ty.slots()) > self.locals.slots.len() {
             return Err(self.invalid_local(index, "store exceeds max_locals"));
         }
-        let end = self.debug_offset(op.offset + op.len - 1) + 1;
-        let debug = self
-            .locals
-            .debug_at(index, end)
-            .or_else(|| self.locals.debug_at(index, self.debug_offset(op.offset)));
+        let debug = self.store_debug(op, index);
         let debug_ty = debug
             .and_then(|entry| Type::parse(entry.descriptor).ok())
             .filter(|ty| {
@@ -561,16 +628,26 @@ impl Machine<'_, '_> {
                     || matches!(value.source, Source::Null)
                     || self.known_assignable(&value.ty, &local.ty))
         });
-        let (ty, name, token_index) = if same {
-            let local = previous.expect("checked active binding");
-            (local.ty.clone(), local.name.clone(), local.token_index)
+        let ty = if same {
+            previous.expect("checked active binding").ty.clone()
         } else {
-            let ty = debug_ty.unwrap_or_else(|| value.ty.clone());
-            let name = self.locals.local_name(index, &ty, debug);
-            (ty, name, None)
+            debug_ty.unwrap_or_else(|| value.ty.clone())
         };
-        let value = self.coerce(value, &ty, false)?;
-        self.before_statement(value.order)?;
+        Ok((ty, debug, same))
+    }
+
+    fn bind_local_store(
+        &mut self,
+        index: u16,
+        ty: Type,
+        debug: Option<LocalVariable<'c>>,
+        same: bool,
+    ) -> Local {
+        let slot = usize::from(index);
+        let width = usize::from(ty.slots());
+        if same {
+            return self.locals.slots[slot].as_ref().expect("checked active binding").clone();
+        }
         if slot > 0
             && self.locals.slots[slot - 1]
                 .as_ref()
@@ -581,31 +658,13 @@ impl Machine<'_, '_> {
         if width == 2 {
             self.locals.slots[slot + 1] = None;
         }
-        let token_index = if same {
-            token_index
-        } else {
-            self.locals.new_local_token_index(index)
-        };
-        let local = Local {
-            name,
+        Local {
+            name: self.locals.local_name(index, &ty, debug.as_ref()),
             ty,
-            debug_range: range,
+            debug_range: debug.map(|entry| (entry.start_pc, entry.length)),
             receiver: false,
-            token_index,
-        };
-        let mut text = if same {
-            Document::new()
-        } else {
-            let mut ty = self.local_type_document(&local.ty);
-            ty.push(' ');
-            ty
-        };
-        self.append_local_binding(&mut text, index, &local, !same);
-        self.locals.slots[slot] = Some(local);
-        text.push_str(" = ");
-        text.append(value.text);
-        text.push(';');
-        Ok(Effect::Statement(text))
+            token_index: self.locals.new_local_token_index(index),
+        }
     }
 
     pub(super) fn increment(&mut self, index: u16, amount: i16) -> Result<Effect, LiftError> {

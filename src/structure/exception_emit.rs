@@ -15,9 +15,10 @@ use super::{Emitter, Line, Region, StructureError};
 struct Resource {
     acquisition: usize,
     slot: u16,
-    normal_cleanup: usize,
+    body_stop: usize,
     exit: ResourceExit,
     skipped: Vec<usize>,
+    redirects: Vec<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -132,6 +133,9 @@ impl Emitter<'_> {
         if let Some(resource) = self.prove_resource(shape, region, machine, depth)? {
             return self.emit_resource(shape, resource, region, machine, depth);
         }
+        if !shape.split_resource_exits.is_empty() {
+            return Err(StructureError::ExceptionHandlers);
+        }
         let (clauses, scope) = if let Some(inner) = exceptions.catches_of_finally(shape) {
             (
                 inner,
@@ -185,7 +189,9 @@ impl Emitter<'_> {
             );
             if self.region(
                 catch.start,
-                scope.exception(clauses.join, catch.arm, None),
+                scope
+                    .exception(clauses.join, catch.arm, None)
+                    .with_exception_layout(self.layout.containing_loop(catch.start)),
                 &mut body,
                 depth + 1,
             )? {
@@ -218,7 +224,9 @@ impl Emitter<'_> {
                 }
                 if !self.region_with_offsets(
                     branch.entry,
-                    region.exception(Some(finally.block()), finally.arm, None),
+                    region
+                        .exception(Some(finally.block()), finally.arm, None)
+                        .with_exception_layout(self.layout.containing_loop(branch.entry)),
                     &mut body,
                     depth + 1,
                     &mut offsets,
@@ -366,9 +374,10 @@ impl Emitter<'_> {
             Resource {
                 acquisition,
                 slot: legacy.slot,
-                normal_cleanup: shape.join.ok_or(StructureError::ExceptionHandlers)?,
+                body_stop: shape.join.ok_or(StructureError::ExceptionHandlers)?,
                 exit,
                 skipped,
+                redirects: Vec::new(),
             },
             region,
             machine,
@@ -417,12 +426,27 @@ impl Emitter<'_> {
         }
         let next = match resource.exit {
             ResourceExit::Continue(next) => {
-                if !self.scoped_arm(
+                if self.exception_redirects.contains_key(&resource.body_stop)
+                    || resource
+                        .redirects
+                        .iter()
+                        .any(|entry| self.exception_redirects.contains_key(entry))
+                {
+                    return Err(StructureError::ExceptionHandlers);
+                }
+                for &entry in &resource.redirects {
+                    self.exception_redirects.insert(entry, resource.body_stop);
+                }
+                let reaches_stop = self.scoped_arm(
                     shape.start,
-                    region.exception(Some(resource.normal_cleanup), shape.body, Some(machine)),
+                    region.exception(Some(resource.body_stop), shape.body, Some(machine)),
                     machine,
                     depth + 1,
-                )? {
+                );
+                for entry in resource.redirects {
+                    self.exception_redirects.remove(&entry);
+                }
+                if !reaches_stop? {
                     return Err(self.unstructured(shape.start));
                 }
                 Some(next)
@@ -616,46 +640,17 @@ impl Emitter<'_> {
             return Ok(None);
         }
 
-        let (normal_close, null_continuation) = if null_rethrow.is_some() {
-            let [load, test] = self.block_instructions(normal_cleanup) else {
-                return Ok(None);
-            };
-            let &[continuation, close] = self.graph.blocks[normal_cleanup].successors.as_slice()
-            else {
-                return Ok(None);
-            };
-            if reference_load(load) != Some(slot) || test.opcode != 0xc6 {
-                return Ok(None);
-            }
-            skipped.push(normal_cleanup);
-            (close, Some(continuation))
-        } else {
-            if !self.allocates_nonnull(predecessor, machine)? {
-                return Ok(None);
-            }
-            (normal_cleanup, None)
-        };
-        let close_exit = match null_continuation {
-            Some(next) => {
-                if self.after_prefix(normal_close, 2) != Some(next) {
-                    return Ok(None);
-                }
-                self.resource_return_tail(next, 0)
-                    .unwrap_or(CloseExit::Continue(next))
-            }
-            None => {
-                if let Some(returned) = self.resource_return_tail(normal_close, 2) {
-                    returned
-                } else if let Some(next) = self.after_prefix(normal_close, 2) {
-                    self.resource_return_tail(next, 0)
-                        .unwrap_or(CloseExit::Continue(next))
-                } else {
-                    return Ok(None);
-                }
-            }
-        };
-        if self.close_method(normal_close, slot, machine)? != Some(close_method) {
+        let nullable = null_rethrow.is_some();
+        if !nullable && !self.allocates_nonnull(predecessor, machine)? {
             return Ok(None);
+        }
+        let Some((normal_close, close_exit)) =
+            self.match_normal_resource_close(normal_cleanup, slot, nullable, close_method, machine)?
+        else {
+            return Ok(None);
+        };
+        if normal_cleanup != normal_close {
+            skipped.push(normal_cleanup);
         }
         skipped.push(normal_close);
         let exit = match close_exit {
@@ -704,6 +699,54 @@ impl Emitter<'_> {
         };
 
         let ambient = &self.graph.blocks[normal_close].exception_successors;
+        let mut body_stop = normal_cleanup;
+        let mut redirects = Vec::new();
+        if !shape.split_resource_exits.is_empty() {
+            let ResourceExit::Continue(next) = exit else {
+                return Ok(None);
+            };
+            if self.exceptions.contains(Some(shape.body), next)
+                || !self.exceptions.contains(region.exception_arm, next)
+                || self.exceptions.at_start(region.exception_arm, next).is_some()
+                || self.exceptions.bypass_cleanup(next) != next
+                || self.layout.loops[next].is_some()
+                || region.loop_transfer(next).is_some()
+                || !self.graph.blocks[next].exception_predecessors.is_empty()
+            {
+                return Ok(None);
+            }
+            for &entry in &shape.split_resource_exits {
+                let Some((close, CloseExit::Continue(target))) =
+                    self.match_normal_resource_close(entry, slot, nullable, close_method, machine)?
+                else {
+                    return Ok(None);
+                };
+                if next != target
+                    || skipped.contains(&entry)
+                    || skipped.contains(&close)
+                    || self.graph.blocks[close].exception_successors != *ambient
+                    || self.exceptions.at_start(region.exception_arm, entry).is_some()
+                    || self.exceptions.at_start(region.exception_arm, close).is_some()
+                {
+                    return Ok(None);
+                }
+                if entry != close {
+                    skipped.push(entry);
+                }
+                skipped.push(close);
+                redirects.push(entry);
+            }
+            redirects.push(normal_cleanup);
+            if redirects.iter().any(|&entry| {
+                self.graph.blocks[entry]
+                    .predecessors
+                    .iter()
+                    .any(|&pred| !self.exceptions.contains(Some(shape.body), pred))
+            }) {
+                return Ok(None);
+            }
+            body_stop = next;
+        }
         if self.graph.blocks[suppression.start].exception_successors != *ambient
             || self.graph.blocks[rethrow].exception_successors != *ambient
             || !self.graph.blocks[exceptional_close]
@@ -722,6 +765,7 @@ impl Emitter<'_> {
                 .is_some()
             || skipped.iter().any(|&block| {
                 self.emitted[block]
+                    || self.exceptions.bypass_cleanup(block) != block
                     || self.exceptions.cleanup_prefix(block) != 0
                     || (!self.exceptions.contains(region.exception_arm, block)
                         && !matches!(exit, ResourceExit::Return { transfer, .. }
@@ -745,10 +789,51 @@ impl Emitter<'_> {
         Ok(Some(Resource {
             acquisition,
             slot,
-            normal_cleanup,
+            body_stop,
             exit,
             skipped,
+            redirects,
         }))
+    }
+
+    fn match_normal_resource_close(
+        &self,
+        entry: usize,
+        slot: u16,
+        nullable: bool,
+        close_method: u16,
+        machine: &Machine<'_, '_>,
+    ) -> Result<Option<(usize, CloseExit)>, StructureError> {
+        let (close, exit) = if nullable {
+            let [load, test] = self.block_instructions(entry) else {
+                return Ok(None);
+            };
+            let &[next, close] = self.graph.blocks[entry].successors.as_slice() else {
+                return Ok(None);
+            };
+            if reference_load(load) != Some(slot)
+                || test.opcode != 0xc6
+                || self.after_prefix(close, 2) != Some(next)
+            {
+                return Ok(None);
+            }
+            (
+                close,
+                self.resource_return_tail(next, 0)
+                    .unwrap_or(CloseExit::Continue(next)),
+            )
+        } else if let Some(returned) = self.resource_return_tail(entry, 2) {
+            (entry, returned)
+        } else if let Some(next) = self.after_prefix(entry, 2) {
+            (
+                entry,
+                self.resource_return_tail(next, 0)
+                    .unwrap_or(CloseExit::Continue(next)),
+            )
+        } else {
+            return Ok(None);
+        };
+        Ok((self.close_method(close, slot, machine)? == Some(close_method)).then_some((close, exit)))
     }
 
     fn resource_return_tail(&self, block: usize, consumed: usize) -> Option<CloseExit> {

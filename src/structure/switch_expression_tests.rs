@@ -177,6 +177,26 @@ fn recovers_shared_predicate_continuations_with_edge_polarity() {
 }
 
 #[test]
+fn accepts_the_if_body_falling_through_to_the_shared_bypass() {
+    let mut bytes = vec![0x1a];
+    lookup(&mut bytes, 14, &[(1, 0), (2, 7)]);
+    bytes.extend([
+        0x1b, 0x9c, 0, 21, 0xa7, 0, 14,
+        0x1b, 0x9d, 0, 10, 0xa7, 0, 11,
+        0x1b, 0x9a, 0, 7,
+        0xb8, 0, 9, 0x57, 0xb1,
+    ]);
+    let lines = lift(&bytes, "(II)V", 60, 0).unwrap();
+    assert_eq!(
+        render(&lines[0]).0,
+        "if (switch (var0) {\n   case 1 -> var1 < 0;\n   case 2 -> var1 > 0;\n   default -> var1 == 0;\n}) {"
+    );
+    let continuation: Vec<_> = lines[1..].iter()
+        .map(|line| (line.depth, line.text.as_flat())).collect();
+    assert_eq!(continuation, [(1, "Example.side();"), (0, "}"), (0, "return;")]);
+}
+
+#[test]
 fn joins_return_values_with_their_bytecode_offsets() {
     let bytes = int_switch(&[0x1a], &[0xac]);
     let lines = lift(&bytes, "(I)I", 60, 0).unwrap();

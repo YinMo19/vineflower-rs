@@ -49,6 +49,7 @@ pub(super) struct ProtectedRegion {
     pub(super) monitor: Option<Monitor>,
     pub(super) legacy_resource: Option<Legacy>,
     pub(super) join: Option<usize>,
+    pub(super) split_resource_exits: Vec<usize>,
     enclosing: Option<ArmId>,
 }
 
@@ -206,6 +207,7 @@ impl Exceptions {
                 covered,
                 routes,
                 &mut cleanups,
+                machine,
             )?;
         }
         let owners = result.link()?;
@@ -276,6 +278,7 @@ impl Exceptions {
                     exit,
                 }),
                 join: Some(close),
+                split_resource_exits: Vec::new(),
                 enclosing: None,
             });
             self.omitted_instructions.extend(plan.null_init);
@@ -378,6 +381,7 @@ impl Exceptions {
         covered: &[usize],
         routes: &[Route],
         cleanups: &mut BTreeMap<usize, CleanupPlan>,
+        machine: Option<&Machine<'_, '_>>,
     ) -> Result<(), StructureError> {
         let id = ExceptionId(self.regions.len());
         let mut body: BTreeSet<_> = covered.iter().copied().collect();
@@ -462,7 +466,15 @@ impl Exceptions {
             });
         }
         if exits.len() > 1 {
-            return Err(unsupported());
+            // An ordinary try has one normal continuation. Leave separate
+            // edges intact only for a possible resource with inlined closes;
+            // its emitter must prove those exits before consuming any copy.
+            let (Some(machine), [route]) = (machine, routes) else {
+                return Err(unsupported());
+            };
+            if route.catch_type == 0 || machine.exception_class(route.catch_type)? != "java/lang/Throwable" {
+                return Err(unsupported());
+            }
         }
         if let Some(branch) = finally.as_ref().and_then(Finally::branched)
             && exits.first().copied() != branch.body_join
@@ -478,6 +490,7 @@ impl Exceptions {
             monitor,
             legacy_resource: None,
             join: exits.pop_first(),
+            split_resource_exits: exits.into_iter().collect(),
             enclosing: None,
         });
         Ok(())

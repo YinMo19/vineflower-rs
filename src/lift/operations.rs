@@ -11,9 +11,9 @@ use crate::{
 
 use super::{
     Effect, LiftError, Machine,
+    assignment_expr::{Access, AddressPart, Binary},
     expr::{
-        ADDITIVE, BIT_AND, BIT_OR, BIT_XOR, BOOLEAN, Category, Comparison, Expr, INT,
-        MULTIPLICATIVE, PRIMARY, RELATIONAL, Relation, SHIFT, Source, TERNARY, UNARY,
+        BOOLEAN, Category, Comparison, Expr, INT, PRIMARY, RELATIONAL, Relation, Source, TERNARY, UNARY,
     },
     object_type,
 };
@@ -23,7 +23,7 @@ impl Machine<'_, '_> {
         if (0x74..=0x77).contains(&opcode) {
             let category = Category::for_local(opcode - 0x74);
             let value = self.pop_category(category)?;
-            let value = self.as_int(value);
+            let value = self.as_int(self.implicit_unboxing(value));
             // At equal precedence a unary minus can become a prefix -- token.
             let mut text = Document::from("-");
             value.append_at(UNARY + 1, &mut text);
@@ -35,35 +35,8 @@ impl Machine<'_, '_> {
                 false,
             )?);
         }
-        let (category, right_category, operator, precedence) = if opcode < 0x74 {
-            let relative = opcode - 0x60;
-            let category = Category::for_local(relative % 4);
-            let (operator, precedence) = [
-                ("+", ADDITIVE),
-                ("-", ADDITIVE),
-                ("*", MULTIPLICATIVE),
-                ("/", MULTIPLICATIVE),
-                ("%", MULTIPLICATIVE),
-            ][usize::from(relative / 4)];
-            (category, category, operator, precedence)
-        } else {
-            let relative = opcode - 0x78;
-            let category = Category::for_local(relative % 2);
-            let right_category = if relative < 6 {
-                Category::Int
-            } else {
-                category
-            };
-            let (operator, precedence) = [
-                ("<<", SHIFT),
-                (">>", SHIFT),
-                (">>>", SHIFT),
-                ("&", BIT_AND),
-                ("|", BIT_OR),
-                ("^", BIT_XOR),
-            ][usize::from(relative / 2)];
-            (category, right_category, operator, precedence)
-        };
+        let Binary { left: category, right: right_category, operator, precedence, can_throw } =
+            Binary::of(opcode).expect("binary arithmetic opcode");
         let right = self.pop_category(right_category)?;
         let left = self.pop_category(category)?;
         let boolean = opcode >= 0x7e
@@ -80,8 +53,8 @@ impl Machine<'_, '_> {
                 category.numeric_type(),
             )
         };
-        let can_throw =
-            matches!(category, Category::Int | Category::Long) && matches!(operator, "/" | "%");
+        let left = self.implicit_unboxing(left);
+        let right = self.implicit_unboxing(right);
         let mut text = Document::new();
         left.append_at(precedence, &mut text);
         text.push(' ');
@@ -125,6 +98,9 @@ impl Machine<'_, '_> {
         ][usize::from(index)];
         let right = self.pop_category(category)?;
         let left = self.pop_category(category)?;
+        // The eventual consumer can compare for equality, so retain one
+        // explicit accessor if both source operands are wrappers.
+        let (left, right) = self.unbox_comparison(left, right, true);
         let order = self.order_of([&left, &right], false)?;
         let observable = left.observable || right.observable;
         let nan = match index {
@@ -171,16 +147,23 @@ impl Machine<'_, '_> {
 
     pub(super) fn conditional(&mut self, op: &Instruction) -> Result<Effect, LiftError> {
         let target = self.target(op)?;
+        self.boolean_condition = super::BooleanCondition::comparison();
         let (when_true, when_false) = match op.opcode {
             0x99..=0x9e => {
                 let relation = Relation::opcode_index(op.opcode - 0x99);
                 let value = self.pop_category(Category::Int)?;
+                let value = self.implicit_unboxing(value);
                 if let Source::Comparison(cmp) = value.source {
+                    self.boolean_condition = super::BooleanCondition::UNKNOWN;
                     (
                         relation.against_cmp(&cmp),
                         relation.inverse().against_cmp(&cmp),
                     )
                 } else if value.ty == BOOLEAN && relation.equality() {
+                    self.boolean_condition = super::BooleanCondition::tested(
+                        &value,
+                        matches!(relation, Relation::Ne),
+                    );
                     let mut negation = Document::from("!");
                     value.append_at(UNARY, &mut negation);
                     let truth = value.text;
@@ -208,13 +191,19 @@ impl Machine<'_, '_> {
                     })
                     && (left.ty == BOOLEAN || right.ty == BOOLEAN)
                 {
-                    self.relations(
-                        relation,
-                        &self.boolean_value(left),
-                        &self.boolean_value(right),
-                    )?
+                    let (left, right) = self.unbox_comparison(
+                        self.boolean_value(left),
+                        self.boolean_value(right),
+                        true,
+                    );
+                    self.relations(relation, &left, &right)?
                 } else {
-                    self.relations(relation, &self.as_int(left), &self.as_int(right))?
+                    let (left, right) = self.unbox_comparison(
+                        self.as_int(left),
+                        self.as_int(right),
+                        relation.equality(),
+                    );
+                    self.relations(relation, &left, &right)?
                 }
             }
             0xa5..=0xa6 | 0xc6..=0xc7 => {
@@ -266,14 +255,20 @@ impl Machine<'_, '_> {
 
     pub(super) fn array_load(&mut self, kind: u8) -> Result<(), LiftError> {
         let index = self.pop_category(Category::Int)?;
-        let index = self.as_int(index);
+        let address_index = AddressPart::index(&index);
+        let index = self.as_int(self.implicit_unboxing(index));
         let (array, component) = self.array_operand(kind)?;
         let mut text = Document::new();
         array.append_at(PRIMARY, &mut text);
         text.push('[');
         text.append_ref(&index.text);
         text.push(']');
-        self.push(self.expression(component, text, PRIMARY, [&array, &index], true)?)
+        let address_array = AddressPart::receiver(&array);
+        let mut value = self.expression(component, text, PRIMARY, [&array, &index], true)?;
+        if let (Some(array), Some(index)) = (address_array, address_index) {
+            value.source = Source::Access(Access::Array { store: 0x4f + kind, array, index });
+        }
+        self.push(value)
     }
 
     pub(super) fn array_store(&mut self, kind: u8) -> Result<Effect, LiftError> {
@@ -284,7 +279,7 @@ impl Machine<'_, '_> {
         };
         let value = self.pop_category(category)?;
         let index = self.pop_category(Category::Int)?;
-        let index = self.as_int(index);
+        let index = self.as_int(self.implicit_unboxing(index));
         let (mut array, component) = self.array_operand(kind)?;
         let value = if kind == 4 {
             if !matches!(value.source, Source::Null)
@@ -297,7 +292,7 @@ impl Machine<'_, '_> {
             }
             value
         } else {
-            self.coerce(value, &component, false)?
+            self.coerce_assignment(value, &component)?
         };
         let order = self.order_of([&array, &index, &value], true)?;
         self.before_statement(order)?;
@@ -404,7 +399,7 @@ impl Machine<'_, '_> {
         let mut counts = Vec::with_capacity(dimensions);
         for _ in 0..dimensions {
             let count = self.pop_category(Category::Int)?;
-            counts.push(self.as_int(count));
+            counts.push(self.as_int(self.implicit_unboxing(count)));
         }
         counts.reverse();
         let mut text = Document::from("new ");

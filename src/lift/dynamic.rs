@@ -15,12 +15,14 @@ use crate::{
         ClassSignature, GenericType, MethodDescriptor, MethodSignature, Primitive, Type,
         TypeArgument,
     },
+    emit::synthetic_marks::append_lambda_mark,
     source_text::Document,
     structure::structure_with_handlers,
 };
 
 use super::{
     Effect, LiftError, Machine,
+    boxing::{unboxed, wrapper},
     expr::{Expr, PRIMARY, Source, UNARY},
 };
 
@@ -442,7 +444,7 @@ impl<'a, 'c> Machine<'a, 'c> {
             let expression = self.expression(
                 factory.return_type,
                 render_lambda(
-                    &target,
+                    lambda_cast(&target),
                     parameters.into_iter().map(Document::from).collect(),
                     body,
                 ),
@@ -644,6 +646,14 @@ impl<'a, 'c> Machine<'a, 'c> {
         {
             lines.pop();
         }
+        let mut prefix = lambda_cast(target);
+        append_lambda_mark(
+            &mut prefix,
+            self.options,
+            site.owner,
+            site.name,
+            site.implementation_descriptor,
+        );
         if let [line] = lines.as_slice()
             && line.depth == 0
             && line.text.ends_with(';')
@@ -665,13 +675,12 @@ impl<'a, 'c> Machine<'a, 'c> {
                     let array = self.render_type(&site.implementation.return_type);
                     let creation = array.replacen("[]", &format!("[{parameter}]"), 1);
                     if statement.strip_prefix("new ") == Some(creation.as_str()) {
-                        let mut reference = lambda_cast(target);
-                        reference.append(self.type_reference(&site.implementation.return_type));
-                        reference.push_str("::new");
-                        return Ok(Some(reference));
+                        prefix.append(self.type_reference(&site.implementation.return_type));
+                        prefix.push_str("::new");
+                        return Ok(Some(prefix));
                     }
                 }
-                return Ok(Some(render_lambda(target, parameters, statement)));
+                return Ok(Some(render_lambda(prefix, parameters, statement)));
             }
             if site.implementation.return_type == Type::Void
                 && instructions
@@ -682,7 +691,7 @@ impl<'a, 'c> Machine<'a, 'c> {
                         |code| matches!(code.opcode, 0xb3 | 0xb5..=0xb9 | 0x4f..=0x56 | 0x84),
                     )
             {
-                return Ok(Some(render_lambda(target, parameters, statement)));
+                return Ok(Some(render_lambda(prefix, parameters, statement)));
             }
         }
         let mut body = Document::from("{");
@@ -694,7 +703,7 @@ impl<'a, 'c> Machine<'a, 'c> {
         }
         body.hard_line(0);
         body.push('}');
-        Ok(Some(render_lambda(target, parameters, body)))
+        Ok(Some(render_lambda(prefix, parameters, body)))
     }
 
     fn lambda_special_qualifier(
@@ -1323,8 +1332,7 @@ fn lambda_cast(target: &Document) -> Document {
     cast
 }
 
-fn render_lambda(target: &Document, parameters: Vec<Document>, body: Document) -> Document {
-    let mut declaration = lambda_cast(target);
+fn render_lambda(mut declaration: Document, parameters: Vec<Document>, body: Document) -> Document {
     let parenthesized = parameters.len() != 1;
     if parenthesized {
         declaration.push('(');
@@ -1358,27 +1366,6 @@ fn primitive_widens(from: Primitive, to: Primitive) -> bool {
             Float => to == Double,
             Boolean | Double => false,
         }
-}
-
-fn wrapper(primitive: Primitive) -> (&'static str, &'static str) {
-    use Primitive::*;
-    match primitive {
-        Boolean => ("java/lang/Boolean", "booleanValue"),
-        Byte => ("java/lang/Byte", "byteValue"),
-        Char => ("java/lang/Character", "charValue"),
-        Short => ("java/lang/Short", "shortValue"),
-        Int => ("java/lang/Integer", "intValue"),
-        Long => ("java/lang/Long", "longValue"),
-        Float => ("java/lang/Float", "floatValue"),
-        Double => ("java/lang/Double", "doubleValue"),
-    }
-}
-
-fn unboxed(name: &str) -> Option<Primitive> {
-    use Primitive::*;
-    [Boolean, Byte, Char, Short, Int, Long, Float, Double]
-        .into_iter()
-        .find(|&p| wrapper(p).0 == name)
 }
 
 fn is_synthetic(pool: &ConstantPool<'_>, member: &Member<'_>) -> bool {
@@ -1542,7 +1529,10 @@ impl<'a, 'c> Machine<'a, 'c> {
             ("explicitCast", Some("Ljava/lang/Object;)Ljava/lang/Object;"), [argument]) => {
                 self.explicit_cast_dynamic(ty, *argument)
             }
-            ("fieldVarHandle" | "staticFieldVarHandle" | "arrayVarHandle" | "invoke", _, _) => {
+            ("fieldVarHandle" | "staticFieldVarHandle" | "arrayVarHandle", _, _) => {
+                self.var_handle_constant(bootstrap, signature, name, ty, args)
+            }
+            ("invoke", _, _) => {
                 Err(self
                     .unsupported("dynamic constant bootstrap requires lazy, cached JVM linkage"))
             }

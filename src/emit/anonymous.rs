@@ -51,6 +51,7 @@ impl<'a, 'c> Writer<'a, 'c> {
             let site = sites.get(id).ok_or_else(invalid)?;
             let tail = fragments.next().ok_or_else(invalid)?;
             let node = self.group.nested_class(&site.class).ok_or_else(invalid)?;
+            self.append_anonymous_synthetic_mark(&site.class);
             self.body.push_str(" {");
             let opening = self.body.len();
             self.body.push('\n');

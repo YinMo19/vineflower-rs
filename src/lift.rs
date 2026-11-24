@@ -5,7 +5,11 @@
 
 mod anonymous;
 mod array_initializer;
+mod assignment_expr;
 mod concat;
+mod condy;
+mod booleans;
+mod boxing;
 mod dynamic;
 mod enum_constants;
 pub(crate) mod enum_switch;
@@ -23,6 +27,7 @@ pub(crate) mod qualified_new;
 mod switch_expression;
 
 pub(crate) use anonymous::{AnonymousBindings, AnonymousSite, AnonymousSites};
+pub(crate) use booleans::{BooleanCondition, BooleanFact, BooleanSelection};
 pub(crate) use dynamic::source_method_name;
 pub(crate) use literal::{constant_literal, constant_literal_with_options, string_literal};
 pub(crate) use locals::IfPatternLocal;
@@ -133,6 +138,8 @@ pub(crate) struct Machine<'a, 'c> {
     array_probe_depth: u8,
     initialized_this: bool,
     instruction_has_source: bool,
+    boolean_condition: BooleanCondition,
+    boolean_return: Option<BooleanFact>,
     opcode: u8,
     offset: u32,
 }
@@ -180,6 +187,8 @@ impl<'a, 'c> Machine<'a, 'c> {
             array_probe_depth: 0,
             initialized_this: method_name != "<init>" || super_class.is_none(),
             instruction_has_source: false,
+            boolean_condition: BooleanCondition::UNKNOWN,
+            boolean_return: None,
             opcode: 0,
             offset: 0,
         })
@@ -402,7 +411,9 @@ impl<'a, 'c> Machine<'a, 'c> {
         {
             return match action {
                 enum_switch::Action::Skip => {
-                    self.instruction_has_source = false;
+                    // The int lookup is the source selector's dispatch;
+                    // the helper array and ordinal call have no source.
+                    self.instruction_has_source = op.opcode == 0x2e;
                     Ok(Effect::None)
                 }
                 enum_switch::Action::Switch(owner) => Ok(Effect::Switch {
@@ -418,17 +429,14 @@ impl<'a, 'c> Machine<'a, 'c> {
                 ..Expr::atom(object_type(), "null".into())
             })?,
             0x02..=0x08 => self.push(Expr::integer(i32::from(op.opcode) - 3))?,
-            0x09..=0x0a => self.push(Expr::literal(
-                Type::Primitive(Primitive::Long),
-                format!("{}L", op.opcode - 0x09).into(),
+            0x09..=0x0a => self.push(Expr::numeric_literal(
+                Primitive::Long, format!("{}L", op.opcode - 0x09).into(), op.opcode == 0x0a,
             ))?,
-            0x0b..=0x0d => self.push(Expr::literal(
-                Type::Primitive(Primitive::Float),
-                format!("{}.0F", op.opcode - 0x0b).into(),
+            0x0b..=0x0d => self.push(Expr::numeric_literal(
+                Primitive::Float, format!("{}.0F", op.opcode - 0x0b).into(), op.opcode == 0x0c,
             ))?,
-            0x0e..=0x0f => self.push(Expr::literal(
-                Type::Primitive(Primitive::Double),
-                format!("{}.0", op.opcode - 0x0e).into(),
+            0x0e..=0x0f => self.push(Expr::numeric_literal(
+                Primitive::Double, format!("{}.0", op.opcode - 0x0e).into(), op.opcode == 0x0f,
             ))?,
             0x10..=0x11 => {
                 let Operand::Immediate(value) = op.operand else {
@@ -530,7 +538,7 @@ impl<'a, 'c> Machine<'a, 'c> {
                 .then(|| numeric::named(constant, None, self.class_name))
                 .flatten()
         };
-        let value = match constant {
+        let mut value = match constant {
             Constant::Integer(value) => {
                 if let Some(named) = named() {
                     Expr {
@@ -602,6 +610,14 @@ impl<'a, 'c> Machine<'a, 'c> {
         if (value.ty.slots() == 2) != (op.opcode == 0x14) {
             return Err(self.invalid_operand("constant width does not match ldc variant"));
         }
+        if match constant {
+            Constant::Long(value) => *value == 1,
+            Constant::Float(value) => *value == 1.0,
+            Constant::Double(value) => *value == 1.0,
+            _ => false,
+        } {
+            value.source = Source::NumericOne;
+        }
         self.push(value)
     }
 
@@ -610,6 +626,7 @@ impl<'a, 'c> Machine<'a, 'c> {
             return Err(self.invalid_stack("constructor returns before initializing this"));
         }
         let expected = &self.descriptor.return_type;
+        self.boolean_return = None;
         let value = if opcode == 0xb1 {
             if *expected != Type::Void {
                 return Err(self.invalid_stack("void return in a nonvoid method"));
@@ -617,7 +634,15 @@ impl<'a, 'c> Machine<'a, 'c> {
             None
         } else {
             let value = self.pop_category(Category::for_local(opcode - 0xac))?;
-            Some(self.coerce(value, expected, false)?)
+            let constant = match value.source {
+                Source::Integer(value) => Some(BooleanFact::constant(value & 1 != 0)),
+                _ => None,
+            };
+            let value = self.coerce_assignment(value, expected)?;
+            if *expected == expr::BOOLEAN && self.options.ternary_constant_simplification {
+                self.boolean_return = constant.or_else(|| BooleanFact::operand(&value));
+            }
+            Some(value)
         };
         self.before_statement(value.as_ref().and_then(|value| value.order))?;
         self.stack.clear();
@@ -684,6 +709,14 @@ impl<'a, 'c> Machine<'a, 'c> {
             .any(|value| value.order.is_some())
         {
             self.freeze_stack(None)?;
+        }
+        if beneath == 0 {
+            for (ordinal, value) in self.stack[start..end].iter_mut().enumerate() {
+                value.alias.get_or_insert(assignment_expr::StackAlias {
+                    instruction: self.offset,
+                    ordinal: ordinal as u8,
+                });
+            }
         }
         self.stack.extend_from_within(start..end);
         self.stack[insert..].rotate_right(end - start);

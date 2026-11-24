@@ -15,6 +15,9 @@ use super::protected::ArmId;
 pub(super) struct Region<'r, 'a, 'c> {
     pub(super) stop: Option<usize>,
     pub(super) loop_header: Option<usize>,
+    // A detached handler is lexically inside the loop even though normal
+    // backedges do not put its CFG blocks in that loop.
+    layout_loop_header: Option<usize>,
     pub(super) protected: Option<&'r Machine<'a, 'c>>,
     pub(super) exception_arm: Option<ArmId>,
     pub(super) switch_depth: usize,
@@ -26,6 +29,7 @@ impl<'r, 'a, 'c> Region<'r, 'a, 'c> {
     pub(super) const METHOD: Self = Self {
         stop: None,
         loop_header: None,
+        layout_loop_header: None,
         protected: None,
         exception_arm: None,
         switch_depth: 0,
@@ -45,6 +49,7 @@ impl<'r, 'a, 'c> Region<'r, 'a, 'c> {
         Self {
             stop: Some(scope.continue_at.get()),
             loop_header: Some(scope.header),
+            layout_loop_header: Some(scope.header),
             loop_scope: Some(scope),
             outer: Some(self),
             ..*self
@@ -100,6 +105,13 @@ impl<'r, 'a, 'c> Region<'r, 'a, 'c> {
             protected: protected.or(self.protected),
             exception_arm: Some(arm),
             ..self.branch(stop)
+        }
+    }
+
+    pub(super) fn with_exception_layout(self, containing_loop: Option<usize>) -> Self {
+        Self {
+            layout_loop_header: containing_loop,
+            ..self
         }
     }
 
@@ -322,7 +334,11 @@ impl Layout {
     }
 
     pub(super) fn inside(&self, block: usize, region: Region<'_, '_, '_>) -> bool {
-        self.level[block] == region.loop_header && !region.has_stop(block)
+        self.containing_loop(block) == region.layout_loop_header && !region.has_stop(block)
+    }
+
+    pub(super) fn containing_loop(&self, block: usize) -> Option<usize> {
+        self.level[block]
     }
 
     pub(super) fn direct_loop_member(&self, block: usize, header: usize) -> bool {

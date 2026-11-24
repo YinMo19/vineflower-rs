@@ -1,7 +1,7 @@
 // Copyright 2000-2020 JetBrains s.r.o. and the Vineflower contributors.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::Arc;
+use std::{ops::Range, sync::Arc};
 
 use crate::{
     descriptor::{MethodDescriptor, Primitive, Type},
@@ -68,6 +68,7 @@ pub(super) fn call_source(
     descriptor: &MethodDescriptor,
     receiver: Option<Expr>,
     mut args: Vec<Expr>,
+    omitted: Option<Range<u32>>,
 ) -> Source {
     let [parameter] = descriptor.parameters.as_slice() else {
         return Source::Plain;
@@ -81,7 +82,11 @@ pub(super) fn call_source(
             && matches!(&descriptor.return_type, Type::Object(result) if result == owner)
             && (printable(parameter) || is_string(parameter)) =>
         {
-            Arc::make_mut(&mut parts).push(args.pop().unwrap().into());
+            let mut part = args.pop().unwrap();
+            if let Some(range) = omitted {
+                part.text.omit_bytes(range);
+            }
+            Arc::make_mut(&mut parts).push(part.into());
             Source::StringBuilder(parts)
         }
         None if owner == "java/lang/String"
@@ -89,7 +94,11 @@ pub(super) fn call_source(
             && is_string(&descriptor.return_type)
             && printable(parameter) =>
         {
-            Source::StringConversion(Box::new(args.pop().unwrap()))
+            let mut value = args.pop().unwrap();
+            if let Some(range) = omitted {
+                value.text.omit_bytes(range);
+            }
+            Source::StringConversion(Box::new(value))
         }
         _ => Source::Plain,
     }

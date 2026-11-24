@@ -447,3 +447,143 @@ fn lowers_only_representable_constant_bootstraps() {
         "{error:#?}"
     );
 }
+
+const VAR_HANDLE: &str = "Ljava/lang/invoke/VarHandle;";
+const FIELD_BOOTSTRAP_SUFFIX: &str =
+    "Ljava/lang/Class;Ljava/lang/Class;)Ljava/lang/invoke/VarHandle;";
+const ARRAY_BOOTSTRAP_SUFFIX: &str = "Ljava/lang/Class;)Ljava/lang/invoke/VarHandle;";
+
+fn add_handle_method(class: &mut Class, name: &str, load: [u8; 3]) {
+    let [op, high, low] = load;
+    class.method(
+        9,
+        name,
+        "()Ljava/lang/invoke/VarHandle;",
+        &[op, high, low, 0xb0],
+    );
+}
+
+#[test]
+fn lowers_verified_var_handles_only_after_opt_in() {
+    let mut class = Class::default();
+    let point = class.class("java/awt/Point");
+    let [_, high, low] = class.constant(
+        "primitiveClass",
+        ")Ljava/lang/Class;",
+        &[],
+        "I",
+        "Ljava/lang/Class;",
+    );
+    let int = u16::from_be_bytes([high, low]);
+    let load = class.constant(
+        "fieldVarHandle",
+        FIELD_BOOTSTRAP_SUFFIX,
+        &[point, int],
+        "x",
+        VAR_HANDLE,
+    );
+    add_handle_method(&mut class, "x", load);
+
+    let system = class.class("java/lang/System");
+    let stream = class.class("java/io/PrintStream");
+    let load = class.constant(
+        "staticFieldVarHandle",
+        FIELD_BOOTSTRAP_SUFFIX,
+        &[system, stream],
+        "out",
+        VAR_HANDLE,
+    );
+    add_handle_method(&mut class, "out", load);
+
+    let strings = class.class("[Ljava/lang/String;");
+    let load = class.constant(
+        "arrayVarHandle",
+        ARRAY_BOOTSTRAP_SUFFIX,
+        &[strings],
+        "unused",
+        VAR_HANDLE,
+    );
+    add_handle_method(&mut class, "strings", load);
+
+    let bytes = class.finish();
+    assert!(decompile(&bytes, &Options::default()).is_err());
+    let mut options = Options::default();
+    options
+        .set("decompile-complex-constant-dynamic", "1")
+        .unwrap();
+    let text = decompile(&bytes, &options).unwrap().text;
+    assert_eq!(
+        text.matches("/* $VF: constant dynamic replaced with non-lazy method call */")
+            .count(),
+        3
+    );
+    // Calls may wrap once the warning pushes them beyond the preferred width.
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let flat = flat.replace("( ", "(").replace(" )", ")");
+    for call in [
+        "ConstantBootstraps.fieldVarHandle(MethodHandles.lookup(), \"x\", VarHandle.class, Point.class, int.class)",
+        "ConstantBootstraps.staticFieldVarHandle(MethodHandles.lookup(), \"out\", VarHandle.class, System.class, PrintStream.class)",
+        "MethodHandles.arrayElementVarHandle(String[].class)",
+    ] {
+        assert!(flat.contains(call), "{text}");
+    }
+}
+
+#[test]
+fn rejects_malformed_bootstraps_even_after_opt_in() {
+    let mut options = Options::default();
+    options
+        .set("decompile-complex-constant-dynamic", "1")
+        .unwrap();
+    for (bootstrap, suffix, target, expected) in [
+        (
+            "arrayVarHandle",
+            "Ljava/lang/Class;)Ljava/lang/Object;",
+            "[I",
+            "descriptor or arity",
+        ),
+        (
+            "arrayVarHandle",
+            ARRAY_BOOTSTRAP_SUFFIX,
+            "java/lang/String",
+            "needs an array class",
+        ),
+        (
+            "fieldVarHandle",
+            FIELD_BOOTSTRAP_SUFFIX,
+            "[I",
+            "descriptor or arity",
+        ),
+    ] {
+        let mut class = Class::default();
+        let target = class.class(target);
+        let load = class.constant(bootstrap, suffix, &[target], "x", VAR_HANDLE);
+        add_handle_method(&mut class, "broken", load);
+        let error = decompile(&class.finish(), &options).unwrap_err();
+        assert!(format!("{error:#?}").contains(expected), "{error:#?}");
+    }
+
+    let mut class = Class::default();
+    let owner = class.class("java/awt/Point");
+    let [_, hi, lo] = class.constant(
+        "nullConstant",
+        ")Ljava/lang/Object;",
+        &[],
+        "ignored",
+        "Ljava/lang/Class;",
+    );
+    let not_primitive = u16::from_be_bytes([hi, lo]);
+    let load = class.constant(
+        "fieldVarHandle",
+        FIELD_BOOTSTRAP_SUFFIX,
+        &[owner, not_primitive],
+        "x",
+        VAR_HANDLE,
+    );
+    add_handle_method(&mut class, "broken", load);
+    let error = decompile(&class.finish(), &options).unwrap_err();
+    assert!(
+        format!("{error:#?}").contains("not a verified primitiveClass"),
+        "{error:#?}"
+    );
+}

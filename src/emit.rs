@@ -11,6 +11,7 @@ mod nested;
 mod options_support;
 mod record;
 pub(crate) mod symbols;
+pub(crate) mod synthetic_marks;
 mod type_annotations;
 
 pub use mapping::{MethodMap, SourceMap};
@@ -547,6 +548,7 @@ impl<'a, 'c> Writer<'a, 'c> {
                 );
             }
         }
+        self.append_local_synthetic_mark(&mut head);
         head.push_str(" {");
         self.document_line(0, &head);
 
@@ -1311,6 +1313,9 @@ impl<'a, 'c> Writer<'a, 'c> {
             if mapping {
                 for offset in line.offsets {
                     offsets.entry(offset).or_insert(start);
+                }
+                for offset in line.text.omitted_bytecode().flatten() {
+                    offsets.remove(&offset);
                 }
             }
         }

@@ -44,6 +44,10 @@ enum Kind {
         start: u32,
         end: u32,
     },
+    OmittedBytes {
+        start: u32,
+        end: u32,
+    },
     HardLine {
         delta: usize,
     },
@@ -166,7 +170,7 @@ impl Document {
         assert!(
             self.events[..first]
                 .iter()
-                .all(|event| matches!(event.kind, Kind::Anchor { .. })),
+                .all(|event| matches!(event.kind, Kind::Anchor { .. } | Kind::OmittedBytes { .. })),
             "cannot replace a prefix containing layout groups or breaks",
         );
         self.flat.replace_range(..len, prefix);
@@ -211,7 +215,7 @@ impl Document {
         assert!(
             self.events[first..]
                 .iter()
-                .all(|event| matches!(event.kind, Kind::End | Kind::Anchor { .. })),
+                .all(|event| matches!(event.kind, Kind::End | Kind::Anchor { .. } | Kind::OmittedBytes { .. })),
             "cannot truncate through registered layout events",
         );
         if let Some(event) = self.events[..first]
@@ -351,7 +355,7 @@ impl Document {
             assert!(
                 self.events[end + 1..]
                     .iter()
-                    .all(|event| matches!(event.kind, Kind::Anchor { .. })),
+                    .all(|event| matches!(event.kind, Kind::Anchor { .. } | Kind::OmittedBytes { .. })),
                 "receiver is not an intact qualifier chain",
             );
             self.events.remove(end);
@@ -430,6 +434,24 @@ impl Document {
                 },
             });
         }
+    }
+
+    /// A compiler-only operation absorbed by an expression rewrite. Keep
+    /// its CFG provenance but omit it from source mappings.
+    pub(crate) fn omit_bytes(&mut self, offsets: Range<u32>) {
+        if !offsets.is_empty() {
+            self.events.push(Event {
+                at: self.flat.len(),
+                kind: Kind::OmittedBytes { start: offsets.start, end: offsets.end },
+            });
+        }
+    }
+
+    pub(crate) fn omitted_bytecode(&self) -> impl Iterator<Item = Range<u32>> + '_ {
+        self.events.iter().filter_map(|event| match event.kind {
+            Kind::OmittedBytes { start, end } => Some(start..end),
+            _ => None,
+        })
     }
 
     /// Register a collection of expression or rule offsets without allocating
@@ -834,6 +856,7 @@ where
                     (self.on_anchor)(start..end, self.lines);
                     index += 1;
                 }
+                Kind::OmittedBytes { .. } => index += 1,
                 Kind::HardLine { delta } => {
                     self.cursor += 1;
                     self.newline(self.depth + delta + extra);

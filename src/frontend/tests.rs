@@ -210,6 +210,7 @@ fn supported_flags_feed_shared_options_and_unsupported_flags_error() {
             "--bytecode-source-mapping".into(),
             "--__dump_original_lines__=1".into(),
             "--no-use-method-parameters".into(),
+            "-mcs=1".into(),
             "-hes=0".into(),
             "--__unit_test_mode__".into(),
             "-nls=0".into(),
@@ -241,6 +242,7 @@ fn supported_flags_feed_shared_options_and_unsupported_flags_error() {
     assert!(!options.hide_default_constructor);
     assert!(options.include_line_mappings);
     assert!(options.dump_original_lines);
+    assert!(options.mark_corresponding_synthetics);
     assert!(!options.use_method_parameters);
     assert!(!options.hide_empty_super);
     assert!(options.unit_test_mode);

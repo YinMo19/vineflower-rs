@@ -171,6 +171,11 @@ const SETTINGS: &[Setting] = &[
         "Append a source symbol token listing",
     ),
     flag(
+        "mark-corresponding-synthetics",
+        "mcs",
+        "Mark the implementation of lambdas, anonymous classes, and local classes",
+    ),
+    flag(
         "unit-test-mode",
         "__unit_test_mode__",
         "Append source maps for test comparisons",
@@ -199,6 +204,11 @@ const SETTINGS: &[Setting] = &[
         "decompile-assert",
         "das",
         "Recover assert statements from compiler-generated guards",
+    ),
+    flag(
+        "decompile-complex-constant-dynamic",
+        "dcc",
+        "Recover supported complex dynamic constants as non-lazy method calls",
     ),
     flag(
         "override-annotation",
@@ -235,6 +245,11 @@ const SETTINGS: &[Setting] = &[
         "keep-literals",
         "lit",
         "Keep special floating-point literals without resugaring",
+    ),
+    flag(
+        "ternary-constant-simplification",
+        "tcs",
+        "Replace boolean conditional expressions with short-circuit operators",
     ),
     flag(
         "rename-members",

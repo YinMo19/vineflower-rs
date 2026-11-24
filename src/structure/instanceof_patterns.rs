@@ -48,6 +48,7 @@ impl Emitter<'_> {
         head: usize,
         machine: &Machine<'_, '_>,
         region: Region<'_, '_, '_>,
+        allowed_exit: Option<usize>,
     ) -> Option<Site> {
         if !machine.supports_instanceof_patterns()
             || !machine.this_is_initialized()
@@ -74,7 +75,7 @@ impl Emitter<'_> {
         };
         let next = &self.graph.blocks[success];
         if self.emitted[success]
-            || !self.layout.inside(success, region)
+            || (!self.layout.inside(success, region) && Some(success) != allowed_exit)
             || next.predecessors != [head]
             || !next.exception_predecessors.is_empty()
             || !next.exception_successors.is_empty()
@@ -166,12 +167,53 @@ impl Emitter<'_> {
         depth: usize,
         offsets: Vec<u32>,
     ) -> Result<(Tail, Option<Binding>), StructureError> {
-        let Some(site) = self.instanceof_site(block, machine, region) else {
+        let Some(site) = self.instanceof_site(block, machine, region, None) else {
             return Ok((
                 self.lift_block(block, machine, region, depth, offsets)?,
                 None,
             ));
         };
+        self.lift_instanceof_site(block, site, machine, region, depth, offsets)
+    }
+
+    /// When the matching edge exits a negated loop, the binding can exist
+    /// after source `while` only if all exits execute that test and the
+    /// condition itself can become the loop header rather than a body guard.
+    pub(super) fn lift_inverted_instanceof_loop_head<'a, 'c>(
+        &mut self,
+        block: usize,
+        exit: usize,
+        machine: &mut Machine<'a, 'c>,
+        region: Region<'_, 'a, 'c>,
+        depth: usize,
+    ) -> Option<(Tail, Binding)> {
+        if !machine.stack_is_empty() { return None; }
+        let site = self.instanceof_site(block, machine, region, Some(exit)).filter(|site| site.success == exit)?;
+        let names = machine.local_name_checkpoint();
+        let start = self.lines.len();
+        let mut trial = machine.clone();
+        let lifted = self.lift_instanceof_site(block, site, &mut trial, region, depth, Vec::new());
+        if let Ok((tail, Some(binding))) = lifted
+            && self.lines.len() == start && trial.stack_is_empty()
+            && trial.same_locals(machine) && trial.take_prelude().is_empty()
+        {
+            *machine = trial;
+            return Some((tail, binding));
+        }
+        self.lines.truncate(start);
+        machine.restore_local_names(names);
+        None
+    }
+
+    fn lift_instanceof_site<'a, 'c>(
+        &mut self,
+        block: usize,
+        site: Site,
+        machine: &mut Machine<'a, 'c>,
+        region: Region<'_, 'a, 'c>,
+        depth: usize,
+        offsets: Vec<u32>,
+    ) -> Result<(Tail, Option<Binding>), StructureError> {
         let mut cursor = site.alias.unwrap_or(site.load + 1);
         let Tail {
             effect,
@@ -266,7 +308,10 @@ impl Emitter<'_> {
         binding: &mut Binding,
         offsets: &mut Vec<u32>,
         control: &mut RangeInclusive<u32>,
-    ) -> Result<(), StructureError> {
+    ) -> Result<bool, StructureError> {
+        if self.fold_instanceof_alternative(head, region, machine, depth, condition, binding, offsets, control)? {
+            return Ok(false);
+        }
         let mut folded = Vec::new();
         self.fold_instanceof_guards(
             head,
@@ -283,7 +328,97 @@ impl Emitter<'_> {
         for block in folded {
             self.emitted[block] = true;
         }
-        Ok(())
+        Ok(true)
+    }
+
+    /// Fold `match && guard || alternative` only when the shared success
+    /// never reads the binding and every predecessor of the alternative is
+    /// one of the false edges already represented by the guarded test.
+    fn fold_instanceof_alternative<'a, 'c>(
+        &mut self,
+        head: usize,
+        region: Region<'_, 'a, 'c>,
+        machine: &Machine<'a, 'c>,
+        depth: usize,
+        condition: &mut Condition,
+        binding: &mut Binding,
+        offsets: &mut Vec<u32>,
+        control: &mut RangeInclusive<u32>,
+    ) -> Result<bool, StructureError> {
+        let success_is_taken = binding.succeeds_at(condition.taken);
+        let failure = if success_is_taken { condition.fallthrough } else { condition.taken };
+        let alternative = &self.graph.blocks[failure];
+        let guard = &self.graph.blocks[binding.success];
+        let [taken, fallthrough] = *alternative.successors.as_slice() else { return Ok(false); };
+        let (shared, unique) = match (guard.successors.contains(&taken), guard.successors.contains(&fallthrough)) {
+            (true, false) => (taken, fallthrough),
+            (false, true) => (fallthrough, taken),
+            _ => return Ok(false),
+        };
+        if self.emitted[failure] || self.assertion_starts(failure)
+            || !alternative.exception_predecessors.is_empty() || !alternative.exception_successors.is_empty()
+            || !self.layout.inside(failure, region) || self.layout.loops[failure].is_some()
+            || self.exceptions.at_start(region.exception_arm, failure).is_some()
+        {
+            return Ok(false);
+        }
+        let name_checkpoint = machine.local_name_checkpoint();
+        let start = self.lines.len();
+        let mut along = machine.clone();
+        let tail = self.lift_block(failure, &mut along, region, depth, Vec::new());
+        let has_lines = self.lines.len() != start;
+        self.lines.truncate(start);
+        let Ok(Tail {
+            effect: Effect::Branch { target, when_true, when_false },
+            offsets: rhs_offsets,
+            control: Some(rhs_control),
+        }) = tail else {
+            machine.restore_local_names(name_checkpoint);
+            return Ok(false);
+        };
+        if has_lines || !along.same_locals(machine) || !along.same_control_stack(machine) {
+            machine.restore_local_names(name_checkpoint);
+            return Ok(false);
+        }
+        let (taken, _) = self.branch_targets(failure, target)?;
+        let (yes, no) = if taken == shared { (when_true, when_false) } else { (when_false, when_true) };
+        let previous = (binding.success, binding.body_start);
+        let mut trial = Condition {
+            taken: condition.taken,
+            fallthrough: condition.fallthrough,
+            when_true: condition.when_true.clone(),
+            when_false: condition.when_false.clone(),
+        };
+        let mut inner_control = control.clone();
+        let mut inner_offsets = Vec::new();
+        let mut folded = Vec::new();
+        self.fold_instanceof_guards(head, region, machine, depth, &mut trial, binding,
+            &mut inner_offsets, &mut inner_control, Some((failure, shared)), &mut folded)?;
+        let closed = self.graph.blocks[failure].predecessors.iter()
+            .all(|predecessor| *predecessor == head || folded.contains(predecessor));
+        if !closed || binding.body_start.is_some() || !binding.succeeds_at(shared)
+            || *rhs_control.start() <= *inner_control.end()
+        {
+            (binding.success, binding.body_start) = previous;
+            machine.restore_local_names(name_checkpoint);
+            return Ok(false);
+        }
+        if success_is_taken {
+            trial.fallthrough = unique;
+            trial.when_true = logical(trial.when_true, "||", yes);
+            trial.when_false = logical(trial.when_false, "&&", no);
+        } else {
+            trial.taken = unique;
+            trial.when_false = logical(trial.when_false, "||", yes);
+            trial.when_true = logical(trial.when_true, "&&", no);
+        }
+        self.emitted[failure] = true;
+        for block in folded { self.emitted[block] = true; }
+        offsets.extend(inner_offsets);
+        offsets.extend(rhs_offsets);
+        *control = *control.start()..=*rhs_control.end();
+        *condition = trial;
+        Ok(true)
     }
 
     fn fold_instanceof_guards<'a, 'c>(
@@ -429,7 +564,7 @@ impl Emitter<'_> {
                     .exceptions
                     .at_start(region.exception_arm, next)
                     .is_some()
-                || self.instanceof_site(next, machine, region).is_none()
+                || self.instanceof_site(next, machine, region, None).is_none()
             {
                 continue;
             }
