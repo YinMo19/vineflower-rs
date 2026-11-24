@@ -1655,7 +1655,6 @@ impl Table {
         if reference_load(load) != Some(slot)
             || throw.opcode != 0xbf
             || !node.successors.is_empty()
-            || outgoing.is_empty()
             || outgoing.contains(&route)
             || instructions.iter().enumerate().any(|(index, op)| {
                 index != load_index && cleanup_locals::reads(op, slot)
@@ -1663,8 +1662,9 @@ impl Table {
         {
             return None;
         }
-        // Dispatch resumes with the *same object*, at the identical ordered
-        // suffix. Earlier typed rows retain their original priority.
+        // Rethrow resumes dispatch with the same object: either the exact
+        // remaining handler sequence or no local handler at all. Any typed
+        // catch before this route keeps its original priority.
         covered.iter().all(|&block| {
             let active = &self.by_block[block];
             active.iter().position(|&entry| entry == route)
