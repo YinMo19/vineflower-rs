@@ -43,6 +43,40 @@ pub(super) const FINAL: u16 = 0x0010;
 pub(super) const NATIVE: u16 = 0x0100;
 pub(super) const ABSTRACT: u16 = 0x0400;
 
+pub(super) const CONSTRUCTOR_MARKER: &str = "(Lkotlin/jvm/internal/DefaultConstructorMarker;)V";
+
+#[derive(Clone, Copy)]
+pub(super) enum ConstructorCall<'a> {
+    Direct(&'a str),
+    Sealed(&'a str),
+}
+
+impl ConstructorCall<'_> {
+    fn body_after_call<'code>(
+        self,
+        bytecode: &Bytecode<'_, '_>,
+        instructions: &'code [Instruction],
+    ) -> Result<Option<&'code [Instruction]>, KotlinError> {
+        let (receiver, call, rest, owner, descriptor) = match (self, instructions) {
+            (Self::Direct(owner), [receiver, call, rest @ ..]) => (receiver, call, rest, owner, "()V"),
+            (Self::Sealed(owner), [receiver, null, call, rest @ ..]) if null.opcode == 0x01 => {
+                (receiver, call, rest, owner, CONSTRUCTOR_MARKER)
+            }
+            _ => return Ok(None),
+        };
+        let Operand::Constant(index) = call.operand else {
+            return Ok(None);
+        };
+        if local_load(receiver) != Some((0x19, 0))
+            || bytecode.reference(call, 0xb7)? != Some((owner, "<init>", descriptor))
+            || !matches!(bytecode.class.pool.get(index)?, Constant::Methodref { .. })
+        {
+            return Ok(None);
+        }
+        Ok(Some(rest))
+    }
+}
+
 pub(super) struct Bytecode<'a, 'data> {
     pub class: &'a ClassFile<'data>,
     pub owner: &'a str,
@@ -604,10 +638,10 @@ impl<'a, 'data> Bytecode<'a, 'data> {
         member: &Member<'data>,
         descriptor: &MethodDescriptor,
         parameters: &[ValueParameter],
-        superclass: Option<&str>,
+        constructor_call: Option<ConstructorCall<'_>>,
         declaration: &str,
     ) -> Result<Vec<Assignment<'a>>, KotlinError> {
-        let locals = Locals::new(descriptor, superclass.is_some(), parameters, declaration)?;
+        let locals = Locals::new(descriptor, constructor_call.is_some(), parameters, declaration)?;
         if descriptor.return_type != JvmType::Void
             || (member.access_flags & STATIC == 0) != locals.instance
         {
@@ -618,21 +652,10 @@ impl<'a, 'data> Bytecode<'a, 'data> {
         }
         let instructions = self.instructions(member, declaration)?;
         let mut instructions = self.parameter_checks(&instructions, &locals, parameters)?;
-        if let Some(superclass) = superclass {
-            match instructions {
-                [receiver, call, rest @ ..]
-                    if local_load(receiver) == Some((0x19, 0))
-                        && self.reference(call, 0xb7)? == Some((superclass, "<init>", "()V")) =>
-                {
-                    instructions = rest
-                }
-                _ => {
-                    return Err(KotlinError::unsupported(
-                        declaration,
-                        "non-trivial superclass constructor call",
-                    ));
-                }
-            }
+        if let Some(call) = constructor_call {
+            instructions = call.body_after_call(self, instructions)?.ok_or_else(|| {
+                KotlinError::unsupported(declaration, "non-trivial superclass constructor call")
+            })?;
         }
         let (ret, statements) = instructions
             .split_last()
@@ -644,6 +667,15 @@ impl<'a, 'data> Bytecode<'a, 'data> {
             ));
         }
         self.assignment_slice(statements, &locals, declaration)
+    }
+
+    pub fn has_empty_constructor_body(
+        &self,
+        member: &Member<'data>,
+        call: ConstructorCall<'_>,
+    ) -> Result<bool, KotlinError> {
+        let instructions = self.instructions(member, self.owner)?;
+        Ok(matches!(call.body_after_call(self, &instructions)?, Some([ret]) if ret.opcode == 0xb1))
     }
 
     /// Lower the verified user segment of a Kotlin singleton's `<clinit>`.

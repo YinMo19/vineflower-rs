@@ -271,6 +271,7 @@ pub struct ClassDeclaration {
     pub flags: Flags,
     pub companion_name: Option<String>,
     pub nested_names: Vec<String>,
+    pub sealed_subclasses: Vec<ClassName>,
     pub enum_entries: Vec<String>,
     pub supertypes: Vec<Type>,
     pub context_receivers: Vec<Type>,

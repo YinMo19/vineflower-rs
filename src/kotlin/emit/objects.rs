@@ -5,7 +5,10 @@ use std::{borrow::Cow, cell::RefCell, ops::Range};
 use crate::{
     bytecode::{Instruction, Operand},
     classfile::{Constant, find_attribute},
-    kotlin::{JvmFieldSignature, Type, body::{Assignment, load_opcode, local_load, local_store, return_opcode}},
+    kotlin::{
+        JvmFieldSignature, Type,
+        body::{Assignment, CONSTRUCTOR_MARKER, ConstructorCall, load_opcode, local_load, local_store, return_opcode},
+    },
 };
 
 use super::{
@@ -16,7 +19,6 @@ use super::{
 const SYNTHETIC: u16 = 0x1000;
 const PUBLIC: u16 = 0x0001;
 const PRIVATE: u16 = 0x0002;
-const MARKER: &str = "(Lkotlin/jvm/internal/DefaultConstructorMarker;)V";
 const JVM_STATIC: &str = "Lkotlin/jvm/JvmStatic;";
 
 pub(super) struct Singleton<'a, 'data> {
@@ -82,6 +84,7 @@ impl<'a, 'data> Singleton<'a, 'data> {
     pub fn validate(
         body: &Bytecode<'a, 'data>,
         declaration: &ClassDeclaration,
+        constructor_call: ConstructorCall<'_>,
         host: Option<(&Bytecode<'a, 'data>, &str)>,
     ) -> Result<Self, KotlinError> {
         let invalid = || error(body.owner, "Kotlin singleton constructor or allocation shell");
@@ -98,20 +101,15 @@ impl<'a, 'data> Singleton<'a, 'data> {
             return Err(invalid());
         }
         let method = body.find_method(sig)?.ok_or_else(invalid)?;
-        let instructions = body.instructions(method, body.owner)?;
-        if method.access_flags != PRIVATE || !matches!(instructions.as_slice(), [receiver, call, ret]
-            if local_load(receiver) == Some((0x19, 0)) && ret.opcode == 0xb1
-                && body.reference(call, 0xb7)? == Some(("java/lang/Object", "<init>", "()V")))
+        if method.access_flags != PRIVATE || !body.has_empty_constructor_body(method, constructor_call)?
         {
             return Err(invalid());
         }
         if companion {
-            let marked = raw_method(body, "<init>", MARKER)?.ok_or_else(invalid)?;
+            let marked = raw_method(body, "<init>", CONSTRUCTOR_MARKER)?.ok_or_else(invalid)?;
             if !body.class.fields.is_empty() || raw_method(body, "<clinit>", "()V")?.is_some()
                 || marked.access_flags != PUBLIC | SYNTHETIC
-                || !matches!(body.instructions(marked, body.owner)?.as_slice(), [receiver, call, ret]
-                    if local_load(receiver) == Some((0x19, 0)) && ret.opcode == 0xb1
-                        && body.reference(call, 0xb7)? == Some((body.owner, "<init>", "()V")))
+                || !body.has_empty_constructor_body(marked, ConstructorCall::Direct(body.owner))?
             {
                 return Err(invalid());
             }
@@ -141,7 +139,7 @@ impl<'a, 'data> Singleton<'a, 'data> {
         let Some(prefix) = code.get(..first_assignment) else { return Err(invalid()); };
         let [new, dup, tail @ ..] = prefix else { unreachable!() };
         let (init, put, constructor_descriptor) = match tail {
-            [null, init, put] if companion && null.opcode == 0x01 => (init, put, MARKER),
+            [null, init, put] if companion && null.opcode == 0x01 => (init, put, CONSTRUCTOR_MARKER),
             [init, put] if !companion => (init, put, "()V"),
             _ => return Err(invalid()),
         };

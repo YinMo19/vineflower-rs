@@ -680,6 +680,11 @@ impl<'strings> Reader<'_, 'strings> {
                 .iter()
                 .map(|&index| reader.name(Some(index)))
                 .collect::<Result<_, _>>()?,
+            sealed_subclasses: class
+                .sealed_subclasses
+                .iter()
+                .map(|&index| reader.names.class(index))
+                .collect::<Result<_, _>>()?,
             enum_entries: class
                 .enum_entries
                 .iter()

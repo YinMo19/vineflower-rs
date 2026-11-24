@@ -280,6 +280,8 @@ pub(super) struct Class {
     pub type_aliases: Vec<TypeAlias>,
     #[prost(message, repeated, tag = "13")]
     pub enum_entries: Vec<EnumEntry>,
+    #[prost(int32, repeated, packed = "true", tag = "16")]
+    pub sealed_subclasses: Vec<i32>,
     #[prost(message, repeated, tag = "20")]
     pub context_receivers: Vec<Type>,
     #[prost(int32, repeated, packed = "true", tag = "21")]

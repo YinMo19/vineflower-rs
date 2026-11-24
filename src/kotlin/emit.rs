@@ -1,6 +1,6 @@
 // Copyright 2026 Vineflower contributors. Licensed under the Apache License, Version 2.0.
 
-use std::{borrow::Cow, collections::HashMap, ops::Range};
+use std::{borrow::Cow, collections::{HashMap, HashSet}, ops::Range};
 
 use crate::{
     Options,
@@ -11,10 +11,10 @@ use crate::{
 };
 
 use super::{
-    ClassDeclaration, ClassKind, Constructor, Declaration, Flags, Function, JvmMethodSignature,
-    KotlinError, MemberKind, Metadata, Modality, PackageDeclaration, Property, TypeParameter,
-    ValueParameter, Variance, Visibility,
-    body::{self, ABSTRACT, Body, Bytecode, Expr, FINAL, NATIVE, STATIC},
+    ClassDeclaration, ClassKind, Classifier, Constructor, Declaration, Flags, Function,
+    JvmMethodSignature, KotlinError, MemberKind, Metadata, Modality, PackageDeclaration, Property,
+    TypeParameter, ValueParameter, Variance, Visibility,
+    body::{self, ABSTRACT, Body, Bytecode, CONSTRUCTOR_MARKER, ConstructorCall, Expr, FINAL, NATIVE, STATIC},
     syntax::{INDENT, Types, identifier, qualified, variance_prefix, visibility},
 };
 
@@ -210,6 +210,106 @@ struct ClassScope<'scope, 'a, 'data> {
     depth: u8,
 }
 
+fn validate_sealed_children(
+    bytecode: &Bytecode<'_, '_>,
+    declaration: &ClassDeclaration,
+    children: &[nesting::Child<'_, '_>],
+) -> Result<(), KotlinError> {
+    let invalid = || error(bytecode.owner, "sealed subclasses do not match the Kotlin class group");
+    let mut remaining = HashSet::with_capacity(declaration.sealed_subclasses.len());
+    for child in &declaration.sealed_subclasses {
+        if child.local || !remaining.insert(child.id.as_str()) {
+            return Err(invalid());
+        }
+    }
+    let permits = bytecode.class.permitted_subclasses()?;
+    // Older JVM targets encode sealing in Kotlin metadata and constructor access only.
+    let check_permits = bytecode.class.major_version >= 61 || !permits.is_empty();
+    let mut permitted = HashSet::with_capacity(permits.len());
+    for index in permits {
+        if !permitted.insert(bytecode.class.pool.class_name(index)?) {
+            return Err(invalid());
+        }
+    }
+    for child in children {
+        let class = child.class;
+        let direct = class.super_class != 0 && class.pool.class_name(class.super_class)? == bytecode.owner;
+        if remaining.remove(child.declaration.name.id.as_str()) != direct
+            || (direct && check_permits && !permitted.remove(class.pool.class_name(class.this_class)?))
+        {
+            return Err(invalid());
+        }
+    }
+    if !remaining.is_empty() || !permitted.is_empty() {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+fn validate_hierarchy_constructors(
+    bytecode: &Bytecode<'_, '_>,
+    declaration: &ClassDeclaration,
+    sealed: bool,
+) -> Result<(), KotlinError> {
+    let invalid = || error(bytecode.owner, "unproven sealed hierarchy constructor");
+    let [constructor] = declaration.constructors.as_slice() else { return Err(invalid()); };
+    let signature = constructor.signature.as_ref().filter(|s| s.name == "<init>").ok_or_else(invalid)?;
+    let primary = bytecode.find_method(signature)?.ok_or_else(invalid)?;
+    let visibility = constructor.flags.visibility()?;
+    let expected_flags = if sealed {
+        // A protected Kotlin sealed constructor is private at the JVM level.
+        if !matches!(visibility, Visibility::Protected | Visibility::Private)
+            || !constructor.parameters.is_empty()
+            || !signature.descriptor.parameters.is_empty()
+            || signature.descriptor.return_type != JvmType::Void
+        {
+            return Err(invalid());
+        }
+        0x0002
+    } else {
+        match visibility {
+            Visibility::Public | Visibility::Internal => 0x0001,
+            Visibility::Private | Visibility::PrivateToThis => 0x0002,
+            Visibility::Protected => 0x0004,
+            Visibility::Local => return Err(invalid()),
+        }
+    };
+    if primary.access_flags != expected_flags {
+        return Err(invalid());
+    }
+    let pool = &bytecode.class.pool;
+    let mut bridge = false;
+    for method in &bytecode.class.methods {
+        if std::ptr::eq(method, primary) || pool.utf8(method.name_index)? != "<init>" {
+            continue;
+        }
+        if !sealed || bridge || method.access_flags != 0x1001
+            || pool.utf8(method.descriptor_index)? != CONSTRUCTOR_MARKER
+            || !bytecode.has_empty_constructor_body(method, ConstructorCall::Direct(bytecode.owner))?
+        {
+            return Err(invalid());
+        }
+        bridge = true;
+    }
+    if bridge != sealed {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+fn sealed_supertype(ty: &super::Type, parent: &ClassDeclaration) -> bool {
+    matches!(&ty.classifier, Classifier::Class(name) if *name == parent.name)
+        && ty.arguments.is_empty()
+        && !ty.nullable
+        && !ty.suspend
+        && !ty.definitely_not_null
+        && ty.outer.is_none()
+        && ty.abbreviated.is_none()
+        && ty.flexible.is_none()
+        && !ty.raw
+        && ty.annotations.is_empty()
+}
+
 fn render_class<'a, 'data>(
     out: &mut String,
     bytecode: &Bytecode<'a, 'data>,
@@ -250,6 +350,66 @@ fn render_class<'a, 'data>(
         ));
     }
     let interface = declaration.kind == ClassKind::Interface;
+    let hierarchy = declaration.flags.modality();
+    let sealed = hierarchy == Modality::Sealed;
+    if interface != (bytecode.class.access_flags & 0x0200 != 0) {
+        return Err(invalid("metadata class kind does not match the JVM class"));
+    }
+    if interface && hierarchy != Modality::Abstract {
+        return Err(invalid("non-abstract interface declarations"));
+    }
+    if !bytecode.class.interfaces.is_empty() {
+        return Err(invalid("inherited declarations require supertype context"));
+    }
+    let superclass = (bytecode.class.super_class != 0)
+        .then(|| bytecode.class.pool.class_name(bytecode.class.super_class))
+        .transpose()?;
+    let (supertype, constructor_call) = match (parent, superclass) {
+        (Some((host, enclosing)), Some(owner))
+            if enclosing.flags.modality() == Modality::Sealed && host.owner == owner =>
+        {
+            let [ty] = declaration.supertypes.as_slice() else {
+                return Err(invalid("sealed superclass does not match Kotlin metadata"));
+            };
+            if !matches!(declaration.kind, ClassKind::Class | ClassKind::Object)
+                || !sealed_supertype(ty, enclosing)
+            {
+                return Err(invalid("sealed superclass does not match Kotlin metadata"));
+            }
+            (Some(ty), ConstructorCall::Sealed(owner))
+        }
+        (_, Some("java/lang/Object"))
+            if declaration.supertypes.iter().all(|ty| ty.class_id() == Some("kotlin/Any")) =>
+        {
+            (None, ConstructorCall::Direct("java/lang/Object"))
+        }
+        _ => return Err(invalid("inherited declarations require supertype context")),
+    };
+    if sealed {
+        let inheritable = |flags: Flags| {
+            flags.member_kind() != MemberKind::FakeOverride && flags.modality() != Modality::Final
+        };
+        if declaration.kind != ClassKind::Class || data_class || !declaration.type_parameters.is_empty()
+            || declaration.members.functions.iter().any(|f| inheritable(f.flags))
+            || declaration.members.properties.iter().any(|p| inheritable(p.flags))
+        {
+            return Err(invalid("sealed class with unsupported inherited declarations"));
+        }
+        validate_sealed_children(bytecode, declaration, &children)?;
+    } else if !declaration.sealed_subclasses.is_empty() {
+        return Err(invalid("sealed subclass metadata on a non-sealed class"));
+    }
+    if sealed || supertype.is_some() {
+        let expected = match hierarchy {
+            Modality::Final => FINAL,
+            Modality::Open => 0,
+            Modality::Abstract | Modality::Sealed => ABSTRACT,
+        };
+        if bytecode.class.access_flags & (FINAL | ABSTRACT) != expected {
+            return Err(invalid("sealed hierarchy modality does not match the JVM class"));
+        }
+    }
+
     let singleton = match declaration.kind {
         ClassKind::Class | ClassKind::Interface => None,
         ClassKind::Object | ClassKind::CompanionObject => {
@@ -268,23 +428,10 @@ fn render_class<'a, 'data>(
             } else {
                 None
             };
-            Some(objects::Singleton::validate(bytecode, declaration, host)?)
+            Some(objects::Singleton::validate(bytecode, declaration, constructor_call, host)?)
         }
         _ => return Err(invalid("class kind")),
     };
-    if interface != (bytecode.class.access_flags & 0x0200 != 0) {
-        return Err(invalid("metadata class kind does not match the JVM class"));
-    }
-    if bytecode.class.super_class == 0
-        || bytecode.class.pool.class_name(bytecode.class.super_class)? != "java/lang/Object"
-        || !bytecode.class.interfaces.is_empty()
-        || declaration
-            .supertypes
-            .iter()
-            .any(|ty| ty.class_id() != Some("kotlin/Any"))
-    {
-        return Err(invalid("inherited declarations require supertype context"));
-    }
     if !declaration.members.type_aliases.is_empty() {
         return Err(invalid("nested type aliases"));
     }
@@ -298,9 +445,8 @@ fn render_class<'a, 'data>(
         }
         _ => return Err(invalid("nontrivial constructor declarations")),
     };
-    let hierarchy = declaration.flags.modality();
-    if hierarchy == Modality::Sealed || (interface && hierarchy != Modality::Abstract) {
-        return Err(invalid("sealed or non-abstract interface declarations"));
+    if sealed || supertype.is_some() {
+        validate_hierarchy_constructors(bytecode, declaration, sealed)?;
     }
     if !nested && declaration.flags.visibility()? == Visibility::Protected {
         return Err(invalid("protected top-level class"));
@@ -312,7 +458,12 @@ fn render_class<'a, 'data>(
     } else {
         Layout::Class
     };
-    let plan = Plan::new(bytecode, &declaration.members, constructor, layout)?;
+    let plan = Plan::new(
+        bytecode,
+        &declaration.members,
+        constructor.map(|constructor| (constructor, constructor_call)),
+        layout,
+    )?;
     if data_class {
         data::validate(bytecode, declaration, &plan)?;
     }
@@ -345,12 +496,14 @@ fn render_class<'a, 'data>(
     )?;
     if let Some(constructor) = constructor {
         let constructor_visibility = constructor.flags.visibility()?;
-        if constructor_visibility != Visibility::Public {
+        let explicit_visibility = constructor_visibility != Visibility::Public
+            && !(sealed && constructor_visibility == Visibility::Protected);
+        if explicit_visibility {
             out.push(' ');
             out.push_str(visibility(constructor_visibility)?);
             out.push_str("constructor");
         }
-        if constructor_visibility != Visibility::Public || !constructor.parameters.is_empty() {
+        if explicit_visibility || !constructor.parameters.is_empty() {
             let signature = constructor
                 .signature
                 .as_ref()
@@ -390,6 +543,11 @@ fn render_class<'a, 'data>(
             }
             out.push(')');
         }
+    }
+    if let Some(supertype) = supertype {
+        out.push_str(" : ");
+        types.write(out, supertype)?;
+        out.push_str("()");
     }
     type_constraints(out, &types, &declaration.type_parameters)?;
     let mut members = String::new();
@@ -487,7 +645,7 @@ impl<'a, 'data, 'metadata> Plan<'a, 'data, 'metadata> {
     fn new(
         bytecode: &Bytecode<'a, 'data>,
         members: &'metadata PackageDeclaration,
-        constructor: Option<&'metadata Constructor>,
+        constructor: Option<(&'metadata Constructor, ConstructorCall<'_>)>,
         layout: Layout<'metadata, 'a, 'data>,
     ) -> Result<Self, KotlinError> {
         let singleton = layout.singleton();
@@ -528,7 +686,7 @@ impl<'a, 'data, 'metadata> Plan<'a, 'data, 'metadata> {
                 "JVM fields without Kotlin declarations",
             ));
         }
-        let parameters = constructor.map_or(&[][..], |con| con.parameters.as_slice());
+        let parameters = constructor.map_or(&[][..], |(con, _)| con.parameters.as_slice());
         let mut promoted = vec![None; parameters.len()];
         let mut ordered = Vec::new();
         let clinit = if matches!(layout, Layout::Class | Layout::File) {
@@ -552,7 +710,7 @@ impl<'a, 'data, 'metadata> Plan<'a, 'data, 'metadata> {
         } else {
             None
         };
-        let initialization = if let Some(constructor) = constructor {
+        let initialization = if let Some((constructor, constructor_call)) = constructor {
             let signature = constructor
                 .signature
                 .as_ref()
@@ -565,7 +723,7 @@ impl<'a, 'data, 'metadata> Plan<'a, 'data, 'metadata> {
                 method,
                 &signature.descriptor,
                 parameters,
-                Some("java/lang/Object"),
+                Some(constructor_call),
                 bytecode.owner,
             )?;
             Some((assignments, method))
