@@ -474,7 +474,7 @@ impl<'a, 'data> Bytecode<'a, 'data> {
                 instructions
             };
             if descriptor.return_type == JvmType::Void {
-                let body = decisions::lower(
+                return decisions::lower(
                     self,
                     decoded,
                     start,
@@ -483,8 +483,7 @@ impl<'a, 'data> Bytecode<'a, 'data> {
                     parameters,
                     declaration,
                     trace,
-                )?;
-                return Ok(Body::Decision(body));
+                );
             }
             let (expr, materialized) = control::lower(
                 self,

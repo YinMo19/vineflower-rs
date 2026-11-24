@@ -5,11 +5,9 @@ use std::ops::Range;
 use crate::cfg::ControlFlowGraph;
 
 use super::{
-    Bytecode, Code, Expected, Expr, Instruction, KotlinError, Locals, Operand, Primitive,
-    StackValue, ValueParameter,
-    logic::{self, Conditional},
-    pop_value,
-    statements::{self, Statement},
+    Body, Bytecode, Code, Expected, Expr, ExprKind, Instruction, KotlinError, Literal, Locals, Operand,
+    Primitive, StackValue, ValueParameter, local_store, logic::{self, Conditional}, pop_value,
+    statements::{self, ConditionalInitializer, Statement, StatementBlock},
 };
 
 pub(in crate::kotlin) struct DecisionBody<'a> {
@@ -26,6 +24,82 @@ struct Arm<'a> {
     statements: Vec<Statement<'a>>,
 }
 
+/// Recognize a closed diamond that either joins with one stack value or
+/// assigns the same fresh debug local on both arms. In the latter layout
+/// Kotlin may preinitialize the slot with an unused primitive literal.
+fn initializer<'a, 'data>(
+    bytecode: &Bytecode<'a, 'data>,
+    instructions: &[Instruction],
+    start: usize,
+    code: &Code<'data>,
+    locals: &Locals<'_>,
+    parameters: &[ValueParameter],
+    declaration: &str,
+    cfg: &ControlFlowGraph,
+) -> Result<Vec<Statement<'a>>, KotlinError> {
+    let invalid = || KotlinError::unsupported(declaration, "not a closed Kotlin local initializer");
+    let body = &instructions[start..];
+    let [entry, yes, no, join] = cfg.blocks.as_slice() else { return Err(invalid()); };
+    if entry.successors != [2, 1] || yes.successors != [3] || no.successors != [3]
+        || !join.successors.is_empty() || body.last().is_none_or(|ret| ret.opcode != 0xb1)
+    {
+        return Err(invalid());
+    }
+    let [prefix @ .., branch] = &body[entry.instructions.clone()] else { return Err(invalid()); };
+    let [yes @ .., jump] = &body[yes.instructions.clone()] else { return Err(invalid()); };
+    let no = &body[no.instructions.clone()];
+    if !matches!(jump.opcode, 0xa7 | 0xc8) {
+        return Err(invalid());
+    }
+    let mut stack = Vec::new();
+    let join = start + join.instructions.start;
+    let (guard, yes, no, store, end) = if let Some(site) = instructions.get(join)
+        && local_store(site).is_some()
+    {
+        (prefix, yes, no, join, join + 1)
+    } else {
+        let [seed, store, guard @ ..] = prefix else { return Err(invalid()); };
+        let [yes @ .., yes_store] = yes else { return Err(invalid()); };
+        let [no @ .., no_store] = no else { return Err(invalid()); };
+        let (opcode, slot) = local_store(store).ok_or_else(invalid)?;
+        if slot < locals.next_slot() || local_store(yes_store) != Some((opcode, slot))
+            || local_store(no_store) != Some((opcode, slot))
+        {
+            return Err(invalid());
+        }
+        bytecode.expression(seed, locals, &mut stack, declaration)?;
+        if !matches!(stack.pop(), Some(StackValue::Value(Expr {
+            kind: ExprKind::Literal(Literal::Int(_) | Literal::Long(_) | Literal::Float(_) | Literal::Double(_)), ..
+        }))) || !stack.is_empty() {
+            return Err(invalid());
+        }
+        (guard, yes, no, start + 1, join)
+    };
+    for instruction in guard {
+        bytecode.expression(instruction, locals, &mut stack, declaration)?;
+    }
+    let condition = logic::condition(branch.opcode, &mut stack, parameters, declaration)?;
+    if !stack.is_empty() {
+        return Err(invalid());
+    }
+    let mut arm = |instructions: &[Instruction]| {
+        for instruction in instructions {
+            bytecode.expression(instruction, locals, &mut stack, declaration)?;
+        }
+        if stack.len() != 1 {
+            return Err(invalid());
+        }
+        pop_value(&mut stack, declaration)
+    };
+    let yes = arm(yes)?;
+    let no = arm(no)?;
+    statements::lower_conditional_initializer(
+        bytecode, instructions, code, locals,
+        ConditionalInitializer { instructions: start..end, store, condition, yes, no },
+        declaration,
+    )
+}
+
 /// Recover ordered predicates and their statement arms. A guard may merge
 /// short-circuit Boolean values, but may not mutate locals or retain a live
 /// stack when it enters either statement arm. The method returns at one
@@ -39,10 +113,20 @@ pub(super) fn lower<'class, 'data>(
     parameters: &[ValueParameter],
     declaration: &str,
     trace: bool,
-) -> Result<DecisionBody<'class>, KotlinError> {
+) -> Result<Body<'class>, KotlinError> {
     let invalid = || KotlinError::unsupported(declaration, "unsupported Kotlin decision statement");
     let instructions_slice = &instructions[start..];
     let cfg = ControlFlowGraph::build(instructions_slice, &[]).map_err(|_| invalid())?;
+    if cfg.blocks.len() == 4
+        && let Ok(statements) = initializer(bytecode, &instructions, start, code, locals, parameters, declaration, &cfg)
+    {
+        return Ok(Body::Statements(StatementBlock {
+            statements,
+            lines: if trace { code.line_numbers(&bytecode.class.pool)? } else { Vec::new() },
+            instructions,
+            implicit_return: true,
+        }));
+    }
     let exit = cfg.blocks.len().checked_sub(1).ok_or_else(invalid)?;
     let return_range = cfg.blocks[exit].instructions.clone();
     if !matches!(&instructions_slice[return_range.clone()], [ret] if ret.opcode == 0xb1)
@@ -108,13 +192,13 @@ pub(super) fn lower<'class, 'data>(
     } else {
         Vec::new()
     };
-    Ok(DecisionBody {
+    Ok(Body::Decision(DecisionBody {
         arms,
         end,
         instructions,
         start,
         lines,
-    })
+    }))
 }
 
 struct Lowering<'a, 'class, 'data> {

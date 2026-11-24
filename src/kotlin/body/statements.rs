@@ -7,7 +7,7 @@ use crate::classfile::LocalVariable;
 use super::{
     Bytecode, Code, Expected, Expr, ExprKind, Instruction, JvmType, KotlinError, Literal, Locals,
     Primitive, ScopedLocal, StackValue, Type, ValueParameter, extensions::{Value, exact_type},
-    identifier, invocations::Call, load_opcode, local_load, local_store, nullable, pop_value,
+    identifier, invocations::{Call, kotlin_type}, load_opcode, local_load, local_store, logic, nullable, pop_value,
 };
 
 /// Statements and their original bytecode spans. Stack shuffles do not have
@@ -43,6 +43,21 @@ pub(super) struct Binding<'a> {
     range: Range<u32>,
 }
 
+
+pub(super) struct ConditionalInitializer<'a> {
+    pub(super) instructions: Range<usize>,
+    /// The store that starts the LVT range, including a dead initial store
+    /// before a closed conditional whose two arms both overwrite it.
+    pub(super) store: usize,
+    pub(super) condition: Expr<'a>,
+    pub(super) yes: Expr<'a>,
+    pub(super) no: Expr<'a>,
+}
+
+enum Initial<'a> {
+    Stack(usize, Expr<'a>),
+    Declaration(Statement<'a>, Rc<Binding<'a>>),
+}
 #[derive(Default)]
 struct DebugLocals<'a> {
     entries: Vec<LocalVariable<'a>>,
@@ -68,6 +83,13 @@ impl Statement<'_> {
             Kind::Declare(local, value) => {
                 out.push_str("val ");
                 identifier(out, local.name, declaration)?;
+                // Without an expected type Kotlin gives small numeric
+                // literals type Int, even when JVM iload read a Byte/Short.
+                match local.value.jvm {
+                    JvmType::Primitive(Primitive::Byte) => out.push_str(": kotlin.Byte"),
+                    JvmType::Primitive(Primitive::Short) => out.push_str(": kotlin.Short"),
+                    _ => {}
+                }
                 out.push_str(" = ");
                 return value.write(out, &local.value.ty, &local.value.jvm, parameters, declaration);
             }
@@ -222,7 +244,7 @@ pub(super) fn lower_nullable<'a, 'data>(
     };
     let (mut statements, value) = lower_block(
         bytecode, instructions, start..last, locals, declaration, &[], &debug,
-        Some((join, expression)),
+        Some(Initial::Stack(join, expression)),
     )?;
     if !matches!(statements.first(), Some(Statement { kind: Kind::Declare(_, _), instructions }) if instructions.end == join + 1) {
         return Err(invalid());
@@ -236,6 +258,41 @@ pub(super) fn lower_nullable<'a, 'data>(
         kind: Kind::Return(value.expr, Value { ty: ty.clone(), jvm: jvm.clone() }),
     });
     Ok(statements)
+}
+
+pub(super) fn lower_conditional_initializer<'a, 'data>(
+    bytecode: &Bytecode<'a, 'data>,
+    instructions: &[Instruction],
+    code: &Code<'data>,
+    locals: &Locals<'_>,
+    init: ConditionalInitializer<'a>,
+    declaration: &str,
+) -> Result<Vec<Statement<'a>>, KotlinError> {
+    let invalid = || KotlinError::unsupported(declaration, "unsupported conditional local initializer");
+    let ConditionalInitializer { instructions: span, store, condition, yes, no } = init;
+    let site = &instructions[store];
+    let (opcode, slot) = local_store(site).filter(|&(_, slot)| slot >= locals.next_slot())
+        .ok_or_else(invalid)?;
+    let after = site.offset + site.len;
+    let debug = DebugLocals { entries: code.local_variables(&bytecode.class.pool)?, max: code.max_locals };
+    let mut entries = debug.entries.iter().filter(|local| local.index == slot && u32::from(local.start_pc) == after);
+    let local = entries.next().filter(|_| entries.next().is_none()).ok_or_else(invalid)?;
+    let jvm = JvmType::parse(local.descriptor)?;
+    let yes_type = debug_value_type(&yes, &jvm, locals).ok_or_else(invalid)?;
+    if debug_value_type(&no, &jvm, locals).as_ref() != Some(&yes_type) {
+        return Err(invalid());
+    }
+    let value = Value { ty: yes_type, jvm };
+    let binding = debug_binding(bytecode.owner, local, instructions, &debug, &[], locals, value, opcode, declaration)?;
+    let expression = logic::Conditional::new(condition, yes, no, declaration)?;
+    let start = span.start;
+    let seed = Statement { instructions: span, kind: Kind::Declare(Rc::clone(&binding), expression) };
+    let last = instructions.len() - 1;
+    let (statements, value) = lower_block(
+        bytecode, instructions, start..last, locals, declaration, &[], &debug,
+        Some(Initial::Declaration(seed, binding)),
+    )?;
+    closed(statements, value, declaration)
 }
 
 pub(super) fn lower_range<'a>(
@@ -300,18 +357,27 @@ fn lower_block<'a>(
     declaration: &str,
     scoped: &[ScopedLocal<'a>],
     debug: &DebugLocals<'a>,
-    initial: Option<(usize, Expr<'a>)>,
+    initial: Option<Initial<'a>>,
 ) -> Result<(Vec<Statement<'a>>, Option<TailValue<'a>>), KotlinError> {
     let mut statements = Vec::new();
     let mut stack = Vec::new();
     let mut declared: Vec<Rc<Binding<'a>>> = Vec::new();
     let mut argument_first = false;
     let mut index = range.start;
-    if let Some((join, value)) = initial {
-        index = join;
-        stack.push(StackValue::Value(value));
-    }
     let mut first = range.start;
+    match initial {
+        Some(Initial::Stack(join, value)) => {
+            index = join;
+            stack.push(StackValue::Value(value));
+        }
+        Some(Initial::Declaration(statement, binding)) => {
+            index = statement.instructions.end;
+            first = index;
+            statements.push(statement);
+            declared.push(binding);
+        }
+        None => {}
+    }
     let invalid = || KotlinError::unsupported(declaration, "unsupported Kotlin statement bytecode");
     let first_free = scoped.iter().map(|local| local.first_free())
         .fold(locals.next_slot(), u16::max);
@@ -328,7 +394,12 @@ fn lower_block<'a>(
                     return Err(invalid());
                 }
                 let value = pop_value(&mut stack, declaration)?;
-                let binding = debug_binding(bytecode.owner, local, instructions, debug, &declared, locals, &value, store, declaration)?;
+                let jvm = JvmType::parse(local.descriptor)?;
+                let ty = debug_value_type(&value, &jvm, locals)
+                    .ok_or_else(|| KotlinError::unsupported(declaration, "unproven Kotlin debug local"))?;
+                let binding = debug_binding(
+                    bytecode.owner, local, instructions, debug, &declared, locals, Value { ty, jvm }, store, declaration,
+                )?;
                 declared.push(Rc::clone(&binding));
                 statements.push(Statement { instructions: first..index + 1, kind: Kind::Declare(binding, value) });
                 first = index + 1;
@@ -447,18 +518,17 @@ fn debug_binding<'a>(
     debug: &DebugLocals<'a>,
     declared: &[Rc<Binding<'a>>],
     locals: &Locals<'_>,
-    value: &Expr<'_>,
+    value: Value,
     store: u8,
     declaration: &str,
 ) -> Result<Rc<Binding<'a>>, KotlinError> {
     let invalid = || KotlinError::unsupported(declaration, "unproven Kotlin debug local");
-    let jvm = JvmType::parse(local.descriptor)?;
-    let (ty, source_jvm) = value.source_type(locals).ok_or_else(invalid)?;
+    let jvm = &value.jvm;
     let start = u32::from(local.start_pc);
     let range = start..start + u32::from(local.length);
     let root = owner.split(['/', '$']).next().unwrap();
     let short = owner.rsplit('/').next().unwrap();
-    if &jvm != source_jvm || jvm == JvmType::Void || !exact_type(ty, &jvm, false)
+    if *jvm == JvmType::Void || !exact_type(&value.ty, jvm, false)
         || load_opcode(&jvm) + 0x21 != store
         || local.index.checked_add(jvm.slots()).is_none_or(|end| end > debug.max)
         || range.is_empty() || range.end > instructions.last().map_or(0, |last| last.offset + last.len)
@@ -481,7 +551,29 @@ fn debug_binding<'a>(
             return Err(invalid());
         }
     }
-    Ok(Rc::new(Binding { name: local.name, value: Value { ty: ty.clone(), jvm }, slot: local.index, range }))
+    Ok(Rc::new(Binding { name: local.name, value, slot: local.index, range }))
+}
+
+fn debug_value_type(value: &Expr<'_>, jvm: &JvmType, locals: &Locals<'_>) -> Option<Type> {
+    if let Some((ty, actual)) = value.source_type(locals) {
+        return (actual == jvm).then(|| ty.clone());
+    }
+    use JvmType::Primitive as Jvm;
+    use Literal::*;
+    let ExprKind::Literal(literal) = &value.kind else { return None };
+    let id = match (literal, jvm) {
+        (String(_), JvmType::Object(name)) if name == "java/lang/String" => "kotlin/String",
+        (Int(0 | 1), Jvm(Primitive::Boolean)) => "kotlin/Boolean",
+        (Int(number), Jvm(Primitive::Byte)) if i8::try_from(*number).is_ok() => "kotlin/Byte",
+        (Int(number), Jvm(Primitive::Short)) if i16::try_from(*number).is_ok() => "kotlin/Short",
+        (Int(number), Jvm(Primitive::Char)) if u16::try_from(*number).is_ok() => "kotlin/Char",
+        (Int(_), Jvm(Primitive::Int)) => "kotlin/Int",
+        (Long(_), Jvm(Primitive::Long)) => "kotlin/Long",
+        (Float(_), Jvm(Primitive::Float)) => "kotlin/Float",
+        (Double(_), Jvm(Primitive::Double)) => "kotlin/Double",
+        _ => return None,
+    };
+    Some(kotlin_type(id))
 }
 
 impl PrintOperand {
