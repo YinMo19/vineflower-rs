@@ -125,17 +125,7 @@ impl Machine<'_, '_> {
     // where removing a wrapper changes the conditional's standalone type.
     pub(super) fn coerce_assignment(&self, value: Expr, expected: &Type) -> Result<Expr, LiftError> {
         let mut value = self.coerce(value, expected, false)?;
-        if let Source::WidenedPrimitive { operand_precedence } = value.source
-            && let Type::Primitive(target) = expected
-        {
-            let enclosed = operand_precedence < super::expr::UNARY;
-            let prefix_len = target.java_name().len() + 2 + usize::from(enclosed);
-            value.text.replace_literal_prefix(prefix_len, "");
-            if enclosed {
-                value.text.pop();
-            }
-            value.precedence = operand_precedence;
-            value.source = Source::Plain;
+        if value.elide_final_widening(expected) {
             return Ok(value);
         }
         Ok(match (&value.source, expected) {
@@ -189,6 +179,28 @@ impl Machine<'_, '_> {
             constant: false,
             ..value
         }
+    }
+}
+
+impl Expr {
+    /// Keep any preceding cast: an intermediate float conversion may round.
+    pub(super) fn elide_final_widening(&mut self, expected: &Type) -> bool {
+        let Source::WidenedPrimitive { operand_precedence, .. } = self.source else {
+            return false;
+        };
+        let Type::Primitive(target) = expected else { return false };
+        if self.ty != *expected {
+            return false;
+        }
+        let enclosed = operand_precedence < super::expr::UNARY;
+        let prefix_len = target.java_name().len() + 2 + usize::from(enclosed);
+        self.text.replace_literal_prefix(prefix_len, "");
+        if enclosed {
+            self.text.pop();
+        }
+        self.precedence = operand_precedence;
+        self.source = Source::Plain;
+        true
     }
 }
 

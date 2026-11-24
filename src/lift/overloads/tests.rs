@@ -254,12 +254,53 @@ fn checks_strict_applicability_without_removing_other_conversions() {
         };
         assert!(!call(null));
         assert!(
-            !machine.invocation_argument_widens(&reference(OBJECT), &Type::Object(STRING.into()))
+            !machine.can_pass_argument_implicitly(&reference(OBJECT), &Type::Object(STRING.into()))
         );
         assert!(
             !machine
-                .invocation_argument_widens(&Expr::integer(1), &Type::Primitive(Primitive::Long))
+                .can_pass_argument_implicitly(&Expr::integer(1), &Type::Primitive(Primitive::Long))
         );
+    });
+}
+
+#[test]
+fn checks_the_type_before_the_final_widening_and_keeps_typed_null_for_overloads() {
+    let parent = class(
+        PARENT,
+        Some(OBJECT),
+        0,
+        &[
+            (STATIC_PUBLIC, "only", "(D)V", None),
+            (STATIC_PUBLIC, "overloaded", "(D)V", None),
+            (STATIC_PUBLIC, "overloaded", "(F)V", None),
+            (STATIC_PUBLIC, "reference", STRING_ARG, None),
+        ],
+    );
+    with_machine(&[&parent], &Options::default(), |machine| {
+        let double = Type::Primitive(Primitive::Double);
+        let mut value = Expr {
+            source: Source::WidenedPrimitive {
+                operand_type: Primitive::Float,
+                operand_precedence: super::super::expr::UNARY,
+            },
+            ..Expr::atom(double.clone(), "(double)(float)input".into())
+        };
+        for (name, expected) in [("only", true), ("overloaded", false)] {
+            assert_eq!(
+                omit(&machine, PARENT, PARENT, name, "(D)V", std::slice::from_ref(&value), 0xb8),
+                expected
+            );
+        }
+        assert!(value.elide_final_widening(&double));
+        assert_eq!(value.text.as_flat(), "(float)input");
+
+        let null = Expr { source: Source::Null, ..Expr::atom(Type::Object(OBJECT.into()), "null".into()) };
+        let args = [null];
+        assert!(omit(&machine, PARENT, PARENT, "reference", STRING_ARG, &args, 0xb8));
+        assert!(!omit(
+            &machine, STRING, STRING, "valueOf",
+            "(Ljava/lang/Object;)Ljava/lang/String;", &args, 0xb8
+        ));
     });
 }
 

@@ -583,6 +583,10 @@ impl Machine<'_, '_> {
                 *value = self.reference_cast(operand, ty.clone(), false)?;
                 continue;
             }
+            if omit_widening && self.can_pass_argument_implicitly(value, ty) {
+                value.elide_final_widening(ty);
+                continue;
+            }
             if value.ty == *ty && !matches!(value.source, Source::Null) {
                 continue;
             }
@@ -606,7 +610,6 @@ impl Machine<'_, '_> {
             if enclosing_constructor
                 || throwable_constructor && throwable_parameter && known_throwable
                 || generic.is_some_and(|call| call.argument_fits(index, value, ty, self))
-                || omit_widening && self.invocation_argument_widens(value, ty)
             {
                 continue;
             }

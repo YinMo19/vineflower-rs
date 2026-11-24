@@ -87,10 +87,13 @@ impl Machine<'_, '_> {
         ][usize::from(index)];
         let value = self.pop_category(from)?;
         let value = self.as_int(value);
+        let Type::Primitive(operand_type) = value.ty else {
+            return Err(self.invalid_stack("numeric conversion requires a primitive operand"));
+        };
         let operand_precedence = value.precedence;
         let mut converted = self.cast(value, Type::Primitive(to), false)?;
         if matches!(index, 0..=2 | 4..=5 | 8) {
-            converted.source = Source::WidenedPrimitive { operand_precedence };
+            converted.source = Source::WidenedPrimitive { operand_type, operand_precedence };
         }
         self.push(converted)
     }

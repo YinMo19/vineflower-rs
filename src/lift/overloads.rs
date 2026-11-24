@@ -28,6 +28,11 @@ enum DeclarationClass<'a, 'c> {
     Library(Arc<ClassMetadata>),
 }
 
+enum ImplicitArgument<'a> {
+    Typed(Cow<'a, Type>),
+    Null,
+}
+
 struct Invocation<'a> {
     name: &'a str,
     source_name: &'a str,
@@ -39,16 +44,46 @@ struct Invocation<'a> {
 }
 
 impl<'a, 'c> Machine<'a, 'c> {
-    pub(super) fn invocation_argument_widens(&self, value: &Expr, formal: &Type) -> bool {
-        value.ty != *formal
-            && Category::of(&value.ty) == Some(Category::Ref)
-            && Category::of(formal) == Some(Category::Ref)
-            && !matches!(value.source, Source::Null | Source::New(_))
-            && self.known_assignable(&value.ty, formal)
+    pub(super) fn can_pass_argument_implicitly(&self, value: &Expr, formal: &Type) -> bool {
+        self.implicit_argument_type(value, formal).is_some()
+    }
+
+    fn implicit_argument_type<'v>(
+        &self,
+        value: &'v Expr,
+        formal: &Type,
+    ) -> Option<ImplicitArgument<'v>> {
+        if matches!(value.source, Source::Null) {
+            return (Category::of(formal) == Some(Category::Ref)).then_some(ImplicitArgument::Null);
+        }
+        if let Source::WidenedPrimitive { operand_type, .. } = value.source
+            && value.ty == *formal
+        {
+            let source = Type::Primitive(operand_type);
+            return strict_conversion(self, &source, formal)
+                .then_some(ImplicitArgument::Typed(Cow::Owned(source)));
+        }
+        if value.ty == *formal {
+            return None;
+        }
+        let allowed = match (&value.ty, formal) {
+            (Type::Primitive(_), Type::Primitive(_)) => {
+                // A displayed literal need not have the type inferred for its
+                // JVM slot (e.g. a small integer is not a byte in source).
+                matches!(value.source, Source::Local(_))
+                    && strict_conversion(self, &value.ty, formal)
+            }
+            _ => Category::of(&value.ty) == Some(Category::Ref)
+                && Category::of(formal) == Some(Category::Ref)
+                && !matches!(value.source, Source::New(_))
+                && !self.local_argument_needs_erasure(value)
+                && self.known_assignable(&value.ty, formal),
+        };
+        allowed.then_some(ImplicitArgument::Typed(Cow::Borrowed(&value.ty)))
     }
 
     /// Prove that the same fixed-arity JVM descriptor wins after omitting the
-    /// widening reference casts. `lookup_owner` is the rendered qualifier's
+    /// source casts. `lookup_owner` is the rendered qualifier's
     /// static type, which can be more specific than the constant-pool owner.
     /// Other arguments must still be rendered at their descriptor types.
     pub(super) fn omit_invocation_casts(
@@ -66,7 +101,7 @@ impl<'a, 'c> Machine<'a, 'c> {
             || !arguments
                 .iter()
                 .zip(&method.parameters)
-                .any(|(actual, formal)| self.invocation_argument_widens(actual, formal))
+                .any(|(actual, formal)| self.can_pass_argument_implicitly(actual, formal))
         {
             return false;
         }
@@ -83,7 +118,8 @@ impl<'a, 'c> Machine<'a, 'c> {
             && name == "valueOf"
             && source_name == name
             && descriptor == "(Ljava/lang/Object;)Ljava/lang/String;"
-            && matches!(arguments, [argument] if matches!(argument.ty, Type::Object(_)));
+            && matches!(arguments, [argument] if matches!(argument.ty, Type::Object(_))
+                && !matches!(argument.source, Source::Null));
         let mut call = Invocation {
             name,
             source_name: &source_name,
@@ -282,12 +318,14 @@ impl Invocation<'_> {
             .zip(self.parameters)
             .zip(&candidate.parameters)
         {
-            let actual = if machine.invocation_argument_widens(actual, formal) {
-                &actual.ty
-            } else {
-                formal
+            let applicable = match machine.implicit_argument_type(actual, formal) {
+                Some(ImplicitArgument::Null) => Category::of(competing) == Some(Category::Ref),
+                Some(ImplicitArgument::Typed(actual)) => {
+                    potential_strict_conversion(machine, &actual, competing)
+                }
+                None => potential_strict_conversion(machine, formal, competing),
             };
-            if !potential_strict_conversion(machine, actual, competing) {
+            if !applicable {
                 return true;
             }
             if formal != competing {

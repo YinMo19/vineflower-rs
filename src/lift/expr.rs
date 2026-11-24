@@ -71,8 +71,11 @@ pub(super) enum Source {
     Integer(i32),
     NumericOne,
     /// A JVM numeric widening whose final conversion can be supplied by
-    /// an assignment context, but not by an arbitrary operator or overload.
-    WidenedPrimitive { operand_precedence: u8 },
+    /// assignment or by a call proven to select the original descriptor.
+    WidenedPrimitive {
+        operand_type: Primitive,
+        operand_precedence: u8,
+    },
     Access(Access),
     Null,
     This,
