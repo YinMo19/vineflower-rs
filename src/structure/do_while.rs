@@ -126,7 +126,7 @@ impl Emitter<'_> {
         true
     }
 
-    fn emit_post_test_loop<'a, 'c>(
+    pub(super) fn emit_post_test_loop<'a, 'c>(
         &mut self,
         header: usize,
         test: PostTest,

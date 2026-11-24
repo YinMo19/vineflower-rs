@@ -937,6 +937,39 @@ impl<'c> Machine<'_, 'c> {
         (access, Some(blank))
     }
 
+    /// Move an initialized declaration to the scope after a proved labeled
+    /// departure. The initializer still executes at its original bytecode.
+    pub(crate) fn promote_label_local(
+        &mut self,
+        from: &Self,
+        slot: u16,
+        statement: &mut Document,
+    ) -> Option<Document> {
+        let index = usize::from(slot);
+        let local = from.locals.slots.get(index)?.as_ref()?;
+        if local.ty != INT
+            || self.locals.slots.get(index)?.is_some()
+            || index.checked_sub(1).is_some_and(|low| {
+                self.locals.slots[low].as_ref().is_some_and(|local| local.ty.slots() == 2)
+            })
+            || self.locals.slots.iter().flatten().any(|other| other.name == local.name)
+        {
+            return None;
+        }
+        let mut declaration = from.declared_local_document(slot, local).ok()?;
+        let prefix = declaration.len();
+        if !statement.as_flat().strip_prefix(declaration.as_flat())?.starts_with(" = ") {
+            return None;
+        }
+        statement.replace_literal_prefix(prefix, &local.name);
+        if let Some(token) = from.local_binding_token(slot, local, false) {
+            statement.token_at(0..local.name.len(), token);
+        }
+        declaration.push(';');
+        self.locals.slots[index] = Some(local.clone());
+        Some(declaration)
+    }
+
     fn declared_local_document(&self, index: u16, local: &Local) -> Result<Document, LiftError> {
         let mut text = self.declared_local_type(index, local)?;
         text.push(' ');

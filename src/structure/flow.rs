@@ -255,9 +255,10 @@ impl Layout {
                 return Err(unsupported());
             }
             let monitor_boundary = exceptions.monitor_finally_boundary(header);
+            let label_boundary = exceptions.finally_label_boundary(header);
             let predicate = cuts.iter().find(|cut| cut.owns(header) && !inside(cut.header));
             let outer_transfer = |block| {
-                if monitor_boundary == Some(block) {
+                if monitor_boundary == Some(block) || label_boundary == Some(block) {
                     return true;
                 }
                 if predicate.is_some_and(|cut| cut.outcomes.contains(&block)) {

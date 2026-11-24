@@ -9,7 +9,8 @@ use crate::cfg::ControlFlowGraph;
 use super::cleanup_locals;
 use super::monitor::{MonitorCandidates, MonitorPlan};
 use super::{
-    Dominance, MonitorDeparture, Route, local_touches, normal_exits, reference_load, reference_store,
+    Dominance, MonitorDeparture, Route, local_access, local_touches, normal_exits, reference_load,
+    reference_store,
 };
 
 pub(in crate::structure) struct BranchedFinally {
@@ -20,6 +21,7 @@ pub(in crate::structure) struct BranchedFinally {
     pub(super) body_join: Option<usize>,
     pub(super) projected_entries: BTreeSet<usize>,
     pub(super) returns: Vec<ReturnResume>,
+    pub(in crate::structure) label: Option<LabelResume>,
     pub(super) prefix_block: Option<usize>,
     pub(in crate::structure) tail: Option<usize>,
     pub(super) tail_code: Range<usize>,
@@ -40,6 +42,143 @@ pub(in crate::structure) struct FinallyMonitorExit {
 pub(in crate::structure) struct SharedReturn {
     pub(in crate::structure) block: usize,
     pub(in crate::structure) jump: usize,
+}
+
+/// One normal cleanup copy resumes a break to an enclosing labeled block.
+/// The other continues to the loop condition; the cleanup's own break
+/// overrides both and exits only the loop.
+pub(in crate::structure) struct LabelResume {
+    pub(in crate::structure) entry: usize,
+    pub(in crate::structure) target: usize,
+    pub(in crate::structure) jump: usize,
+    pub(in crate::structure) loop_exit: usize,
+    pub(in crate::structure) locals: Vec<LabelLocal>,
+}
+
+pub(in crate::structure) struct LabelLocal {
+    pub(in crate::structure) slot: u16,
+    pub(in crate::structure) store: usize,
+    pub(in crate::structure) from_finally: bool,
+}
+
+impl LabelResume {
+    fn prove(
+        instructions: &[Instruction],
+        graph: &ControlFlowGraph,
+        routes: &[Vec<Route>],
+        body: &BTreeSet<usize>,
+        dominance: &Dominance,
+        branch: &BranchedFinally,
+        entries: &BTreeMap<usize, Option<usize>>,
+    ) -> Option<Self> {
+        if entries.len() != 2
+            || branch.loop_targets.len() != 1
+            || !branch.returns.is_empty()
+            || !branch.tail_code.is_empty()
+            || !branch.nested_handlers.is_empty()
+            || branch.shared_return.is_some()
+            || branch.monitor_exit.is_some()
+        {
+            return None;
+        }
+        let tail = branch.tail?;
+        let &loop_exit = branch.loop_targets.first()?;
+        let &header = body.first()?;
+        let shape = dominance.natural_loops(graph).iter().find(|shape| shape.header == header)?;
+        let &[latch] = shape.latches.as_slice() else { return None };
+        let test = &graph.blocks[latch];
+        if test.successors.len() != 2
+            || !test.successors.contains(&header)
+            || !test.successors.contains(&loop_exit)
+            || !super::super::do_while::is_conditional(instructions[test.instructions.end - 1].opcode)
+            || entries.values().filter(|&&target| target == Some(latch)).count() != 1
+        {
+            return None;
+        }
+        let (&entry, &target) = entries.iter().find(|&(_, &target)| target != Some(latch))?;
+        let target = target?;
+        if target <= loop_exit {
+            return None;
+        }
+        for end in [loop_exit, target] {
+            let node = &graph.blocks[end];
+            if !node.successors.is_empty()
+                || !node.exception_predecessors.is_empty()
+                || !routes[end].is_empty()
+                || !matches!(instructions[node.instructions.end - 1].opcode, 0xac..=0xb1)
+            {
+                return None;
+            }
+        }
+        let exit = &graph.blocks[loop_exit];
+        if exit.predecessors.iter().any(|pred| {
+            *pred != latch && !branch.blocks.contains(pred) && !branch.removed.contains(pred)
+        }) {
+            return None;
+        }
+        let target_node = &graph.blocks[target];
+        let &[source] = target_node.predecessors.as_slice() else { return None };
+        let &[origin] = graph.blocks[entry].predecessors.as_slice() else { return None };
+        if !branch.removed.contains(&source)
+            || !body.contains(&origin)
+            || graph.blocks[origin].successors != [entry]
+        {
+            return None;
+        }
+
+        let read_slots: BTreeSet<_> = instructions[target_node.instructions.clone()]
+            .iter()
+            .filter(|op| matches!(op.opcode, 0x15 | 0x1a..=0x1d))
+            .filter_map(local_access)
+            .collect();
+        let mut locals = Vec::new();
+        for slot in read_slots {
+            // Values transferred out of these scopes may only be observed at
+            // the label. Prove a single writer before the pending break, or
+            // a writer that dominates completion of the canonical finally.
+            let mut prior = None;
+            let mut cleanup = None;
+            let mut copies = 0;
+            let mut observed_elsewhere = false;
+            for (block, node) in graph.blocks.iter().enumerate() {
+                if block == target { continue; }
+                for index in node.instructions.clone() {
+                    let op = &instructions[index];
+                    if !local_touches(op, slot) { continue; }
+                    if !matches!(op.opcode, 0x36 | 0x3b..=0x3e) {
+                        observed_elsewhere = true;
+                        continue;
+                    }
+                    if block == origin && prior.is_none() {
+                        prior = Some(index);
+                    } else if branch.blocks.contains(&block) && cleanup.is_none()
+                        && dominance.contains(block, tail)
+                    {
+                        cleanup = Some(index);
+                    } else if branch.removed.contains(&block) {
+                        copies += 1;
+                    } else {
+                        return None;
+                    }
+                }
+            }
+            match (prior, cleanup, copies) {
+                (Some(store), None, 0) if !observed_elsewhere => {
+                    locals.push(LabelLocal { slot, store, from_finally: false });
+                }
+                (None, Some(store), 2) if !observed_elsewhere => {
+                    locals.push(LabelLocal { slot, store, from_finally: true });
+                }
+                (None, None, 0) => {}
+                _ => return None,
+            }
+        }
+        if !locals.iter().any(|local| local.from_finally) {
+            return None;
+        }
+        let jump = graph.blocks[source].instructions.end - 1;
+        Some(Self { entry, target, jump, loop_exit, locals })
+    }
 }
 
 pub(super) struct ReturnResume {
@@ -330,6 +469,7 @@ impl BranchedFinally {
             body_join: None,
             projected_entries: BTreeSet::new(),
             returns: Vec::new(),
+            label: None,
             prefix_block: None,
             tail,
             tail_code,
@@ -339,8 +479,7 @@ impl BranchedFinally {
             nested_handlers,
             copied_routes: BTreeSet::new(),
         };
-        let mut tails = BTreeSet::new();
-        let mut continuing = BTreeSet::new();
+        let mut continuing = BTreeMap::new();
         for &sample in &exits {
             let pair = match (monitor, monitors.get(&sample).map(|&(plan, _)| plan)) {
                 (Some(pattern), Some(sample)) => Some(MonitorCopy { pattern, sample }),
@@ -368,8 +507,7 @@ impl BranchedFinally {
             {
                 result.returns.push(resume);
             } else {
-                continuing.insert(sample);
-                tails.extend(tail);
+                continuing.insert(sample, tail);
             }
             for block in removed {
                 if !result.removed.insert(block) {
@@ -377,6 +515,13 @@ impl BranchedFinally {
                 }
             }
         }
+        result.label = LabelResume::prove(
+            instructions, graph, routes, body, dominance, &result, &continuing,
+        );
+        if let Some(label) = &result.label {
+            continuing.remove(&label.entry);
+        }
+        let mut tails: BTreeSet<_> = continuing.values().flatten().copied().collect();
         if !result.tail_code.is_empty()
             && tails.iter().any(|&tail| {
                 graph.blocks[tail]
@@ -428,10 +573,10 @@ impl BranchedFinally {
             return None;
         }
         if exits.len() > 1 {
-            result.body_join = result.continuation.or_else(|| continuing.first().copied());
-            result.projected_entries = continuing;
+            result.body_join = result.continuation.or_else(|| continuing.first_key_value().map(|(&entry, _)| entry));
+            result.projected_entries = continuing.into_keys().collect();
         } else {
-            result.body_join = continuing.first().copied();
+            result.body_join = continuing.first_key_value().map(|(&entry, _)| entry);
         }
         Some(result)
     }

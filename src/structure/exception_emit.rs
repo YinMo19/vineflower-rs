@@ -417,6 +417,7 @@ impl Emitter<'_> {
                     return Err(self.unstructured(terminal));
                 }
             }
+            Self::record_finally_label_completion(region, shape.body, terminal, &body);
             Self::check_scope(body, machine, self.offset(finally.block()))?;
         }
         self.syntax(depth, "}");

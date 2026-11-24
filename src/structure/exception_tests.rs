@@ -632,6 +632,46 @@ fn mirrored_finally_keeps_only_the_nested_catch_with_identical_dispatch() {
 }
 
 #[test]
+fn pending_labeled_break_exports_locals_written_before_and_during_finally() {
+    let bytes = [
+        0x1a, 0x10, 25, 0xa2, 0, 15, // 0: if x >= 25, use the ordinary cleanup
+        0x08, 0x3c, // 6: save the first value before breaking the label
+        0x1a, 0x3d, 0x1a, 0x06, 0xa4, 0, 37, // 8: assign the second value; if x <= 3, resume at 49
+        0xa7, 0, 32, // 15: break the loop to 47, overriding the labeled break
+        0x1a, 0x3d, 0x1a, 0x06, 0xa4, 0, 19, // 18: ordinary cleanup; if x <= 3, go to 41
+        0xa7, 0, 22, // 25: break the loop to 47
+        0x4e, // 28: save the original exception
+        0x1a, 0x3d, 0x1a, 0x06, 0xa4, 0, 6, // 29: exceptional cleanup; if x <= 3, go to 39
+        0xa7, 0, 11, // 36: break the loop to 47, overriding the exception
+        0x2d, 0xbf, // 39: rethrow the original exception
+        0x1a, 0x10, 45, 0xa1, 0xff, 0xd4, // 41: do-while condition, loop to 0
+        0x04, 0xac, // 47: return 1 after a loop break or failed condition
+        0x1b, 0x1c, 0x60, 0xac, // 49: return the sum after the labeled break
+    ];
+    let handlers = [handler(0, 8, 28, 0), handler(28, 29, 28, 0)];
+    let lines = test_method_with_descriptor(&bytes, &handlers, &[], "(I)I").unwrap();
+    assert_eq!(lines[0].text, "int var1;");
+    assert_eq!(lines[1].text, "int var2;");
+    assert_eq!(lines[2].text, "label49: {");
+    assert_eq!(lines[3].text, "do {");
+    assert!(lines.iter().any(|line| line.text == "var1 = 5;"));
+    assert!(lines.iter().any(|line| line.text == "var2 = var0;"));
+    assert!(lines.iter().any(|line| line.text == "break label49;"));
+    assert!(lines.iter().any(|line| line.text == "break;"));
+    assert_eq!(lines.last().unwrap().text, "return var1 + var2;");
+    assert_eq!(lines.last().unwrap().depth, 0);
+
+    // The proof only exports locals along the verified labeled departure;
+    // it cannot move a value needed along the independent loop exit.
+    let mut other_exit_reads_the_local = bytes;
+    other_exit_reads_the_local[47] = 0x1c; // iload_2, not iconst_1
+    assert!(matches!(
+        classify(&other_exit_reads_the_local, &handlers).1,
+        Err(StructureError::ExceptionHandlers),
+    ));
+}
+
+#[test]
 fn each_branched_finally_copy_projects_to_one_proven_continuation() {
     let mut bytes = vec![
         0x2a, // 0: aload_0

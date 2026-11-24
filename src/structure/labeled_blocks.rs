@@ -5,6 +5,7 @@ use crate::{bytecode::Operand, lift::Machine, source_text::Document};
 use super::{
     Arm, Condition, Emitter, Line, Region, StructureError, instanceof_patterns,
     protected::{ArmId, MonitorDeparture, ProtectedRegion},
+    flow::Loop,
 };
 
 mod resource_switch;
@@ -32,7 +33,7 @@ pub(super) enum EdgeLine {
 impl Scope<'_, '_> {
     pub(super) fn head_tail(&self, block: usize) -> Option<usize> {
         (self.head == block
-            && !matches!(&self.edges, Edges::Monitor { branch_tail: false, .. }))
+            && !matches!(&self.edges, Edges::Monitor { branch_tail: false, .. } | Edges::Finally { .. }))
         .then_some(self.tail)
     }
 
@@ -56,6 +57,7 @@ enum Edges {
     Explicit,
     Resource { arm: ArmId, abrupt_entries: BTreeSet<usize> },
     Monitor { arm: ArmId, edge: MonitorDeparture, branch_tail: bool },
+    Finally { body: ArmId, entry: usize, jump: usize },
 }
 
 enum Head {
@@ -64,6 +66,108 @@ enum Head {
 }
 
 impl Emitter<'_> {
+    pub(super) fn emit_loop_with_finally_label<'a, 'c>(
+        &mut self,
+        header: usize,
+        loop_shape: Loop,
+        region: Region<'_, 'a, 'c>,
+        machine: &mut Machine<'a, 'c>,
+        depth: usize,
+    ) -> Result<Option<usize>, StructureError> {
+        let exceptions = self.exceptions;
+        let Some(shape) = exceptions.at_start(region.exception_arm, header)
+            .map(|id| exceptions.region(id))
+        else { return Ok(None); };
+        let Some(finally) = &shape.finally else { return Ok(None); };
+        let Some(plan) = finally.branched().and_then(|branch| branch.label.as_ref())
+        else { return Ok(None); };
+        let Some(test) = loop_shape.post_test else { return Err(self.unstructured(header)); };
+        if loop_shape.exception_body != Some(shape.body)
+            || loop_shape.exit != Some(plan.loop_exit)
+            || !shape.catches.is_empty()
+            || region.label_scope().is_some()
+            || region.exception_arm.is_some()
+            || !self.layout.inside(plan.target, region)
+        {
+            return Err(self.unstructured(header));
+        }
+        self.require_empty_stack(machine, header)?;
+        let scope = Scope {
+            head: header,
+            tail: plan.loop_exit,
+            join: plan.target,
+            name: format!("label{}", self.offset(plan.target)),
+            edges: Edges::Finally { body: shape.body, entry: plan.entry, jump: plan.jump },
+            exits: RefCell::new(Vec::with_capacity(2)),
+        };
+        let label_region = region.label_body(&scope, Some(plan.target));
+        let start = self.lines.len();
+        self.syntax(depth, &format!("{}: {{", scope.name));
+        self.lines[start].sequence_boundary = true;
+        // This plan already proved the separate latch and abrupt ordinary
+        // exit, so emit the post-test loop without a speculative retry.
+        self.emit_post_test_loop(header, test, label_region, machine, depth + 1)?;
+        if self.region(plan.loop_exit, label_region, &mut machine.clone(), depth + 1)? {
+            return Err(self.unstructured(plan.loop_exit));
+        }
+        let states = scope.exits.into_inner();
+        let [prior, cleanup] = states.as_slice() else { return Err(self.unstructured(header)); };
+        if prior.block != plan.entry || cleanup.block != finally.block() {
+            return Err(self.unstructured(header));
+        }
+        let mut declarations = Vec::with_capacity(plan.locals.len());
+        for local in &plan.locals {
+            let offset = self.instructions[local.store].offset;
+            let mut lines = self.lines[start..].iter_mut().filter(|line| line.offsets.contains(&offset));
+            let (Some(line), None) = (lines.next(), lines.next()) else {
+                return Err(StructureError::Flow { offset });
+            };
+            let source = if local.from_finally { &cleanup.state } else { &prior.state };
+            let declaration = machine.promote_label_local(source, local.slot, &mut line.text)
+                .ok_or(StructureError::Flow { offset })?;
+            declarations.push(Line::new(depth, declaration, Vec::new()));
+        }
+        self.lines.splice(start..start, declarations);
+        self.syntax(depth, "}");
+        Ok(Some(plan.target))
+    }
+
+    pub(super) fn record_finally_label_break<'a, 'c>(
+        &mut self,
+        block: usize,
+        region: Region<'_, 'a, 'c>,
+        machine: &Machine<'a, 'c>,
+        depth: usize,
+        offsets: &mut Vec<u32>,
+    ) -> Result<bool, StructureError> {
+        let Some(scope) = region.label_scope() else { return Ok(false); };
+        if let &Edges::Finally { body, entry, jump } = &scope.edges
+            && region.exception_arm == Some(body)
+            && block == entry
+        {
+            self.require_empty_stack(machine, block)?;
+            scope.exits.borrow_mut().push(Exit { block, state: machine.clone() });
+            let op = &self.instructions[jump];
+            offsets.extend(op.offset..op.offset + op.len);
+            self.push(depth, format!("break {};", scope.name), mem::take(offsets));
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    pub(super) fn record_finally_label_completion<'a, 'c>(
+        region: Region<'_, 'a, 'c>,
+        body: ArmId,
+        block: usize,
+        machine: &Machine<'a, 'c>,
+    ) {
+        if let Some(scope) = region.label_scope()
+            && matches!(&scope.edges, Edges::Finally { body: owner, .. } if *owner == body)
+        {
+            scope.exits.borrow_mut().push(Exit { block, state: machine.clone() });
+        }
+    }
+
     fn labeled_plan(
         &self,
         head: usize,

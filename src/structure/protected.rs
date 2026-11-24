@@ -518,6 +518,13 @@ impl Exceptions {
         })
     }
 
+    pub(super) fn finally_label_boundary(&self, header: usize) -> Option<usize> {
+        self.loop_finally_regions().find_map(|(region, finally)| {
+            if region.start != header { return None; }
+            Some(finally.branched()?.label.as_ref()?.target)
+        })
+    }
+
     pub(super) fn counted_loop_finally_entry(&self, block: usize) -> bool {
         self.loop_finally_regions().any(|(_, finally)| {
             self.contains(Some(finally.arm), block) || finally.branched().unwrap().removed.contains(&block)
@@ -665,10 +672,15 @@ impl Exceptions {
         }
         let mut pending: BTreeSet<_> = normal_exits(graph, &body).collect();
         let mut exits = BTreeSet::new();
+        let label_entry = finally.as_ref().and_then(Finally::branched)
+            .and_then(|branch| branch.label.as_ref()).map(|label| label.entry);
         // A protected range can end immediately before an exclusive goto or
         // return. These instructions themselves cannot throw. Preserve their
         // source placement, particularly returns whose value is still stacked.
         while let Some(exit) = pending.pop_first() {
+            if label_entry == Some(exit) {
+                continue;
+            }
             let exit = self.bypass_cleanup(exit);
             if body.contains(&exit) {
                 continue;

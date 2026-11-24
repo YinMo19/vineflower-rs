@@ -278,6 +278,9 @@ impl Emitter<'_> {
                 self.predicate_exit(scope, outcome, machine, depth, pending)?;
                 return Ok(false);
             }
+            if self.record_finally_label_break(block, region, machine, depth, pending)? {
+                return Ok(false);
+            }
             block = self.exceptions.bypass_cleanup(block);
             let Some(next) = self.redirected_exception_block(block, region, machine, depth, pending)?
             else {
@@ -319,6 +322,11 @@ impl Emitter<'_> {
                 continue;
             }
             if !first_header && let Some(loop_shape) = self.layout.loops[block] {
+                if let Some(next) = self.emit_loop_with_finally_label(block, loop_shape, region, machine, depth)? {
+                    block = next;
+                    pending.clear();
+                    continue;
+                }
                 let Some((exit, resume)) =
                     self.emit_loop(block, loop_shape, region, machine, depth, pending)?
                 else {
