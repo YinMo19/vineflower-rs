@@ -896,7 +896,9 @@ impl<'c> Machine<'_, 'c> {
         selector: Option<&Type>,
     ) -> Result<Document, LiftError> {
         let value = Expr::atom(tested.clone(), Document::new());
-        let target = LocalWrite { index, category: Category::Ref };
+        let category = Category::of(tested)
+            .ok_or_else(|| self.unsupported("invalid pattern binding type"))?;
+        let target = LocalWrite { index, category };
         let (ty, debug, same) = self.resolve_local_store(store, target, &value)?;
         let generic = self.locals.declaration_signature(&ty, debug.as_ref());
         if same || !self.preserves_pattern_binding_type(
