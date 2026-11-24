@@ -92,6 +92,9 @@ impl<'a, 'c> Writer<'a, 'c> {
                     });
                 }
             }
+            declaration.bindings = sites
+                .as_ref()
+                .and_then(|sites| sites.uncaptured_local_bindings(child, self.anonymous_bindings.clone()));
         }
         let method_error = |source| DecompileError::Method {
             name: name.into(),

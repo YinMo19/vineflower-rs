@@ -21,6 +21,7 @@ pub(crate) struct LocalSite {
     offset: u32,
     plan: Rc<LocalPlan>,
     bindings: Rc<[Capture]>,
+    enclosing_names: crate::lift::locals::LexicalNames,
 }
 
 impl LocalSite {
@@ -50,6 +51,7 @@ impl LocalSite {
             Rc::clone(&self.bindings),
             Rc::clone(&self.plan),
             parent,
+            self.enclosing_names.clone(),
         )
     }
 }
@@ -432,6 +434,7 @@ impl Machine<'_, '_> {
                 offset: self.debug_offset(self.offset),
                 plan: Rc::clone(&plan),
                 bindings: bindings.into(),
+                enclosing_names: self.locals.lexical_names(),
             });
         }
         Ok(&args[..args

@@ -549,6 +549,58 @@ impl<'a, 'c> Machine<'a, 'c> {
         }
     }
 
+    fn single_lambda_site(&self, site: &LambdaSite<'_>) -> Result<bool, LiftError> {
+        let Some(bootstraps) = self.bootstrap.as_deref() else {
+            return Ok(false);
+        };
+        let pool = &self.class.pool;
+        let target = (site.owner, site.name, site.implementation_descriptor);
+        let is_target = |index| pool.member_ref(index).is_ok_and(|member| member == target);
+        let is_handle = |index| {
+            matches!(pool.get(index), Ok(Constant::MethodHandle { reference_index, .. })
+                if is_target(*reference_index))
+        };
+        let mut bootstrap = None;
+        for (index, method) in bootstraps.iter().enumerate() {
+            if is_handle(method.method_ref) {
+                return Ok(false);
+            }
+            for (argument, &constant) in method.arguments.iter().enumerate() {
+                if is_handle(constant) && (argument != 1 || bootstrap.replace(index).is_some()) {
+                    return Ok(false);
+                }
+            }
+        }
+        let Some(bootstrap) = bootstrap else {
+            return Ok(false);
+        };
+        let mut found = false;
+        for method in &self.class.methods {
+            let Some(code) = method.code(pool)? else { continue };
+            let Ok(instructions) = decode(code.bytes) else { return Ok(false) };
+            for op in instructions {
+                match (op.opcode, op.operand) {
+                    (0xba, Operand::Constant(index))
+                        if matches!(pool.get(index)?, Constant::InvokeDynamic { bootstrap_index, .. }
+                            if usize::from(*bootstrap_index) == bootstrap) =>
+                    {
+                        if found || method.name_index != self.method.name_index
+                            || method.descriptor_index != self.method.descriptor_index
+                            || op.offset != self.debug_offset(self.offset)
+                        {
+                            return Ok(false);
+                        }
+                        found = true;
+                    }
+                    (0xb6..=0xb8 | 0x12..=0x14, Operand::Constant(index))
+                        if is_target(index) || is_handle(index) => return Ok(false),
+                    _ => {}
+                }
+            }
+        }
+        Ok(found)
+    }
+
     fn inline_lambda(
         &self,
         helper: &'c Member<'a>,
@@ -598,6 +650,32 @@ impl<'a, 'c> Machine<'a, 'c> {
         let Ok(graph) = ControlFlowGraph::build(&instructions, &code.exceptions) else {
             return Ok(None);
         };
+        let nested_anonymous = self.group.is_some_and(|group| {
+            group.children(self.owner).any(|(_, node)| {
+                matches!(node.kind, crate::context::NestedKind::Anonymous)
+                    && node.method.as_ref().is_some_and(|(name, descriptor)| {
+                        name == site.name && descriptor == site.implementation_descriptor
+                    })
+            })
+        });
+        let nested_sites = if nested_anonymous {
+            // A real anonymous class has observable class identity. Unlike
+            // ordinary helper expressions, it may not be copied to multiple
+            // lambda sites, or moved into the body of an anonymous SAM class.
+            if anonymous.is_some()
+                || helper.access_flags & 0x0002 == 0
+                || self.class.major_version >= 55
+                || !self.single_lambda_site(site)?
+            {
+                return Ok(None);
+            }
+            let Some(sites) = &self.anonymous_sites else {
+                return Ok(None);
+            };
+            Some((sites, sites.borrow().len()))
+        } else {
+            None
+        };
         let mut machine = Machine::new(
             self.class,
             helper,
@@ -614,8 +692,8 @@ impl<'a, 'c> Machine<'a, 'c> {
         machine.bootstrap.clone_from(&self.bootstrap);
         // Bound the amount of source copied by each helper tree, not only
         // its call depth (a helper can contain many nested factories).
-        let nested_sites = instructions.iter().filter(|op| op.opcode == 0xba).count();
-        let nesting_cost = (usize::BITS - nested_sites.leading_zeros()).max(1) as u8;
+        let nested_factories = instructions.iter().filter(|op| op.opcode == 0xba).count();
+        let nesting_cost = (usize::BITS - nested_factories.leading_zeros()).max(1) as u8;
         machine.lambda_depth = self.lambda_depth + nesting_cost;
         let local_helpers = self
             .dynamic_helpers
@@ -629,6 +707,13 @@ impl<'a, 'c> Machine<'a, 'c> {
         machine
             .locals
             .bind_lambda_scope(&self.locals, &captures, &site.implementation, is_static);
+        if let Some((sites, _)) = nested_sites {
+            machine.locals.inherit_lexical_scope(&self.locals);
+            // Keep the outer method's registry; the final source writer
+            // expands these entries after it writes the inlined lambda.
+            machine.anonymous_sites = Some(std::rc::Rc::clone(sites));
+            machine.set_anonymous_source(&instructions);
+        }
         let mut parameters =
             Vec::with_capacity(site.implementation.parameters.len() - captured.len());
         let mut slot = u16::from(!is_static);
@@ -656,6 +741,9 @@ impl<'a, 'c> Machine<'a, 'c> {
         let Ok(mut lines) =
             structure_with_handlers(&instructions, &graph, machine, &code.exceptions)
         else {
+            if let Some((sites, checkpoint)) = nested_sites {
+                sites.borrow_mut().truncate(checkpoint);
+            }
             return Ok(None);
         };
         if let (Some(outer), Some(retained)) = (&self.dynamic_helpers, local_helpers) {

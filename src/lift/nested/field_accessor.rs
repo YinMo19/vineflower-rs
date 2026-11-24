@@ -1,9 +1,12 @@
+use std::collections::HashSet;
+
 use crate::{
     bytecode::{Instruction, Operand},
     classfile::{ClassError, ClassFile, Constant, ConstantPool, find_attribute},
     context::NestedKind,
     descriptor::{MethodDescriptor, Type},
 };
+use crate::source_text::Document;
 
 use super::{Effect, Expr, LiftError, Machine, PRIMARY, Source, parameter_load_slot};
 use crate::lift::assignment_expr::{Binary, Form, one_instruction, store_dup_opcode};
@@ -189,6 +192,87 @@ fn increment(
 }
 
 impl Machine<'_, '_> {
+    fn lexical_accessor_target(
+        &self,
+        owner: &str,
+        receiver: &Expr,
+        field: &FieldAccessor<'_>,
+        source: &str,
+    ) -> Result<bool, LiftError> {
+        let Some(group) = self.group else {
+            return Ok(false);
+        };
+        if receiver.order.is_some()
+            || receiver.observable
+            || !matches!(&receiver.ty, Type::Object(actual) if actual == owner)
+        {
+            return Ok(false);
+        }
+        // An anonymous class has no `TypeName.this` spelling. A simple name
+        // is equivalent only if each enclosing instance exists in Java, and
+        // neither a field nor a local in any crossed scope wins lookup.
+        let mut cursor = self.owner;
+        let mut checked = HashSet::new();
+        let mut pending = Vec::new();
+        while cursor != owner {
+            let Some(node) = group.nested_class(cursor).filter(|_| group.is_attached(cursor)) else {
+                return Ok(false);
+            };
+            let Some(outer) = group.enclosing_instance(cursor) else {
+                return Ok(false);
+            };
+            if !matches!(node.kind, NestedKind::Member(_))
+                && !self.anonymous_bindings.as_deref()
+                    .and_then(|bindings| bindings.enclosing_names(cursor))
+                    .is_some_and(|names| !names.binds(source))
+            {
+                return Ok(false);
+            }
+            pending.push(cursor);
+            while let Some(ancestor) = pending.pop() {
+                if !checked.insert(ancestor) {
+                    continue;
+                }
+                let Some(class) = group.get(ancestor) else {
+                    if ancestor == "java/lang/Object" {
+                        continue; // Object declares no fields.
+                    }
+                    return Ok(false);
+                };
+                let pool = &class.pool;
+                for member in &class.fields {
+                    let name = pool.utf8(member.name_index)?;
+                    let descriptor = pool.utf8(member.descriptor_index)?;
+                    if self.source_field_name(ancestor, name, descriptor) == source {
+                        return Ok(false);
+                    }
+                }
+                for index in std::iter::once(class.super_class).chain(class.interfaces.iter().copied()) {
+                    if index != 0 {
+                        pending.push(pool.class_name(index)?);
+                    }
+                }
+            }
+            cursor = outer;
+        }
+        let Some(class) = group.get(owner) else {
+            return Ok(false);
+        };
+        for member in &class.fields {
+            let name = class.pool.utf8(member.name_index)?;
+            let descriptor = class.pool.utf8(member.descriptor_index)?;
+            if (name != field.name || descriptor != field.descriptor)
+                && self.source_field_name(owner, name, descriptor) == source
+            {
+                return Ok(false);
+            }
+        }
+        if self.anonymous_bindings.as_deref().is_some_and(|bindings| bindings.binds_name(source)) {
+            return Ok(false);
+        }
+        Ok(self.locals.reserve_unshadowed_field(source, self.lambda_depth != 0))
+    }
+
     pub(super) fn emit_field_accessor(
         &mut self,
         owner: &str,
@@ -197,6 +281,7 @@ impl Machine<'_, '_> {
         field: FieldAccessor<'_>,
     ) -> Result<Effect, LiftError> {
         let fail = || self.unsupported("synthetic nest field is not nameable here");
+        let source = self.source_field_name(owner, field.name, field.descriptor);
         let (mut target, passed) = if field.is_static {
             if self.group.is_some_and(|group| {
                 group
@@ -205,24 +290,30 @@ impl Machine<'_, '_> {
             }) {
                 return Err(fail());
             }
-            (self.class_reference(owner), args)
+            let mut qualifier = self.class_reference(owner);
+            qualifier.push('.');
+            (qualifier, args)
         } else {
             let (receiver, passed) = args.split_first().ok_or_else(fail)?;
-            if self.unnamed_enclosing_receiver(receiver) {
-                return Err(fail());
-            }
-            let target = if receiver.ty == signature.parameters[0]
-                && !matches!(receiver.source, Source::Null)
-            {
-                receiver.at(PRIMARY).into_owned()
+            let qualifier = if self.unnamed_enclosing_receiver(receiver) {
+                if !self.lexical_accessor_target(owner, receiver, &field, source)? {
+                    return Err(fail());
+                }
+                Document::new()
             } else {
-                self.member_receiver(receiver.clone(), owner, false)?
-                    .into_at(PRIMARY)
+                let mut qualifier = if receiver.ty == signature.parameters[0]
+                    && !matches!(receiver.source, Source::Null)
+                {
+                    receiver.at(PRIMARY).into_owned()
+                } else {
+                    self.member_receiver(receiver.clone(), owner, false)?
+                        .into_at(PRIMARY)
+                };
+                qualifier.push('.');
+                qualifier
             };
-            (target, passed)
+            (qualifier, passed)
         };
-        target.push('.');
-        let source = self.source_field_name(owner, field.name, field.descriptor);
         self.append_field_reference(&mut target, source, owner, field.name, field.descriptor);
         match field.action {
             Action::Read => {

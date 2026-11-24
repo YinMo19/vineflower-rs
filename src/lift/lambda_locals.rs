@@ -22,6 +22,10 @@ impl Locals<'_> {
         Some((index, self.parameter_names.contains(&local.name)))
     }
 
+    pub(in crate::lift) fn inherit_lexical_scope(&mut self, outer: &Self) {
+        self.lambda_enclosing = Some(Rc::new(outer.lexical_names()));
+    }
+
     pub(in crate::lift) fn bind_lambda_scope(
         &mut self,
         outer: &Self,

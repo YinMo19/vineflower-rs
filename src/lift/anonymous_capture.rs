@@ -15,6 +15,7 @@ use super::super::{
     nested::parameter_load_slot,
 };
 use super::local::LocalPlan;
+use crate::lift::locals::LexicalNames;
 
 pub(crate) type AnonymousBindings = Rc<CaptureFrame>;
 
@@ -23,6 +24,7 @@ pub(crate) struct CaptureFrame {
     captures: Rc<[Capture]>,
     parent: Option<AnonymousBindings>,
     plan: Option<Rc<LocalPlan>>,
+    enclosing_names: Option<LexicalNames>,
 }
 
 pub(super) struct Capture {
@@ -101,20 +103,18 @@ impl Capture {
 
 impl CaptureFrame {
     pub(super) fn bind(
-        owner: &Rc<str>,
-        captures: &Rc<[Capture]>,
+        owner: Rc<str>,
+        captures: Rc<[Capture]>,
         parent: Option<AnonymousBindings>,
-    ) -> Option<AnonymousBindings> {
-        if captures.is_empty() {
-            parent
-        } else {
-            Some(Rc::new(Self {
-                owner: Rc::clone(owner),
-                captures: Rc::clone(captures),
-                parent,
-                plan: None,
-            }))
-        }
+        enclosing_names: Option<LexicalNames>,
+    ) -> AnonymousBindings {
+        Rc::new(Self {
+            owner,
+            captures,
+            parent,
+            plan: None,
+            enclosing_names,
+        })
     }
 
     pub(super) fn named(
@@ -122,12 +122,14 @@ impl CaptureFrame {
         captures: Rc<[Capture]>,
         plan: Rc<LocalPlan>,
         parent: Option<AnonymousBindings>,
+        enclosing_names: LexicalNames,
     ) -> AnonymousBindings {
         Rc::new(Self {
             owner,
             captures,
             plan: Some(plan),
             parent,
+            enclosing_names: Some(enclosing_names),
         })
     }
 
@@ -162,6 +164,20 @@ impl CaptureFrame {
         None
     }
 
+    pub(in crate::lift) fn enclosing_names(&self, owner: &str) -> Option<&LexicalNames> {
+        self.frame(owner)?.enclosing_names.as_ref()
+    }
+
+    fn reserve_names(&self, locals: &crate::lift::locals::Locals<'_>) {
+        let mut frame = Some(self);
+        while let Some(candidate) = frame {
+            for capture in &*candidate.captures {
+                locals.reserve_capture_name(capture.name.as_str());
+            }
+            frame = candidate.parent.as_deref();
+        }
+    }
+
     pub(in crate::lift) fn binds_name(&self, name: &str) -> bool {
         let mut frame = Some(self);
         while let Some(candidate) = frame {
@@ -186,6 +202,9 @@ impl<'a, 'c> Machine<'a, 'c> {
 
 impl Machine<'_, '_> {
     pub(crate) fn set_anonymous_bindings(&mut self, bindings: Option<AnonymousBindings>) {
+        if let Some(bindings) = &bindings {
+            bindings.reserve_names(&self.locals);
+        }
         self.anonymous_bindings = bindings;
     }
 

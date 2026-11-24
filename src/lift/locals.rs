@@ -81,6 +81,19 @@ enum NameUse {
     Local,
 }
 
+#[derive(Clone)]
+pub(crate) struct LexicalNames {
+    names: Rc<RefCell<Names>>,
+    parent: Option<Rc<Self>>,
+}
+
+impl LexicalNames {
+    pub(crate) fn binds(&self, name: &str) -> bool {
+        matches!(self.names.borrow().used.get(name), Some(NameUse::Local))
+            || self.parent.as_deref().is_some_and(|parent| parent.binds(name))
+    }
+}
+
 impl Names {
     fn fresh(&mut self, name: &str) -> String {
         self.fresh_owned(name.into())
@@ -162,6 +175,7 @@ pub(super) struct Locals<'a> {
     decompile_generics: bool,
     use_debug_names: bool,
     names: Rc<RefCell<Names>>,
+    lambda_enclosing: Option<Rc<LexicalNames>>,
     parameter_names: Rc<[String]>,
     tokens: Option<local_tokens::LocalTokens<'a>>,
     track_int_fits: bool,
@@ -232,6 +246,7 @@ impl<'a> Locals<'a> {
             generic,
             use_debug_names: options.use_debug_names,
             names: Rc::new(RefCell::new(names)),
+            lambda_enclosing: None,
             parameter_names: Rc::default(),
             tokens: None,
             track_int_fits: false,
@@ -319,6 +334,20 @@ impl<'a> Locals<'a> {
 
     pub(super) fn parameters(&self) -> &[String] {
         &self.parameter_names
+    }
+
+    pub(super) fn lexical_names(&self) -> LexicalNames {
+        LexicalNames {
+            names: Rc::clone(&self.names),
+            parent: self.lambda_enclosing.clone(),
+        }
+    }
+
+    pub(super) fn reserve_capture_name(&self, name: &str) {
+        let mut names = self.names.borrow_mut();
+        if !names.used.contains_key(name) {
+            names.used.insert(name.into(), NameUse::Reserved);
+        }
     }
 
     pub(super) fn reserve_unshadowed_field(&self, name: &str, in_lambda: bool) -> bool {

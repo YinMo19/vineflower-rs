@@ -20,6 +20,7 @@ use super::{
 mod capture;
 pub(crate) use capture::AnonymousBindings;
 use capture::{Capture, CaptureFrame, loaded_parameter, writes_local};
+use super::locals::LexicalNames;
 
 #[path = "local_classes.rs"]
 mod local;
@@ -30,6 +31,7 @@ pub(crate) type AnonymousSites = Rc<RefCell<NestedSites>>;
 #[derive(Default)]
 pub(crate) struct NestedSites {
     entries: Vec<NestedSite>,
+    enclosing_names: Option<LexicalNames>,
 }
 
 enum NestedSite {
@@ -38,6 +40,19 @@ enum NestedSite {
 }
 
 impl NestedSites {
+    pub(crate) fn uncaptured_local_bindings(
+        &self,
+        owner: &str,
+        parent: Option<AnonymousBindings>,
+    ) -> Option<AnonymousBindings> {
+        Some(CaptureFrame::bind(
+            owner.into(),
+            Rc::default(),
+            parent,
+            Some(self.enclosing_names.clone()?),
+        ))
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
@@ -75,6 +90,7 @@ pub(crate) struct AnonymousSite {
     pub instructions: Vec<Instruction>,
     pub initializer_start: usize,
     captures: Option<Rc<[Capture]>>,
+    enclosing_names: Option<LexicalNames>,
 }
 
 impl AnonymousSite {
@@ -90,6 +106,7 @@ impl AnonymousSite {
             instructions,
             initializer_start,
             captures: None,
+            enclosing_names: None,
         }
     }
 
@@ -97,10 +114,15 @@ impl AnonymousSite {
         &self,
         parent: Option<AnonymousBindings>,
     ) -> Option<AnonymousBindings> {
-        if let Some(captures) = &self.captures {
-            return CaptureFrame::bind(&self.class, captures, parent);
+        if self.captures.is_none() && self.enclosing_names.is_none() {
+            return parent;
         }
-        parent
+        Some(CaptureFrame::bind(
+            Rc::clone(&self.class),
+            self.captures.clone().unwrap_or_default(),
+            parent,
+            self.enclosing_names.clone(),
+        ))
     }
 
     pub(crate) fn captures_field(&self, name: &str, descriptor: &str) -> bool {
@@ -114,6 +136,7 @@ impl AnonymousSite {
 
 impl Machine<'_, '_> {
     pub(crate) fn set_anonymous_sites(&mut self, sites: AnonymousSites) {
+        sites.borrow_mut().enclosing_names = Some(self.locals.lexical_names());
         self.anonymous_sites = Some(sites);
     }
 
@@ -303,6 +326,7 @@ impl Machine<'_, '_> {
             instructions,
             initializer_start,
             captures: (!captures.fields.is_empty()).then(|| captures.fields.into()),
+            enclosing_names: Some(self.locals.lexical_names()),
         });
         head.append_relative_arguments(visible_args.iter().map(|arg| &arg.text));
         let _ = write!(head, "\0{id}\0");
