@@ -80,6 +80,7 @@ Exact upstream comparison with all fixture bytecode and required JDKs:
 | Nested switch exits, multi-entry loops, Groovy checked dispatch and Kotlin suspend closures | 154 | 93 | 450 | 0 |
 | Nested finally, Java 25 anonymous classes, Scala boolean joins, and Kotlin constructor delegation | 154 | 88 | 455 | 0 |
 | Transparent rethrows, qualified enum patterns, and conditional case fallthrough | 154 | 85 | 458 | 0 |
+| Finally locals and saved returns, loop continuations, grouped unnamed patterns, and short-circuit assignments | 154 | 80 | 463 | 0 |
 
 All eight upstream CLI and bulk cases match. The full test remains failing
 until all 697 comparisons match.
