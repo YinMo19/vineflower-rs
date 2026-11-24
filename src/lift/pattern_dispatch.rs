@@ -15,6 +15,9 @@ use super::{
 };
 
 const BOOTSTRAP_DESCRIPTOR: &str = "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;[Ljava/lang/Object;)Ljava/lang/invoke/CallSite;";
+const CONSTANT_INVOKE: &str = "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/Class;Ljava/lang/invoke/MethodHandle;[Ljava/lang/Object;)Ljava/lang/Object;";
+const ENUM_DESC: &str = "Ljava/lang/Enum$EnumDesc;";
+const CLASS_DESC: &str = "Ljava/lang/constant/ClassDesc;";
 const ENUM_FLAG: u16 = 0x4000;
 const ENUM_CONSTANT_FLAGS: u16 = ENUM_FLAG | 0x0008 | 0x0010;
 
@@ -36,6 +39,7 @@ pub(crate) enum PatternLabel {
     String(String),
     Integer(i32),
     Enum(String),
+    QualifiedEnum { ty: Type, name: String },
 }
 
 fn pattern_integer_type(selector: &Type, value: i32) -> Option<Primitive> {
@@ -78,17 +82,9 @@ impl Machine<'_, '_> {
         else {
             return Ok(None);
         };
-        let Constant::MethodHandle {
-            reference_kind: 6,
-            reference_index,
-        } = *pool.get(method.method_ref)?
-        else {
+        let Some((owner, name, signature)) = self.static_handle(method.method_ref, false)? else {
             return Ok(None);
         };
-        if !matches!(pool.get(reference_index)?, Constant::Methodref { .. }) {
-            return Ok(None);
-        }
-        let (owner, name, signature) = pool.member_ref(reference_index)?;
         if owner != "java/lang/runtime/SwitchBootstraps" || signature != BOOTSTRAP_DESCRIPTOR {
             return Ok(None);
         }
@@ -133,13 +129,26 @@ impl Machine<'_, '_> {
                     self.options.ascii_strings,
                 )),
                 Constant::Integer(value) if !enum_switch => PatternLabel::Integer(value),
+                Constant::Dynamic { .. } if !enum_switch && self.supports_null_default() => {
+                    let Some(label) = self.read_qualified_enum_label(index)? else {
+                        return Ok(None);
+                    };
+                    label
+                }
                 _ => return Ok(None),
             };
             labels.push(label);
         }
         let enum_descriptor = enum_owner.map(|owner| format!("L{owner};"));
         if let Some((owner, descriptor)) = enum_owner.zip(enum_descriptor.as_deref())
-            && !self.proves_enum_dispatch(owner, descriptor, &labels)
+            && !self.proves_enum_dispatch(
+                owner,
+                descriptor,
+                labels.iter().filter_map(|label| match label {
+                    PatternLabel::Enum(name) => Some(name.as_str()),
+                    _ => None,
+                }),
+            )
         {
             return Ok(None);
         }
@@ -150,15 +159,86 @@ impl Machine<'_, '_> {
         }))
     }
 
-    fn proves_enum_dispatch(&self, owner: &str, descriptor: &str, labels: &[PatternLabel]) -> bool {
-        let proves_names = |exists: &dyn Fn(&str) -> bool| {
-            labels.iter().all(|label| match label {
-                PatternLabel::Enum(name) => exists(name)
-                    && crate::naming::is_valid_local_identifier(
-                        self.source_field_name(owner, name, descriptor),
-                        self.class.major_version,
-                    ),
-                _ => true,
+    fn read_qualified_enum_label(&self, index: u16) -> Result<Option<PatternLabel>, LiftError> {
+        // Javac's typeSwitch represents a qualified enum constant as two
+        // nested condy calls. Match the two exact factories, not arbitrary
+        // ConstantBootstraps.invoke call graphs.
+        let Some([factory, class_index, name]) = self.constant_invoke(index, ENUM_DESC)? else {
+            return Ok(None);
+        };
+        if self.static_handle(*factory, false)? != Some((
+            "java/lang/Enum$EnumDesc", "of",
+            "(Ljava/lang/constant/ClassDesc;Ljava/lang/String;)Ljava/lang/Enum$EnumDesc;",
+        )) {
+            return Ok(None);
+        }
+        let Some([factory, binary_name]) = self.constant_invoke(*class_index, CLASS_DESC)? else {
+            return Ok(None);
+        };
+        if self.static_handle(*factory, true)? != Some((
+            "java/lang/constant/ClassDesc", "of", "(Ljava/lang/String;)Ljava/lang/constant/ClassDesc;",
+        )) {
+            return Ok(None);
+        }
+        let pool = &self.class.pool;
+        let (Constant::String(binary_name), Constant::String(name)) =
+            (pool.get(*binary_name)?, pool.get(*name)?)
+        else {
+            return Ok(None);
+        };
+        let binary_name = pool.utf8(*binary_name)?;
+        if binary_name.contains(['/', ';', '[']) || binary_name.split('.').any(str::is_empty) {
+            return Ok(None);
+        }
+        let owner = binary_name.replace('.', "/");
+        let descriptor = format!("L{owner};");
+        let name = pool.utf8(*name)?;
+        Ok(self.proves_enum_dispatch(&owner, &descriptor, std::iter::once(name)).then(|| {
+            PatternLabel::QualifiedEnum { ty: Type::Object(owner), name: name.into() }
+        }))
+    }
+
+    fn constant_invoke(&self, index: u16, descriptor: &str) -> Result<Option<&[u16]>, LiftError> {
+        let pool = &self.class.pool;
+        let Constant::Dynamic { bootstrap_index, name_and_type_index } = *pool.get(index)? else {
+            return Ok(None);
+        };
+        if pool.name_and_type(name_and_type_index)? != ("invoke", descriptor) {
+            return Ok(None);
+        }
+        let Some(method) = self.bootstrap.as_ref().and_then(|table| table.get(usize::from(bootstrap_index)))
+        else {
+            return Ok(None);
+        };
+        Ok((self.static_handle(method.method_ref, false)?
+            == Some(("java/lang/invoke/ConstantBootstraps", "invoke", CONSTANT_INVOKE)))
+            .then_some(method.arguments.as_slice()))
+    }
+
+    fn static_handle(&self, index: u16, interface: bool) -> Result<Option<(&str, &str, &str)>, LiftError> {
+        let pool = &self.class.pool;
+        let Constant::MethodHandle { reference_kind: 6, reference_index } = *pool.get(index)? else {
+            return Ok(None);
+        };
+        match (interface, pool.get(reference_index)?) {
+            (false, Constant::Methodref { .. }) | (true, Constant::InterfaceMethodref { .. }) => {
+                Ok(Some(pool.member_ref(reference_index)?))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn proves_enum_dispatch<'n>(
+        &self,
+        owner: &str,
+        descriptor: &str,
+        mut names: impl Iterator<Item = &'n str>,
+    ) -> bool {
+        let mut proves_names = |exists: &dyn Fn(&str) -> bool| {
+            names.all(|name| {
+                exists(name) && crate::naming::is_valid_local_identifier(
+                    self.source_field_name(owner, name, descriptor), self.class.major_version,
+                )
             })
         };
         if let Some(class) = self.group.and_then(|group| group.get(owner))
@@ -324,6 +404,7 @@ impl Machine<'_, '_> {
                     PatternLabel::Integer(value) => pattern_integer_type(ty, *value).is_some(),
                     PatternLabel::String(_) => matches!(ty, Type::Object(name) if name == "java/lang/String"),
                     PatternLabel::Enum(_) => ty == &dispatch.call_selector,
+                    PatternLabel::QualifiedEnum { ty: owner, .. } => self.known_assignable(owner, ty),
                 })
         };
         if !is_null && !self.known_assignable(&value.ty, &dispatch.call_selector) {
@@ -360,6 +441,11 @@ impl Machine<'_, '_> {
                 let descriptor = dispatch.enum_descriptor.as_deref().expect("checked enum");
                 self.source_field_name(owner, name, descriptor).into()
             }
+            PatternLabel::QualifiedEnum { ty: ty @ Type::Object(owner), name } => {
+                let descriptor = format!("L{owner};");
+                format!("{}.{}", self.render_type(ty), self.source_field_name(owner, name, &descriptor)).into()
+            }
+            PatternLabel::QualifiedEnum { .. } => unreachable!("enum owner is a class"),
             PatternLabel::Integer(value) => super::literal::integer_literal(
                 *value,
                 Some(&Type::Primitive(pattern_integer_type(selector, *value).expect("checked selector"))),
