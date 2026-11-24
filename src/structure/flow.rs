@@ -399,7 +399,7 @@ impl Layout {
                     })
             });
             let mut exit = conditional_case.as_ref().map(|case| case.continuation)
-                .or(post_exit).or(mirrored_exit).or_else(|| {
+                .or(post_exit).or(mirrored_exit).or_else(|| exceptions.retry_loop_exit(header)).or_else(|| {
                 // A repeating try or terminal retry owns even the noncyclic
                 // terminal tails of its body; none is a loop exit.
                 if repeating_try.is_some() || terminal_retry {

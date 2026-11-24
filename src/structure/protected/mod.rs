@@ -499,6 +499,15 @@ impl Exceptions {
         })
     }
 
+    pub(super) fn retry_loop_exit(&self, header: usize) -> Option<usize> {
+        let mut exits = self.regions.iter().filter_map(|region| match region.loop_departure {
+            Some(LoopDeparture::Break { header: head, target, .. }) if head == header => Some(target),
+            _ => None,
+        });
+        let exit = exits.next()?;
+        exits.all(|other| other == exit).then_some(exit)
+    }
+
     // The flag distinguishes a terminal protected arm from one that breaks
     // out of the retry loop on its normal path.
     pub(super) fn retry_loop_body(&self, header: usize) -> Option<(ArmId, bool)> {
@@ -1518,17 +1527,15 @@ impl LoopDeparture {
         latch: usize,
         target: usize,
     ) -> Option<Self> {
-        // The bytecode may loop only after the exception edge. Prove that the
-        // actual catch entry is the sole backedge and has only its binding,
-        // optional update and jump, not other operations to move or discard.
+        // The backedge is reachable only through the catch. Its original
+        // effects remain inside that catch; only its final goto is a retry.
         let handler = &graph.blocks[latch];
         let &[header] = handler.successors.as_slice() else {
             return None;
         };
         let (jump, prefix) = instructions[handler.instructions.clone()].split_last()?;
-        let (store, rest) = prefix.split_first()?;
+        let store = prefix.first()?;
         if reference_store(store).is_none()
-            || !matches!(rest, [] | [Instruction { operand: Operand::Increment { .. }, .. }])
             || !matches!(jump.opcode, 0xa7 | 0xc8)
             || !handler.predecessors.is_empty()
             || !handler.exception_successors.is_empty()
@@ -1540,21 +1547,28 @@ impl LoopDeparture {
             return None;
         }
         let head = &graph.blocks[header];
-        let [first, second] = *head.successors.as_slice() else {
-            return None;
-        };
-        let entry = if first == target {
-            second
-        } else if second == target {
-            first
-        } else {
-            return None;
-        };
-        if !matches!(instructions[head.instructions.end - 1].opcode, 0x99..=0xa6 | 0xc6..=0xc7)
-            || !matches!(head.predecessors.as_slice(), [a, b] if *a == latch || *b == latch)
-            || !dominators.contains(entry, start)
-        {
-            return None;
+        match *head.successors.as_slice() {
+            [first, second] => {
+                let entry = if first == target { second } else if second == target { first } else { return None; };
+                if !matches!(instructions[head.instructions.end - 1].opcode, 0x99..=0xa6 | 0xc6..=0xc7)
+                    || !matches!(head.predecessors.as_slice(), [a, b] if *a == latch || *b == latch)
+                    || !dominators.contains(entry, start)
+                {
+                    return None;
+                }
+            }
+            [next] if next == start => {
+                // A linear header can run non-protected effects before a
+                // protected subloop. That subloop is then an exit-only tail
+                // on normal edges, not the continuation of the retry loop.
+                let natural = dominators.natural_loops(graph).iter().find(|shape| shape.header == header)?;
+                if natural.latches != [latch] || !head.exception_predecessors.is_empty()
+                    || !head.exception_successors.is_empty()
+                {
+                    return None;
+                }
+            }
+            _ => return None,
         }
         // The only normal edges out of the try must be explicit jumps with
         // no other effect. In particular do not pull the target into the try.
