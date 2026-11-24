@@ -74,4 +74,8 @@ fn table_switch_emits_only_true_default_aliases_and_keeps_fallthrough() {
         assert_eq!(lines[method.offsets[&offset]].trim(), statement, "offset {offset}");
     }
     assert!(!method.offsets.contains_key(&103) && !method.offsets.contains_key(&104));
+    assert!(!method.offsets.contains_key(&129) && !method.offsets.contains_key(&132));
+    for offset in [130, 131, 133] {
+        assert_eq!(lines[method.offsets[&offset]].trim(), "x += 170000;");
+    }
 }

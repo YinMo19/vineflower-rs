@@ -301,6 +301,13 @@ impl Machine<'_, '_> {
         let Candidate { store, target, form, order, operands, leaves_value, declaration } = candidate;
         let mut right = self.pop_raw()?;
         let left = if operands >= 2 { Some(self.pop_raw()?) } else { None };
+        let implicit_update = if !leaves_value
+            && matches!((form, target), (Form::Compound(_), Target::Local(_)))
+        {
+            left.as_ref().and_then(Expr::deferred_operand_origin)
+        } else {
+            None
+        };
         if operands == 3 {
             self.pop_raw()?;
         }
@@ -324,6 +331,12 @@ impl Machine<'_, '_> {
             right = self.boolean_value(right);
         }
         let (mut text, precedence) = form.render(access, Some(right.text));
+        if let Some(load) = implicit_update {
+            // The source compound operator already performs the old-value
+            // load and arithmetic; the explicit RHS and store own the map.
+            text.omit_bytes(load.bytes());
+            text.omit_bytes(first.offset..first.offset + first.len);
+        }
         if leaves_value {
             self.push(Expr {
                 order,
