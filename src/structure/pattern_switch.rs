@@ -135,7 +135,9 @@ pub(super) fn local(op: &Instruction, store: bool, reference: bool) -> Option<u1
     }
 }
 
-fn touches_slot(op: &Instruction, slot: u16) -> bool {
+enum SlotAccess { Read, Write }
+
+fn slot_access(op: &Instruction, slot: u16) -> Option<SlotAccess> {
     let (index, wide) = match (op.opcode, &op.operand) {
         (0x15..=0x19 | 0x36..=0x3a | 0xa9, Operand::Local(index)) => {
             (*index, matches!(op.opcode, 0x16 | 0x18 | 0x37 | 0x39))
@@ -145,9 +147,11 @@ fn touches_slot(op: &Instruction, slot: u16) -> bool {
             (u16::from(relative % 4), matches!(relative / 4, 1 | 3))
         }
         (0x84, Operand::Increment { index, .. }) => (*index, false),
-        _ => return false,
+        _ => return None,
     };
-    slot == index || wide && index.checked_add(1) == Some(slot)
+    (slot == index || wide && index.checked_add(1) == Some(slot)).then_some(
+        if matches!(op.opcode, 0x36..=0x4e) { SlotAccess::Write } else { SlotAccess::Read }
+    )
 }
 
 const NULL_KEY: i32 = -1;
@@ -159,8 +163,34 @@ struct Arm {
     binding: Option<(Range<usize>, u16)>,
     /// Javac 17 enumSwitch erases the source pattern type to the enum class.
     enum_pattern_type: Option<Type>,
+    alternatives: Option<guards::Alternatives>,
     guard: Option<guards::Guard>,
     nullable_type: bool,
+}
+
+impl Arm {
+    fn entry(&self, target: usize) -> Option<usize> {
+        match &self.guard {
+            Some(guard) => guard.success(),
+            None => Some(self.alternatives.as_ref().map_or(target, |shape| shape.entry)),
+        }
+    }
+
+    fn synthetic_retry(&self) -> Option<usize> {
+        let retry = self.alternatives.as_ref()?.retry;
+        (!self.guard.as_ref().is_some_and(|guard| guard.retry_blocks().any(|block| block == retry)))
+            .then_some(retry)
+    }
+
+    fn retries(&self) -> impl Iterator<Item = usize> + '_ {
+        self.guard.iter().flat_map(guards::Guard::retry_blocks).chain(self.synthetic_retry())
+    }
+
+    fn prefix_blocks(&self) -> impl Iterator<Item = usize> + '_ {
+        self.alternatives.iter().flat_map(guards::Alternatives::test_blocks)
+            .chain(self.guard.iter().flat_map(guards::Guard::blocks))
+            .chain(self.synthetic_retry())
+    }
 }
 
 struct BoundArm<'a, 'c> {
@@ -259,7 +289,7 @@ impl Emitter<'_> {
                 return Ok(None);
             };
             let keys = &mut groups.entry(target).or_default().keys;
-            if keys.first().zip(latest_type_key).is_some_and(|(&first, type_key)| first < type_key) {
+            if !type_label && keys.first().zip(latest_type_key).is_some_and(|(&first, type_key)| first < type_key) {
                 // One source arm cannot put its constants on both sides of
                 // a type test or its guard without changing priority.
                 return Ok(None);
@@ -276,7 +306,7 @@ impl Emitter<'_> {
             return Ok(None);
         }
 
-        let mut alias_uses = BTreeSet::from([indy - 2, head.alias_store]);
+        let mut alias_uses = BTreeSet::from([indy - 2]);
         let targets: BTreeSet<_> = groups.keys().copied().collect();
         for (&target, arm) in &mut groups {
             let cfg = &self.graph.blocks[target];
@@ -299,6 +329,33 @@ impl Emitter<'_> {
                         }
                         _ => continue,
                     }
+                }
+                keys if keys.len() > 1 && keys.iter().all(|&key| key != NULL_KEY
+                    && matches!(dispatch.labels[key as usize], PatternLabel::Type(_))) =>
+                {
+                    // A comma-separated label cannot move past an intervening
+                    // bootstrap entry, bind a variable, or consume null.
+                    if !machine.supports_unnamed_record_components()
+                        || !machine.can_project_record_patterns()
+                        || !keys.windows(2).all(|keys| keys[0] + 1 == keys[1])
+                        || self.record_patterns.is_some_and(|plans| plans.get(switch.offset, self.offset(target)).is_some())
+                    {
+                        return Ok(None);
+                    }
+                    let Some(proof) = &restart else { return Ok(None) };
+                    let Some(shape) = proof.alternatives(self, machine, target, head.alias, keys, &dispatch.labels, &targets)
+                    else { return Ok(None) };
+                    let Some(guard) = proof.arm(
+                        self, shape.entry, self.graph.blocks[shape.entry].instructions.start,
+                        *keys.last().expect("multiple alternatives"), &targets, Some(&shape),
+                    ) else { return Ok(None) };
+                    if guard.as_ref().is_some_and(|guard| guard.success().is_none()) {
+                        return Ok(None);
+                    }
+                    alias_uses.extend(shape.tests.iter().map(|&(test, _)| self.graph.blocks[test].instructions.start));
+                    arm.alternatives = Some(shape);
+                    arm.guard = guard;
+                    continue;
                 }
                 keys if keys.iter().any(|&key| key != NULL_KEY
                     && matches!(dispatch.labels[key as usize], PatternLabel::Type(_))) => return Ok(None),
@@ -350,7 +407,7 @@ impl Emitter<'_> {
                 return Ok(None);
             }
             if let Some(proof) = &restart {
-                let Some(guard) = proof.arm(self, target, body_start, key, &targets) else {
+                let Some(guard) = proof.arm(self, target, body_start, key, &targets, None) else {
                     return Ok(None);
                 };
                 if guard.as_ref().is_some_and(|guard| guard.success().is_none())
@@ -367,37 +424,40 @@ impl Emitter<'_> {
                 return Ok(None);
             }
         }
-        // Only a genuinely unconditional pattern can dominate later labels
-        // or conflict with default. For enumSwitch use the proved source type.
-        let pattern_types: Vec<_> = groups.iter().filter_map(|(&target, arm)| {
-            let &key = arm.keys.first().filter(|&&key| key != NULL_KEY)?;
-            let PatternLabel::Type(ty) = &dispatch.labels[key as usize] else { return None };
+        // Only an unconditional arm can dominate another arm, but alternatives
+        // in the same label must not dominate one another even with a guard.
+        let labels = &dispatch.labels;
+        let pattern_types: Vec<_> = groups.iter().flat_map(|(&target, arm)| {
             let record = self.record_patterns.and_then(|plans| plans.get(switch.offset, self.offset(target)));
-            (arm.guard.is_none() && !record.is_some_and(|record| record.may_fail))
-                .then_some((key, arm.enum_pattern_type.as_ref().unwrap_or(ty)))
+            let unconditional = arm.guard.is_none() && !record.is_some_and(|record| record.may_fail);
+            arm.keys.iter().filter_map(move |&key| {
+                let PatternLabel::Type(ty) = labels.get(key as usize)? else { return None };
+                Some((key, arm.enum_pattern_type.as_ref().unwrap_or(ty), unconditional, target))
+            })
         }).collect();
-        for arm in groups.values() {
+        for (&target, arm) in &groups {
             for &key in &arm.keys {
-                if key != NULL_KEY
-                    && let PatternLabel::Type(ty) = &dispatch.labels[key as usize]
-                    && pattern_types.iter().any(|&(earlier, prior)| {
-                        earlier < key && machine.pattern_covers(prior, arm.enum_pattern_type.as_ref().unwrap_or(ty))
-                    })
-                {
+                let ty = match labels.get(key as usize) {
+                    Some(PatternLabel::Type(ty)) => arm.enum_pattern_type.as_ref().unwrap_or(ty),
+                    Some(PatternLabel::QualifiedEnum { ty, .. }) => ty,
+                    _ => continue,
+                };
+                if pattern_types.iter().any(|&(earlier, prior, unconditional, group)| {
+                    earlier < key && (unconditional || group == target)
+                        && machine.record_component_covers(prior, ty)
+                }) {
                     return Ok(None);
                 }
             }
         }
-        if restart.as_ref().is_some_and(|proof| !proof.owns_all_retries(groups.values().filter_map(|arm| arm.guard.as_ref()))) {
-            return Ok(None);
-        }
-        if self.instructions.iter().enumerate().any(|(index, op)| {
-            touches_slot(op, head.alias) && !alias_uses.contains(&index)
-                || head.restart_store.is_some_and(|store| {
-                    touches_slot(op, head.restart) && index != store && index != indy - 1
-                        && !restart.as_ref().is_some_and(|proof| proof.restart_store(index))
+        if restart.as_ref().is_some_and(|proof| !proof.owns_all_retries(groups.values().flat_map(Arm::retries)))
+            || !self.pattern_local_is_private(block, head.alias_store, head.alias, |index| alias_uses.contains(&index))
+            || head.restart_store.is_some_and(|store| {
+                !self.pattern_local_is_private(block, store, head.restart, |index| {
+                    index == indy - 1 || restart.as_ref().is_some_and(|proof| proof.restart_store(index))
                 })
-        }) {
+            })
+        {
             return Ok(None);
         }
 
@@ -412,13 +472,7 @@ impl Emitter<'_> {
             .or_else(|| self.layout.normal_join(dispatch_block, within))
             .or_else(|| self.layout.common_join(
                 self.graph, within,
-                groups.iter().filter_map(|(&target, arm)| {
-                    let entry = match &arm.guard {
-                        Some(guard) => guard.success()?,
-                        None => target,
-                    };
-                    Some((entry, None))
-                }),
+                groups.iter().filter_map(|(&target, arm)| Some((arm.entry(target)?, None))),
             ))
             .or(region.stop);
         if groups.keys().any(|&target| Some(target) == join && Some(target) != source_default)
@@ -450,7 +504,9 @@ impl Emitter<'_> {
             total,
             switch.offset + switch.len - 1,
         )?;
-        if pattern_types.iter().any(|&(key, ty)| Some(key) != total_key && machine.pattern_covers(ty, &selector_type)) {
+        if pattern_types.iter().any(|&(key, ty, unconditional, _)| {
+            unconditional && Some(key) != total_key && machine.record_component_covers(ty, &selector_type)
+        }) {
             // A source default conflicts with a total pattern, and a total
             // pattern before the final one would dominate it.
             return Err(self.unstructured(dispatch_block));
@@ -476,6 +532,33 @@ impl Emitter<'_> {
         let trial = (|| {
             for (target, arm) in &ordered {
                 let mut entry = baseline.clone();
+                if let Some(shape) = &arm.alternatives {
+                    let mut label = Document::new();
+                    for (index, (&key, &(test, bridge))) in arm.keys.iter().zip(&shape.tests).enumerate() {
+                        if index != 0 {
+                            label.push_str(", ");
+                        }
+                        label.anchor(self.pattern_block_bytes(test));
+                        if let Some(bridge) = bridge {
+                            label.anchor(self.pattern_block_bytes(bridge));
+                        }
+                        let PatternLabel::Type(ty) = &dispatch.labels[key as usize] else {
+                            unreachable!("proved an unnamed type pattern");
+                        };
+                        label.append(entry.unnamed_record_component(Some(ty)));
+                    }
+                    label.anchor(self.pattern_block_bytes(shape.retry));
+                    if let Some(guard) = &arm.guard {
+                        let first = self.graph.blocks[shape.entry].instructions.start;
+                        label.push_str(guard_keyword);
+                        label.append(guard.document(self, first, &entry).ok_or_else(|| self.unstructured(shape.entry))?);
+                    }
+                    staged.push(BoundArm {
+                        entry,
+                        labels: vec![CaseLabel { text: label, offsets: Vec::new() }],
+                    });
+                    continue;
+                }
                 let mut binding_offsets = Vec::new();
                 let mut labels: Vec<CaseLabel> = Vec::with_capacity(arm.keys.len());
                 if let Some((indices, _)) = &arm.binding {
@@ -560,8 +643,7 @@ impl Emitter<'_> {
             *pending = offsets;
             return Ok(Some(Some(target)));
         }
-        if (restart.is_none() || constructor_setup.is_some())
-            && let Some(join) = join
+        if let Some(join) = join
             && self.try_pattern_switch_value(
                 dispatch_block, within, machine, depth, &selector, &ordered, &staged, source_default, join,
                 &control, constructor_setup,
@@ -612,19 +694,17 @@ impl Emitter<'_> {
             if join == Some(*target) {
                 continue;
             }
-            let path = if let Some(guard) = &arm.guard {
-                let Some(success) = guard.success() else {
-                    self.syntax(depth + 2, "break;");
-                    continue;
-                };
-                self.branch_arm(success, switch_region, &entry, depth + 2)?
-            } else if let Some((indices, _)) = &arm.binding {
-                self.pattern_arm(*target, switch_region, entry, depth + 2, indices.end)?
+            let Some(body) = arm.entry(*target) else {
+                self.syntax(depth + 2, "break;");
+                continue;
+            };
+            let path = if arm.guard.is_none() && let Some((indices, _)) = &arm.binding {
+                self.pattern_arm(body, switch_region, entry, depth + 2, indices.end)?
             } else {
-                self.branch_arm(*target, switch_region, &entry, depth + 2)?
+                self.branch_arm(body, switch_region, &entry, depth + 2)?
             };
             if path.exit.is_some() {
-                let offsets = self.transfer_offsets(*target, &path);
+                let offsets = self.transfer_offsets(if arm.alternatives.is_some() { body } else { *target }, &path);
                 if return_join.is_some() {
                     self.push(depth + 2, Document::from("return;"), offsets);
                 } else {
@@ -681,14 +761,54 @@ impl Emitter<'_> {
         arms: &[(usize, Arm)],
     ) -> Result<(), StructureError> {
         self.emitted[dispatch] = true;
-        for guard in arms.iter().filter_map(|(_, arm)| arm.guard.as_ref()) {
-            for owned in guard.blocks() {
-                if mem::replace(&mut self.emitted[owned], true) {
-                    return Err(self.unstructured(owned));
-                }
+        for owned in arms.iter().flat_map(|(_, arm)| arm.prefix_blocks()) {
+            if mem::replace(&mut self.emitted[owned], true) {
+                return Err(self.unstructured(owned));
             }
         }
         Ok(())
+    }
+
+    fn pattern_block_bytes(&self, block: usize) -> Range<u32> {
+        let range = &self.graph.blocks[block].instructions;
+        let last = &self.instructions[range.end - 1];
+        self.instructions[range.start].offset..last.offset + last.len
+    }
+
+    /// A later switch can reuse the same JVM slot; only the eliminated
+    /// definition must be private. Follow it until a real overwrite.
+    fn pattern_local_is_private(
+        &self,
+        block: usize,
+        store: usize,
+        slot: u16,
+        owned: impl Fn(usize) -> bool,
+    ) -> bool {
+        let mut pending = vec![(block, store + 1)];
+        let mut seen = BTreeSet::new();
+        while let Some((block, first)) = pending.pop() {
+            let node = &self.graph.blocks[block];
+            if first == node.instructions.start && !seen.insert(block) {
+                continue;
+            }
+            let mut overwritten = false;
+            for index in first..node.instructions.end {
+                match slot_access(&self.instructions[index], slot) {
+                    Some(SlotAccess::Write) if !owned(index) => {
+                        overwritten = true;
+                        break;
+                    }
+                    Some(SlotAccess::Read) if !owned(index) => return false,
+                    _ => {}
+                }
+            }
+            let at_start = |&next: &usize| (next, self.graph.blocks[next].instructions.start);
+            pending.extend(node.exception_successors.iter().map(at_start));
+            if !overwritten {
+                pending.extend(node.successors.iter().map(at_start));
+            }
+        }
+        true
     }
 
     fn transfer_offsets(&self, target: usize, path: &super::Arm<'_, '_>) -> Vec<u32> {
@@ -776,5 +896,8 @@ fn groups_can_own_return(
         && matches!(&emitter.instructions[join_block.instructions.clone()], [op] if op.opcode == 0xb1)
         && groups
             .iter()
-            .any(|(target, _)| *target == join_block.predecessors[0])
+            .any(|(target, arm)| {
+                let entry = if arm.alternatives.is_some() { arm.entry(*target) } else { Some(*target) };
+                entry == Some(join_block.predecessors[0])
+            })
 }

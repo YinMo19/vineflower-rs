@@ -24,7 +24,7 @@ impl Emitter<'_> {
     ) -> bool {
         if !machine.supports_switch_expressions()
             || arms.iter().any(|(_, arm)| arm.guard.as_ref().is_some_and(|guard| {
-                constructor_setup.is_none() || guard.success().is_none()
+                constructor_setup.is_none() && arm.alternatives.is_none() || guard.success().is_none()
             }))
         {
             return false;
@@ -42,13 +42,11 @@ impl Emitter<'_> {
         }) {
             return false;
         }
-        let entries = || arms.iter().map(|(target, arm)| {
-            arm.guard.as_ref().and_then(super::guards::Guard::success).unwrap_or(*target)
-        });
+        let entries = || arms.iter().filter_map(|(target, arm)| arm.entry(*target));
         let Some(proof) = self.switch_region_entries(header, region, entries(), join, |entry, pred| {
-            arms.iter().any(|(target, arm)| match &arm.guard {
-                Some(guard) => guard.success() == Some(entry) && guard.blocks().any(|owned| owned == pred),
-                None => *target == entry && pred == header,
+            arms.iter().any(|(target, arm)| {
+                arm.entry(*target) == Some(entry)
+                    && if entry == *target { pred == header } else { arm.prefix_blocks().any(|owned| owned == pred) }
             })
         }) else {
             return false;
@@ -64,12 +62,11 @@ impl Emitter<'_> {
                 let mut local = bound.entry.clone();
                 let entry = local.switch_arm_entry(control).ok()?;
                 helpers.push(entry.clone());
-                let path = if let Some(guard) = &arm.guard {
-                    self.branch_arm(guard.success()?, arm_region, &entry, depth + 2).ok()?
-                } else if let Some((indices, _)) = &arm.binding {
-                    self.pattern_arm(*target, arm_region, entry, depth + 2, indices.end).ok()?
+                let body = arm.entry(*target)?;
+                let path = if arm.guard.is_none() && let Some((indices, _)) = &arm.binding {
+                    self.pattern_arm(body, arm_region, entry, depth + 2, indices.end).ok()?
                 } else {
-                    self.branch_arm(*target, arm_region, &entry, depth + 2).ok()?
+                    self.branch_arm(body, arm_region, &entry, depth + 2).ok()?
                 };
                 lifted.push(path);
             }
