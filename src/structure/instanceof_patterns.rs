@@ -1,0 +1,650 @@
+// Based on Vineflower's IfPatternMatchProcessor (Apache-2.0).
+use std::{
+    mem,
+    ops::{Range, RangeInclusive},
+};
+
+use crate::{
+    bytecode::{Instruction, Operand},
+    descriptor::Type,
+    lift::{Effect, IfPatternLocal, Machine},
+};
+
+use super::{Arm, Condition, Emitter, Region, StructureError, Tail, logical};
+
+pub(super) struct Binding {
+    success: usize,
+    body_start: Option<usize>,
+    local: IfPatternLocal,
+}
+
+impl Binding {
+    pub(super) fn succeeds_at(&self, block: usize) -> bool {
+        self.success == block
+    }
+
+    pub(super) fn enter(&self, machine: &mut Machine<'_, '_>) -> Option<usize> {
+        machine.install_if_pattern_local(&self.local);
+        self.body_start
+    }
+}
+
+struct Site {
+    success: usize,
+    beginning: usize,
+    alias: Option<usize>,
+    head_end: usize,
+    load: usize,
+    test: usize,
+    cast: usize,
+    store: usize,
+    slot: u16,
+    ty: Type,
+}
+
+impl Emitter<'_> {
+    fn instanceof_site(
+        &mut self,
+        head: usize,
+        machine: &Machine<'_, '_>,
+        region: Region<'_, '_, '_>,
+    ) -> Option<Site> {
+        if !machine.supports_instanceof_patterns()
+            || !machine.this_is_initialized()
+            || region.exception_arm.is_some()
+            || region.protected.is_some()
+            || self.assertion_starts(head)
+        {
+            return None;
+        }
+        let block = &self.graph.blocks[head];
+        if !block.exception_successors.is_empty() {
+            return None;
+        }
+        let [taken, fallthrough] = *block.successors.as_slice() else {
+            return None;
+        };
+        let [.., load, test, branch] = &self.instructions[block.instructions.clone()] else {
+            return None;
+        };
+        let success = match branch.opcode {
+            0x99 => fallthrough, // ifeq: the matching path is not taken
+            0x9a => taken,       // ifne: the matching path is taken
+            _ => return None,
+        };
+        let next = &self.graph.blocks[success];
+        if self.emitted[success]
+            || !self.layout.inside(success, region)
+            || next.predecessors != [head]
+            || !next.exception_predecessors.is_empty()
+            || !next.exception_successors.is_empty()
+            || self.layout.loops[success].is_some()
+            || self
+                .exceptions
+                .at_start(region.exception_arm, success)
+                .is_some()
+        {
+            return None;
+        }
+        let selector = reference_local(load, false)?;
+        let [reload, cast, store, ..] = &self.instructions[next.instructions.clone()] else {
+            return None;
+        };
+        if reference_local(reload, false) != Some(selector) {
+            return None;
+        }
+        let slot = reference_local(store, true)?;
+        if slot == selector {
+            return None;
+        }
+        let (0xc1, Operand::Constant(test_class), 0xc0, Operand::Constant(cast_class)) =
+            (test.opcode, &test.operand, cast.opcode, &cast.operand)
+        else {
+            return None;
+        };
+        let ty = machine.pattern_class(*test_class).ok()?;
+        if machine.pattern_class(*cast_class).ok()? != ty {
+            return None;
+        }
+        let load = block.instructions.end - 3;
+        let cast = next.instructions.start + 1;
+        let store = cast + 1;
+        if [load, load + 1, load + 2, cast - 1, cast, store]
+            .into_iter()
+            .any(|index| self.exceptions.skips_instruction(index))
+        {
+            return None;
+        }
+        // Javac often evaluates a selector once into an unnamed alias. Erase
+        // that store only if neither edge can observe the slot before another
+        // write. In particular, a second check or an escaping use keeps it.
+        let unmatched = if success == taken { fallthrough } else { taken };
+        let alias = load.checked_sub(1).filter(|&index| {
+            index >= block.instructions.start
+                && reference_local(&self.instructions[index], true) == Some(selector)
+                && !self.exceptions.skips_instruction(index)
+        });
+        let head_range = block.instructions.clone();
+        let alias = alias.filter(|_| {
+            let after = self.graph.blocks[success].instructions.end;
+            let use_after = self.instructions[store + 1..after]
+                .iter()
+                .find_map(|instruction| local_access(instruction, selector));
+            let escapes = use_after.unwrap_or_else(|| {
+                // A prologue's block can have more than one successor when
+                // there is a short-circuiting guard after the store.
+                match *self.graph.blocks[success].successors.as_slice() {
+                    [] => false,
+                    [only] => self.local_is_live(only, selector),
+                    [first, second] => {
+                        self.local_is_live(first, selector) || self.local_is_live(second, selector)
+                    }
+                    _ => true,
+                }
+            });
+            !escapes && !self.local_is_live(unmatched, selector)
+        });
+        Some(Site {
+            success,
+            beginning: head_range.start,
+            alias,
+            head_end: head_range.end,
+            load,
+            test: load + 1,
+            cast,
+            store,
+            slot,
+            ty,
+        })
+    }
+
+    pub(super) fn lift_instanceof_head<'a, 'c>(
+        &mut self,
+        block: usize,
+        machine: &mut Machine<'a, 'c>,
+        region: Region<'_, 'a, 'c>,
+        depth: usize,
+        offsets: Vec<u32>,
+    ) -> Result<(Tail, Option<Binding>), StructureError> {
+        let Some(site) = self.instanceof_site(block, machine, region) else {
+            return Ok((
+                self.lift_block(block, machine, region, depth, offsets)?,
+                None,
+            ));
+        };
+        let mut cursor = site.alias.unwrap_or(site.load + 1);
+        let Tail {
+            effect,
+            mut offsets,
+            ..
+        } = self.lift_range(
+            block,
+            site.beginning..cursor,
+            machine,
+            region,
+            depth,
+            offsets,
+        )?;
+        if !matches!(effect, Effect::None) {
+            return Err(self.unstructured(block));
+        }
+        let inline = site.alias.is_some_and(|alias| {
+            let op = &self.instructions[alias];
+            let slot = reference_local(op, true).expect("an alias is an astore");
+            machine.if_pattern_alias_unnamed(op, slot) && machine.if_pattern_selector(&site.ty)
+        });
+        if !inline && cursor != site.load + 1 {
+            let tail = self.lift_range(
+                block,
+                cursor..site.load + 1,
+                machine,
+                region,
+                depth,
+                offsets,
+            )?;
+            if !matches!(tail.effect, Effect::None) {
+                return Err(self.unstructured(block));
+            }
+            offsets = tail.offsets;
+            cursor = site.load + 1;
+        }
+        let cast = &self.instructions[site.cast];
+        let store = &self.instructions[site.store];
+        let local = if machine.if_pattern_selector(&site.ty) {
+            machine.prepare_if_pattern_local(&site.ty, cast, store, site.slot)?
+        } else {
+            None
+        };
+        let Some(local) = local else {
+            return Ok((
+                self.lift_range(
+                    block,
+                    cursor..site.head_end,
+                    machine,
+                    region,
+                    depth,
+                    offsets,
+                )?,
+                None,
+            ));
+        };
+        let test = &self.instructions[site.test];
+        let branch = &self.instructions[site.test + 1];
+        machine.lift_if_pattern_test(test, &local)?;
+        let control = machine.control_order(branch)?;
+        let effect = machine.step(branch)?;
+        for instruction in self.instructions[cursor..site.head_end]
+            .iter()
+            .chain(&self.instructions[site.cast - 1..=site.store])
+        {
+            offsets.extend(instruction.offset..instruction.offset + instruction.len);
+        }
+        Ok((
+            Tail {
+                effect,
+                offsets,
+                control,
+            },
+            Some(Binding {
+                success: site.success,
+                body_start: Some(site.store + 1),
+                local,
+            }),
+        ))
+    }
+
+    /// Merge guards only along the uniquely-owned matching edge. The
+    /// alternate edge must be the same edge as the failed type test, so the
+    /// binding remains in scope for every reachable use after the guard.
+    pub(super) fn collapse_instanceof_guard<'a, 'c>(
+        &mut self,
+        head: usize,
+        region: Region<'_, 'a, 'c>,
+        machine: &Machine<'a, 'c>,
+        depth: usize,
+        condition: &mut Condition,
+        binding: &mut Binding,
+        offsets: &mut Vec<u32>,
+        control: &mut RangeInclusive<u32>,
+    ) -> Result<(), StructureError> {
+        let mut folded = Vec::new();
+        self.fold_instanceof_guards(
+            head,
+            region,
+            machine,
+            depth,
+            condition,
+            binding,
+            offsets,
+            control,
+            None,
+            &mut folded,
+        )?;
+        for block in folded {
+            self.emitted[block] = true;
+        }
+        Ok(())
+    }
+
+    fn fold_instanceof_guards<'a, 'c>(
+        &mut self,
+        mut head: usize,
+        region: Region<'_, 'a, 'c>,
+        machine: &Machine<'a, 'c>,
+        depth: usize,
+        condition: &mut Condition,
+        binding: &mut Binding,
+        offsets: &mut Vec<u32>,
+        control: &mut RangeInclusive<u32>,
+        bypass: Option<(usize, usize)>,
+        folded: &mut Vec<usize>,
+    ) -> Result<(), StructureError> {
+        let success_is_taken = binding.success == condition.taken;
+        let failure = if success_is_taken {
+            condition.fallthrough
+        } else {
+            condition.taken
+        };
+        loop {
+            let next = binding.success;
+            let node = &self.graph.blocks[next];
+            if node.predecessors != [head]
+                || !node.exception_predecessors.is_empty()
+                || !node.exception_successors.is_empty()
+                || node.successors.len() != 2
+                || !node.successors.contains(&failure)
+                || self.emitted[next]
+                || self.assertion_starts(next)
+                || self.layout.loops[next].is_some()
+                || !self.layout.inside(next, region)
+                || self
+                    .exceptions
+                    .at_start(region.exception_arm, next)
+                    .is_some()
+            {
+                break;
+            }
+            let mut along = machine.clone();
+            along.install_if_pattern_local(&binding.local);
+            let baseline = along.clone();
+            let range =
+                binding.body_start.unwrap_or(node.instructions.start)..node.instructions.end;
+            let name_checkpoint = machine.local_name_checkpoint();
+            let start = self.lines.len();
+            let tail = self.lift_range(next, range, &mut along, region, depth, Vec::new());
+            let has_lines = self.lines.len() != start;
+            self.lines.truncate(start);
+            let Ok(Tail {
+                effect:
+                    Effect::Branch {
+                        target,
+                        when_true,
+                        when_false,
+                    },
+                offsets: inner_offsets,
+                control: Some(inner_control),
+            }) = tail
+            else {
+                machine.restore_local_names(name_checkpoint);
+                break;
+            };
+            if has_lines
+                || !along.same_locals(&baseline)
+                || !along.same_control_stack(&baseline)
+                || *inner_control.start() <= *control.end()
+            {
+                machine.restore_local_names(name_checkpoint);
+                break;
+            }
+            let (taken, fallthrough) = self.branch_targets(next, target)?;
+            let (unique, yes, no) = if taken == failure {
+                (fallthrough, when_false, when_true)
+            } else {
+                (taken, when_true, when_false)
+            };
+            // A third path into the surviving arm would not establish the
+            // binding. Never infer scope from a shared successor alone.
+            let survivor = &self.graph.blocks[unique];
+            let owned = survivor.predecessors == [next];
+            let bypasses_binding = bypass.is_some_and(|(outer, shared)| {
+                shared == unique
+                    && survivor.predecessors.len() == 2
+                    && survivor.predecessors.contains(&next)
+                    && survivor.predecessors.contains(&outer)
+            }) && !self.local_is_live(unique, binding.local.slot());
+            if !(owned || bypasses_binding)
+                || !self.graph.blocks[unique].exception_predecessors.is_empty()
+                || !self.layout.inside(unique, region)
+            {
+                machine.restore_local_names(name_checkpoint);
+                break;
+            }
+            if success_is_taken {
+                condition.taken = unique;
+                condition.when_true = logical(mem::take(&mut condition.when_true), "&&", yes);
+                condition.when_false = logical(mem::take(&mut condition.when_false), "||", no);
+            } else {
+                condition.fallthrough = unique;
+                condition.when_false = logical(mem::take(&mut condition.when_false), "&&", yes);
+                condition.when_true = logical(mem::take(&mut condition.when_true), "||", no);
+            }
+            folded.push(next);
+            binding.success = unique;
+            binding.body_start = None;
+            head = next;
+            offsets.extend(inner_offsets);
+            *control = *control.start()..=*inner_control.end();
+        }
+        Ok(())
+    }
+
+    /// Factor a preceding `&&` or `||` into a pattern condition. A bypassed
+    /// match can contribute to the condition, but cannot bind the local on
+    /// a path that did not evaluate the type test.
+    pub(super) fn collapse_instanceof_prefix<'a, 'c>(
+        &mut self,
+        head: usize,
+        region: Region<'_, 'a, 'c>,
+        machine: &Machine<'a, 'c>,
+        depth: usize,
+        condition: &mut Condition,
+        offsets: &mut Vec<u32>,
+        control: &mut RangeInclusive<u32>,
+    ) -> Result<Option<Option<Binding>>, StructureError> {
+        if condition.taken == condition.fallthrough {
+            return Ok(None);
+        }
+        for (next, shared) in [
+            (condition.fallthrough, condition.taken),
+            (condition.taken, condition.fallthrough),
+        ] {
+            let node = &self.graph.blocks[next];
+            if node.predecessors != [head]
+                || node.successors.len() != 2
+                || !node.exception_predecessors.is_empty()
+                || self.emitted[next]
+                || self.layout.loops[next].is_some()
+                || !self.layout.inside(next, region)
+                || self
+                    .exceptions
+                    .at_start(region.exception_arm, next)
+                    .is_some()
+                || self.instanceof_site(next, machine, region).is_none()
+            {
+                continue;
+            }
+            let name_checkpoint = machine.local_name_checkpoint();
+            let start = self.lines.len();
+            let mut along = machine.clone();
+            let tail = self.lift_instanceof_head(next, &mut along, region, depth, Vec::new());
+            let has_lines = self.lines.len() != start;
+            self.lines.truncate(start);
+            let Ok((
+                Tail {
+                    effect:
+                        Effect::Branch {
+                            target,
+                            when_true,
+                            when_false,
+                        },
+                    offsets: mut inner_offsets,
+                    control: Some(mut inner_control),
+                },
+                Some(mut binding),
+            )) = tail
+            else {
+                machine.restore_local_names(name_checkpoint);
+                continue;
+            };
+            if has_lines
+                || !along.same_locals(machine)
+                || !along.same_control_stack(machine)
+                || *inner_control.start() <= *control.end()
+            {
+                machine.restore_local_names(name_checkpoint);
+                continue;
+            }
+            let (taken, fallthrough) = self.branch_targets(next, target)?;
+            let mut inner = Condition {
+                taken,
+                fallthrough,
+                when_true,
+                when_false,
+            };
+            let mut folded = Vec::new();
+            self.fold_instanceof_guards(
+                next,
+                region,
+                machine,
+                depth,
+                &mut inner,
+                &mut binding,
+                &mut inner_offsets,
+                &mut inner_control,
+                Some((head, shared)),
+                &mut folded,
+            )?;
+            let Condition {
+                taken,
+                fallthrough,
+                when_true,
+                when_false,
+            } = inner;
+            let (unique, yes, no) = if taken == shared {
+                (fallthrough, when_false, when_true)
+            } else if fallthrough == shared {
+                (taken, when_true, when_false)
+            } else {
+                machine.restore_local_names(name_checkpoint);
+                continue;
+            };
+            let binding = if binding.succeeds_at(unique) {
+                Some(binding)
+            } else if binding.body_start.is_none()
+                && !self.local_is_live(shared, binding.local.slot())
+            {
+                None
+            } else {
+                machine.restore_local_names(name_checkpoint);
+                continue;
+            };
+            if next == condition.taken {
+                condition.taken = unique;
+                condition.when_true = logical(mem::take(&mut condition.when_true), "&&", yes);
+                condition.when_false = logical(mem::take(&mut condition.when_false), "||", no);
+            } else {
+                condition.fallthrough = unique;
+                condition.when_false = logical(mem::take(&mut condition.when_false), "&&", yes);
+                condition.when_true = logical(mem::take(&mut condition.when_true), "||", no);
+            }
+            self.emitted[next] = true;
+            for block in folded {
+                self.emitted[block] = true;
+            }
+            offsets.extend(inner_offsets);
+            *control = *control.start()..=*inner_control.end();
+            return Ok(Some(binding));
+        }
+        Ok(None)
+    }
+
+    pub(super) fn instanceof_join(
+        &self,
+        join: Option<usize>,
+        region: Region<'_, '_, '_>,
+        binding: Option<&Binding>,
+    ) -> Option<usize> {
+        // The success node is not a shared join. An abrupt sibling can make
+        // the generic if recognizer pick it as the next block, so keep the
+        // matching path in the arm which owns its declaration instead.
+        if binding.is_some_and(|binding| join == Some(binding.success)) {
+            region.stop
+        } else {
+            join
+        }
+    }
+
+    pub(super) fn instanceof_empty_arm(
+        &self,
+        binding: Option<&Binding>,
+        join: Option<usize>,
+        arm: usize,
+    ) -> bool {
+        let Some(binding) = binding.filter(|binding| binding.success == arm) else {
+            return false;
+        };
+        let block = &self.graph.blocks[binding.success];
+        let start = binding.body_start.unwrap_or(block.instructions.start);
+        let no_body = match &self.instructions[start..block.instructions.end] {
+            [] => true,
+            [op] => matches!(op.opcode, 0xa7 | 0xc8),
+            _ => false,
+        };
+        no_body && matches!(block.successors.as_slice(), [only] if Some(*only) == join)
+    }
+
+    pub(super) fn instanceof_branch_arm<'a, 'c>(
+        &mut self,
+        start: usize,
+        region: Region<'_, 'a, 'c>,
+        baseline: &Machine<'a, 'c>,
+        depth: usize,
+        binding: Option<&Binding>,
+    ) -> Result<Arm<'a, 'c>, StructureError> {
+        let Some(binding) = binding.filter(|binding| binding.success == start) else {
+            return self.branch_arm(start, region, baseline, depth);
+        };
+        let first_line = self.lines.len();
+        let mut body = baseline.clone();
+        let body_start = binding.enter(&mut body);
+        let mut offsets = Vec::new();
+        let reaches = self.run_region(
+            start,
+            region,
+            &mut body,
+            depth,
+            &mut offsets,
+            false,
+            body_start,
+        )?;
+        if reaches
+            && !self.local_is_live(
+                region.stop.expect("branch reached its stop"),
+                binding.local.slot(),
+            )
+        {
+            body.restore_if_pattern_slot(baseline, &binding.local);
+        }
+        Ok(Arm {
+            exit: reaches.then_some(body),
+            offsets,
+            start: first_line,
+            end: self.lines.len(),
+        })
+    }
+
+    pub(super) fn lift_if_arm_start<'a, 'c>(
+        &mut self,
+        block: usize,
+        start: usize,
+        machine: &mut Machine<'a, 'c>,
+        region: Region<'_, 'a, 'c>,
+        depth: usize,
+        offsets: Vec<u32>,
+    ) -> Result<Tail, StructureError> {
+        let mut range: Range<usize> = self.graph.blocks[block].instructions.clone();
+        self.exception_range(block, region, &mut range)?;
+        self.lift_range(block, start..range.end, machine, region, depth, offsets)
+    }
+}
+
+fn reference_local(instruction: &Instruction, store: bool) -> Option<u16> {
+    let (wide, compact) = if store { (0x3a, 0x4b) } else { (0x19, 0x2a) };
+    match (instruction.opcode, &instruction.operand) {
+        (opcode, Operand::Local(slot)) if opcode == wide => Some(*slot),
+        (opcode, _) if (compact..compact + 4).contains(&opcode) => {
+            Some(u16::from(opcode - compact))
+        }
+        _ => None,
+    }
+}
+
+/// Classify an access by whether it reads the current binding before writing.
+fn local_access(instruction: &Instruction, slot: u16) -> Option<bool> {
+    let (index, read, wide_write) = match (instruction.opcode, &instruction.operand) {
+        (0x15..=0x19 | 0xa9, Operand::Local(index)) => (*index, true, false),
+        (op @ 0x1a..=0x2d, _) => (u16::from((op - 0x1a) % 4), true, false),
+        (op @ 0x36..=0x3a, Operand::Local(index)) => (*index, false, matches!(op, 0x37 | 0x39)),
+        (op @ 0x3b..=0x4e, _) => (
+            u16::from((op - 0x3b) % 4),
+            false,
+            matches!((op - 0x3b) / 4, 1 | 3),
+        ),
+        (0x84, Operand::Increment { index, .. }) => (*index, true, false),
+        _ => return None,
+    };
+    (slot == index || wide_write && index.checked_add(1) == Some(slot)).then_some(read)
+}
+
+#[cfg(test)]
+mod tests;

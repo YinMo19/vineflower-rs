@@ -6,7 +6,7 @@ use crate::{
     bytecode::{self, Instruction, Operand},
     classfile::ClassFile,
     context::NestedKind,
-    descriptor::{ClassSignature, MethodDescriptor, Type},
+    descriptor::{ClassSignature, GenericType, MethodDescriptor, Type, TypeArgument},
     source_text::Document,
 };
 
@@ -21,7 +21,53 @@ mod capture;
 pub(crate) use capture::AnonymousBindings;
 use capture::{Capture, CaptureFrame, loaded_parameter, writes_local};
 
-pub(crate) type AnonymousSites = Rc<RefCell<Vec<AnonymousSite>>>;
+#[path = "local_classes.rs"]
+mod local;
+use local::LocalSite;
+
+pub(crate) type AnonymousSites = Rc<RefCell<NestedSites>>;
+
+#[derive(Default)]
+pub(crate) struct NestedSites {
+    entries: Vec<NestedSite>,
+}
+
+enum NestedSite {
+    Anonymous(AnonymousSite),
+    Local(LocalSite),
+}
+
+impl NestedSites {
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub(crate) fn truncate(&mut self, len: usize) {
+        self.entries.truncate(len);
+    }
+
+    pub(crate) fn push(&mut self, site: AnonymousSite) {
+        self.entries.push(NestedSite::Anonymous(site));
+    }
+
+    pub(crate) fn get(&self, index: usize) -> Option<&AnonymousSite> {
+        match self.entries.get(index)? {
+            NestedSite::Anonymous(site) => Some(site),
+            NestedSite::Local(_) => None,
+        }
+    }
+
+    pub(crate) fn local_sites<'s>(&'s self, class: &'s str) -> impl Iterator<Item = &'s LocalSite> {
+        self.entries.iter().filter_map(move |entry| match entry {
+            NestedSite::Local(site) if site.class() == class => Some(site),
+            _ => None,
+        })
+    }
+
+    fn push_local(&mut self, site: LocalSite) {
+        self.entries.push(NestedSite::Local(site));
+    }
+}
 
 pub(crate) struct AnonymousSite {
     pub class: Rc<str>,
@@ -230,22 +276,22 @@ impl Machine<'_, '_> {
                     && head.starts_with("new ")
                     && !head.contains(".new ")
                 {
-                    head.replace_literal_prefix(
-                        head.len(),
-                        &format!("new {}", signature.superclass.render(self.class_name)),
-                    );
+                    head = Document::from("new ");
+                    self.append_generic_reference(&mut head, &signature.superclass);
                 }
                 (head, visible_args)
             }
             [interface] if super_owner == "java/lang/Object" && loads.is_empty() => {
-                let name = signature
+                let mut head = Document::from("new ");
+                if let Some(interface) = signature
                     .as_ref()
                     .and_then(|signature| signature.interfaces.first())
-                    .map_or_else(
-                        || pool.class_name(*interface).map(self.class_name),
-                        |interface| Ok(interface.render(self.class_name)),
-                    )?;
-                (Document::from(format!("new {name}")), &args[first..last])
+                {
+                    self.append_generic_reference(&mut head, interface);
+                } else {
+                    head.append(self.class_reference(pool.class_name(*interface)?));
+                }
+                (head, &args[first..last])
             }
             _ => return Err(fail()),
         };
@@ -261,6 +307,58 @@ impl Machine<'_, '_> {
         head.append_relative_arguments(visible_args.iter().map(|arg| &arg.text));
         let _ = write!(head, "\0{id}\0");
         Ok(Some(head))
+    }
+
+    fn append_generic_reference(&self, head: &mut Document, ty: &GenericType) {
+        match ty {
+            GenericType::Class(class) => {
+                head.append(self.class_reference(&class.internal_name));
+                self.append_generic_arguments(head, &class.arguments);
+                let mut owner = class.internal_name.clone();
+                for part in &class.nested {
+                    owner.push('$');
+                    owner.push_str(&part.name);
+                    head.push('.');
+                    self.append_class_reference(head, &part.name, &owner);
+                    self.append_generic_arguments(head, &part.arguments);
+                }
+            }
+            GenericType::Array {
+                element,
+                dimensions,
+            } => {
+                self.append_generic_reference(head, element);
+                for _ in 0..*dimensions {
+                    head.push_str("[]");
+                }
+            }
+            _ => head.push_str(&ty.render(self.class_name)),
+        }
+    }
+
+    fn append_generic_arguments(&self, head: &mut Document, arguments: &[TypeArgument]) {
+        if arguments.is_empty() {
+            return;
+        }
+        head.push('<');
+        for (index, argument) in arguments.iter().enumerate() {
+            if index != 0 {
+                head.push_str(", ");
+            }
+            match argument {
+                TypeArgument::Any => head.push('?'),
+                TypeArgument::Exact(ty) => self.append_generic_reference(head, ty),
+                TypeArgument::Extends(ty) => {
+                    head.push_str("? extends ");
+                    self.append_generic_reference(head, ty);
+                }
+                TypeArgument::Super(ty) => {
+                    head.push_str("? super ");
+                    self.append_generic_reference(head, ty);
+                }
+            }
+        }
+        head.push('>');
     }
 }
 

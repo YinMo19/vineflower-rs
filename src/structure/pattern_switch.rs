@@ -1,6 +1,10 @@
 // Copyright 2000-2024 JetBrains s.r.o. Use of this source code is governed by the Apache 2.0 license that can be found in the LICENSE file.
 
-use std::{collections::{BTreeMap, BTreeSet}, mem, ops::Range};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    mem,
+    ops::Range,
+};
 
 use crate::{
     bytecode::{Instruction, Operand},
@@ -21,9 +25,14 @@ struct Head {
 }
 
 impl Head {
-    fn recognize(instructions: &[Instruction], range: Range<usize>, pool: &ConstantPool<'_>) -> Option<Self> {
+    fn recognize(
+        instructions: &[Instruction],
+        range: Range<usize>,
+        pool: &ConstantPool<'_>,
+    ) -> Option<Self> {
         let dyn_index = range.end.checked_sub(2)?;
-        if dyn_index < range.start || instructions[dyn_index].opcode != 0xba
+        if dyn_index < range.start
+            || instructions[dyn_index].opcode != 0xba
             || !matches!(instructions[range.end - 1].operand, Operand::Switch { .. })
         {
             return None;
@@ -33,17 +42,26 @@ impl Head {
         let tail = instructions.get(range.start..dyn_index)?;
         let restart_op = tail.last()?;
         let (alias_op, alias_store, restart, restart_store) = if push_zero(restart_op) {
-            (tail.get(tail.len().checked_sub(2)?)?, tail.get(tail.len().checked_sub(3)?)?, 0, None)
+            (
+                tail.get(tail.len().checked_sub(2)?)?,
+                tail.get(tail.len().checked_sub(3)?)?,
+                0,
+                None,
+            )
         } else {
             let restart = local(restart_op, false, false)?;
-            let [.., alias_store, zero, store, alias_op, _] = tail else { return None; };
+            let [.., alias_store, zero, store, alias_op, _] = tail else {
+                return None;
+            };
             if !push_zero(zero) || local(store, true, false) != Some(restart) {
                 return None;
             }
             (alias_op, alias_store, restart, Some(dyn_index - 3))
         };
         let alias = local(alias_op, false, true)?;
-        if local(alias_store, true, true) != Some(alias) || restart_store.is_some() && restart == alias {
+        if local(alias_store, true, true) != Some(alias)
+            || restart_store.is_some() && restart == alias
+        {
             return None;
         }
         let mut setup = dyn_index - if restart_store.is_some() { 5 } else { 3 };
@@ -51,22 +69,43 @@ impl Head {
         if null_check {
             setup -= 3;
         }
-        Some(Self { setup, restart, restart_store, alias, null_check })
+        Some(Self {
+            setup,
+            restart,
+            restart_store,
+            alias,
+            null_check,
+        })
     }
 }
 
 fn ends_with_null_check(instructions: &[Instruction], pool: &ConstantPool<'_>) -> bool {
-        let [.., dup, call, pop] = instructions else { return false; };
-        if (dup.opcode, call.opcode, pop.opcode) != (0x59, 0xb8, 0x57) {
-            return false;
-        }
-        let Operand::Constant(index) = call.operand else { return false; };
-        matches!(pool.get(index), Ok(Constant::Methodref { .. }))
-            && matches!(pool.member_ref(index), Ok(("java/util/Objects", "requireNonNull", "(Ljava/lang/Object;)Ljava/lang/Object;")))
+    let [.., dup, call, pop] = instructions else {
+        return false;
+    };
+    if (dup.opcode, call.opcode, pop.opcode) != (0x59, 0xb8, 0x57) {
+        return false;
     }
+    let Operand::Constant(index) = call.operand else {
+        return false;
+    };
+    matches!(pool.get(index), Ok(Constant::Methodref { .. }))
+        && matches!(
+            pool.member_ref(index),
+            Ok((
+                "java/util/Objects",
+                "requireNonNull",
+                "(Ljava/lang/Object;)Ljava/lang/Object;"
+            ))
+        )
+}
 
 fn push_zero(op: &Instruction) -> bool {
-    op.opcode == 0x03 || matches!((op.opcode, &op.operand), (0x10 | 0x11, Operand::Immediate(0)))
+    op.opcode == 0x03
+        || matches!(
+            (op.opcode, &op.operand),
+            (0x10 | 0x11, Operand::Immediate(0))
+        )
 }
 
 fn local(op: &Instruction, store: bool, reference: bool) -> Option<u16> {
@@ -85,7 +124,9 @@ fn local(op: &Instruction, store: bool, reference: bool) -> Option<u16> {
 
 fn touches_slot(op: &Instruction, slot: u16) -> bool {
     let (index, wide) = match (op.opcode, &op.operand) {
-        (0x15..=0x19 | 0x36..=0x3a | 0xa9, Operand::Local(index)) => (*index, matches!(op.opcode, 0x16 | 0x18 | 0x37 | 0x39)),
+        (0x15..=0x19 | 0x36..=0x3a | 0xa9, Operand::Local(index)) => {
+            (*index, matches!(op.opcode, 0x16 | 0x18 | 0x37 | 0x39))
+        }
         (0x1a..=0x2d | 0x3b..=0x4e, _) => {
             let relative = op.opcode - if op.opcode <= 0x2d { 0x1a } else { 0x3b };
             (u16::from(relative % 4), matches!(relative / 4, 1 | 3))
@@ -115,12 +156,15 @@ impl Emitter<'_> {
         pending: &mut Vec<u32>,
     ) -> Result<Option<Option<usize>>, StructureError> {
         let range = self.graph.blocks[block].instructions.clone();
-        if range.is_empty() || region.exception_arm.is_some() || region.protected.is_some()
+        if range.is_empty()
+            || region.exception_arm.is_some()
+            || region.protected.is_some()
             || !self.graph.blocks[block].exception_successors.is_empty()
         {
             return Ok(None);
         }
-        let Some(head) = Head::recognize(self.instructions, range.clone(), machine.constant_pool()) else {
+        let Some(head) = Head::recognize(self.instructions, range.clone(), machine.constant_pool())
+        else {
             return Ok(None);
         };
         let indy = range.end - 2;
@@ -128,24 +172,32 @@ impl Emitter<'_> {
         let Some(dispatch) = machine.read_pattern_dispatch(&self.instructions[indy])? else {
             return Ok(None);
         };
-        let Operand::Switch { default, cases } = &switch.operand else { unreachable!() };
-        let Some(default) = self.graph.block_at(*default) else { return Ok(None); };
+        let Operand::Switch { default, cases } = &switch.operand else {
+            unreachable!()
+        };
+        let Some(default) = self.graph.block_at(*default) else {
+            return Ok(None);
+        };
         let mut groups = BTreeMap::<usize, Arm>::new();
         groups.entry(default).or_default();
         let mut by_key = vec![None; dispatch.labels.len()];
         let mut null_target = None;
         for &(key, target) in cases {
-            let Some(target) = self.graph.block_at(target) else { return Ok(None); };
+            let Some(target) = self.graph.block_at(target) else {
+                return Ok(None);
+            };
             match key {
                 NULL_KEY => null_target = Some(target),
                 k if k >= 0 && (k as usize) < by_key.len() => by_key[k as usize] = Some(target),
-                k if k == by_key.len() as i32 && target == default => {},
-                _ if target == default => {}, // tableswitch padding
+                k if k == by_key.len() as i32 && target == default => {}
+                _ if target == default => {} // tableswitch padding
                 _ => return Ok(None),
             }
         }
         for (key, target) in by_key.into_iter().enumerate() {
-            let Some(target) = target.filter(|&target| target != default) else { return Ok(None); };
+            let Some(target) = target.filter(|&target| target != default) else {
+                return Ok(None);
+            };
             groups.entry(target).or_default().keys.push(key as i32);
         }
         if !head.null_check {
@@ -157,7 +209,14 @@ impl Emitter<'_> {
             return Ok(None);
         }
 
-        let mut alias_uses = BTreeSet::from([indy - 2, if head.restart_store.is_some() { indy - 5 } else { indy - 3 }]);
+        let mut alias_uses = BTreeSet::from([
+            indy - 2,
+            if head.restart_store.is_some() {
+                indy - 5
+            } else {
+                indy - 3
+            },
+        ]);
         let mut pattern_types = Vec::new();
         for (&target, arm) in &mut groups {
             let cfg = &self.graph.blocks[target];
@@ -165,24 +224,42 @@ impl Emitter<'_> {
                 return Ok(None);
             }
             let [key] = arm.keys.as_slice() else {
-                if arm.keys.iter().any(|&key| key != NULL_KEY && matches!(dispatch.labels[key as usize], PatternLabel::Type(_))) {
+                if arm.keys.iter().any(|&key| {
+                    key != NULL_KEY
+                        && matches!(dispatch.labels[key as usize], PatternLabel::Type(_))
+                }) {
                     return Ok(None);
                 }
                 continue;
             };
-            if *key == NULL_KEY { continue; }
-            let PatternLabel::Type(ty) = &dispatch.labels[*key as usize] else { continue; };
+            if *key == NULL_KEY {
+                continue;
+            }
+            let PatternLabel::Type(ty) = &dispatch.labels[*key as usize] else {
+                continue;
+            };
             // The implicit match order must not introduce a dominated case or
             // an unconditional type pattern next to a default arm.
-            if machine.pattern_covers(ty, &dispatch.selector) { return Ok(None); }
+            if machine.pattern_covers(ty, &dispatch.selector) {
+                return Ok(None);
+            }
             pattern_types.push((*key, ty));
             let body = &self.instructions[cfg.instructions.clone()];
-            if body.first().is_some_and(|op| local(op, false, true) == Some(head.alias)) {
+            if body
+                .first()
+                .is_some_and(|op| local(op, false, true) == Some(head.alias))
+            {
                 let (width, slot) = match body {
                     [_, cast, store, ..] if cast.opcode == 0xc0 => {
-                        let Operand::Constant(index) = cast.operand else { return Ok(None); };
-                        if machine.pattern_class(index)? != *ty { return Ok(None); }
-                        let Some(slot) = local(store, true, true) else { return Ok(None); };
+                        let Operand::Constant(index) = cast.operand else {
+                            return Ok(None);
+                        };
+                        if machine.pattern_class(index)? != *ty {
+                            return Ok(None);
+                        }
+                        let Some(slot) = local(store, true, true) else {
+                            return Ok(None);
+                        };
                         (3, slot)
                     }
                     _ => return Ok(None),
@@ -196,20 +273,33 @@ impl Emitter<'_> {
         }
         pattern_types.sort_by_key(|&(key, _)| key);
         for (i, &(_, ty)) in pattern_types.iter().enumerate() {
-            if pattern_types[..i].iter().any(|&(_, prior)| machine.pattern_covers(prior, ty)) {
+            if pattern_types[..i]
+                .iter()
+                .any(|&(_, prior)| machine.pattern_covers(prior, ty))
+            {
                 return Ok(None);
             }
         }
         if self.instructions.iter().enumerate().any(|(index, op)| {
             touches_slot(op, head.alias) && !alias_uses.contains(&index)
-                || head.restart_store.is_some_and(|store| touches_slot(op, head.restart) && index != store && index != indy - 1)
+                || head.restart_store.is_some_and(|store| {
+                    touches_slot(op, head.restart) && index != store && index != indy - 1
+                })
         }) {
             return Ok(None);
         }
 
-        let join = self.layout.normal_join(block, region).or_else(|| {
-            self.layout.common_join(self.graph, region, groups.keys().copied().map(|target| (target, None)))
-        }).or(region.stop);
+        let join = self
+            .layout
+            .normal_join(block, region)
+            .or_else(|| {
+                self.layout.common_join(
+                    self.graph,
+                    region,
+                    groups.keys().copied().map(|target| (target, None)),
+                )
+            })
+            .or(region.stop);
         if groups.keys().any(|&target| Some(target) == join) {
             return Ok(None);
         }
@@ -218,14 +308,27 @@ impl Emitter<'_> {
         // Preserve the bootstrap matching order even if the bytecode lays
         // the switch blocks out differently. Null never competes with a type.
         ordered.sort_by_key(|(target, arm)| {
-            if *target == default { (2, 0) }
-            else if arm.keys == [NULL_KEY] { (0, 0) }
-            else { (1, arm.keys.first().copied().unwrap_or_default()) }
+            if *target == default {
+                (2, 0)
+            } else if arm.keys == [NULL_KEY] {
+                (0, 0)
+            } else {
+                (1, arm.keys.first().copied().unwrap_or_default())
+            }
         });
 
         self.emitted[block] = true;
-        let tail = self.lift_range(block, range.start..head.setup, machine, region, depth, mem::take(pending))?;
-        if !matches!(tail.effect, Effect::None) { return Err(self.unstructured(block)); }
+        let tail = self.lift_range(
+            block,
+            range.start..head.setup,
+            machine,
+            region,
+            depth,
+            mem::take(pending),
+        )?;
+        if !matches!(tail.effect, Effect::None) {
+            return Err(self.unstructured(block));
+        }
         let mut offsets = tail.offsets;
         let selector = machine.take_pattern_selector(
             &self.instructions[head.setup],
@@ -238,7 +341,11 @@ impl Emitter<'_> {
         }
         offsets.extend(switch.offset..switch.offset + switch.len);
         let start = self.lines.len();
-        self.push(depth, super::surrounded(selector, "switch (", ") {"), offsets);
+        self.push(
+            depth,
+            super::surrounded(selector, "switch (", ") {"),
+            offsets,
+        );
         let mut live = Vec::new();
         let return_join = join.filter(|&join| {
             if region.loop_transfer(join).is_some() {
@@ -265,14 +372,22 @@ impl Emitter<'_> {
                         PatternLabel::Constant(text) => text.clone(),
                         PatternLabel::Type(ty) => entry.pattern_binding(
                             ty,
-                            arm.binding.as_ref().map(|(indices, slot)| (&self.instructions[indices.end - 1], *slot)),
+                            arm.binding.as_ref().map(|(indices, slot)| {
+                                (&self.instructions[indices.end - 1], *slot)
+                            }),
                             self.offset(*target),
                         )?,
                     }
                 };
-                self.push(depth + 1, format!("case {label}:"), mem::take(&mut binding_offsets));
+                self.push(
+                    depth + 1,
+                    format!("case {label}:"),
+                    mem::take(&mut binding_offsets),
+                );
             }
-            if *target == default { self.syntax(depth + 1, "default:"); }
+            if *target == default {
+                self.syntax(depth + 1, "default:");
+            }
             let path = if let Some((indices, _)) = &arm.binding {
                 self.pattern_arm(*target, switch_region, entry, depth + 2, indices.end)?
             } else {
@@ -293,12 +408,19 @@ impl Emitter<'_> {
             self.emitted[join] = true;
             return Ok(Some(None));
         }
-        if live.is_empty() { return Ok(Some(None)); }
+        if live.is_empty() {
+            return Ok(Some(None));
+        }
         let join = join.expect("pattern switch normal arm reaches its join");
         let exits: Vec<_> = live.iter().map(|(arm, _, _)| arm).collect();
         let (declarations, assignments) = self.merge_arms(machine, join, &exits)?;
-        for ((arm, needs_break, mut offsets), assignments) in live.into_iter().zip(assignments).rev() {
-            let mut statements: Vec<_> = assignments.into_iter().map(|text| Line::new(depth + 2, text, mem::take(&mut offsets))).collect();
+        for ((arm, needs_break, mut offsets), assignments) in
+            live.into_iter().zip(assignments).rev()
+        {
+            let mut statements: Vec<_> = assignments
+                .into_iter()
+                .map(|text| Line::new(depth + 2, text, mem::take(&mut offsets)))
+                .collect();
             if needs_break {
                 statements.push(Line::new(depth + 2, "break;", mem::take(&mut offsets)));
             } else {
@@ -306,7 +428,12 @@ impl Emitter<'_> {
             }
             self.lines.splice(arm.end..arm.end, statements);
         }
-        self.lines.splice(start..start, declarations.into_iter().map(|text| Line::new(depth, text, Vec::new())));
+        self.lines.splice(
+            start..start,
+            declarations
+                .into_iter()
+                .map(|text| Line::new(depth, text, Vec::new())),
+        );
         Ok(Some(Some(join)))
     }
 
@@ -315,7 +442,8 @@ impl Emitter<'_> {
             return path.offsets.clone();
         }
         let range = self.graph.blocks[target].instructions.clone();
-        self.instructions.get(range.end - 1)
+        self.instructions
+            .get(range.end - 1)
             .filter(|op| matches!(op.opcode, 0xa7 | 0xc8))
             .map(|op| vec![op.offset])
             .unwrap_or_default()
@@ -329,32 +457,53 @@ impl Emitter<'_> {
         depth: usize,
         start: usize,
     ) -> Result<super::Arm<'a, 'c>, StructureError> {
-        if !self.layout.inside(block, region) || self.emitted[block] || self.layout.loops[block].is_some()
-            || self.exceptions.at_start(region.exception_arm, block).is_some()
+        if !self.layout.inside(block, region)
+            || self.emitted[block]
+            || self.layout.loops[block].is_some()
+            || self
+                .exceptions
+                .at_start(region.exception_arm, block)
+                .is_some()
         {
             return Err(self.unstructured(block));
         }
         self.emitted[block] = true;
         let start_line = self.lines.len();
         let end = self.graph.blocks[block].instructions.end;
-        let super::Tail { effect, mut offsets, .. } = self.lift_range(block, start..end, &mut entry, region, depth, Vec::new())?;
+        let super::Tail {
+            effect,
+            mut offsets,
+            ..
+        } = self.lift_range(block, start..end, &mut entry, region, depth, Vec::new())?;
         let reaches = match effect {
             Effect::None | Effect::Jump(_) => {
                 let next = self.single_successor(block)?;
                 self.region_with_offsets(next, region, &mut entry, depth, &mut offsets)?
             }
             Effect::Return(value) => {
-                let text = value.map_or_else(|| Document::from("return;"), |value| super::surrounded(value, "return ", ";"));
+                let text = value.map_or_else(
+                    || Document::from("return;"),
+                    |value| super::surrounded(value, "return ", ";"),
+                );
                 self.push(depth, text, mem::take(&mut offsets));
                 false
             }
             Effect::Throw(value) => {
-                self.push(depth, super::surrounded(value, "throw ", ";"), mem::take(&mut offsets));
+                self.push(
+                    depth,
+                    super::surrounded(value, "throw ", ";"),
+                    mem::take(&mut offsets),
+                );
                 false
             }
             _ => return Err(self.unstructured(block)),
         };
-        Ok(super::Arm { exit: reaches.then_some(entry), offsets, start: start_line, end: self.lines.len() })
+        Ok(super::Arm {
+            exit: reaches.then_some(entry),
+            offsets,
+            start: start_line,
+            end: self.lines.len(),
+        })
     }
 }
 
@@ -371,7 +520,9 @@ fn groups_can_own_return(
         && join_block.exception_predecessors.is_empty()
         && join_block.exception_successors.is_empty()
         && matches!(&emitter.instructions[join_block.instructions.clone()], [op] if op.opcode == 0xb1)
-        && groups.iter().any(|(target, _)| *target == join_block.predecessors[0])
+        && groups
+            .iter()
+            .any(|(target, _)| *target == join_block.predecessors[0])
 }
 
 #[cfg(test)]
@@ -388,11 +539,19 @@ mod tests {
         let mut instructions = decode(prefix).unwrap();
         let offset = prefix.len() as u32;
         instructions.extend([
-            Instruction { offset, opcode: 0xba, operand: Operand::Constant(1), len: 5 },
+            Instruction {
+                offset,
+                opcode: 0xba,
+                operand: Operand::Constant(1),
+                len: 5,
+            },
             Instruction {
                 offset: offset + 5,
                 opcode: 0xab,
-                operand: Operand::Switch { default: offset + 16, cases: Vec::new() },
+                operand: Operand::Switch {
+                    default: offset + 16,
+                    cases: Vec::new(),
+                },
                 len: 11,
             },
         ]);

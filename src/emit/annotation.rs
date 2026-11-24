@@ -1,5 +1,7 @@
 // Based on Vineflower annotation attributes and AnnotationExprent (Apache-2.0).
-use super::{DecompileError, Document, Writer, parse};
+use std::borrow::Cow;
+
+use super::{DecompileError, Document, Token, TokenKind, Writer, parse, symbols};
 use crate::{
     classfile::{Annotation, ElementValue, Member},
     descriptor::{Primitive, Type},
@@ -35,46 +37,70 @@ impl<'a> Writer<'a, '_> {
         Ok(())
     }
 
-    pub(super) fn annotation(&self, annotation: &Annotation) -> Result<String, DecompileError> {
-        Ok(self.annotation_document(annotation, None)?.into_flat())
-    }
-
     pub(super) fn annotation_document(
         &self,
         annotation: &Annotation,
         depth: Option<usize>,
     ) -> Result<Document, DecompileError> {
         let pool = &self.class.pool;
-        let name = self.annotation_type(pool.utf8(annotation.type_index)?)?;
+        let ty = parse(pool.utf8(annotation.type_index)?, Type::parse)?;
+        let Type::Object(owner) = ty else {
+            return Err(DecompileError::InvalidAttribute("annotation type"));
+        };
+        let name = self.names.render(&owner);
         let mut elements = Vec::with_capacity(annotation.elements.len());
         for (member, value) in &annotation.elements {
             let member = pool.utf8(*member)?;
             let mut doc = Document::new();
             if annotation.elements.len() != 1 || member != "value" {
-                doc.push_str(member);
+                if self.options.dump_text_tokens
+                    && let Some(descriptor) = self.annotation_member_type(&owner, member, value)?
+                {
+                    doc.token(
+                        member,
+                        Token {
+                            declaration: false,
+                            kind: TokenKind::Method {
+                                owner: owner.clone(),
+                                name: member.into(),
+                                descriptor: descriptor.into_owned(),
+                            },
+                        },
+                    );
+                } else {
+                    doc.push_str(member);
+                }
                 doc.push_str(" = ");
             }
-            match value {
-                ElementValue::Annotation(nested) => {
-                    doc.append(self.annotation_document(nested, None)?)
-                }
-                _ => doc.push_str(&self.annotation_value(value)?),
+            if let ElementValue::Array(values) = value
+                && let [only] = values.as_slice()
+                && !matches!(only, ElementValue::Array(_))
+            {
+                doc.append(self.annotation_value(only)?);
+            } else {
+                doc.append(self.annotation_value(value)?);
             }
             elements.push(doc);
         }
-        Ok(match depth {
+        let mut doc = match depth {
             Some(depth) => Document::annotation(depth, &name, elements),
             None => Document::inline_annotation(&name, elements),
-        })
+        };
+        if self.options.dump_text_tokens {
+            symbols::class_ranges(&mut doc, 1, &name, &owner);
+        }
+        Ok(doc)
     }
 
-    pub(super) fn annotation_value(&self, value: &ElementValue) -> Result<String, DecompileError> {
+    pub(super) fn annotation_value(
+        &self,
+        value: &ElementValue,
+    ) -> Result<Document, DecompileError> {
         let pool = &self.class.pool;
         match value {
-            ElementValue::Constant { tag: b's', index } => Ok(string_literal(
-                &pool.utf16(*index)?,
-                self.options.ascii_strings,
-            )),
+            ElementValue::Constant { tag: b's', index } => {
+                Ok(string_literal(&pool.utf16(*index)?, self.options.ascii_strings).into())
+            }
             ElementValue::Constant { tag, index } => {
                 let primitive = match tag {
                     b'B' => Primitive::Byte,
@@ -94,6 +120,7 @@ impl<'a> Writer<'a, '_> {
                     self.options,
                     |name| self.names.render(name),
                 )
+                .map(Document::from)
                 .map_err(|source| DecompileError::Render {
                     context: "annotation constant",
                     source: Box::new(source),
@@ -103,24 +130,62 @@ impl<'a> Writer<'a, '_> {
                 type_name_index,
                 const_name_index,
             } => {
-                let mut result = self.annotation_type(pool.utf8(*type_name_index)?)?;
+                let descriptor = pool.utf8(*type_name_index)?;
+                let ty = parse(descriptor, Type::parse)?;
+                let Type::Object(owner) = ty else {
+                    return Err(DecompileError::InvalidAttribute("annotation enum type"));
+                };
+                let mut result = Document::new();
+                symbols::append_class(
+                    &mut result,
+                    &self.names.render(&owner),
+                    &owner,
+                    self.options.dump_text_tokens,
+                );
+                let name = pool.utf8(*const_name_index)?;
                 result.push('.');
-                result.push_str(pool.utf8(*const_name_index)?);
+                if self.options.dump_text_tokens {
+                    result.token(
+                        name,
+                        Token {
+                            declaration: false,
+                            kind: TokenKind::Field {
+                                owner,
+                                name: name.into(),
+                                descriptor: descriptor.into(),
+                            },
+                        },
+                    );
+                } else {
+                    result.push_str(name);
+                }
                 Ok(result)
             }
             ElementValue::Class(index) => {
-                let mut result = self.annotation_type(pool.utf8(*index)?)?;
+                let descriptor = pool.utf8(*index)?;
+                let ty = if descriptor == "V" {
+                    Type::Void
+                } else {
+                    parse(descriptor, Type::parse)?
+                };
+                let mut result = self.render_type_target(
+                    &ty,
+                    &[],
+                    crate::classfile::TypeTarget::Field,
+                    &[],
+                    false,
+                )?;
                 result.push_str(".class");
                 Ok(result)
             }
-            ElementValue::Annotation(annotation) => self.annotation(annotation),
+            ElementValue::Annotation(annotation) => self.annotation_document(annotation, None),
             ElementValue::Array(values) => {
-                let mut result = String::from("{");
+                let mut result = Document::from("{");
                 for (index, value) in values.iter().enumerate() {
                     if index != 0 {
                         result.push_str(", ");
                     }
-                    result.push_str(&self.annotation_value(value)?);
+                    result.append(self.annotation_value(value)?);
                 }
                 result.push('}');
                 Ok(result)
@@ -128,10 +193,42 @@ impl<'a> Writer<'a, '_> {
         }
     }
 
-    fn annotation_type(&self, desc: &str) -> Result<String, DecompileError> {
-        if desc == "V" {
-            return Ok("void".into());
+    fn annotation_member_type(
+        &self,
+        owner: &str,
+        name: &str,
+        value: &ElementValue,
+    ) -> Result<Option<Cow<'_, str>>, DecompileError> {
+        if let Some(class) = self.group.get(owner) {
+            for method in &class.methods {
+                let pool = &class.pool;
+                let descriptor = pool.utf8(method.descriptor_index)?;
+                if descriptor.starts_with("()") && pool.utf8(method.name_index)? == name {
+                    return Ok(Some(Cow::Borrowed(descriptor)));
+                }
+            }
         }
-        Ok(parse(desc, Type::parse)?.render(|name| self.names.render(name)))
+        let mut desc = String::from("()");
+        let mut value = value;
+        while let ElementValue::Array(elements) = value {
+            let Some(first) = elements.first() else {
+                return Ok(None);
+            };
+            desc.push('[');
+            value = first;
+        }
+        match value {
+            ElementValue::Constant { tag: b's', .. } => desc.push_str("Ljava/lang/String;"),
+            ElementValue::Constant { tag, .. } => desc.push(char::from(*tag)),
+            ElementValue::Enum {
+                type_name_index, ..
+            } => desc.push_str(self.class.pool.utf8(*type_name_index)?),
+            ElementValue::Class(_) => desc.push_str("Ljava/lang/Class;"),
+            ElementValue::Annotation(annotation) => {
+                desc.push_str(self.class.pool.utf8(annotation.type_index)?)
+            }
+            ElementValue::Array(_) => unreachable!("annotation array element type"),
+        }
+        Ok(Some(Cow::Owned(desc)))
     }
 }

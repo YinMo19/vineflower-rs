@@ -25,7 +25,7 @@ fn classify(
 ) -> (ControlFlowGraph, Result<Exceptions, StructureError>) {
     let instructions = decode(bytes).unwrap();
     let graph = ControlFlowGraph::build(&instructions, handlers).unwrap();
-    let regions = Exceptions::new(&instructions, &graph, handlers);
+    let regions = Exceptions::new(&instructions, &graph, handlers, None);
     (graph, regions)
 }
 
@@ -419,6 +419,125 @@ fn resource_fold_requires_suppression_on_the_original_exception() {
             .count(),
         2
     );
+}
+
+#[test]
+fn nullable_resource_return_preserves_the_value_before_closing() {
+    let bytes = [
+        0x2a, 0x4c, // 0: aload_0; astore_1
+        0x2b, 0x4d, // 2: aload_1; astore_2 (return spill)
+        0x2b, // 4: aload_1
+        0xc6, 0, 9,    // 5: ifnull 14
+        0x2b, // 8: aload_1
+        0xb9, 0, 13, 1, 0, // 9: invokeinterface AutoCloseable.close()
+        0x2c, 0xb0, // 14: aload_2; areturn
+        0x4d, 0x2b, // 16: astore_2; aload_1
+        0xc6, 0, 18,   // 18: ifnull 36
+        0x2b, // 21: aload_1
+        0xb9, 0, 13, 1, 0, // 22: invokeinterface AutoCloseable.close()
+        0xa7, 0, 9, // 27: goto 36
+        0x4e, 0x2c, 0x2d, // 30: astore_3; aload_2; aload_3
+        0xb6, 0, 19, // 33: invokevirtual Throwable.addSuppressed(Throwable)
+        0x2c, 0xbf, // 36: aload_2; athrow
+    ];
+    let handlers = [handler(2, 4, 16, 15), handler(21, 27, 30, 15)];
+    let lines = test_method_with_descriptor(
+        &bytes,
+        &handlers,
+        &[],
+        "(Ljava/lang/AutoCloseable;)Ljava/lang/AutoCloseable;",
+    )
+    .unwrap();
+    let text: Vec<_> = lines.iter().map(|line| line.text.as_flat()).collect();
+    assert_eq!(
+        text,
+        [
+            "try (java.lang.AutoCloseable var1 = var0) {",
+            "return var1;",
+            "}"
+        ]
+    );
+    assert_eq!(lines[1].offsets, [2, 15]);
+
+    let mut bytes = bytes.to_vec();
+    bytes.extend([0x4c, 0x01, 0xb0]); // 38: astore_1; aconst_null; areturn
+    let handlers = [
+        handlers[0],
+        handlers[1],
+        handler(0, 14, 38, 26),
+        handler(16, 38, 38, 26),
+    ];
+    let lines = test_method_with_descriptor(
+        &bytes,
+        &handlers,
+        &[],
+        "(Ljava/lang/AutoCloseable;)Ljava/lang/AutoCloseable;",
+    )
+    .unwrap();
+    let text: Vec<_> = lines.iter().map(|line| line.text.as_flat()).collect();
+    assert_eq!(
+        text,
+        [
+            "try (java.lang.AutoCloseable var1 = var0) {",
+            "return var1;",
+            "} catch (java.lang.RuntimeException var1_1) {",
+            "return null;",
+            "}",
+        ]
+    );
+    assert_eq!(lines[1].depth, 1);
+}
+
+#[test]
+fn legacy_resource_proves_the_primary_exception_and_both_closes() {
+    let mut bytes = [
+        0x2a, 0x4c, 0x01, 0x4d, // 0: resource store; primary = null
+        0x2b, 0x4e, // 4: spill the return
+        0x2b, 0xc6, 0, 33, // 6: if resource is null, return at 40
+        0x2c, 0xc6, 0, 23, // 10: if primary is null, close at 34
+        0x2b, 0xb9, 0, 13, 1, 0, // 14: close with primary
+        0xa7, 0, 20, // 20: goto 40
+        0x3a, 4, 0x2c, 0x19, 4, // 23: secondary catch; load primary and secondary
+        0xb6, 0, 19, // 28: addSuppressed
+        0xa7, 0, 9, // 31: goto 40
+        0x2b, 0xb9, 0, 13, 1, 0, // 34: close with no primary
+        0x2d, 0xb0, // 40: return spill
+        0x4e, 0x2d, 0x4d, 0x2d, 0xbf, // 42: record and rethrow original failure
+        0x3a, 5, // 47: catch-all stores incoming exception
+        0x2b, 0xc6, 0, 33, // 49: if resource is null, rethrow at 83
+        0x2c, 0xc6, 0, 23, // 53: if primary is null, close at 77
+        0x2b, 0xb9, 0, 13, 1, 0, // 57: close with primary
+        0xa7, 0, 20, // 63: goto 83
+        0x3a, 4, 0x2c, 0x19, 4, // 66: secondary catch; load primary and secondary
+        0xb6, 0, 19, // 71: addSuppressed
+        0xa7, 0, 9, // 74: goto 83
+        0x2b, 0xb9, 0, 13, 1, 0, // 77: close with no primary
+        0x19, 5, 0xbf, // 83: rethrow incoming exception
+    ];
+    let handlers = [
+        handler(14, 20, 23, 15),
+        handler(4, 6, 42, 15),
+        handler(4, 6, 47, 0),
+        handler(57, 63, 66, 15),
+        handler(42, 49, 47, 0),
+    ];
+    let descriptor = "(Ljava/lang/AutoCloseable;)Ljava/lang/AutoCloseable;";
+    let lines = test_method_with_descriptor(&bytes, &handlers, &[], descriptor).unwrap();
+    let text: Vec<_> = lines.iter().map(|line| line.text.as_flat()).collect();
+    assert_eq!(
+        text,
+        [
+            "try (java.lang.AutoCloseable var1 = var0) {",
+            "return var1;",
+            "}"
+        ]
+    );
+
+    bytes[67] = 5; // Overwrite the exception that the catch-all must rethrow.
+    assert!(matches!(
+        test_method_with_descriptor(&bytes, &handlers, &[], descriptor),
+        Err(StructureError::ExceptionHandlers),
+    ));
 }
 
 #[test]

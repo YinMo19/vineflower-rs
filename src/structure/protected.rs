@@ -2,6 +2,7 @@
 
 pub(super) mod cleanup_locals;
 mod finally_graph;
+mod legacy_resource;
 mod monitor;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -10,8 +11,10 @@ use std::ops::Range;
 use crate::bytecode::{Instruction, Operand};
 use crate::cfg::ControlFlowGraph;
 use crate::classfile::ExceptionHandler;
+use crate::lift::Machine;
 
 use self::finally_graph::BranchedFinally;
+use self::legacy_resource::LegacyResource;
 use self::monitor::{MonitorHandler, MonitorPlan};
 use super::StructureError;
 
@@ -44,6 +47,7 @@ pub(super) struct ProtectedRegion {
     pub(super) catches: Vec<Catch>,
     pub(super) finally: Option<Finally>,
     pub(super) monitor: Option<Monitor>,
+    pub(super) legacy_resource: Option<Legacy>,
     pub(super) join: Option<usize>,
     enclosing: Option<ArmId>,
 }
@@ -62,6 +66,22 @@ pub(super) struct Finally {
 pub(super) struct Monitor {
     arm: ArmId,
     pub(super) plan: MonitorPlan,
+}
+
+pub(super) struct Legacy {
+    pub(super) arm: ArmId,
+    pub(super) acquisition: usize,
+    pub(super) slot: u16,
+    pub(super) exit: LegacyExit,
+}
+
+pub(super) enum LegacyExit {
+    Continue(usize),
+    Return {
+        spill: usize,
+        block: usize,
+        transfer: usize,
+    },
 }
 
 struct Cleanup {
@@ -122,6 +142,7 @@ impl Exceptions {
         instructions: &[Instruction],
         graph: &ControlFlowGraph,
         handlers: &[ExceptionHandler],
+        machine: Option<&Machine<'_, '_>>,
     ) -> Result<Self, StructureError> {
         if handlers.is_empty() {
             return Ok(Self::default());
@@ -129,6 +150,9 @@ impl Exceptions {
         let mut table = Table::new(instructions, graph, handlers)?;
         let dominators = Dominance::new(graph);
         let mut result = Self::default();
+        if let Some(machine) = machine {
+            result.classify_legacy_resources(instructions, graph, &mut table, machine)?;
+        }
         let mut cleanups = BTreeMap::new();
         // Register verified normal copies before classifying bodies. A copy
         // can be an exit of both a finally and its nested typed catch.
@@ -189,6 +213,82 @@ impl Exceptions {
         Ok(result)
     }
 
+    fn classify_legacy_resources(
+        &mut self,
+        instructions: &[Instruction],
+        graph: &ControlFlowGraph,
+        table: &mut Table,
+        machine: &Machine<'_, '_>,
+    ) -> Result<(), StructureError> {
+        loop {
+            let mut proven = None;
+            for (covered, routes) in &table.by_range {
+                for route in routes.iter().filter(|route| route.catch_type == 0) {
+                    if let Some(plan) = LegacyResource::prove(
+                        instructions,
+                        graph,
+                        &table.by_block,
+                        machine,
+                        covered,
+                        route.handler,
+                    )? {
+                        proven = Some(plan);
+                        break;
+                    }
+                }
+                if proven.is_some() {
+                    break;
+                }
+            }
+            let Some(plan) = proven else { return Ok(()) };
+            let mut rows = plan.copies.iter();
+            let Some((&close, &next)) = rows.next() else {
+                return Err(unsupported());
+            };
+            if rows.next().is_some() {
+                // The regular structurer must own distinct departures
+                // (including labeled break/continue) before we hide them.
+                return Err(unsupported());
+            }
+            let scaffold = plan.scaffold;
+            let id = ExceptionId(self.regions.len());
+            let body = self.add_arm(id, plan.covered);
+            let arm = self.add_arm(id, scaffold);
+            let exit = if let Some(returned) = plan.returned {
+                LegacyExit::Return {
+                    spill: returned.spill,
+                    block: returned.block,
+                    transfer: returned.transfer,
+                }
+            } else {
+                LegacyExit::Continue(next)
+            };
+            self.regions.push(ProtectedRegion {
+                start: plan.start,
+                body,
+                catches: Vec::new(),
+                finally: None,
+                monitor: None,
+                legacy_resource: Some(Legacy {
+                    arm,
+                    acquisition: plan.acquisition,
+                    slot: plan.resource,
+                    exit,
+                }),
+                join: Some(close),
+                enclosing: None,
+            });
+            self.omitted_instructions.extend(plan.null_init);
+            for routes in &mut table.by_block {
+                routes.retain(|route| !plan.routes.contains(route));
+            }
+            for routes in table.by_range.values_mut() {
+                routes.retain(|route| !plan.routes.contains(route));
+            }
+            table.by_range.retain(|_, routes| !routes.is_empty());
+        }
+    }
+
     pub(super) fn at_start(&self, arm: Option<ArmId>, block: usize) -> Option<ExceptionId> {
         self.entries.get(&(arm, block)).copied()
     }
@@ -213,7 +313,11 @@ impl Exceptions {
             return None;
         }
         let inner = self.region(self.at_start(Some(outer.body), outer.start)?);
-        if inner.finally.is_some() || inner.monitor.is_some() || inner.join != outer.join {
+        if inner.finally.is_some()
+            || inner.monitor.is_some()
+            || inner.legacy_resource.is_some()
+            || inner.join != outer.join
+        {
             return None;
         }
         // The hierarchy already proves that the inner arms are disjoint
@@ -372,6 +476,7 @@ impl Exceptions {
             catches,
             finally,
             monitor,
+            legacy_resource: None,
             join: exits.pop_first(),
             enclosing: None,
         });
@@ -634,7 +739,8 @@ impl Exceptions {
             let arms = std::iter::once(region.body)
                 .chain(region.catches.iter().map(|catch| catch.arm))
                 .chain(region.finally.iter().map(|finally| finally.arm))
-                .chain(region.monitor.iter().map(|monitor| monitor.arm));
+                .chain(region.monitor.iter().map(|monitor| monitor.arm))
+                .chain(region.legacy_resource.iter().map(|resource| resource.arm));
             let mut enclosing = None;
             for &candidate in &memberships[&region.start] {
                 let candidate_arm = &self.arms[candidate.0];
@@ -644,6 +750,10 @@ impl Exceptions {
                 if arms
                     .clone()
                     .all(|arm| self.arms[arm.0].blocks.is_subset(&candidate_arm.blocks))
+                    && region
+                        .legacy_resource
+                        .as_ref()
+                        .is_none_or(|resource| candidate_arm.blocks.contains(&resource.acquisition))
                     && region.monitor.as_ref().is_none_or(|monitor| {
                         candidate_arm.blocks.contains(&monitor.plan.acquisition)
                     })

@@ -173,6 +173,7 @@ impl<'a, 'c> Writer<'a, 'c> {
             anonymous_bindings: self.anonymous_bindings.clone(),
             body: String::new(),
             lines: 0,
+            tokens: Vec::new(),
             mapping: self.mapping.as_ref().map(|_| SourceMap::default()),
         };
         loop {
@@ -193,6 +194,7 @@ impl<'a, 'c> Writer<'a, 'c> {
                 *output = Some(MethodOutput {
                     body: mem::take(&mut buffer.body),
                     lines: mem::take(&mut buffer.lines),
+                    tokens: mem::take(&mut buffer.tokens),
                     mapping: buffer.mapping.as_mut().map(mem::take),
                 });
                 changed = true;
@@ -213,6 +215,11 @@ impl<'a, 'c> Writer<'a, 'c> {
             if let (Some(mapping), Some(method_mapping)) = (&mut self.mapping, output.mapping) {
                 mapping.append(method_mapping, self.lines);
             }
+            self.tokens
+                .extend(output.tokens.into_iter().map(|(token, mut range)| {
+                    range.shift_lines(self.lines);
+                    (token, range)
+                }));
             self.lines += output.lines;
             *needs_gap = true;
         }
@@ -255,5 +262,6 @@ impl<'a, 'c> Writer<'a, 'c> {
 struct MethodOutput {
     body: String,
     lines: usize,
+    tokens: Vec<(Rc<super::Token>, super::TokenRange)>,
     mapping: Option<SourceMap>,
 }

@@ -1,13 +1,16 @@
 // Based on Vineflower ClassWriter and NestedClassProcessor (Apache-2.0).
 // Copyright 2000-2021 JetBrains s.r.o.
-use std::rc::Rc;
+use std::{iter::Peekable, ops::Range, rc::Rc};
 
 use crate::{
     cfg::ControlFlowGraph,
     context::NestedKind,
     descriptor::MethodDescriptor,
     lift::{AnonymousSite, AnonymousSites, Machine},
-    source_text::Document,
+    source_text::{
+        Document,
+        tokens::{Token, TokenPosition, TokenRange},
+    },
     structure::{assertions::Sites, structure_with_assertions},
 };
 
@@ -16,10 +19,9 @@ use super::{DecompileError, Writer, parse};
 impl<'a, 'c> Writer<'a, 'c> {
     pub(super) fn anonymous_sites(&self) -> Option<AnonymousSites> {
         (self.options.decompile_inner
-            && self
-                .group
-                .children(self.owner)
-                .any(|(_, class)| matches!(class.kind, NestedKind::Anonymous)))
+            && self.group.children(self.owner).any(|(_, class)| {
+                matches!(class.kind, NestedKind::Anonymous | NestedKind::Local(_))
+            }))
         .then(AnonymousSites::default)
     }
 
@@ -39,9 +41,12 @@ impl<'a, 'c> Writer<'a, 'c> {
         let mut fragments = text.split('\0');
         let depth = self.depth + depth;
         self.indent_anonymous(depth);
-        self.body
-            .push_str(fragments.next().expect("split yields initial fragment"));
+        let first = fragments.next().expect("split yields initial fragment");
+        let mut tokens = doc.flat_tokens().peekable();
+        self.append_anonymous_fragment(first, 0, &mut tokens);
+        let mut fragment_start = first.len() + 1;
         while let Some(id) = fragments.next() {
+            fragment_start += id.len() + 1;
             let id = id.parse::<usize>().map_err(|_| invalid())?;
             let site = sites.get(id).ok_or_else(invalid)?;
             let tail = fragments.next().ok_or_else(invalid)?;
@@ -65,11 +70,63 @@ impl<'a, 'c> Writer<'a, 'c> {
                 self.indent_anonymous(depth);
             }
             self.body.push('}');
-            self.body.push_str(tail);
+            self.append_anonymous_fragment(tail, fragment_start, &mut tokens);
+            fragment_start += tail.len() + 1;
         }
         self.body.push('\n');
         self.lines += 1;
         Ok(())
+    }
+
+    fn append_anonymous_fragment<'t>(
+        &mut self,
+        fragment: &str,
+        start: usize,
+        tokens: &mut Peekable<impl Iterator<Item = (Range<usize>, &'t Rc<Token>)>>,
+    ) {
+        if self.options.dump_text_tokens {
+            let mut position = TokenPosition {
+                line: self.lines,
+                column: self
+                    .body
+                    .rsplit('\n')
+                    .next()
+                    .unwrap_or_default()
+                    .encode_utf16()
+                    .count(),
+            };
+            let mut previous = 0;
+            let end = start + fragment.len();
+            while tokens.peek().is_some_and(|(span, _)| span.start < end) {
+                let (span, token) = tokens.next().expect("peeked token");
+                if span.start < start || span.end > end {
+                    continue;
+                }
+                let offset = span.start - start;
+                let width = fragment[offset..span.end - start].encode_utf16().count();
+                for ch in fragment[previous..offset].chars() {
+                    if ch == '\n' {
+                        position.line += 1;
+                        position.column = 0;
+                    } else {
+                        position.column += ch.len_utf16();
+                    }
+                }
+                previous = offset;
+                self.tokens.push((
+                    Rc::clone(token),
+                    TokenRange {
+                        start: position,
+                        end: TokenPosition {
+                            column: position.column + width,
+                            ..position
+                        },
+                    },
+                ));
+            }
+        }
+        self.lines += fragment.bytes().filter(|&byte| byte == b'\n').count();
+        self.body.push_str(fragment);
     }
 
     fn indent_anonymous(&mut self, depth: usize) {

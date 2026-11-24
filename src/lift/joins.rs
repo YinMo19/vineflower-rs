@@ -1,13 +1,17 @@
 // Copyright 2000-2018 JetBrains s.r.o. Use of this source code is governed by the Apache 2.0 license that can be found in the LICENSE file.
 
-use std::ops::RangeInclusive;
+use std::{ops::RangeInclusive, rc::Rc};
 
 use super::Local;
 use crate::lift::{
     LiftError, Machine,
     expr::{BOOLEAN, Category, Expr, INT, Order, Source, TERNARY},
 };
-use crate::{bytecode::Instruction, descriptor::Type, source_text::Document};
+use crate::{
+    bytecode::Instruction,
+    descriptor::{GenericType, MethodSignature, Type, TypeArgument},
+    source_text::{Document, tokens::Token},
+};
 
 pub(crate) struct JoinCode {
     pub(crate) declarations: Vec<Document>,
@@ -30,20 +34,29 @@ pub(crate) struct LocalJoinCode {
 
 pub(crate) struct LocalCopy {
     pub(crate) statement: Document,
-    direct: Option<(String, String)>,
+    direct: Option<DirectLocalCopy>,
+}
+
+struct DirectLocalCopy {
+    source: String,
+    target: String,
+    token: Option<Rc<Token>>,
 }
 
 impl LocalCopy {
     /// If the source is an immediately preceding declaration, assign to the
     /// outer binding directly. Its RHS and bytecode mapping stay in place.
     pub(crate) fn fuse(&self, line: &mut Document) -> bool {
-        let Some((declaration, assignment)) = &self.direct else {
+        let Some(copy) = &self.direct else {
             return false;
         };
-        if !line.starts_with(declaration) {
+        if !line.starts_with(&copy.source) {
             return false;
         }
-        line.replace_literal_prefix(declaration.len(), assignment);
+        line.replace_literal_prefix(copy.source.len(), &copy.target);
+        if let Some(token) = &copy.token {
+            line.token_at(0..copy.target.len() - " = ".len(), Rc::clone(token));
+        }
         true
     }
 }
@@ -53,6 +66,144 @@ pub(crate) struct HeldStack {
 }
 
 impl Machine<'_, '_> {
+    pub(crate) fn loop_binding_type(&self, slot: u16) -> Option<&Type> {
+        Some(&self.locals.slots.get(usize::from(slot))?.as_ref()?.ty)
+    }
+
+    pub(crate) fn loop_binding_starts_here(
+        &self,
+        slot: u16,
+        store: &Instruction,
+        earlier_store: bool,
+    ) -> bool {
+        let Some(local) = self
+            .locals
+            .slots
+            .get(usize::from(slot))
+            .and_then(Option::as_ref)
+        else {
+            return false;
+        };
+        if let Some((start, _)) = local.debug_range {
+            let end = self.debug_offset(store.offset + store.len - 1) + 1;
+            return u32::from(start) == end;
+        }
+        if earlier_store {
+            return false;
+        }
+        let receiver = u16::from(self.method.access_flags & 0x0008 == 0);
+        slot >= receiver
+            + self
+                .descriptor
+                .parameters
+                .iter()
+                .map(Type::slots)
+                .sum::<u16>()
+    }
+
+    pub(crate) fn bind_loop_element(
+        &mut self,
+        store: &Instruction,
+        slot: u16,
+        ty: Type,
+    ) -> Option<Document> {
+        let index = usize::from(slot);
+        if index + usize::from(ty.slots()) > self.locals.slots.len()
+            || self.locals.slots[index].is_some()
+            || index > 0
+                && self.locals.slots[index - 1]
+                    .as_ref()
+                    .is_some_and(|local| local.ty.slots() == 2)
+            || ty.slots() == 2 && self.locals.slots[index + 1].is_some()
+        {
+            return None;
+        }
+        let end = self.debug_offset(store.offset + store.len - 1) + 1;
+        let debug = self.locals.debug_at(slot, end);
+        let debug_range = debug.map(|entry| (entry.start_pc, entry.length));
+        if debug.is_some_and(|entry| Type::parse(entry.descriptor).ok().as_ref() != Some(&ty)) {
+            // Do not remove a separate JVM store conversion or let the
+            // foreach declaration introduce a different binding type.
+            return None;
+        }
+        let name = self.locals.local_name(slot, &ty, debug);
+        let mut declaration = self.local_type_document(&ty);
+        declaration.push(' ');
+        let local = Local {
+            name,
+            ty,
+            debug_range,
+            receiver: false,
+            token_index: self.locals.new_local_token_index(slot),
+        };
+        self.append_local_binding(&mut declaration, slot, &local, true);
+        self.locals.slots[index] = Some(local);
+        Some(declaration)
+    }
+
+    pub(crate) fn forget_loop_binding(&mut self, slot: u16) {
+        self.locals.slots[usize::from(slot)] = None;
+    }
+
+    pub(crate) fn loop_receiver(&self, slot: u16) -> Option<Document> {
+        let local = self.locals.slots.get(usize::from(slot))?.as_ref()?;
+        if Category::of(&local.ty) != Some(Category::Ref) {
+            return None;
+        }
+        Some(match self.lexical_parameter(slot) {
+            Some(expr) => expr.text,
+            None => self.local_binding_document(slot, local, false),
+        })
+    }
+
+    pub(crate) fn render_loop_type(&self, ty: &Type) -> String {
+        self.render_type(ty)
+    }
+
+    pub(crate) fn supports_enhanced_for(&self) -> bool {
+        self.class.major_version >= 49
+    }
+
+    pub(crate) fn proves_iterable(&self, ty: &Type, owner: &str) -> bool {
+        let Type::Object(receiver) = ty else {
+            return false;
+        };
+        if platform_iterable(receiver) && platform_iterable(owner) {
+            return true;
+        }
+        let iterable = Type::Object("java/lang/Iterable".into());
+        (platform_iterable(receiver) || self.known_assignable(ty, &iterable))
+            && (platform_iterable(owner)
+                || self.known_assignable(&Type::Object(owner.into()), &iterable))
+    }
+
+    pub(crate) fn loop_receiver_has_element(&self, slot: u16, ty: &Type, owner: &str) -> bool {
+        // Local declarations currently render erased JVM types. A matching
+        // parameter signature is already printed with its type arguments.
+        self.loop_parameter_element(slot, owner).as_ref() == Some(ty)
+    }
+
+    fn loop_parameter_element(&self, slot: u16, owner: &str) -> Option<Type> {
+        let local = self.locals.slots.get(usize::from(slot))?.as_ref()?;
+        if !self.options.decompile_generics {
+            return None;
+        }
+        if !local.debug_range.is_none_or(|range| range.0 == 0) {
+            return None;
+        }
+        let mut cursor = u16::from(self.method.access_flags & 0x0008 == 0);
+        let ordinal = self.descriptor.parameters.iter().position(|ty| {
+            let matches = cursor == slot;
+            cursor += ty.slots();
+            matches
+        })?;
+        let signature = self.method.signature(&self.class.pool).ok()??;
+        let mut method = MethodSignature::parse(signature).ok()?;
+        (ordinal < method.parameters.len())
+            .then(|| method.parameters.swap_remove(ordinal))
+            .and_then(|ty| iterable_argument(ty, owner))
+    }
+
     pub(crate) fn control_order(
         &self,
         instruction: &Instruction,
@@ -454,14 +605,19 @@ impl Machine<'_, '_> {
                 before.clone()
             } else {
                 let name = self.locals.local_name(index, &ty, debug);
-                code.declarations
-                    .push(format!("{} {name};", self.render_type(&ty)).into());
-                Local {
+                let mut declaration = self.local_type_document(&ty);
+                declaration.push(' ');
+                let local = Local {
                     name,
                     ty,
                     debug_range,
                     receiver: false,
-                }
+                    token_index: self.locals.new_local_token_index(index),
+                };
+                self.append_local_binding(&mut declaration, index, &local, true);
+                declaration.push(';');
+                code.declarations.push(declaration);
+                local
             };
             for (arm, assignments) in arms.iter().zip(&mut code.arms) {
                 let value = arm.locals.slots[slot]
@@ -469,17 +625,26 @@ impl Machine<'_, '_> {
                     .expect("checked incoming binding");
                 if value.name != local.name {
                     let expr = arm.coerce(
-                        Expr::atom(value.ty.clone(), value.name.clone().into()),
+                        Expr::atom(
+                            value.ty.clone(),
+                            arm.local_binding_document(index, value, false),
+                        ),
                         &local.ty,
                         false,
                     )?;
+                    let token = self.local_binding_token(index, &local, false);
+                    let mut target = Document::new();
+                    if let Some(token) = &token {
+                        target.token(&local.name, Rc::clone(token));
+                    } else {
+                        target.push_str(&local.name);
+                    }
                     assignments.push(LocalCopy {
-                        statement: assignment(&local.name, expr.text),
-                        direct: (value.ty == local.ty).then(|| {
-                            (
-                                format!("{} {} = ", self.render_type(&value.ty), value.name),
-                                format!("{} = ", local.name),
-                            )
+                        statement: local_assignment(target, expr.text),
+                        direct: (value.ty == local.ty).then(|| DirectLocalCopy {
+                            source: format!("{} {} = ", self.render_type(&value.ty), value.name),
+                            target: format!("{} = ", local.name),
+                            token,
                         }),
                     });
                 }
@@ -529,11 +694,17 @@ impl Machine<'_, '_> {
                 return Err(invalid());
             }
             let value = self.coerce(
-                Expr::atom(from.ty.clone(), from.name.clone().into()),
+                Expr::atom(
+                    from.ty.clone(),
+                    self.local_binding_document(slot as u16, from, false),
+                ),
                 &to.ty,
                 false,
             )?;
-            assignments.push(assignment(&to.name, value.text));
+            assignments.push(local_assignment(
+                entry.local_binding_document(slot as u16, to, false),
+                value.text,
+            ));
         }
         Ok(assignments)
     }
@@ -585,11 +756,74 @@ impl Machine<'_, '_> {
     }
 }
 
+// This part of the platform hierarchy is known without runtime classes and
+// each listed type carries the Iterable parameter through without changes.
+fn platform_iterable(name: &str) -> bool {
+    matches!(
+        name,
+        "java/lang/Iterable"
+            | "java/util/Collection"
+            | "java/util/List"
+            | "java/util/Set"
+            | "java/util/SortedSet"
+            | "java/util/NavigableSet"
+            | "java/util/Queue"
+            | "java/util/Deque"
+            | "java/util/ArrayList"
+            | "java/util/LinkedList"
+            | "java/util/HashSet"
+            | "java/util/TreeSet"
+            | "java/util/ArrayDeque"
+            | "java/util/Vector"
+    )
+}
+
+fn iterable_argument(ty: GenericType, owner: &str) -> Option<Type> {
+    let GenericType::Class(class) = ty else {
+        return None;
+    };
+    if class.internal_name != owner || !class.nested.is_empty() || !platform_iterable(owner) {
+        return None;
+    }
+    let [argument]: [TypeArgument; 1] = class.arguments.try_into().ok()?;
+    match argument {
+        TypeArgument::Exact(ty) | TypeArgument::Extends(ty) => generic_erasure(ty),
+        _ => None,
+    }
+}
+
+fn generic_erasure(ty: GenericType) -> Option<Type> {
+    match ty {
+        GenericType::Class(class) if class.nested.is_empty() => {
+            Some(Type::Object(class.internal_name))
+        }
+        GenericType::Array {
+            dimensions,
+            element,
+        } => {
+            let mut ty = generic_erasure(*element)?;
+            for _ in 0..dimensions {
+                ty = Type::Array(Box::new(ty));
+            }
+            Some(ty)
+        }
+        GenericType::Primitive(primitive) => Some(Type::Primitive(primitive)),
+        _ => None,
+    }
+}
+
 fn assignment(target: &str, mut value: Document) -> Document {
     value.prepend_str(" = ");
     value.prepend_str(target);
     value.push(';');
     value
+}
+
+fn local_assignment(mut target: Document, value: Document) -> Document {
+    target.push_str(" = ");
+    target.append(value);
+    target.push(';');
+    target
 }
 
 fn boolean_arm(condition: &Document, value: &Expr, and: bool) -> (Document, u8) {

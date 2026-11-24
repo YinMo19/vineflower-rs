@@ -53,6 +53,8 @@ Exact upstream comparison with all fixture bytecode and required JDKs:
 | Class groups and structured recovery | 73 | 254 | 370 | 0 |
 | Assertions, switch dispatch and array literals | 85 | 227 | 385 | 0 |
 | Width-aware source documents and switch expressions | 93 | 227 | 377 | 0 |
+| Allocation and stack-bookkeeping source maps | 100 | 227 | 370 | 0 |
+| Kotlin when and single-pass JVM pattern switches | 101 | 221 | 375 | 0 |
 
 All eight upstream CLI and bulk cases match. The full test remains failing
 until all 697 comparisons match.

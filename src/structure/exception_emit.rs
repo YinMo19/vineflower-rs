@@ -7,7 +7,8 @@ use crate::lift::{Effect, Machine};
 use crate::source_text::Document;
 
 use super::protected::{
-    Catch, ExceptionId, Monitor, ProtectedRegion, local_touches, reference_load, reference_store,
+    Catch, ExceptionId, Legacy, LegacyExit, Monitor, ProtectedRegion, cleanup_locals,
+    local_touches, reference_load, reference_store,
 };
 use super::{Emitter, Region, StructureError};
 
@@ -15,8 +16,23 @@ struct Resource {
     acquisition: usize,
     slot: u16,
     normal_cleanup: usize,
-    continuation: usize,
+    exit: ResourceExit,
     skipped: Vec<usize>,
+}
+
+#[derive(Clone, Copy)]
+enum ResourceExit {
+    Continue(usize),
+    Return { spill: usize, transfer: usize },
+}
+
+enum CloseExit {
+    Continue(usize),
+    Return {
+        block: usize,
+        transfer: usize,
+        local: cleanup_locals::Local,
+    },
 }
 
 impl Emitter<'_> {
@@ -38,10 +54,11 @@ impl Emitter<'_> {
         }
         self.require_empty_stack(machine, shape.start)?;
         pending.clear();
+        if let Some(legacy) = &shape.legacy_resource {
+            return self.emit_legacy_resource(shape, legacy, region, machine, depth);
+        }
         if let Some(resource) = self.prove_resource(shape, region, machine, depth)? {
-            return self
-                .emit_resource(shape, resource, region, machine, depth)
-                .map(Some);
+            return self.emit_resource(shape, resource, region, machine, depth);
         }
         let (clauses, scope) = if let Some(inner) = exceptions.catches_of_finally(shape) {
             (
@@ -59,6 +76,10 @@ impl Emitter<'_> {
             machine,
             depth + 1,
         )?;
+        // If the entire protected body is one verified resource statement,
+        // the surrounding catch/finally clauses are its Java clauses. The
+        // acquisition and both close paths remain inside that same scope.
+        self.fuse_resource_wrapper(body_lines, depth);
         for catch in &clauses.catches {
             let store = &self.instructions[self.graph.blocks[catch.start].instructions.start];
             let mut body = machine.clone();
@@ -82,9 +103,12 @@ impl Emitter<'_> {
                     (union, name)
                 }
             };
+            let mut header = Document::from(format!("}} catch ({types} "));
+            header.append(name);
+            header.push_str(") {");
             self.push(
                 depth,
-                Document::from(format!("}} catch ({types} {name}) {{")),
+                header,
                 (store.offset..store.offset + store.len).collect(),
             );
             if self.region(
@@ -161,6 +185,27 @@ impl Emitter<'_> {
         Ok(if reaches_join { continuation } else { None })
     }
 
+    fn fuse_resource_wrapper(&mut self, wrapper: usize, depth: usize) {
+        let lines = &self.lines[wrapper..];
+        let [_, header, middle @ .., end] = lines else {
+            return;
+        };
+        if header.depth != depth + 1
+            || !header.text.as_flat().starts_with("try (")
+            || end.depth != depth + 1
+            || end.text.as_flat() != "}"
+            || !end.offsets.is_empty()
+            || middle.iter().any(|line| line.depth <= depth + 1)
+        {
+            return;
+        }
+        self.lines.pop();
+        self.lines.remove(wrapper);
+        for line in &mut self.lines[wrapper..] {
+            line.depth -= 1;
+        }
+    }
+
     fn emit_monitor<'a, 'c>(
         &mut self,
         shape: &ProtectedRegion,
@@ -208,6 +253,92 @@ impl Emitter<'_> {
         Ok(if reaches { shape.join } else { None })
     }
 
+    fn emit_legacy_resource<'a, 'c>(
+        &mut self,
+        shape: &ProtectedRegion,
+        legacy: &Legacy,
+        region: Region<'_, 'a, 'c>,
+        machine: &mut Machine<'a, 'c>,
+        depth: usize,
+    ) -> Result<Option<usize>, StructureError> {
+        let acquisition = self
+            .resource_declaration(legacy.acquisition, legacy.slot, depth, machine, 2)
+            .ok_or_else(|| self.unstructured(shape.start))?;
+        let mut terminal = None;
+        let exit = match legacy.exit {
+            LegacyExit::Continue(next) => ResourceExit::Continue(next),
+            LegacyExit::Return {
+                spill,
+                block,
+                transfer,
+            } => {
+                if self.exceptions.at_start(Some(shape.body), spill).is_some()
+                    || self.exceptions.cleanup_prefix(spill) != 0
+                    || self.exceptions.skips_binding(spill)
+                    || self.exceptions.monitor_acquisition_end(spill).is_some()
+                    || self
+                        .exceptions
+                        .skips_instruction(self.graph.blocks[spill].instructions.end - 1)
+                {
+                    return Err(self.unstructured(spill));
+                }
+                terminal = Some(block);
+                ResourceExit::Return { spill, transfer }
+            }
+        };
+        let mut skipped = Vec::new();
+        for block in self.exceptions.arm_blocks(legacy.arm).chain(terminal) {
+            if self.emitted[block]
+                || self.exceptions.cleanup_prefix(block) != 0
+                || (!self.exceptions.contains(region.exception_arm, block)
+                    && !matches!(exit, ResourceExit::Return { transfer, .. }
+                        if self.graph.blocks[block].instructions.contains(&transfer)
+                            && self.graph.blocks[block].exception_successors.is_empty()))
+            {
+                return Err(self.unstructured(block));
+            }
+            skipped.push(block);
+        }
+        self.emit_resource(
+            shape,
+            Resource {
+                acquisition,
+                slot: legacy.slot,
+                normal_cleanup: shape.join.ok_or(StructureError::ExceptionHandlers)?,
+                exit,
+                skipped,
+            },
+            region,
+            machine,
+            depth,
+        )
+    }
+
+    fn resource_declaration(
+        &self,
+        block: usize,
+        slot: u16,
+        depth: usize,
+        machine: &Machine<'_, '_>,
+        suffix: usize,
+    ) -> Option<usize> {
+        let index = self.lines.len().checked_sub(1)?;
+        let instructions = self.block_instructions(block);
+        let store = instructions.get(instructions.len().checked_sub(suffix + 1)?)?;
+        let line = &self.lines[index];
+        let (ty, name) = machine.resource_local(slot)?;
+        let text = line.text.as_flat();
+        (line.depth == depth
+            && line.offsets.contains(&store.offset)
+            && text.ends_with(';')
+            && text
+                .strip_prefix(&ty)
+                .and_then(|text| text.strip_prefix(' '))
+                .and_then(|text| text.strip_prefix(name))
+                .is_some_and(|text| text.starts_with(" = ")))
+        .then_some(index)
+    }
+
     fn emit_resource<'a, 'c>(
         &mut self,
         shape: &ProtectedRegion,
@@ -215,24 +346,76 @@ impl Emitter<'_> {
         region: Region<'_, 'a, 'c>,
         machine: &mut Machine<'a, 'c>,
         depth: usize,
-    ) -> Result<usize, StructureError> {
+    ) -> Result<Option<usize>, StructureError> {
         let line = &mut self.lines[resource.acquisition];
         line.text.pop(); // Verified declaration terminator.
         line.text.surround("try (", ") {");
         for block in resource.skipped {
             self.emitted[block] = true;
         }
-        if !self.scoped_arm(
-            shape.start,
-            region.exception(Some(resource.normal_cleanup), shape.body, Some(machine)),
-            machine,
-            depth + 1,
-        )? {
-            return Err(self.unstructured(shape.start));
-        }
+        let next = match resource.exit {
+            ResourceExit::Continue(next) => {
+                if !self.scoped_arm(
+                    shape.start,
+                    region.exception(Some(resource.normal_cleanup), shape.body, Some(machine)),
+                    machine,
+                    depth + 1,
+                )? {
+                    return Err(self.unstructured(shape.start));
+                }
+                Some(next)
+            }
+            ResourceExit::Return { spill, transfer } => {
+                self.emit_resource_return(shape, spill, transfer, region, machine, depth + 1)?;
+                None
+            }
+        };
         self.syntax(depth, "}");
         machine.forget_resource_local(resource.slot);
-        Ok(resource.continuation)
+        Ok(next)
+    }
+
+    fn emit_resource_return<'a, 'c>(
+        &mut self,
+        shape: &ProtectedRegion,
+        spill: usize,
+        transfer: usize,
+        region: Region<'_, 'a, 'c>,
+        baseline: &Machine<'a, 'c>,
+        depth: usize,
+    ) -> Result<(), StructureError> {
+        let scope = region.exception(Some(spill), shape.body, Some(baseline));
+        let mut body = baseline.clone();
+        let mut offsets = Vec::new();
+        if !self.region_with_offsets(shape.start, scope, &mut body, depth, &mut offsets)?
+            || mem::replace(&mut self.emitted[spill], true)
+        {
+            return Err(self.unstructured(spill));
+        }
+        let range = &self.graph.blocks[spill].instructions;
+        let tail = self.lift_range(
+            spill,
+            range.start..range.end - 1,
+            &mut body,
+            scope,
+            depth,
+            offsets,
+        )?;
+        if !matches!(tail.effect, Effect::None) {
+            return Err(self.unstructured(spill));
+        }
+        let transfer = &self.instructions[transfer];
+        let Effect::Return(Some(mut value)) = body.step(transfer)? else {
+            return Err(self.unstructured(spill));
+        };
+        let mut offsets = tail.offsets;
+        for statement in body.take_prelude() {
+            self.push(depth, statement, mem::take(&mut offsets));
+        }
+        offsets.extend(transfer.offset..transfer.offset + transfer.len);
+        value.surround("return ", ";");
+        self.push(depth, value, offsets);
+        Self::check_scope(body, baseline, self.offset(spill))
     }
 
     // javac's modern resource lowering has two close paths. The exception
@@ -261,25 +444,12 @@ impl Emitter<'_> {
         let Some(slot) = reference_store(initialization) else {
             return Ok(None);
         };
-        let Some((ty, name)) = machine.resource_local(slot) else {
+        let Some(acquisition) = self.resource_declaration(predecessor, slot, depth, machine, 0)
+        else {
             return Ok(None);
         };
-        let Some(acquisition) = self.lines.len().checked_sub(1) else {
-            return Ok(None);
-        };
-        let line = &self.lines[acquisition];
         if self.graph.blocks[predecessor].successors != [shape.start]
             || !self.exceptions.contains(region.exception_arm, predecessor)
-            || line.depth != depth
-            || !line.offsets.contains(&initialization.offset)
-            || !line.text.as_flat().ends_with(';')
-            || line
-                .text
-                .as_flat()
-                .strip_prefix(&ty)
-                .and_then(|text| text.strip_prefix(' '))
-                .and_then(|text| text.strip_prefix(name))
-                .is_none_or(|text| !text.starts_with(" = "))
         {
             return Ok(None);
         }
@@ -402,15 +572,73 @@ impl Emitter<'_> {
             }
             (normal_cleanup, None)
         };
-        let Some(continuation) = self.after_prefix(normal_close, 2) else {
-            return Ok(None);
+        let close_exit = match null_continuation {
+            Some(next) => {
+                if self.after_prefix(normal_close, 2) != Some(next) {
+                    return Ok(None);
+                }
+                self.resource_return_tail(next, 0)
+                    .unwrap_or(CloseExit::Continue(next))
+            }
+            None => {
+                if let Some(returned) = self.resource_return_tail(normal_close, 2) {
+                    returned
+                } else if let Some(next) = self.after_prefix(normal_close, 2) {
+                    self.resource_return_tail(next, 0)
+                        .unwrap_or(CloseExit::Continue(next))
+                } else {
+                    return Ok(None);
+                }
+            }
         };
-        if null_continuation.is_some_and(|target| target != continuation)
-            || self.close_method(normal_close, slot, machine)? != Some(close_method)
-        {
+        if self.close_method(normal_close, slot, machine)? != Some(close_method) {
             return Ok(None);
         }
         skipped.push(normal_close);
+        let exit = match close_exit {
+            CloseExit::Continue(next) => {
+                if skipped.contains(&next)
+                    || self
+                        .layout
+                        .local_is_live(self.graph, self.instructions, next, slot)
+                {
+                    return Ok(None);
+                }
+                ResourceExit::Continue(next)
+            }
+            CloseExit::Return {
+                block,
+                transfer,
+                local,
+            } => {
+                let &[spill] = self.graph.blocks[normal_cleanup].predecessors.as_slice() else {
+                    return Ok(None);
+                };
+                let spill_node = &self.graph.blocks[spill];
+                let spill_index = spill_node.instructions.end - 1;
+                if !self.exceptions.contains(Some(shape.body), spill)
+                    || self.exceptions.at_start(Some(shape.body), spill).is_some()
+                    || self.exceptions.skips_binding(spill)
+                    || self.exceptions.skips_instruction(spill_index)
+                    || self.exceptions.cleanup_prefix(spill) != 0
+                    || self.exceptions.monitor_acquisition_end(spill).is_some()
+                    || spill_node.successors != [normal_cleanup]
+                    || (block != normal_close
+                        && self.graph.blocks[block]
+                            .predecessors
+                            .iter()
+                            .any(|pred| !skipped.contains(pred)))
+                    || cleanup_locals::store(&self.instructions[spill_index]) != Some(local)
+                    || self.protected_resource_slot_overlap(local, normal_close, primary.start)
+                {
+                    return Ok(None);
+                }
+                if block != normal_close {
+                    skipped.push(block);
+                }
+                ResourceExit::Return { spill, transfer }
+            }
+        };
 
         let ambient = &self.graph.blocks[normal_close].exception_successors;
         if self.graph.blocks[suppression.start].exception_successors != *ambient
@@ -421,7 +649,6 @@ impl Emitter<'_> {
                 .copied()
                 .filter(|&handler| handler != suppression.start)
                 .eq(ambient.iter().copied())
-            || skipped.contains(&continuation)
             || self
                 .exceptions
                 .at_start(region.exception_arm, normal_cleanup)
@@ -433,7 +660,12 @@ impl Emitter<'_> {
             || skipped.iter().any(|&block| {
                 self.emitted[block]
                     || self.exceptions.cleanup_prefix(block) != 0
-                    || !self.exceptions.contains(region.exception_arm, block)
+                    || (!self.exceptions.contains(region.exception_arm, block)
+                        && !matches!(exit, ResourceExit::Return { transfer, .. }
+                            if self.graph.blocks[block].instructions.contains(&transfer)
+                                && self.graph.blocks[block].exception_successors.is_empty()))
+                    || (!self.graph.blocks[block].exception_predecessors.is_empty()
+                        && !self.exceptions.contains(Some(primary.arm), block))
                     || self.graph.blocks[block].predecessors.iter().any(|pred| {
                         !skipped.contains(pred)
                             && !self.exceptions.contains(Some(shape.body), *pred)
@@ -444,9 +676,6 @@ impl Emitter<'_> {
                     matches!(instruction.opcode, 0xac..=0xb1) || is_slot_write(instruction, slot)
                 })
             })
-            || self
-                .layout
-                .local_is_live(self.graph, self.instructions, continuation, slot)
         {
             return Ok(None);
         }
@@ -454,9 +683,59 @@ impl Emitter<'_> {
             acquisition,
             slot,
             normal_cleanup,
-            continuation,
+            exit,
             skipped,
         }))
+    }
+
+    fn resource_return_tail(&self, block: usize, consumed: usize) -> Option<CloseExit> {
+        if !self.graph.blocks[block].exception_predecessors.is_empty() {
+            return None;
+        }
+        let [load, transfer] = self.block_instructions(block).get(consumed..)? else {
+            return None;
+        };
+        let local = cleanup_locals::returned(load, transfer)?;
+        Some(CloseExit::Return {
+            block,
+            transfer: self.graph.blocks[block].instructions.end - 1,
+            local,
+        })
+    }
+
+    fn protected_resource_slot_overlap(
+        &mut self,
+        spill: cleanup_locals::Local,
+        normal_close: usize,
+        handler: usize,
+    ) -> bool {
+        // Close receives only the resource; it may not overwrite the spill
+        // nor expose it to an outer handler. The original store has no
+        // observable value on an exceptional body path (it ran last).
+        self.block_instructions(normal_close)[..2]
+            .iter()
+            .any(|op| spill.touches(op))
+            || self.graph.blocks[normal_close]
+                .exception_successors
+                .iter()
+                .copied()
+                .any(|target| {
+                    // Layout tracks reads by the low slot of each binding.
+                    // Include preceding slots for possible category-2 aliases.
+                    target == handler
+                        || spill.slots().any(|slot| {
+                            self.layout
+                                .local_is_live(self.graph, self.instructions, target, slot)
+                                || slot.checked_sub(1).is_some_and(|previous| {
+                                    self.layout.local_is_live(
+                                        self.graph,
+                                        self.instructions,
+                                        target,
+                                        previous,
+                                    )
+                                })
+                        })
+                })
     }
 
     fn close_method(

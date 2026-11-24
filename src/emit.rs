@@ -10,6 +10,7 @@ mod names;
 mod nested;
 mod options_support;
 mod record;
+pub(crate) mod symbols;
 mod type_annotations;
 
 pub use mapping::{MethodMap, SourceMap};
@@ -31,7 +32,10 @@ use crate::{
     javadoc::JavadocTarget,
     lift::{DynamicHelpers, Machine, constant_literal_with_options},
     naming::MemberRenames,
-    source_text::Document,
+    source_text::{
+        Document,
+        tokens::{self, Token, TokenKind, TokenRange},
+    },
     structure::{
         Line, StructureError,
         assertions::{Guard, Sites, interface_guards, is_guard_field},
@@ -148,6 +152,7 @@ pub(crate) fn decompile_class(
             options.banner.clone(),
             &source,
             map.as_mut(),
+            &mut [],
             options,
         );
         return Ok(Source {
@@ -210,12 +215,14 @@ fn decompile_java<'a>(
         options,
         body: String::new(),
         lines: 0,
+        tokens: Vec::new(),
         mapping: options.include_line_mappings.then(SourceMap::default),
     };
     let package = source_name
         .rsplit_once('/')
         .map(|(package, _)| package.replace('/', "."));
     let mut prefix = options.banner.clone();
+    let mut token_prefix = None;
     match simple(source_name) {
         "module-info" if class.access_flags & MODULE != 0 => {
             writer.module()?;
@@ -227,6 +234,7 @@ fn decompile_java<'a>(
         }
         "package-info" => {
             writer.class_annotations(0)?;
+            token_prefix = Some(prefix.len());
             prefix.push_str(&writer.body);
             writer.body.clear();
             if let Some(package) = &package {
@@ -246,11 +254,31 @@ fn decompile_java<'a>(
             }
         }
     }
+    if !writer.tokens.is_empty() {
+        let token_prefix = &prefix[..token_prefix.unwrap_or(prefix.len())];
+        let newlines = token_prefix.bytes().filter(|&byte| byte == b'\n').count();
+        let first_column = token_prefix
+            .rsplit('\n')
+            .next()
+            .unwrap_or("")
+            .encode_utf16()
+            .count();
+        for (_, range) in &mut writer.tokens {
+            if range.start.line == 0 {
+                range.start.column += first_column;
+            }
+            if range.end.line == 0 {
+                range.end.column += first_column;
+            }
+            range.shift_lines(newlines);
+        }
+    }
     let text = finish_source(
         class_name,
         prefix,
         &writer.body,
         writer.mapping.as_mut(),
+        &mut writer.tokens,
         options,
     );
     Ok(Source {
@@ -267,6 +295,7 @@ fn finish_source(
     mut prefix: String,
     body: &str,
     mapping: Option<&mut SourceMap>,
+    source_tokens: &mut [(Rc<Token>, TokenRange)],
     options: &Options,
 ) -> String {
     if let Some(mapping) = mapping {
@@ -282,6 +311,9 @@ fn finish_source(
         }
     } else {
         prefix.push_str(body);
+    }
+    if options.dump_text_tokens {
+        tokens::dump(&mut prefix, source_tokens);
     }
     if options.crlf {
         prefix.replace('\n', "\r\n")
@@ -304,6 +336,7 @@ struct Writer<'a, 'c> {
     options: &'c Options,
     body: String,
     lines: usize,
+    tokens: Vec<(Rc<Token>, TokenRange)>,
     mapping: Option<SourceMap>,
 }
 
@@ -331,7 +364,7 @@ impl<'a, 'c> Writer<'a, 'c> {
         doc: &Document,
         on_anchor: impl FnMut(std::ops::Range<u32>, usize),
     ) {
-        if !doc.has_layout() {
+        if !doc.has_layout() && !(self.options.dump_text_tokens && doc.has_tokens()) {
             self.line(depth, doc.as_str());
             return;
         }
@@ -339,14 +372,27 @@ impl<'a, 'c> Writer<'a, 'c> {
         for _ in 0..depth {
             self.body.push_str(&self.options.indent);
         }
-        self.lines += doc.render_at(
-            &mut self.body,
-            self.options.preferred_line_length,
-            &self.options.indent,
-            self.options.crlf,
-            depth,
-            on_anchor,
-        );
+        let width = self.options.preferred_line_length;
+        let indent = &self.options.indent;
+        let crlf = self.options.crlf;
+        self.lines += if self.options.dump_text_tokens {
+            let first_line = self.lines;
+            let tokens = &mut self.tokens;
+            doc.render_with_tokens_at(
+                &mut self.body,
+                width,
+                indent,
+                crlf,
+                depth,
+                on_anchor,
+                |token, mut range| {
+                    range.shift_lines(first_line);
+                    tokens.push((Rc::clone(token), range));
+                },
+            )
+        } else {
+            doc.render_at(&mut self.body, width, indent, crlf, depth, on_anchor)
+        };
         self.body.push('\n');
         self.lines += 1;
     }
@@ -375,7 +421,7 @@ impl<'a, 'c> Writer<'a, 'c> {
         self.javadoc(0, JavadocTarget::Class(self.class));
         self.class_annotations(0)?;
 
-        let mut head = String::new();
+        let mut head = Document::new();
         visibility(&mut head, flags);
         if !is_enum && !is_interface && components.is_none() {
             modifier(&mut head, flags, ABSTRACT, "abstract ");
@@ -410,7 +456,19 @@ impl<'a, 'c> Writer<'a, 'c> {
                 _ => "class ",
             },
         );
-        head.push_str(name);
+        if self.options.dump_text_tokens {
+            head.token(
+                name,
+                Token {
+                    declaration: true,
+                    kind: TokenKind::Class {
+                        name: self.owner.into(),
+                    },
+                },
+            );
+        } else {
+            head.push_str(name);
+        }
         let sig = if self.options.decompile_generics {
             self.class
                 .signature()?
@@ -430,11 +488,12 @@ impl<'a, 'c> Writer<'a, 'c> {
                 TypeTarget::ClassTypeParameter,
             )?;
         }
-        let record_components = if let Some(components) = &components {
-            Some((head.len(), self.record_components_source(components)?))
-        } else {
-            None
-        };
+        if let Some(components) = &components {
+            head.append(Document::record(
+                self.depth,
+                self.record_components_source(components)?,
+            ));
+        }
         if components.is_none()
             && !is_enum
             && !is_interface
@@ -449,7 +508,7 @@ impl<'a, 'c> Writer<'a, 'c> {
                 let ty = Type::Object(pool.class_name(self.class.super_class)?.into());
                 self.render_type_target(&ty, &annotations, target, &[], false)?
             };
-            head.push_str(&ty);
+            head.append(ty);
         }
         if !is_annotation && !self.class.interfaces.is_empty() {
             head.push_str(if is_interface {
@@ -470,25 +529,26 @@ impl<'a, 'c> Writer<'a, 'c> {
                     let ty = Type::Object(pool.class_name(interface)?.into());
                     self.render_type_target(&ty, &annotations, target, &[], false)?
                 };
-                head.push_str(&ty);
+                head.append(ty);
             }
         }
         if !is_enum && !permitted.is_empty() {
             head.push_str(" permits ");
-            push_class_list(&mut head, &permitted, self.class, &|name| {
-                self.names.render(name)
-            })?;
+            for (index, &class) in permitted.iter().enumerate() {
+                if index != 0 {
+                    head.push_str(", ");
+                }
+                let name = pool.class_name(class)?;
+                symbols::append_class(
+                    &mut head,
+                    &self.names.render(name),
+                    name,
+                    self.options.dump_text_tokens,
+                );
+            }
         }
         head.push_str(" {");
-        if let Some((at, components)) = record_components {
-            let suffix = head.split_off(at);
-            let mut doc = Document::from(head);
-            doc.append(Document::record(self.depth, components));
-            doc.push_str(&suffix);
-            self.document_line(0, &doc);
-        } else {
-            self.line(0, &head);
-        }
+        self.document_line(0, &head);
 
         let mut needs_gap = false;
         let emit_fields = self.options.method_to_decompile.is_empty();
@@ -501,17 +561,19 @@ impl<'a, 'c> Writer<'a, 'c> {
             self.field_initializers(emit_fields, is_enum || components.is_some())?;
         for field in self.class.fields.iter().filter(|_| emit_fields) {
             let pool = &self.class.pool;
-            if self.has_lexical_owner()
-                && self
+            if self.has_lexical_owner() {
+                let name = pool.utf8(field.name_index)?;
+                let descriptor = pool.utf8(field.descriptor_index)?;
+                if self
                     .group
-                    .outer_field(
-                        self.owner,
-                        pool.utf8(field.name_index)?,
-                        pool.utf8(field.descriptor_index)?,
-                    )
+                    .outer_field(self.owner, name, descriptor)
                     .is_some()
-            {
-                continue;
+                    || self.anonymous_bindings.as_deref().is_some_and(|bindings| {
+                        bindings.captures_field(self.owner, name, descriptor)
+                    })
+                {
+                    continue;
+                }
             }
             if let Some(info) = &enumeration {
                 let name = self.class.pool.utf8(field.name_index)?;
@@ -605,7 +667,7 @@ impl<'a, 'c> Writer<'a, 'c> {
         let descriptor = pool.utf8(field.descriptor_index)?;
         let ty = parse(descriptor, Type::parse)?;
         let map_name = |name: &str| self.names.render(name);
-        let mut out = String::new();
+        let mut out = Document::new();
         let flags = field.access_flags;
         if !is_interface {
             visibility(&mut out, flags);
@@ -620,7 +682,7 @@ impl<'a, 'c> Writer<'a, 'c> {
         declarations.extend(field.annotations(pool, false)?);
         if let Some(signature) = self.member_signature(field)? {
             let ty = parse(signature, FieldSignature::parse)?;
-            out.push_str(&self.render_type_target(
+            out.append(self.render_type_target(
                 &ty.field_type,
                 &annotations,
                 TypeTarget::Field,
@@ -628,7 +690,7 @@ impl<'a, 'c> Writer<'a, 'c> {
                 false,
             )?);
         } else {
-            out.push_str(&self.render_type_target(
+            out.append(self.render_type_target(
                 &ty,
                 &annotations,
                 TypeTarget::Field,
@@ -642,8 +704,7 @@ impl<'a, 'c> Writer<'a, 'c> {
             .names
             .renames()
             .field_alias(self.owner, name, descriptor);
-        out.push_str(renamed.unwrap_or(name));
-        let mut out = Document::from(out);
+        self.field_symbol(&mut out, renamed.unwrap_or(name), name, descriptor);
         if let Some(value) = find_attribute(&field.attributes, pool, "ConstantValue")? {
             let index = u16::from_be_bytes(
                 value
@@ -728,6 +789,22 @@ impl<'a, 'c> Writer<'a, 'c> {
                         .is_some(),
             )
         };
+        let captured_parameters = if constructor {
+            self.anonymous_bindings.as_deref().map_or(0, |bindings| {
+                bindings.local_constructor_capture_count(self.owner, descriptor)
+            })
+        } else {
+            0
+        };
+        let parameter_end = ty
+            .parameters
+            .len()
+            .checked_sub(captured_parameters)
+            .filter(|&end| end >= implicit_parameters)
+            .ok_or(DecompileError::InvalidAttribute(
+                "captured constructor parameters",
+            ))?;
+        let visible_parameters = parameter_end - implicit_parameters;
         let names = self.names;
         let map_name = |name: &str| names.render(name);
         let exceptions = method.exceptions(pool)?;
@@ -824,8 +901,9 @@ impl<'a, 'c> Writer<'a, 'c> {
                     ty,
                     matching,
                     |name| self.names.render(name),
-                    |annotation| self.annotation(annotation),
+                    |annotation| self.annotation_document(annotation, None),
                     false,
+                    self.options.dump_text_tokens,
                 )
                 .map(Some)
                 .map_err(|error| crate::lift::LiftError::TypeAnnotation(Box::new(error)))
@@ -908,8 +986,7 @@ impl<'a, 'c> Writer<'a, 'c> {
             }
         }
         let is_interface = self.class.access_flags & INTERFACE != 0;
-        let mut head = String::new();
-        let mut arguments_at = None;
+        let mut head = Document::new();
         if initializer {
             head.push_str("static");
         } else {
@@ -917,7 +994,7 @@ impl<'a, 'c> Writer<'a, 'c> {
             if constructor
                 && self.options.hide_default_constructor
                 && constructors == 1
-                && ty.parameters.len() == implicit_parameters
+                && visible_parameters == 0
                 && exceptions.is_empty()
                 && annotations.is_empty()
                 && (enumeration.is_some() || flags & VISIBILITY == self.flags & VISIBILITY)
@@ -983,7 +1060,7 @@ impl<'a, 'c> Writer<'a, 'c> {
                 .transpose()?;
             let signature = signature.as_ref().filter(|sig| {
                 sig.parameters.len() == parameters.len()
-                    || sig.parameters.len() + implicit_parameters == parameters.len()
+                    || sig.parameters.len() == visible_parameters
             });
             let mut type_annotations = method.method_type_annotations(pool, true)?;
             type_annotations.extend(method.method_type_annotations(pool, false)?);
@@ -998,7 +1075,9 @@ impl<'a, 'c> Writer<'a, 'c> {
                 )?;
                 head.push(' ');
             }
+            let name_at;
             if constructor {
+                name_at = head.len();
                 head.push_str(class_name);
             } else {
                 let declarations = &annotations;
@@ -1019,8 +1098,9 @@ impl<'a, 'c> Writer<'a, 'c> {
                         false,
                     )?
                 };
-                head.push_str(&result);
+                head.append(result);
                 head.push(' ');
+                name_at = head.len();
                 if let Some(renamed) = renamed {
                     head.push_str(renamed);
                 } else {
@@ -1029,10 +1109,22 @@ impl<'a, 'c> Writer<'a, 'c> {
                     ));
                 }
             }
-            let arguments_start = head.len();
+            if self.options.dump_text_tokens {
+                head.token_at(
+                    name_at..head.len(),
+                    Token {
+                        declaration: true,
+                        kind: TokenKind::Method {
+                            owner: self.owner.into(),
+                            name: name.into(),
+                            descriptor: descriptor.into(),
+                        },
+                    },
+                );
+            }
             let mut args = Vec::with_capacity(ty.parameters.len());
             if let Some(receiver) = self.annotated_receiver(&type_annotations, constructor)? {
-                args.push(Document::from(receiver));
+                args.push(receiver);
             }
             let annot_visible = method.parameter_annotations(pool, true)?;
             let annot_invisible = method.parameter_annotations(pool, false)?;
@@ -1041,18 +1133,32 @@ impl<'a, 'c> Writer<'a, 'c> {
             } else {
                 Vec::new()
             };
-            for (index, (param, name)) in ty
+            let method_name = name;
+            for (index, ((param, slot), parameter_name)) in ty
                 .parameters
                 .iter()
+                .scan(u32::from(flags & STATIC == 0), |slot, param| {
+                    let current = *slot;
+                    *slot += u32::from(param.slots());
+                    Some((param, current))
+                })
                 .zip(parameters)
                 .enumerate()
                 .skip(implicit_parameters)
+                .take(visible_parameters)
             {
                 let mut parameter = Document::new();
                 let mut declarations = Vec::new();
                 for group in [&annot_visible, &annot_invisible] {
-                    let skip = ty.parameters.len().saturating_sub(group.len());
-                    if let Some(annotations) = index.checked_sub(skip).and_then(|i| group.get(i)) {
+                    let selected = if group.len() == visible_parameters {
+                        index
+                            .checked_sub(implicit_parameters)
+                            .and_then(|i| group.get(i))
+                    } else {
+                        let skip = ty.parameters.len().saturating_sub(group.len());
+                        index.checked_sub(skip).and_then(|i| group.get(i))
+                    };
+                    if let Some(annotations) = selected {
                         for annotation in annotations {
                             parameter.append(self.annotation_document(annotation, None)?);
                             parameter.push_str(" ");
@@ -1067,9 +1173,13 @@ impl<'a, 'c> Writer<'a, 'c> {
                     parameter.push_str("final ");
                 }
                 let target = TypeTarget::MethodParameter((index - implicit_parameters) as u8);
-                let varargs = flags & VARARGS != 0 && index + 1 == ty.parameters.len();
+                let varargs = flags & VARARGS != 0 && index + 1 == parameter_end;
                 let rendered = if let Some(sig) = signature {
-                    let skip = ty.parameters.len() - sig.parameters.len();
+                    let skip = if sig.parameters.len() == ty.parameters.len() {
+                        0
+                    } else {
+                        implicit_parameters
+                    };
                     self.render_type_target(
                         &sig.parameters[index - skip],
                         &type_annotations,
@@ -1086,12 +1196,29 @@ impl<'a, 'c> Writer<'a, 'c> {
                         varargs,
                     )?
                 };
-                parameter.push_str(&rendered);
+                parameter.append(rendered);
                 parameter.push_str(" ");
-                parameter.push_str(&name);
+                let start = parameter.len();
+                parameter.push_str(&parameter_name);
+                if self.options.dump_text_tokens {
+                    parameter.token_at(
+                        start..parameter.len(),
+                        Token {
+                            declaration: true,
+                            kind: TokenKind::Variable {
+                                owner: self.owner.into(),
+                                method: method_name.into(),
+                                descriptor: descriptor.into(),
+                                index: slot,
+                                name: parameter_name,
+                                parameter: true,
+                            },
+                        },
+                    );
+                }
                 args.push(parameter);
             }
-            arguments_at = Some((arguments_start, args));
+            head.append(Document::delimited(self.depth + 1, args));
             let generic_throws = signature.filter(|sig| !sig.throws.is_empty());
             if generic_throws.is_some() || !exceptions.is_empty() {
                 head.push_str(" throws ");
@@ -1113,27 +1240,19 @@ impl<'a, 'c> Writer<'a, 'c> {
                         let ty = Type::Object(pool.class_name(exceptions[index])?.into());
                         self.render_type_target(&ty, &type_annotations, target, &[], false)?
                     };
-                    head.push_str(&rendered);
+                    head.append(rendered);
                 }
             }
             if let Some(default) = method.annotation_default(pool)? {
                 head.push_str(" default ");
-                head.push_str(&self.annotation_value(&default)?);
+                head.append(self.annotation_value(&default)?);
             }
         }
         if code.is_some() && initializer && needs_gap {
             self.line(0, "");
         }
         head.push_str(if code.is_some() { " {" } else { ";" });
-        if let Some((at, arguments)) = arguments_at {
-            let suffix = head.split_off(at);
-            let mut doc = Document::from(head);
-            doc.append(Document::delimited(self.depth + 1, arguments));
-            doc.push_str(&suffix);
-            self.document_line(1, &doc);
-        } else {
-            self.line(1, &head);
-        }
+        self.document_line(1, &head);
         if let Some(code) = &code {
             self.method_body(
                 name,
@@ -1158,7 +1277,7 @@ impl<'a, 'c> Writer<'a, 'c> {
     ) -> Result<(), DecompileError> {
         let line_count = lines.len();
         let mut declarations = self
-            .local_declarations(name, descriptor, code, &lines)?
+            .local_declarations(name, descriptor, code, &lines, anonymous_sites)?
             .into_iter()
             .peekable();
         let mapping = self.mapping.is_some();
@@ -1255,7 +1374,7 @@ fn parse<T>(
     })
 }
 
-fn visibility(out: &mut String, flags: u16) {
+fn visibility(out: &mut Document, flags: u16) {
     out.push_str(match flags & VISIBILITY {
         PUBLIC => "public ",
         PRIVATE => "private ",
@@ -1264,23 +1383,8 @@ fn visibility(out: &mut String, flags: u16) {
     });
 }
 
-fn modifier(out: &mut String, flags: u16, mask: u16, text: &'static str) {
+fn modifier(out: &mut Document, flags: u16, mask: u16, text: &'static str) {
     if flags & mask != 0 {
         out.push_str(text);
     }
-}
-
-fn push_class_list(
-    out: &mut String,
-    classes: &[u16],
-    class: &ClassFile<'_>,
-    map: &dyn Fn(&str) -> String,
-) -> Result<(), ClassError> {
-    for (index, &class_index) in classes.iter().enumerate() {
-        if index != 0 {
-            out.push_str(", ");
-        }
-        out.push_str(&map(class.pool.class_name(class_index)?));
-    }
-    Ok(())
 }

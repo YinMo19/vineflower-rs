@@ -15,7 +15,7 @@ impl Local {
         (slot != u16::MAX || !matches!(category, 1 | 3)).then_some(Self { slot, category })
     }
 
-    fn cells(self) -> impl Iterator<Item = u16> {
+    pub(in crate::structure) fn slots(self) -> impl Iterator<Item = u16> {
         std::iter::once(self.slot).chain(
             matches!(self.category, 1 | 3)
                 .then(|| self.slot.checked_add(1))
@@ -24,7 +24,7 @@ impl Local {
     }
 
     pub(in crate::structure) fn touches(self, instruction: &Instruction) -> bool {
-        self.cells()
+        self.slots()
             .any(|slot| super::local_touches(instruction, slot))
     }
 }
@@ -75,7 +75,7 @@ pub(super) fn same_cleanup(
             if a.category != b.category {
                 return false;
             }
-            for (left, right) in a.cells().zip(b.cells()) {
+            for (left, right) in a.slots().zip(b.slots()) {
                 if *from.entry(left).or_insert(right) != right
                     || *to.entry(right).or_insert(left) != left
                 {
@@ -96,6 +96,6 @@ pub(super) fn same_cleanup(
         || !all.iter().any(|op| match op.operand {
             Operand::Increment { index, .. } => renamed.contains(&index),
             _ => local(op, 0x15, 0x1a)
-                .is_some_and(|read| read.cells().any(|slot| renamed.contains(&slot))),
+                .is_some_and(|read| read.slots().any(|slot| renamed.contains(&slot))),
         })
 }

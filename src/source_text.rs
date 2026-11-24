@@ -4,7 +4,12 @@ use std::{
     fmt,
     num::NonZeroUsize,
     ops::{Deref, Range},
+    rc::Rc,
 };
+
+pub(crate) mod tokens;
+
+use tokens::{Span, Token, TokenRange};
 
 /// A flat Java fragment with possible line breaks registered by its producer.
 /// Nested groups make separate fit decisions after earlier breaks have been applied.
@@ -13,6 +18,7 @@ pub(crate) struct Document {
     flat: String,
     events: Vec<Event>,
     open: Option<NonZeroUsize>,
+    tokens: Option<Rc<Vec<Span>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -144,10 +150,6 @@ impl Document {
         &self.flat
     }
 
-    pub(crate) fn into_flat(self) -> String {
-        self.flat
-    }
-
     pub(crate) fn has_layout(&self) -> bool {
         !self.events.is_empty()
     }
@@ -168,6 +170,7 @@ impl Document {
             "cannot replace a prefix containing layout groups or breaks",
         );
         self.flat.replace_range(..len, prefix);
+        self.replace_prefix_tokens(len, prefix.len());
         let (head, tail) = self.events.split_at_mut(first);
         for event in head {
             event.at = 0;
@@ -192,6 +195,7 @@ impl Document {
             assert!(at >= event.at + len, "cannot insert inside a soft break");
         }
         self.flat.insert_str(at, text);
+        self.insert_tokens(at, text.len());
         for event in &mut self.events[first..] {
             event.at += text.len();
         }
@@ -223,6 +227,7 @@ impl Document {
             assert!(len >= event.at + width, "cannot truncate inside a break");
         }
         self.flat.truncate(len);
+        self.truncate_tokens(len);
         for event in &mut self.events[first..] {
             event.at = len;
         }
@@ -248,6 +253,7 @@ impl Document {
             *self = fragment;
             return;
         }
+        self.append_tokens(fragment.tokens);
         self.extend(&fragment.flat, fragment.events);
     }
 
@@ -256,6 +262,7 @@ impl Document {
             fragment.open.is_none(),
             "appended document has an open group"
         );
+        self.append_tokens(fragment.tokens.clone());
         self.extend(&fragment.flat, fragment.events.iter().cloned());
     }
 
@@ -630,8 +637,8 @@ impl Document {
         self.render_at(out, width, indent, crlf, 0, |_, _| {})
     }
 
-    /// As [`Self::render_with_crlf`], resolving relative indentation against
-    /// `depth` and reporting bytecode ranges with zero-based fragment lines.
+    /// Resolve relative indentation against `depth` and report bytecode
+    /// ranges with zero-based fragment lines.
     pub(crate) fn render_at(
         &self,
         out: &mut String,
@@ -641,8 +648,45 @@ impl Document {
         depth: usize,
         on_anchor: impl FnMut(Range<u32>, usize),
     ) -> usize {
+        self.render_impl(out, width, indent, crlf, depth, on_anchor, &[], |_, _| {})
+    }
+
+    /// Also report identifier spans in rendered, zero-based UTF-16 coordinates.
+    pub(crate) fn render_with_tokens_at(
+        &self,
+        out: &mut String,
+        width: usize,
+        indent: &str,
+        crlf: bool,
+        depth: usize,
+        on_anchor: impl FnMut(Range<u32>, usize),
+        on_token: impl FnMut(&Rc<Token>, TokenRange),
+    ) -> usize {
+        self.render_impl(
+            out,
+            width,
+            indent,
+            crlf,
+            depth,
+            on_anchor,
+            self.token_spans(),
+            on_token,
+        )
+    }
+
+    fn render_impl(
+        &self,
+        out: &mut String,
+        width: usize,
+        indent: &str,
+        crlf: bool,
+        depth: usize,
+        on_anchor: impl FnMut(Range<u32>, usize),
+        tokens: &[Span],
+        on_token: impl FnMut(&Rc<Token>, TokenRange),
+    ) -> usize {
         assert!(self.open.is_none(), "cannot render with an open group");
-        if self.events.is_empty() {
+        if self.events.is_empty() && tokens.is_empty() {
             out.push_str(&self.flat);
             return self.flat.bytes().filter(|&byte| byte == b'\n').count();
         }
@@ -659,12 +703,15 @@ impl Document {
             separator_width: if crlf { 2 } else { 1 },
             depth,
             on_anchor,
+            tokens,
+            on_token,
             cursor: 0,
             column,
             has_newline,
             lines: 0,
         };
         renderer.render_events(0, self.events.len(), self.flat.len(), 0, None);
+        debug_assert!(renderer.tokens.is_empty(), "token span was not rendered");
         renderer.lines
     }
 }
@@ -725,7 +772,7 @@ impl ArrayElements<'_> {
     }
 }
 
-struct Renderer<'a, 'out, F> {
+struct Renderer<'a, 'out, A, T> {
     doc: &'a Document,
     out: &'out mut String,
     width: usize,
@@ -733,14 +780,20 @@ struct Renderer<'a, 'out, F> {
     indent_width: usize,
     separator_width: usize,
     depth: usize,
-    on_anchor: F,
+    on_anchor: A,
+    tokens: &'a [Span],
+    on_token: T,
     cursor: usize,
     column: usize,
     has_newline: bool,
     lines: usize,
 }
 
-impl<F: FnMut(Range<u32>, usize)> Renderer<'_, '_, F> {
+impl<A, T> Renderer<'_, '_, A, T>
+where
+    A: FnMut(Range<u32>, usize),
+    T: FnMut(&Rc<Token>, TokenRange),
+{
     fn render_events(
         &mut self,
         mut index: usize,
@@ -850,16 +903,33 @@ impl<F: FnMut(Range<u32>, usize)> Renderer<'_, '_, F> {
     fn copy_until(&mut self, end: usize, extra: usize) {
         let doc = self.doc;
         for part in doc.flat[self.cursor..end].split_inclusive('\n') {
+            let start = self.cursor;
             self.cursor += part.len();
-            if let Some(line) = part.strip_suffix('\n') {
-                self.out.push_str(line);
+            let (line, newline) = part
+                .strip_suffix('\n')
+                .map_or((part, false), |line| (line, true));
+            let mut measured = 0;
+            let end = start + line.len();
+            while let Some((span, remaining)) = self.tokens.split_first()
+                && span.start < end
+            {
+                let offset = span.start - start;
+                self.column += units(&line[measured..offset]);
+                measured = offset;
+                (self.on_token)(
+                    &span.token,
+                    TokenRange::on_line(self.lines, self.column, span.width),
+                );
+                self.tokens = remaining;
+            }
+            self.out.push_str(line);
+            if newline {
                 let continues = self.cursor < doc.flat.len();
                 let blank =
                     self.cursor + 1 < doc.flat.len() && doc.flat.as_bytes()[self.cursor] == b'\n';
                 self.newline(if continues && !blank { extra } else { 0 });
             } else {
-                self.out.push_str(part);
-                self.column += units(part);
+                self.column += units(&line[measured..]);
             }
         }
     }

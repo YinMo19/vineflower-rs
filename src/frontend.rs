@@ -166,6 +166,11 @@ const SETTINGS: &[Setting] = &[
         "Include original source line numbers",
     ),
     flag(
+        "dump-text-tokens",
+        "",
+        "Append a source symbol token listing",
+    ),
+    flag(
         "unit-test-mode",
         "__unit_test_mode__",
         "Append source maps for test comparisons",

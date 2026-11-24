@@ -307,22 +307,28 @@ impl<'a, 'c> Machine<'a, 'c> {
                 }));
         let expression = if direct {
             let qualifier = if let Some(qualifier) = super_qualifier {
-                Document::from(qualifier)
+                qualifier
             } else if bound {
                 self.member_receiver(captures[0].clone(), site.owner, false)?
                     .into_at(PRIMARY)
             } else {
-                Document::from(self.render_type(&reference_type(site.owner)?))
+                self.type_reference(&reference_type(site.owner)?)
             };
             let name = if site.dispatch == Dispatch::Constructor {
-                "new"
+                Cow::Borrowed("new")
             } else {
-                site.name
+                self.source_invocation_name(site.owner, site.name, site.implementation_descriptor)
             };
-            let mut text = qualifier;
-            text.prepend_str(&format!("({target})"));
+            let mut text = lambda_cast(&target);
+            text.append(qualifier);
             text.push_str("::");
-            text.push_str(name);
+            self.append_method_reference(
+                &mut text,
+                &name,
+                site.owner,
+                site.name,
+                site.implementation_descriptor,
+            );
             self.expression(factory.return_type, text, UNARY, &captures, true)?
         } else {
             // The factory captures values, not expressions. Freeze in the JVM
@@ -341,9 +347,18 @@ impl<'a, 'c> Machine<'a, 'c> {
             }
             if bound && !matches!(captures[0].source, Source::This) {
                 self.before_statement(None)?;
-                let objects = (self.class_name)("java/util/Objects");
-                let mut statement = captures[0].text.clone();
-                statement.surround(&format!("{objects}.requireNonNull("), ");");
+                let owner = "java/util/Objects";
+                let mut statement = self.class_reference(owner);
+                statement.push('.');
+                self.append_method_reference(
+                    &mut statement,
+                    "requireNonNull",
+                    owner,
+                    "requireNonNull",
+                    "(Ljava/lang/Object;)Ljava/lang/Object;",
+                );
+                statement.append_relative_arguments([&captures[0].text]);
+                statement.push(';');
                 self.prelude.push(statement);
             }
             let parameters: Vec<_> = (0..sam_count)
@@ -393,18 +408,28 @@ impl<'a, 'c> Machine<'a, 'c> {
                     target
                 }
                 Dispatch::Static => {
-                    let mut call =
-                        Document::from(format!("{}.{source_name}", (self.class_name)(site.owner)));
+                    let mut call = self.class_reference(site.owner);
+                    call.push('.');
+                    self.append_method_reference(
+                        &mut call,
+                        &source_name,
+                        site.owner,
+                        site.name,
+                        site.implementation_descriptor,
+                    );
                     call.append_relative_arguments(arguments.iter().map(|arg| &arg.text));
                     call
                 }
                 _ => {
-                    let mut call = super_qualifier
-                        .map(Document::from)
-                        .or(receiver)
-                        .expect("instance receiver");
+                    let mut call = super_qualifier.or(receiver).expect("instance receiver");
                     call.push('.');
-                    call.push_str(&source_name);
+                    self.append_method_reference(
+                        &mut call,
+                        &source_name,
+                        site.owner,
+                        site.name,
+                        site.implementation_descriptor,
+                    );
                     call.append_relative_arguments(arguments.iter().map(|arg| &arg.text));
                     call
                 }
@@ -416,7 +441,11 @@ impl<'a, 'c> Machine<'a, 'c> {
             };
             let expression = self.expression(
                 factory.return_type,
-                render_lambda(&target, &parameters, body),
+                render_lambda(
+                    &target,
+                    parameters.into_iter().map(Document::from).collect(),
+                    body,
+                ),
                 UNARY,
                 &captures,
                 true,
@@ -502,7 +531,7 @@ impl<'a, 'c> Machine<'a, 'c> {
         helper: &'c Member<'a>,
         site: &LambdaSite<'_>,
         captures: &[Expr],
-        target: &str,
+        target: &Document,
     ) -> Result<Option<Document>, LiftError> {
         // Multiple indy instructions can reference the same helper, including
         // recursively in hand-written bytecode; bound source expansion.
@@ -576,7 +605,30 @@ impl<'a, 'c> Machine<'a, 'c> {
         machine
             .locals
             .bind_lambda_scope(&self.locals, &captures, &site.implementation, is_static);
-        let parameters = machine.parameter_names()[captures.len()..].to_vec();
+        let mut parameters =
+            Vec::with_capacity(site.implementation.parameters.len() - captured.len());
+        let mut slot = u16::from(!is_static);
+        for (index, ty) in site.implementation.parameters.iter().enumerate() {
+            if let Some(capture) = captured.get(index) {
+                if self.options.dump_text_tokens {
+                    if let Source::Local(outer_slot) = capture.source
+                        && self
+                            .local_capture_binding(outer_slot, &capture.text)
+                            .is_some()
+                    {
+                        machine.inherit_lambda_capture_token(slot, self, outer_slot);
+                    } else {
+                        machine.omit_lambda_capture_token(slot);
+                    }
+                }
+            } else {
+                let parameter = machine
+                    .local_document(slot, true)
+                    .unwrap_or_else(|| Document::from(machine.parameter_names()[index].as_str()));
+                parameters.push(parameter);
+            }
+            slot += ty.slots();
+        }
         let Ok(mut lines) =
             structure_with_handlers(&instructions, &graph, machine, &code.exceptions)
         else {
@@ -613,10 +665,13 @@ impl<'a, 'c> Machine<'a, 'c> {
                     let array = self.render_type(&site.implementation.return_type);
                     let creation = array.replacen("[]", &format!("[{parameter}]"), 1);
                     if statement.strip_prefix("new ") == Some(creation.as_str()) {
-                        return Ok(Some(format!("({target}){array}::new").into()));
+                        let mut reference = lambda_cast(target);
+                        reference.append(self.type_reference(&site.implementation.return_type));
+                        reference.push_str("::new");
+                        return Ok(Some(reference));
                     }
                 }
-                return Ok(Some(render_lambda(target, &parameters, statement)));
+                return Ok(Some(render_lambda(target, parameters, statement)));
             }
             if site.implementation.return_type == Type::Void
                 && instructions
@@ -627,7 +682,7 @@ impl<'a, 'c> Machine<'a, 'c> {
                         |code| matches!(code.opcode, 0xb3 | 0xb5..=0xb9 | 0x4f..=0x56 | 0x84),
                     )
             {
-                return Ok(Some(render_lambda(target, &parameters, statement)));
+                return Ok(Some(render_lambda(target, parameters, statement)));
             }
         }
         let mut body = Document::from("{");
@@ -639,14 +694,14 @@ impl<'a, 'c> Machine<'a, 'c> {
         }
         body.hard_line(0);
         body.push('}');
-        Ok(Some(render_lambda(target, &parameters, body)))
+        Ok(Some(render_lambda(target, parameters, body)))
     }
 
     fn lambda_special_qualifier(
         &self,
         site: &LambdaSite<'_>,
         receiver: Option<&Expr>,
-    ) -> Result<Option<String>, LiftError> {
+    ) -> Result<Option<Document>, LiftError> {
         if site.owner == self.owner
             && self.own_method_is_private(site.name, site.implementation_descriptor)?
         {
@@ -666,7 +721,9 @@ impl<'a, 'c> Machine<'a, 'c> {
                 .class_name(index)
                 .is_ok_and(|name| name == site.owner)
         }) {
-            return Ok(Some(format!("{}.super", (self.class_name)(site.owner))));
+            let mut qualifier = self.class_reference(site.owner);
+            qualifier.push_str(".super");
+            return Ok(Some(qualifier));
         }
         Err(self.unsupported("lambda invokespecial target is not a direct supertype"))
     }
@@ -869,8 +926,8 @@ impl<'a, 'c> Machine<'a, 'c> {
         })
     }
 
-    fn lambda_target(&self, interface: &str, site: &LambdaSite<'_>) -> Result<String, LiftError> {
-        let mut target = (self.class_name)(interface);
+    fn lambda_target(&self, interface: &str, site: &LambdaSite<'_>) -> Result<Document, LiftError> {
+        let mut target = self.class_reference(interface);
         let types = if let Some(class) = self.lookup_site_class(interface) {
             if class.flags() & INTERFACE == 0 {
                 return Err(self.invalid_operand("lambda factory does not return an interface"));
@@ -885,7 +942,7 @@ impl<'a, 'c> Machine<'a, 'c> {
                 let mut separator = "";
                 for ty in types {
                     target.push_str(separator);
-                    target.push_str(&self.render_type(&ty));
+                    target.append(self.type_reference(&ty));
                     separator = ", ";
                 }
                 target.push('>');
@@ -920,7 +977,7 @@ impl<'a, 'c> Machine<'a, 'c> {
                     .unsupported("altMetafactory intersection does not have a single source SAM"));
             }
             target.push_str(" & ");
-            target.push_str(&(self.class_name)(marker));
+            target.append(self.class_reference(marker));
         }
         for &bridge in &site.bridges {
             if bridge != site.sam_descriptor
@@ -1260,12 +1317,28 @@ fn jdk_type_arguments(interface: &str, site: &LambdaSite<'_>) -> Option<Vec<Type
         .collect()
 }
 
-fn render_lambda(target: &str, parameters: &[String], body: Document) -> Document {
-    let mut declaration = if let [parameter] = parameters {
-        Document::from(format!("({target}){parameter} -> "))
-    } else {
-        Document::from(format!("({target})({}) -> ", parameters.join(", ")))
-    };
+fn lambda_cast(target: &Document) -> Document {
+    let mut cast = target.clone();
+    cast.surround("(", ")");
+    cast
+}
+
+fn render_lambda(target: &Document, parameters: Vec<Document>, body: Document) -> Document {
+    let mut declaration = lambda_cast(target);
+    let parenthesized = parameters.len() != 1;
+    if parenthesized {
+        declaration.push('(');
+    }
+    for (index, parameter) in parameters.into_iter().enumerate() {
+        if index != 0 {
+            declaration.push_str(", ");
+        }
+        declaration.append(parameter);
+    }
+    if parenthesized {
+        declaration.push(')');
+    }
+    declaration.push_str(" -> ");
     declaration.append(body);
     declaration
 }
@@ -1444,8 +1517,10 @@ impl<'a, 'c> Machine<'a, 'c> {
                 {
                     return Err(self.invalid_operand("enumConstant does not name an enum member"));
                 }
-                let text = format!("{}.{}", (self.class_name)(owner), name);
-                self.expression(ty, text.into(), PRIMARY, [], true)
+                let mut text = self.class_reference(owner);
+                text.push('.');
+                self.append_field_reference(&mut text, name, owner, name, descriptor);
+                self.expression(ty, text, PRIMARY, [], true)
             }
             ("getStaticFinal", Some(")Ljava/lang/Object;"), [])
             | ("getStaticFinal", Some("Ljava/lang/Class;)Ljava/lang/Object;"), [_]) => {
@@ -1495,10 +1570,10 @@ impl<'a, 'c> Machine<'a, 'c> {
                 && pool.utf8(field.descriptor_index)? == descriptor
                 && find_attribute(&field.attributes, pool, "ConstantValue")?.is_some()
             {
-                return Ok(Expr::literal(
-                    ty.clone(),
-                    format!("{}.{}", (self.class_name)(owner), name).into(),
-                ));
+                let mut text = self.class_reference(owner);
+                text.push('.');
+                self.append_field_reference(&mut text, name, owner, name, descriptor);
+                return Ok(Expr::literal(ty.clone(), text));
             }
         }
         Err(self.unsupported("getStaticFinal can cache a value read during class initialization"))
@@ -1528,13 +1603,9 @@ impl<'a, 'c> Machine<'a, 'c> {
             {
                 let class = self.class_type(index)?;
                 let class_type = Type::Object("java/lang/Class".into());
-                let value = self.expression(
-                    class_type.clone(),
-                    format!("{}.class", self.render_type(&class)).into(),
-                    PRIMARY,
-                    [],
-                    true,
-                )?;
+                let mut text = self.type_reference(&class);
+                text.push_str(".class");
+                let value = self.expression(class_type.clone(), text, PRIMARY, [], true)?;
                 return if ty == class_type {
                     Ok(value)
                 } else {

@@ -90,6 +90,7 @@ impl SourceMap {
     }
 
     pub(super) fn dump(&self, root: &str, indent: &str, output: &mut String) {
+        output.push('\n');
         if self.methods.is_empty() && self.original_lines.is_empty() {
             return;
         }
@@ -98,7 +99,6 @@ impl SourceMap {
             classes.entry(&method.class_name).or_default().push(method);
         }
         let first = classes.remove_entry(root);
-        output.push('\n');
         for (class, methods) in first.into_iter().chain(classes) {
             let _ = writeln!(output, "class '{class}' {{");
             for (index, method) in methods.into_iter().enumerate() {

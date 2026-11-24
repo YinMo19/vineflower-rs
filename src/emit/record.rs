@@ -1,5 +1,7 @@
 // Based on Vineflower RecordHelper and ClassWriter (Apache-2.0).
-use super::{DecompileError, FINAL, PRIVATE, PUBLIC, STATIC, VARARGS, VISIBILITY, Writer, parse};
+use super::{
+    DecompileError, Document, FINAL, PRIVATE, PUBLIC, STATIC, VARARGS, VISIBILITY, Writer, parse,
+};
 use crate::{
     bytecode::{Instruction, Operand},
     classfile::{Annotation, ClassError, ClassFile, Constant, Member, RecordComponent, TypeTarget},
@@ -34,7 +36,7 @@ impl<'a> Writer<'a, '_> {
     pub(super) fn record_components_source(
         &self,
         components: &[RecordComponent<'a>],
-    ) -> Result<Vec<String>, DecompileError> {
+    ) -> Result<Vec<Document>, DecompileError> {
         let pool = &self.class.pool;
         let mut canonical = None;
         for method in &self.class.methods {
@@ -54,7 +56,7 @@ impl<'a> Writer<'a, '_> {
         }
         let mut rendered = Vec::with_capacity(components.len());
         for (index, component) in components.iter().enumerate() {
-            let mut out = String::new();
+            let mut out = Document::new();
             let mut declarations = Vec::new();
             let name = pool.utf8(component.name_index)?;
             let descriptor = pool.utf8(component.descriptor_index)?;
@@ -77,7 +79,7 @@ impl<'a> Writer<'a, '_> {
                 }
             }
             for annotation in &declarations {
-                out.push_str(&self.annotation(annotation)?);
+                out.append(self.annotation_document(annotation, None)?);
                 out.push(' ');
             }
             let mut annotations = component.type_annotations(pool, true)?;
@@ -107,9 +109,9 @@ impl<'a> Writer<'a, '_> {
                     varargs,
                 )?
             };
-            out.push_str(&ty);
+            out.append(ty);
             out.push(' ');
-            out.push_str(name);
+            self.field_symbol(&mut out, name, name, descriptor);
             rendered.push(out);
         }
         Ok(rendered)

@@ -30,12 +30,11 @@ impl Machine<'_, '_> {
     }
 
     fn outer_this(&self, outer: &str) -> Expr {
+        let mut text = self.class_reference(outer);
+        text.push_str(".this");
         Expr {
             source: Source::OuterThis,
-            ..Expr::atom(
-                Type::Object(outer.into()),
-                format!("{}.this", (self.class_name)(outer)).into(),
-            )
+            ..Expr::atom(Type::Object(outer.into()), text)
         }
     }
 
@@ -88,7 +87,11 @@ impl Machine<'_, '_> {
     ) -> Result<(Document, &'args [Expr]), LiftError> {
         let plain = || {
             target.map_or_else(
-                || format!("new {}", (self.class_name)(owner)).into(),
+                || {
+                    let mut head = Document::from("new ");
+                    head.append(self.class_reference(owner));
+                    head
+                },
                 Document::from,
             )
         };
@@ -99,6 +102,7 @@ impl Machine<'_, '_> {
             return Ok((plain(), args));
         }
         let args = self.legacy_constructor_arguments(owner, descriptor, args)?;
+        let args = self.local_constructor_arguments(owner, descriptor, args)?;
         if target.is_none()
             && group.is_attached(owner)
             && let Some(class) = group.nested_class(owner)
@@ -160,7 +164,7 @@ impl Machine<'_, '_> {
                     .unwrap_or(member.simple_name);
                 let mut head = receiver.at(PRIMARY).into_owned();
                 head.push_str(".new ");
-                head.push_str(name);
+                self.append_class_reference(&mut head, name, owner);
                 head
             }
         };
@@ -351,7 +355,7 @@ impl Machine<'_, '_> {
         let is_static = matches!(member.opcode, 0xb2 | 0xb3 | 0xb8);
         let skip = usize::from(!is_static);
         let (mut qualifier, passed) = if is_static {
-            (Document::from((self.class_name)(owner)), args)
+            (self.class_reference(owner), args)
         } else {
             let Some((receiver, passed)) = args.split_first() else {
                 return Err(fail());
@@ -363,9 +367,9 @@ impl Machine<'_, '_> {
         };
         if member.opcode < 0xb6 {
             let field_type = Type::parse(target_descriptor)?;
-            let name = self.source_field_name(owner, name, target_descriptor);
+            let source = self.source_field_name(owner, name, target_descriptor);
             qualifier.push('.');
-            qualifier.push_str(name);
+            self.append_field_reference(&mut qualifier, source, owner, name, target_descriptor);
             if matches!(member.opcode, 0xb3 | 0xb5) {
                 if signature.parameters[skip..] != [field_type]
                     || signature.return_type != Type::Void
@@ -394,9 +398,9 @@ impl Machine<'_, '_> {
             return Err(fail());
         }
         self.record_synthetic_invocation(owner, name, target_descriptor);
-        let name = self.source_invocation_name(owner, name, target_descriptor);
+        let source = self.source_invocation_name(owner, name, target_descriptor);
         qualifier.push('.');
-        qualifier.push_str(&name);
+        self.append_method_reference(&mut qualifier, &source, owner, name, target_descriptor);
         qualifier.append_relative_arguments(passed.iter().map(|arg| &arg.text));
         if target.return_type == Type::Void {
             let order = self.order_of(args, true)?;

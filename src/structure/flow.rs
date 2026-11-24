@@ -43,7 +43,7 @@ impl<'r, 'a, 'c> Region<'r, 'a, 'c> {
 
     pub(super) fn loop_body(&'r self, scope: &'r LoopScope<'a, 'c>) -> Self {
         Self {
-            stop: Some(scope.header),
+            stop: Some(scope.continue_at.get()),
             loop_header: Some(scope.header),
             loop_scope: Some(scope),
             outer: Some(self),
@@ -62,7 +62,7 @@ impl<'r, 'a, 'c> Region<'r, 'a, 'c> {
         let mut current = Some(self);
         while let Some(region) = current {
             if let Some(scope) = region.loop_scope {
-                if block == scope.header {
+                if block == scope.continue_at.get() {
                     return Some((scope, Transfer::Continue));
                 }
                 if Some(block) == scope.exit {
@@ -72,6 +72,22 @@ impl<'r, 'a, 'c> Region<'r, 'a, 'c> {
             current = region.outer;
         }
         None
+    }
+
+    pub(super) fn for_loop_prefix(&self, start: usize) -> Option<usize> {
+        let range = self.loop_scope?.element_prefix.get()?;
+        (range.0 == start).then_some(range.1)
+    }
+
+    pub(super) fn for_loop_omits(&self, index: usize) -> bool {
+        self.loop_scope
+            .is_some_and(|scope| scope.update.get() == Some(index))
+    }
+
+    pub(super) fn counted_latch(&self) -> Option<usize> {
+        let scope = self.loop_scope?;
+        let latch = scope.continue_at.get();
+        (latch != scope.header && scope.update.get().is_some()).then_some(latch)
     }
 
     pub(super) fn exception(
@@ -101,6 +117,9 @@ impl<'r, 'a, 'c> Region<'r, 'a, 'c> {
 
 pub(super) struct LoopScope<'a, 'c> {
     pub(super) header: usize,
+    pub(super) continue_at: Cell<usize>,
+    pub(super) update: Cell<Option<usize>>,
+    pub(super) element_prefix: Cell<Option<(usize, usize)>>,
     pub(super) exit: Option<usize>,
     pub(super) entry: Machine<'a, 'c>,
     pub(super) breaks: RefCell<Vec<Machine<'a, 'c>>>,
@@ -304,6 +323,10 @@ impl Layout {
 
     pub(super) fn inside(&self, block: usize, region: Region<'_, '_, '_>) -> bool {
         self.level[block] == region.loop_header && !region.has_stop(block)
+    }
+
+    pub(super) fn direct_loop_member(&self, block: usize, header: usize) -> bool {
+        self.level[block] == Some(header)
     }
 
     pub(super) fn normal_join(&self, head: usize, region: Region<'_, '_, '_>) -> Option<usize> {

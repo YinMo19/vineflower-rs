@@ -346,8 +346,8 @@ impl Machine<'_, '_> {
     }
 
     pub(super) fn cast(&self, expr: Expr, ty: Type, effect: bool) -> Result<Expr, LiftError> {
-        let name = self.render_type(&ty);
-        self.cast_named(expr, ty, effect, &name)
+        let name = self.type_document(&ty);
+        self.cast_named(expr, ty, effect, name)
     }
 
     fn cast_named(
@@ -355,10 +355,10 @@ impl Machine<'_, '_> {
         expr: Expr,
         ty: Type,
         effect: bool,
-        name: &str,
+        name: Document,
     ) -> Result<Expr, LiftError> {
         let mut text = Document::from("(");
-        text.push_str(name);
+        text.append(name);
         text.push(')');
         expr.append_at(UNARY, &mut text);
         self.expression(ty, text, UNARY, [&expr], effect)
@@ -477,7 +477,7 @@ impl Machine<'_, '_> {
         expr: Expr,
         ty: Type,
         effect: bool,
-        name: Option<String>,
+        name: Option<Document>,
     ) -> Result<Expr, LiftError> {
         let object = Type::Object("java/lang/Object".into());
         let expr = if !matches!(expr.source, Source::Null)
@@ -492,7 +492,7 @@ impl Machine<'_, '_> {
             expr
         };
         if let Some(name) = name {
-            self.cast_named(expr, ty, effect, &name)
+            self.cast_named(expr, ty, effect, name)
         } else {
             self.cast(expr, ty, effect)
         }

@@ -2,14 +2,13 @@
 
 use std::collections::HashMap;
 
-use super::{DecompileError, Writer};
+use super::{DecompileError, Document, Writer, symbols};
 use crate::{
     classfile::{Annotation, ClassError, ClassFile, TypeAnnotation, TypePathStep, TypeTarget},
     descriptor::{
         ClassSignature, ClassType, GenericType, NestedType, Type, TypeArgument, TypeParameter,
     },
 };
-use std::fmt::Write;
 
 /// An explicit, non-static membership edge adds one INNER_TYPE step. A `$` in
 /// the binary name alone does not establish such an edge (e.g. Map.Entry).
@@ -89,9 +88,10 @@ pub(super) fn render<'a, 'b, E>(
     ty: impl Into<RenderType<'a>>,
     annotations: impl IntoIterator<Item = &'b TypeAnnotation>,
     mut map_class: impl FnMut(&str) -> String,
-    mut map_annotation: impl FnMut(&Annotation) -> Result<String, E>,
+    mut map_annotation: impl FnMut(&Annotation) -> Result<Document, E>,
     varargs: bool,
-) -> Result<String, E> {
+    marked: bool,
+) -> Result<Document, E> {
     let ty = ty.into();
     let mut by_path = HashMap::<_, Vec<_>>::new();
     for annotation in annotations {
@@ -100,11 +100,12 @@ pub(super) fn render<'a, 'b, E>(
             .or_default()
             .push(&annotation.annotation);
     }
-    if by_path.is_empty() && !varargs {
+    if by_path.is_empty() && !varargs && !marked {
         return Ok(match ty {
             RenderType::Erased(ty) => ty.render(map_class),
             RenderType::Generic(ty) => ty.render(map_class),
-        });
+        }
+        .into());
     }
     let mut renderer = Renderer {
         nesting,
@@ -112,7 +113,8 @@ pub(super) fn render<'a, 'b, E>(
         map_class: &mut map_class,
         map_annotation: &mut map_annotation,
         path: Vec::new(),
-        out: String::new(),
+        out: Document::new(),
+        marked,
     };
     renderer.write_type(ty, varargs)?;
     Ok(renderer.out)
@@ -122,9 +124,10 @@ struct Renderer<'f, 'b, 'n, E> {
     nesting: &'f TypeNesting<'n>,
     by_path: HashMap<&'b [TypePathStep], Vec<&'b Annotation>>,
     map_class: &'f mut dyn FnMut(&str) -> String,
-    map_annotation: &'f mut dyn FnMut(&Annotation) -> Result<String, E>,
+    map_annotation: &'f mut dyn FnMut(&Annotation) -> Result<Document, E>,
     path: Vec<TypePathStep>,
-    out: String,
+    out: Document,
+    marked: bool,
 }
 
 impl<E> Renderer<'_, '_, '_, E> {
@@ -140,7 +143,7 @@ impl<E> Renderer<'_, '_, '_, E> {
                     self.out.push(' ');
                     needs_space = false;
                 }
-                self.out.push_str(&java);
+                self.out.append(java);
                 self.out.push(' ');
             }
         }
@@ -203,7 +206,7 @@ impl<E> Renderer<'_, '_, '_, E> {
                     base = name;
                     break;
                 }
-                implicit.push(simple);
+                implicit.push((base, simple));
                 base = outer;
             }
         }
@@ -211,26 +214,49 @@ impl<E> Renderer<'_, '_, '_, E> {
         // A package or static qualifier comes before the actual type-use node:
         // pkg.Outer.@A Static is legal Java; @A pkg.Outer.Static is not.
         let leaf_start = mapped.rfind('.').map_or(0, |dot| dot + 1);
-        self.out.push_str(&mapped[..leaf_start]);
-        self.write_annotations(false)?;
-        self.out.push_str(&mapped[leaf_start..]);
-        for simple in implicit.into_iter().rev() {
-            self.write_nested(simple)?;
+        if self.by_path.contains_key(self.path.as_slice()) {
+            self.out.push_str(&mapped[..leaf_start]);
+            if self.marked
+                && leaf_start != 0
+                && let Some((parent, _)) = base.rsplit_once('$')
+            {
+                let qualifier = &mapped[..leaf_start - 1];
+                let package = base.rsplit_once('/').map_or("", |(package, _)| package);
+                if qualifier.bytes().ne(package
+                    .bytes()
+                    .map(|byte| if byte == b'/' { b'.' } else { byte }))
+                {
+                    let start = self.out.len() - leaf_start;
+                    symbols::class_ranges(&mut self.out, start, qualifier, parent);
+                }
+            }
+            self.write_annotations(false)?;
+            symbols::append_class(&mut self.out, &mapped[leaf_start..], base, self.marked);
+        } else {
+            symbols::append_class(&mut self.out, &mapped, base, self.marked);
+        }
+        for (owner, simple) in implicit.into_iter().rev() {
+            self.write_nested(simple, owner)?;
         }
         self.write_arguments(arguments)?;
+        let mut owner = self.marked.then(|| name.to_owned());
         for part in nested {
-            self.write_nested(&part.name)?;
+            if let Some(owner) = &mut owner {
+                owner.push('$');
+                owner.push_str(&part.name);
+            }
+            self.write_nested(&part.name, owner.as_deref().unwrap_or(""))?;
             self.write_arguments(&part.arguments)?;
         }
         self.path.truncate(root);
         Ok(())
     }
 
-    fn write_nested(&mut self, name: &str) -> Result<(), E> {
+    fn write_nested(&mut self, name: &str, owner: &str) -> Result<(), E> {
         self.out.push('.');
         self.path.push(TypePathStep::NestedType);
         self.write_annotations(false)?;
-        self.out.push_str(name);
+        symbols::append_class(&mut self.out, name, owner, self.marked);
         Ok(())
     }
 
@@ -285,7 +311,7 @@ impl Writer<'_, '_> {
         target: TypeTarget,
         declarations: &[Annotation],
         varargs: bool,
-    ) -> Result<String, DecompileError> {
+    ) -> Result<Document, DecompileError> {
         render(
             &self.type_nesting,
             ty,
@@ -295,14 +321,15 @@ impl Writer<'_, '_> {
                         || !declarations.contains(&annotation.annotation))
             }),
             |name| self.names.render(name),
-            |annotation| self.annotation(annotation),
+            |annotation| self.annotation_document(annotation, None),
             varargs,
+            self.options.dump_text_tokens,
         )
     }
 
     pub(super) fn type_parameters(
         &self,
-        output: &mut String,
+        output: &mut Document,
         parameters: &[TypeParameter],
         annotations: &[TypeAnnotation],
         target: impl Fn(u8) -> TypeTarget,
@@ -317,7 +344,7 @@ impl Writer<'_, '_> {
             }
             let index = u8::try_from(index)
                 .map_err(|_| DecompileError::InvalidAttribute("annotated type parameter count"))?;
-            output.push_str(&self.render_annotated_type_parameter(
+            output.append(self.render_annotated_type_parameter(
                 &self.type_nesting,
                 parameter,
                 target(index),
@@ -332,7 +359,7 @@ impl Writer<'_, '_> {
         &self,
         annotations: &[TypeAnnotation],
         constructor: bool,
-    ) -> Result<Option<String>, DecompileError> {
+    ) -> Result<Option<Document>, DecompileError> {
         let target = TypeTarget::MethodReceiver;
         if !annotations
             .iter()
@@ -397,7 +424,9 @@ impl Writer<'_, '_> {
                 .group
                 .member_class(outer)
                 .map_or(super::simple(outer), |outer| outer.simple_name);
-            let _ = write!(value, " {name}.this");
+            value.push(' ');
+            value.push_str(name);
+            value.push_str(".this");
         } else {
             value.push_str(" this");
         }
@@ -410,14 +439,15 @@ impl Writer<'_, '_> {
         parameter: &TypeParameter,
         target: TypeTarget,
         annotations: &[TypeAnnotation],
-    ) -> Result<String, DecompileError> {
+    ) -> Result<Document, DecompileError> {
         render_parameter(
             nesting,
             parameter,
             target,
             annotations,
             |name| self.names.render(name),
-            |annotation| self.annotation(annotation),
+            |annotation| self.annotation_document(annotation, None),
+            self.options.dump_text_tokens,
         )
     }
 }
@@ -431,8 +461,9 @@ pub(super) fn render_parameter<E>(
     target: TypeTarget,
     annotations: &[TypeAnnotation],
     mut map_class: impl FnMut(&str) -> String,
-    mut map_annotation: impl FnMut(&Annotation) -> Result<String, E>,
-) -> Result<String, E> {
+    mut map_annotation: impl FnMut(&Annotation) -> Result<Document, E>,
+    marked: bool,
+) -> Result<Document, E> {
     let bound_target = |bound| match target {
         TypeTarget::ClassTypeParameter(parameter) => {
             Some(TypeTarget::ClassTypeParameterBound { parameter, bound })
@@ -442,14 +473,14 @@ pub(super) fn render_parameter<E>(
         }
         _ => None,
     };
-    let mut out = String::new();
+    let mut out = Document::new();
     for annotation in annotations
         .iter()
         .filter(|a| a.target == target && a.path.is_empty())
     {
         let java = map_annotation(&annotation.annotation)?;
         if !java.is_empty() {
-            out.push_str(&java);
+            out.append(java);
             out.push(' ');
         }
     }
@@ -473,13 +504,14 @@ pub(super) fn render_parameter<E>(
             continue;
         }
         out.push_str(separator);
-        out.push_str(&render(
+        out.append(render(
             nesting,
             bound,
             selected,
             &mut map_class,
             &mut map_annotation,
             false,
+            marked,
         )?);
         separator = " & ";
     }
@@ -503,8 +535,8 @@ mod tests {
         }
     }
 
-    fn annotation(tag: &Annotation) -> Result<String, Infallible> {
-        Ok(format!("@A{}", tag.type_index))
+    fn annotation(tag: &Annotation) -> Result<Document, Infallible> {
+        Ok(format!("@A{}", tag.type_index).into())
     }
 
     #[test]
@@ -536,6 +568,7 @@ mod tests {
             |name| name.replace('/', "."),
             annotation,
             true,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -560,6 +593,7 @@ mod tests {
                 "pkg.Outer.Static".into()
             },
             annotation,
+            false,
             false,
         )
         .unwrap();
@@ -611,6 +645,7 @@ mod tests {
             &annotations,
             |name| name.rsplit('/').next().unwrap().to_owned(),
             annotation,
+            false,
         )
         .unwrap();
         assert_eq!(actual, "@A1 T extends @A3 Serializable");

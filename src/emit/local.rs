@@ -1,11 +1,16 @@
 // Based on Vineflower NestedClassProcessor (Apache-2.0).
 // Copyright 2000-2021 JetBrains s.r.o.
-use std::{collections::BTreeMap, iter::Peekable};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    iter::Peekable,
+    rc::Rc,
+};
 
 use crate::{
     bytecode::{self, Instruction, Operand},
     classfile::{BootstrapMethod, ClassError, ClassFile, Code, Constant},
     context::{NestedClass, NestedKind},
+    lift::{AnonymousBindings, AnonymousSites},
     structure::Line,
 };
 
@@ -18,6 +23,7 @@ impl<'a, 'c> Writer<'a, 'c> {
         descriptor: &str,
         code: &Code<'a>,
         lines: &[Line],
+        sites: Option<&AnonymousSites>,
     ) -> Result<Vec<LocalDeclaration<'c>>, DecompileError> {
         if !self.options.decompile_inner {
             return Ok(Vec::new());
@@ -38,6 +44,8 @@ impl<'a, 'c> Writer<'a, 'c> {
                         simple,
                         uses: None,
                         insertion: 0,
+                        captures: BTreeSet::new(),
+                        bindings: None,
                     },
                 ))
             })
@@ -45,21 +53,40 @@ impl<'a, 'c> Writer<'a, 'c> {
         if declarations.is_empty() {
             return Ok(Vec::new());
         }
-        for child in declarations.keys() {
-            let class = self.group.get(child).expect("local class is registered");
+        let sites = sites.map(|sites| sites.borrow());
+        let pool = &self.class.pool;
+        for declaration in declarations.values_mut() {
+            let child = declaration.child;
+            let mut observed = sites.iter().flat_map(|sites| sites.local_sites(child));
+            if let Some(first) = observed.next() {
+                if observed.any(|candidate| !first.same_bindings(candidate)) {
+                    return Err(DecompileError::Unsupported {
+                        feature: "different capture bindings at local-class constructions",
+                    });
+                }
+                declaration.bindings = Some(first.bindings(self.anonymous_bindings.clone()));
+                continue;
+            }
+            let class = group
+                .get(declaration.child)
+                .expect("local class is registered");
             for field in &class.fields {
-                if field.access_flags & (SYNTHETIC | STATIC) == SYNTHETIC
-                    && self
-                        .group
-                        .outer_field(
-                            child,
-                            class.pool.utf8(field.name_index)?,
-                            class.pool.utf8(field.descriptor_index)?,
-                        )
+                let name = class.pool.utf8(field.name_index)?;
+                let descriptor = class.pool.utf8(field.descriptor_index)?;
+                if field.access_flags & (STATIC | 0x0010) == 0x0010
+                    && (field.access_flags & SYNTHETIC != 0
+                        || crate::classfile::find_attribute(
+                            &field.attributes,
+                            &class.pool,
+                            "Synthetic",
+                        )?
+                        .is_some())
+                    && group
+                        .outer_field(declaration.child, name, descriptor)
                         .is_none()
                 {
                     return Err(DecompileError::Unsupported {
-                        feature: "captured local-class variables",
+                        feature: "captured local class without a recoverable construction site",
                     });
                 }
             }
@@ -80,7 +107,27 @@ impl<'a, 'c> Writer<'a, 'c> {
                     .map(move |offset| (offset, index))
             })
             .collect();
-        let pool = &self.class.pool;
+        for declaration in declarations
+            .values_mut()
+            .filter(|declaration| declaration.bindings.is_some())
+        {
+            let registry = sites
+                .as_ref()
+                .expect("binding was recovered from site registry");
+            for site in registry.local_sites(declaration.child) {
+                if let Some(&line) = locations.get(&site.offset()) {
+                    declaration.add_use(line);
+                }
+                for capture in site.declarations() {
+                    let Some(&line) = locations.get(&capture) else {
+                        return Err(DecompileError::Unsupported {
+                            feature: "cannot locate captured variable in the enclosing source",
+                        });
+                    };
+                    declaration.captures.insert(line);
+                }
+            }
+        }
         let mut bootstraps = None;
         for op in &instructions {
             let Some(&line) = locations.get(&op.offset) else {
@@ -158,6 +205,11 @@ impl<'a, 'c> Writer<'a, 'c> {
                 .remove(next)
                 .expect("sorted declaration exists");
             declaration.place(lines, name == "<init>");
+            if !declaration.captures_are_in_scope(lines) {
+                return Err(DecompileError::Unsupported {
+                    feature: "local-class declaration is outside its capture scope",
+                });
+            }
             for dependency in &dependencies[next] {
                 declarations
                     .get_mut(dependency)
@@ -211,15 +263,33 @@ impl<'a, 'c> Writer<'a, 'c> {
             .is_some_and(|declaration| declaration.insertion == index)
         {
             let declaration = declarations.next().expect("peeked declaration");
-            if (index != 0 || any) && !self.body.ends_with("\n\n") {
+            let after_open = self.body.ends_with(" {\n")
+                || self
+                    .body
+                    .rsplit_terminator('\n')
+                    .next()
+                    .is_some_and(|line| {
+                        let line = line.trim_start();
+                        (line.starts_with("case ") || line.starts_with("default:"))
+                            && line.ends_with(':')
+                    });
+            if (index != 0 || any) && !after_open && !self.body.ends_with("\n\n") {
                 self.line(0, "");
             }
-            self.write_nested(
+            let previous = declaration
+                .bindings
+                .as_ref()
+                .map(|bindings| self.anonymous_bindings.replace(Rc::clone(bindings)));
+            let result = self.write_nested(
                 declaration.child,
                 declaration.node,
                 declaration.simple,
                 self.depth + depth + 2,
-            )?;
+            );
+            if let Some(previous) = previous {
+                self.anonymous_bindings = previous;
+            }
+            result?;
             any = true;
         }
         if any && has_following_line {
@@ -235,6 +305,8 @@ pub(in crate::emit) struct LocalDeclaration<'a> {
     simple: &'a str,
     uses: Option<(usize, usize)>,
     insertion: usize,
+    captures: BTreeSet<usize>,
+    bindings: Option<AnonymousBindings>,
 }
 
 impl LocalDeclaration<'_> {
@@ -242,6 +314,20 @@ impl LocalDeclaration<'_> {
         self.uses = Some(self.uses.map_or((index, index), |(first, last)| {
             (first.min(index), last.max(index))
         }));
+    }
+
+    fn captures_are_in_scope(&self, lines: &[Line]) -> bool {
+        let insertion_depth = lines.get(self.insertion).map_or(0, |line| line.depth);
+        self.captures.iter().all(|&capture| {
+            if capture >= self.insertion {
+                return false;
+            }
+            let depth = lines[capture].depth;
+            depth <= insertion_depth
+                && lines[capture + 1..self.insertion]
+                    .iter()
+                    .all(|line| line.depth >= depth)
+        })
     }
 
     fn place(&mut self, lines: &[Line], constructor: bool) {

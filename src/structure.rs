@@ -5,6 +5,8 @@ mod exception_emit;
 #[cfg(test)]
 mod exception_tests;
 mod flow;
+mod for_loops;
+mod instanceof_patterns;
 #[cfg(test)]
 mod join_tests;
 mod pattern_switch;
@@ -109,7 +111,7 @@ pub(crate) fn structure_with_assertions(
     {
         return Err(StructureError::ExceptionHandlers);
     }
-    let exceptions = Exceptions::new(instructions, graph, handlers)?;
+    let exceptions = Exceptions::new(instructions, graph, handlers, Some(&machine))?;
     structure_regions(instructions, graph, machine, &exceptions, assertions)
 }
 
@@ -195,7 +197,7 @@ impl Emitter<'_> {
         depth: usize,
         pending: &mut Vec<u32>,
     ) -> Result<bool, StructureError> {
-        self.run_region(block, region, machine, depth, pending, false)
+        self.run_region(block, region, machine, depth, pending, false, None)
     }
 
     fn run_region<'a, 'c>(
@@ -206,6 +208,7 @@ impl Emitter<'_> {
         depth: usize,
         pending: &mut Vec<u32>,
         mut enter_loop: bool,
+        mut first_instruction: Option<usize>,
     ) -> Result<bool, StructureError> {
         // Bytecode need not originate from Java, so recursion depth is not
         // constrained by the nesting limits of a source compiler.
@@ -252,26 +255,46 @@ impl Emitter<'_> {
                 block = exit;
                 continue;
             }
-            if let Some(next) =
-                self.try_emit_pattern_switch(block, region, machine, depth, pending)?
-            {
-                let Some(next) = next else { return Ok(false) };
-                block = next;
-                continue;
-            }
-            if let Some(next) =
-                self.try_emit_string_switch(block, region, machine, depth, pending)?
-            {
-                let Some(next) = next else { return Ok(false) };
-                block = next;
-                continue;
+            let start = first_instruction
+                .take()
+                .or_else(|| region.for_loop_prefix(self.graph.blocks[block].instructions.start));
+            if start.is_none() {
+                if let Some(next) =
+                    self.try_emit_pattern_switch(block, region, machine, depth, pending)?
+                {
+                    let Some(next) = next else { return Ok(false) };
+                    block = next;
+                    continue;
+                }
+                if let Some(next) =
+                    self.try_emit_string_switch(block, region, machine, depth, pending)?
+                {
+                    let Some(next) = next else { return Ok(false) };
+                    block = next;
+                    continue;
+                }
             }
             self.emitted[block] = true;
+            let (tail, binding) = if let Some(start) = start {
+                (
+                    self.lift_if_arm_start(
+                        block,
+                        start,
+                        machine,
+                        region,
+                        depth,
+                        mem::take(pending),
+                    )?,
+                    None,
+                )
+            } else {
+                self.lift_instanceof_head(block, machine, region, depth, mem::take(pending))?
+            };
             let Tail {
                 effect,
                 mut offsets,
                 control,
-            } = self.lift_block(block, machine, region, depth, mem::take(pending))?;
+            } = tail;
             match effect {
                 Effect::None => {
                     block = self.single_successor(block)?;
@@ -304,6 +327,7 @@ impl Emitter<'_> {
                         machine,
                         depth,
                         condition,
+                        binding,
                         &mut offsets,
                         control,
                     )?
@@ -376,16 +400,19 @@ impl Emitter<'_> {
         let mut control = None;
         let mut index = range.start;
         while index < range.end {
-            if self.exceptions.skips_instruction(index) {
+            if self.exceptions.skips_instruction(index) || region.for_loop_omits(index) {
                 index += 1;
                 continue;
             }
             let instruction = &self.instructions[index];
             if matches!(instruction.opcode, 0xbc | 0xbd)
-                && let Some(consumed) = machine
-                    .try_array_initializer(&self.instructions[index..range.end], |relative, _| {
-                        !self.exceptions.skips_instruction(index + relative)
-                    })
+                && let Some(consumed) = machine.try_array_initializer(
+                    &self.instructions[index..range.end],
+                    |relative, _| {
+                        let index = index + relative;
+                        !self.exceptions.skips_instruction(index) && !region.for_loop_omits(index)
+                    },
+                )
             {
                 offsets.extend(
                     self.instructions[index..index + consumed]
@@ -447,6 +474,7 @@ impl Emitter<'_> {
         machine: &mut Machine<'a, 'c>,
         depth: usize,
         mut condition: Condition,
+        mut binding: Option<instanceof_patterns::Binding>,
         offsets: &mut Vec<u32>,
         mut control: RangeInclusive<u32>,
     ) -> Result<Option<usize>, StructureError> {
@@ -455,7 +483,18 @@ impl Emitter<'_> {
         }
         let held = machine.hold_control_stack(&control)?;
         let prelude = machine.take_prelude();
-        self.collapse_condition(
+        if let Some(binding) = &mut binding {
+            self.collapse_instanceof_guard(
+                block,
+                region,
+                machine,
+                depth,
+                &mut condition,
+                binding,
+                offsets,
+                &mut control,
+            )?;
+        } else if let Some(proof) = self.collapse_instanceof_prefix(
             block,
             region,
             machine,
@@ -463,7 +502,19 @@ impl Emitter<'_> {
             &mut condition,
             offsets,
             &mut control,
-        )?;
+        )? {
+            binding = proof;
+        } else {
+            self.collapse_condition(
+                block,
+                region,
+                machine,
+                depth,
+                &mut condition,
+                offsets,
+                &mut control,
+            )?;
+        }
         let Condition {
             taken,
             fallthrough,
@@ -503,16 +554,38 @@ impl Emitter<'_> {
                 (region.stop == Some(next) || self.layout.inside(next, region)).then_some(next)
             })
             .or(region.stop);
+        let guard_clause = binding
+            .as_ref()
+            .is_some_and(|binding| join.is_some_and(|next| binding.succeeds_at(next)));
+        let join = self.instanceof_join(join, region, binding.as_ref());
         let arm_region = region.branch(join);
-        let (then_at, else_at, condition, inverse) = if join == Some(fallthrough) {
+        let skip_fallthrough = self.skips_to_counted_latch(block, fallthrough, arm_region);
+        let skip_taken = self.skips_to_counted_latch(block, taken, arm_region);
+        let negate = if guard_clause {
+            binding
+                .as_ref()
+                .is_some_and(|binding| binding.succeeds_at(fallthrough))
+        } else {
+            join == Some(fallthrough)
+                || skip_fallthrough
+                || self.instanceof_empty_arm(binding.as_ref(), join, fallthrough)
+        };
+        let (then_at, else_at, condition, inverse) = if negate {
             (taken, fallthrough, when_true, when_false)
         } else {
             (fallthrough, taken, when_false, when_true)
         };
+        let skip_else = if negate { skip_fallthrough } else { skip_taken };
 
         let start = self.lines.len();
-        let then = self.branch_arm(then_at, arm_region, machine, depth + 1)?;
-        let otherwise = self.branch_arm(else_at, arm_region, machine, depth + 1)?;
+        let then =
+            self.instanceof_branch_arm(then_at, arm_region, machine, depth + 1, binding.as_ref())?;
+        let else_depth = if guard_clause { depth } else { depth + 1 };
+        let otherwise =
+            self.instanceof_branch_arm(else_at, arm_region, machine, else_depth, binding.as_ref())?;
+        if guard_clause && then.exit.is_some() {
+            return Err(self.unstructured(block));
+        }
         if start == otherwise.end
             && let (Some(yes), Some(no)) = (&then.exit, &otherwise.exit)
             && yes.same_locals(machine)
@@ -543,21 +616,28 @@ impl Emitter<'_> {
             self.merge_arms(machine, join.expect("reached an if join"), &exits)?
         };
         let mut assignments = assignments.into_iter();
-        let mut assignment_lines = |falls: bool, mut offsets: Vec<u32>| {
+        let mut assignment_lines = |line_depth: usize, falls: bool, mut offsets: Vec<u32>| {
             falls
                 .then(|| assignments.next().expect("one assignment list per arm"))
                 .unwrap_or_default()
                 .into_iter()
-                .map(|text| Line::new(depth + 1, text, mem::take(&mut offsets)))
+                .map(|text| Line::new(line_depth, text, mem::take(&mut offsets)))
                 .collect::<Vec<_>>()
         };
         let then_falls = then.exit.is_some();
         let else_falls = otherwise.exit.is_some();
         let then_end = then.end;
         let else_end = otherwise.end;
-        let mut then_lines = assignment_lines(then_falls, then.offsets);
-        let else_lines = assignment_lines(else_falls, otherwise.offsets);
-        if join != Some(else_at) || !else_lines.is_empty() {
+        let mut then_lines = assignment_lines(depth + 1, then_falls, then.offsets);
+        let else_lines = assignment_lines(else_depth, else_falls, otherwise.offsets);
+        if guard_clause {
+            self.lines.splice(else_end..else_end, else_lines);
+            then_lines.push(Line::new(depth, "}", Vec::new()));
+        } else if (join != Some(else_at)
+            && !skip_else
+            && !self.instanceof_empty_arm(binding.as_ref(), join, else_at))
+            || !else_lines.is_empty()
+        {
             self.lines.splice(else_end..else_end, else_lines);
             then_lines.push(Line::new(depth, "} else {", Vec::new()));
         }
@@ -577,7 +657,9 @@ impl Emitter<'_> {
             mem::take(offsets),
         ));
         self.lines.splice(start..start, header);
-        self.syntax(depth, "}");
+        if !guard_clause {
+            self.syntax(depth, "}");
+        }
         Ok(if then_falls || else_falls { join } else { None })
     }
 
@@ -674,14 +756,17 @@ impl Emitter<'_> {
         region: Region<'_, 'a, 'c>,
         iteration: &mut Machine<'a, 'c>,
         depth: usize,
-    ) -> Result<(usize, usize, Document), StructureError> {
+    ) -> Result<(usize, usize, Document, Option<instanceof_patterns::Binding>), StructureError>
+    {
         let header = scope.header;
         self.emitted[header] = true;
+        let (tail, mut binding) =
+            self.lift_instanceof_head(header, iteration, region, depth, Vec::new())?;
         let Tail {
             effect,
             mut offsets,
             control,
-        } = self.lift_block(header, iteration, region, depth, Vec::new())?;
+        } = tail;
         let Effect::Branch {
             target,
             when_true,
@@ -707,15 +792,28 @@ impl Emitter<'_> {
             when_true,
             when_false,
         };
-        self.collapse_condition(
-            header,
-            region,
-            iteration,
-            depth,
-            &mut condition,
-            &mut offsets,
-            &mut control,
-        )?;
+        if let Some(binding) = &mut binding {
+            self.collapse_instanceof_guard(
+                header,
+                region,
+                iteration,
+                depth,
+                &mut condition,
+                binding,
+                &mut offsets,
+                &mut control,
+            )?;
+        } else {
+            self.collapse_condition(
+                header,
+                region,
+                iteration,
+                depth,
+                &mut condition,
+                &mut offsets,
+                &mut control,
+            )?;
+        }
         let (body, condition, exit_condition) = if condition.taken == test.exit {
             (
                 condition.fallthrough,
@@ -739,7 +837,13 @@ impl Emitter<'_> {
             &mut Vec::new(),
         )?;
         self.syntax(depth, "}");
-        Ok((body, guard, condition))
+        if binding
+            .as_ref()
+            .is_some_and(|binding| !binding.succeeds_at(body))
+        {
+            return Err(self.unstructured(header));
+        }
+        Ok((body, guard, condition, binding))
     }
 
     fn emit_loop<'a, 'c>(
@@ -759,12 +863,46 @@ impl Emitter<'_> {
         let head_line = self.lines.len();
         self.syntax(depth, "while (true) {");
         let mut iteration = machine.clone();
+        let mut for_loop = None;
         let body_region = region.loop_body(&scope);
         let (repeats, guard) = if let Some(test) = shape.test {
-            let (body, guard, condition) =
+            let (body, guard, condition, binding) =
                 self.emit_loop_test(&scope, test, body_region, &mut iteration, depth + 1)?;
-            let repeats =
-                self.region_with_offsets(body, body_region, &mut iteration, depth + 1, pending)?;
+            let body_region = if guard == head_line + 1
+                && body == test.body
+                && binding.is_none()
+                && let Some(plan) = self.prove_for_loop(
+                    header,
+                    test,
+                    region,
+                    &scope.entry,
+                    &mut iteration,
+                    head_line,
+                    depth,
+                ) {
+                if let Some(latch) = plan.latch {
+                    scope.continue_at.set(latch);
+                    self.emitted[latch] = true;
+                }
+                scope.update.set(plan.update);
+                scope
+                    .element_prefix
+                    .set(plan.element.as_ref().map(|range| (range.start, range.end)));
+                for_loop = Some(plan);
+                region.loop_body(&scope)
+            } else {
+                body_region
+            };
+            let first_instruction = binding.and_then(|binding| binding.enter(&mut iteration));
+            let repeats = self.run_region(
+                body,
+                body_region,
+                &mut iteration,
+                depth + 1,
+                pending,
+                false,
+                first_instruction,
+            )?;
             (repeats, Some((guard, condition)))
         } else {
             (
@@ -775,6 +913,7 @@ impl Emitter<'_> {
                     depth + 1,
                     pending,
                     true,
+                    None,
                 )?,
                 None,
             )
@@ -803,16 +942,24 @@ impl Emitter<'_> {
                 stack
             })
             .collect::<Vec<_>>();
+        let mut recovered_condition = None;
         if let Some((guard_line, condition)) = guard
             && guard_line == head_line + 1
             && assignments[0].is_empty()
         {
             let offsets = mem::take(&mut self.lines[guard_line].offsets);
-            self.lines[head_line] =
-                Line::new(depth, surrounded(condition, "while (", ") {"), offsets);
+            if for_loop.is_some() {
+                self.lines[head_line].offsets = offsets;
+                recovered_condition = Some(condition);
+            } else {
+                self.lines[head_line] =
+                    Line::new(depth, surrounded(condition, "while (", ") {"), offsets);
+            }
             self.lines.drain(guard_line..guard_line + 3);
         }
-        self.label_loop(head_line, &scope);
+        if for_loop.is_none() {
+            self.label_loop(head_line, &scope);
+        }
         if assignments.iter().any(|edge| !edge.is_empty()) {
             let body = self.lines.split_off(head_line + 1);
             for mut line in body {
@@ -839,6 +986,12 @@ impl Emitter<'_> {
                 }
             }
         }
+        let mut head_line = head_line;
+        if let Some(plan) = for_loop {
+            let condition = recovered_condition.ok_or_else(|| self.unstructured(header))?;
+            head_line -= plan.write(&mut self.lines, head_line, condition, machine);
+            self.label_loop(head_line, &scope);
+        }
         self.lines.splice(
             head_line..head_line,
             stack
@@ -858,6 +1011,9 @@ impl Emitter<'_> {
     ) -> LoopScope<'a, 'c> {
         LoopScope {
             header,
+            continue_at: Cell::new(header),
+            update: Cell::new(None),
+            element_prefix: Cell::new(None),
             exit,
             entry: machine.clone(),
             breaks: RefCell::default(),

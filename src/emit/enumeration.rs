@@ -345,8 +345,17 @@ impl Writer<'_, '_> {
         if count == 0 {
             self.line(1, ";");
         }
+        let descriptor = self
+            .options
+            .dump_text_tokens
+            .then(|| format!("L{};", self.owner));
         for (index, constant) in enumeration.constants.iter().enumerate() {
-            let mut head = Document::from(constant.name);
+            let mut head = Document::new();
+            if let Some(descriptor) = &descriptor {
+                self.field_symbol(&mut head, constant.name, constant.name, descriptor);
+            } else {
+                head.push_str(constant.name);
+            }
             head.append_ref(&constant.arguments);
             if let Some(id) = constant.subclass {
                 let _ = write!(head, "\0{id}\0");

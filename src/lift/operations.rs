@@ -408,7 +408,7 @@ impl Machine<'_, '_> {
         }
         counts.reverse();
         let mut text = Document::from("new ");
-        text.push_str(&self.render_type(element));
+        text.append(self.type_document(element));
         for count in &counts {
             text.push('[');
             text.append_ref(&count.text);
@@ -467,11 +467,11 @@ impl Machine<'_, '_> {
                 })
                 .transpose()?
                 .flatten()
-                .unwrap_or_else(|| self.render_type(&ty));
+                .unwrap_or_else(|| self.type_document(&ty));
             let mut text = Document::new();
             value.append_at(RELATIONAL, &mut text);
             text.push_str(" instanceof ");
-            text.push_str(&name);
+            text.append(name);
             self.push(self.expression(BOOLEAN, text, RELATIONAL, [&value], true)?)
         }
     }

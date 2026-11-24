@@ -4,7 +4,11 @@ use crate::{
     bytecode::{Instruction, Operand},
     classfile::Constant,
     descriptor::{MethodDescriptor, Type},
-    source_text::Document,
+    emit::symbols::append_class,
+    source_text::{
+        Document,
+        tokens::{Token, TokenKind},
+    },
 };
 
 use super::{
@@ -88,12 +92,12 @@ impl Machine<'_, '_> {
             // declaring class, even though ordinary static writes can qualify.
             Document::new()
         } else {
-            let mut head = Document::from((self.class_name)(owner));
+            let mut head = self.class_reference(owner);
             head.push('.');
             head
         };
         self.anchor_member(&mut access, op);
-        access.push_str(source_name);
+        self.append_field_reference(&mut access, source_name, owner, name, descriptor);
         if let Some(value) = value {
             let order = self.order_of(receiver.iter().chain([&value]), true)?;
             self.before_statement(order)?;
@@ -228,9 +232,11 @@ impl Machine<'_, '_> {
             );
             (text, chain)
         } else if !super_call {
-            ((self.class_name)(owner).into(), false)
+            (self.class_reference(owner), false)
         } else if matches!(tag, Constant::InterfaceMethodref { .. }) {
-            (format!("{}.super", (self.class_name)(owner)).into(), false)
+            let mut qualifier = self.class_reference(owner);
+            qualifier.push_str(".super");
+            (qualifier, false)
         } else {
             ("super".into(), false)
         };
@@ -244,7 +250,7 @@ impl Machine<'_, '_> {
             text.push('.');
         }
         self.anchor_member(&mut text, op);
-        text.push_str(&source_name);
+        self.append_method_reference(&mut text, &source_name, owner, name, method_type);
         text.append_relative_arguments(args.iter().map(|argument| &argument.text));
         if chain {
             text.end_group();
@@ -307,6 +313,94 @@ impl Machine<'_, '_> {
                 })?;
             }
             Ok(Effect::None)
+        }
+    }
+
+    /// A class name used as a source qualifier, not a qualifier value.
+    pub(super) fn class_reference(&self, owner: &str) -> Document {
+        let source = (self.class_name)(owner);
+        if !self.options.dump_text_tokens {
+            return source.into();
+        }
+        let mut document = Document::new();
+        self.append_class_reference(&mut document, &source, owner);
+        document
+    }
+
+    /// Attach a reference to each actually printed class in a nested name.
+    pub(super) fn append_class_reference(&self, text: &mut Document, source: &str, owner: &str) {
+        append_class(
+            text,
+            source,
+            owner,
+            self.options.dump_text_tokens && !source.is_empty(),
+        );
+    }
+
+    pub(super) fn type_reference(&self, ty: &Type) -> Document {
+        let mut element = ty;
+        let mut rank = 0;
+        while let Type::Array(component) = element {
+            rank += 1;
+            element = component;
+        }
+        let mut text = match element {
+            Type::Object(name) => self.class_reference(name),
+            _ => self.render_type(element).into(),
+        };
+        for _ in 0..rank {
+            text.push_str("[]");
+        }
+        text
+    }
+
+    pub(super) fn append_method_reference(
+        &self,
+        text: &mut Document,
+        source: &str,
+        owner: &str,
+        name: &str,
+        descriptor: &str,
+    ) {
+        if self.options.dump_text_tokens {
+            text.token(
+                source,
+                Token {
+                    declaration: false,
+                    kind: TokenKind::Method {
+                        owner: owner.into(),
+                        name: name.into(),
+                        descriptor: descriptor.into(),
+                    },
+                },
+            );
+        } else {
+            text.push_str(source);
+        }
+    }
+
+    pub(super) fn append_field_reference(
+        &self,
+        text: &mut Document,
+        source: &str,
+        owner: &str,
+        name: &str,
+        descriptor: &str,
+    ) {
+        if self.options.dump_text_tokens {
+            text.token(
+                source,
+                Token {
+                    declaration: false,
+                    kind: TokenKind::Field {
+                        owner: owner.into(),
+                        name: name.into(),
+                        descriptor: descriptor.into(),
+                    },
+                },
+            );
+        } else {
+            text.push_str(source);
         }
     }
 

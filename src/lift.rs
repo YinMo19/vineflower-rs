@@ -24,6 +24,7 @@ mod switch_expression;
 pub(crate) use anonymous::{AnonymousBindings, AnonymousSite, AnonymousSites};
 pub(crate) use dynamic::source_method_name;
 pub(crate) use literal::{constant_literal, constant_literal_with_options, string_literal};
+pub(crate) use locals::IfPatternLocal;
 
 #[cfg(test)]
 mod tests;
@@ -100,7 +101,7 @@ pub(crate) enum Effect {
 }
 
 pub(crate) type DynamicHelpers = Rc<RefCell<BTreeSet<(u16, u16)>>>;
-type CodeTypeRenderer<'c> = dyn Fn(&Type, TypeTarget) -> Result<Option<String>, LiftError> + 'c;
+type CodeTypeRenderer<'c> = dyn Fn(&Type, TypeTarget) -> Result<Option<Document>, LiftError> + 'c;
 
 #[derive(Clone)]
 pub(crate) struct Machine<'a, 'c> {
@@ -778,7 +779,32 @@ impl<'a, 'c> Machine<'a, 'c> {
         ty.render(self.class_name)
     }
 
-    fn render_code_type(&self, ty: &Type, target: TypeTarget) -> Result<Option<String>, LiftError> {
+    fn type_document(&self, ty: &Type) -> Document {
+        let rendered = self.render_type(ty);
+        if !self.options.dump_text_tokens {
+            return rendered.into();
+        }
+        let mut leaf = ty;
+        let mut dimensions = 0;
+        while let Type::Array(element) = leaf {
+            leaf = element;
+            dimensions += 1;
+        }
+        if let Type::Object(name) = leaf {
+            let base_end = rendered.len() - dimensions * "[]".len();
+            let mut document = Document::new();
+            crate::emit::symbols::append_class(&mut document, &rendered[..base_end], name, true);
+            document.push_str(&rendered[base_end..]);
+            return document;
+        }
+        rendered.into()
+    }
+
+    fn render_code_type(
+        &self,
+        ty: &Type,
+        target: TypeTarget,
+    ) -> Result<Option<Document>, LiftError> {
         self.code_type_renderer
             .map_or(Ok(None), |render| render(ty, target))
     }

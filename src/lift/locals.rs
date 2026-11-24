@@ -3,6 +3,7 @@
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
+    fmt::Write,
     rc::Rc,
 };
 
@@ -20,18 +21,40 @@ use super::{
     expr::{Category, Expr, INT, Order, Source},
 };
 
+#[path = "instanceof_locals.rs"]
+mod instanceof_locals;
+pub(crate) use instanceof_locals::IfPatternLocal;
+
 #[path = "joins.rs"]
 mod joins;
 #[path = "lambda_locals.rs"]
 mod lambda_locals;
+#[path = "local_tokens.rs"]
+mod local_tokens;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+use local_tokens::LocalTokenIndices;
+
+#[derive(Clone, Debug)]
 struct Local {
     name: String,
     ty: Type,
     debug_range: Option<(u16, u16)>,
     receiver: bool,
+    token_index: Option<u32>,
 }
+
+impl PartialEq for Local {
+    fn eq(&self, other: &Self) -> bool {
+        // Optional token metadata does not decide whether a binding can be
+        // represented by the same declaration at a control-flow join.
+        self.name == other.name
+            && self.ty == other.ty
+            && self.debug_range == other.debug_range
+            && self.receiver == other.receiver
+    }
+}
+
+impl Eq for Local {}
 
 #[derive(Clone, Default)]
 pub(crate) struct Names {
@@ -39,6 +62,7 @@ pub(crate) struct Names {
     suffix: u32,
     version: u16,
     namer: Option<VariableNamer>,
+    token_indices: Option<LocalTokenIndices>,
 }
 
 impl Names {
@@ -110,6 +134,7 @@ pub(super) struct Locals<'a> {
     use_debug_names: bool,
     names: Rc<RefCell<Names>>,
     parameter_names: Rc<[String]>,
+    tokens: Option<local_tokens::LocalTokens<'a>>,
 }
 
 impl<'a> Locals<'a> {
@@ -192,6 +217,7 @@ impl<'a> Locals<'a> {
             use_debug_names: options.use_debug_names,
             names: Rc::new(RefCell::new(names)),
             parameter_names: Rc::default(),
+            tokens: None,
         };
         let mut index = 0;
         if method.access_flags & 0x0008 == 0 {
@@ -207,6 +233,7 @@ impl<'a> Locals<'a> {
                 ty: Type::Object(owner.into()),
                 debug_range: None,
                 receiver: true,
+                token_index: None,
             });
             index = 1;
         }
@@ -249,10 +276,18 @@ impl<'a> Locals<'a> {
                 ty: ty.clone(),
                 debug_range,
                 receiver: false,
+                token_index: None,
             });
             index += ty.slots();
         }
         result.parameter_names = parameter_names.into();
+        if options.dump_text_tokens {
+            result.tokens = Some(local_tokens::LocalTokens::new(
+                class.pool.utf8(method.descriptor_index)?,
+                index,
+            ));
+            result.names.borrow_mut().token_indices = Some(LocalTokenIndices::new(&result.slots));
+        }
         Ok(result)
     }
 
@@ -380,7 +415,7 @@ impl Machine<'_, '_> {
         &mut self,
         catch_type: u16,
         store: &Instruction,
-    ) -> Result<(String, String), LiftError> {
+    ) -> Result<(String, Document), LiftError> {
         self.offset = store.offset;
         self.opcode = store.opcode;
         if !self.stack_is_empty() || !self.initialized_this {
@@ -422,12 +457,15 @@ impl Machine<'_, '_> {
         let range = debug.map(|entry| (entry.start_pc, entry.length));
         let name = self.locals.local_name(index, &ty, debug);
         let display_type = self.render_type(&ty);
-        self.locals.slots[slot] = Some(Local {
-            name: name.clone(),
+        let local = Local {
+            name,
             ty,
             debug_range: range,
             receiver: false,
-        });
+            token_index: self.locals.new_local_token_index(index),
+        };
+        let name = self.local_binding_document(index, &local, true);
+        self.locals.slots[slot] = Some(local);
         Ok((display_type, name))
     }
 
@@ -472,7 +510,10 @@ impl Machine<'_, '_> {
         if let Some(expr) = self.lexical_parameter(index) {
             return self.push(expr);
         }
-        let mut expr = Expr::atom(local.ty.clone(), local.name.clone().into());
+        let mut expr = Expr::atom(
+            local.ty.clone(),
+            self.local_binding_document(index, local, false),
+        );
         if local.receiver {
             expr.source = Source::This;
         } else {
@@ -520,14 +561,13 @@ impl Machine<'_, '_> {
                     || matches!(value.source, Source::Null)
                     || self.known_assignable(&value.ty, &local.ty))
         });
-        let (ty, name, prefix) = if same {
+        let (ty, name, token_index) = if same {
             let local = previous.expect("checked active binding");
-            (local.ty.clone(), local.name.clone(), String::new())
+            (local.ty.clone(), local.name.clone(), local.token_index)
         } else {
             let ty = debug_ty.unwrap_or_else(|| value.ty.clone());
             let name = self.locals.local_name(index, &ty, debug);
-            let prefix = format!("{} ", self.render_type(&ty));
-            (ty, name, prefix)
+            (ty, name, None)
         };
         let value = self.coerce(value, &ty, false)?;
         self.before_statement(value.order)?;
@@ -541,14 +581,27 @@ impl Machine<'_, '_> {
         if width == 2 {
             self.locals.slots[slot + 1] = None;
         }
-        self.locals.slots[slot] = Some(Local {
-            name: name.clone(),
+        let token_index = if same {
+            token_index
+        } else {
+            self.locals.new_local_token_index(index)
+        };
+        let local = Local {
+            name,
             ty,
             debug_range: range,
             receiver: false,
-        });
-        let mut text = Document::from(prefix);
-        text.push_str(&name);
+            token_index,
+        };
+        let mut text = if same {
+            Document::new()
+        } else {
+            let mut ty = self.local_type_document(&local.ty);
+            ty.push(' ');
+            ty
+        };
+        self.append_local_binding(&mut text, index, &local, !same);
+        self.locals.slots[slot] = Some(local);
         text.push_str(" = ");
         text.append(value.text);
         text.push(';');
@@ -581,15 +634,18 @@ impl Machine<'_, '_> {
             self.push(value)?;
             return Ok(Effect::None);
         }
-        let text = match amount {
-            1 => format!("{}++;", local.name),
-            -1 => format!("{}--;", local.name),
-            0 => return Ok(Effect::None),
-            2.. => format!("{} += {amount};", local.name),
-            _ => format!("{} -= {};", local.name, amount.unsigned_abs()),
-        };
+        if amount == 0 {
+            return Ok(Effect::None);
+        }
+        let mut text = self.local_binding_document(index, local, false);
+        match amount {
+            1 => text.push_str("++;"),
+            -1 => text.push_str("--;"),
+            2.. => write!(text, " += {amount};").unwrap(),
+            _ => write!(text, " -= {};", amount.unsigned_abs()).unwrap(),
+        }
         self.before_statement(Some(Order::at(self.offset)))?;
-        Ok(Effect::Statement(text.into()))
+        Ok(Effect::Statement(text))
     }
 }
 
