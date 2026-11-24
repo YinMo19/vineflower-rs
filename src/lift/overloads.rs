@@ -3,7 +3,7 @@ use std::{borrow::Cow, collections::HashSet, sync::Arc};
 use crate::{
     classfile::ClassFile,
     classpath::ClassMetadata,
-    descriptor::{GenericType, MethodDescriptor, MethodSignature, Primitive, Type},
+    descriptor::{GenericType, MethodDescriptor, MethodSignature, Type},
 };
 
 use super::{
@@ -384,19 +384,8 @@ fn reifiable_formal(source: &GenericType, mut erased: &Type) -> bool {
 }
 
 fn strict_conversion(machine: &Machine<'_, '_>, source: &Type, target: &Type) -> bool {
-    use Primitive::*;
     match (source, target) {
-        (Type::Primitive(source), Type::Primitive(target)) => {
-            source == target
-                || matches!(
-                    (source, target),
-                    (Byte, Short | Int | Long | Float | Double)
-                        | (Char | Short, Int | Long | Float | Double)
-                        | (Int, Long | Float | Double)
-                        | (Long, Float | Double)
-                        | (Float, Double)
-                )
-        }
+        (Type::Primitive(source), Type::Primitive(target)) => source.widens_to(*target),
         _ => machine.known_assignable(source, target),
     }
 }

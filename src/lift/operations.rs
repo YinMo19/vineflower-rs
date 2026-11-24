@@ -92,7 +92,7 @@ impl Machine<'_, '_> {
         };
         let operand_precedence = value.precedence;
         let mut converted = self.cast(value, Type::Primitive(to), false)?;
-        if matches!(index, 0..=2 | 4..=5 | 8) {
+        if operand_type != to && operand_type.widens_to(to) {
             converted.source = Source::WidenedPrimitive { operand_type, operand_precedence };
         }
         self.push(converted)

@@ -767,10 +767,10 @@ impl<'a, 'c> Machine<'a, 'c> {
             return true;
         }
         match (from, to) {
-            (Type::Primitive(from), Type::Primitive(to)) => primitive_widens(*from, *to),
+            (Type::Primitive(from), Type::Primitive(to)) => from.widens_to(*to),
             (Type::Primitive(from), Type::Object(to)) => to == wrapper(*from).0,
             (Type::Object(from), Type::Primitive(to)) => {
-                unboxed(from).is_some_and(|p| primitive_widens(p, *to))
+                unboxed(from).is_some_and(|primitive| primitive.widens_to(*to))
             }
             _ => self.known_assignable(from, to),
         }
@@ -787,7 +787,7 @@ impl<'a, 'c> Machine<'a, 'c> {
         }
         let target = self.render_type(to);
         match (from, to) {
-            (Type::Primitive(from), Type::Primitive(to)) if primitive_widens(*from, *to) => {
+            (Type::Primitive(from), Type::Primitive(to)) if from.widens_to(*to) => {
                 expression.surround(&format!("({target})("), ")");
                 Ok(expression)
             }
@@ -795,7 +795,7 @@ impl<'a, 'c> Machine<'a, 'c> {
                 if let Type::Object(name) = to
                     && let Some(primitive) = unboxed(name)
                 {
-                    if !primitive_widens(*from, primitive) {
+                    if !from.widens_to(primitive) {
                         return Err(self.invalid_operand("invalid lambda box conversion"));
                     }
                     if *from != primitive {
@@ -828,7 +828,7 @@ impl<'a, 'c> Machine<'a, 'c> {
                     value.push_str(&format!(".{accessor}()"));
                     return Ok(value);
                 };
-                if !primitive_widens(primitive, *to) {
+                if !primitive.widens_to(*to) {
                     return Err(self.invalid_operand("invalid lambda unboxing conversion"));
                 }
                 let (_, accessor) = wrapper(primitive);
@@ -1378,19 +1378,6 @@ fn render_lambda(mut declaration: Document, parameters: Vec<Document>, body: Doc
 
 fn is_reference(ty: &Type) -> bool {
     matches!(ty, Type::Object(_) | Type::Array(_))
-}
-
-fn primitive_widens(from: Primitive, to: Primitive) -> bool {
-    use Primitive::*;
-    from == to
-        || match from {
-            Byte => matches!(to, Short | Int | Long | Float | Double),
-            Short | Char => matches!(to, Int | Long | Float | Double),
-            Int => matches!(to, Long | Float | Double),
-            Long => matches!(to, Float | Double),
-            Float => to == Double,
-            Boolean | Double => false,
-        }
 }
 
 fn is_synthetic(pool: &ConstantPool<'_>, member: &Member<'_>) -> bool {

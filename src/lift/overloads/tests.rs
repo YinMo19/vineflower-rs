@@ -4,6 +4,7 @@ use crate::{
     ClassGroup, Options,
     classfile::Code,
     classpath::{ClassDataProvider, ClassPath},
+    descriptor::Primitive,
     naming::MemberRenames,
 };
 

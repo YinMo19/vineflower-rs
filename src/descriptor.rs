@@ -65,6 +65,20 @@ impl Primitive {
             Self::Double => "double",
         }
     }
+
+    /// Identity or a Java widening primitive conversion (JLS 5.1.2).
+    pub(crate) fn widens_to(self, target: Self) -> bool {
+        use Primitive::*;
+        self == target
+            || match self {
+                Byte => matches!(target, Short | Int | Long | Float | Double),
+                Short | Char => matches!(target, Int | Long | Float | Double),
+                Int => matches!(target, Long | Float | Double),
+                Long => matches!(target, Float | Double),
+                Float => target == Double,
+                Boolean | Double => false,
+            }
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
