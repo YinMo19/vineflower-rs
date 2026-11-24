@@ -14,6 +14,7 @@ mod instanceof_patterns;
 mod join_tests;
 mod labeled_blocks;
 mod local_joins;
+mod numeric_switch;
 mod pattern_record;
 mod pattern_switch;
 mod protected;
@@ -1305,8 +1306,9 @@ impl Emitter<'_> {
         control: RangeInclusive<u32>,
         dispatch: Option<&string_switch::Dispatch>,
     ) -> Result<Option<usize>, StructureError> {
-        let instruction = &self.instructions[self.graph.blocks[block].instructions.end - 1];
-        let (default, cases) = match dispatch {
+        let instructions = self.instructions;
+        let instruction = &instructions[self.graph.blocks[block].instructions.end - 1];
+        let (default_offset, cases) = match dispatch {
             Some(dispatch) => (dispatch.default, dispatch.cases.as_slice()),
             None => match &instruction.operand {
                 Operand::Switch { default, cases } => (*default, cases.as_slice()),
@@ -1315,24 +1317,25 @@ impl Emitter<'_> {
         };
         let default = self
             .graph
-            .block_at(default)
+            .block_at(default_offset)
             .ok_or_else(|| self.unstructured(block))?;
         let mut groups = BTreeMap::<usize, Vec<CaseLabel>>::new();
         groups.entry(default).or_default();
+        let mut numeric = dispatch.is_none();
         for &(key, target) in cases {
             let target = self
                 .graph
                 .block_at(target)
                 .ok_or_else(|| self.unstructured(block))?;
-            // tableswitch pads missing keys with the default target.
+            // Restore dense table aliases only after expression recovery has declined.
             if target != default || dispatch.is_some() {
                 let (text, offsets) = if let Some(dispatch) = dispatch {
                     let (text, offsets) = dispatch.label(key);
                     (Document::from(text), offsets)
                 } else {
-                    let text = machine
-                        .enum_switch_label(instruction.offset, key)
-                        .unwrap_or_else(|| key.to_string().into());
+                    let label = machine.enum_switch_label(instruction.offset, key);
+                    numeric &= label.is_none();
+                    let text = label.unwrap_or_else(|| key.to_string().into());
                     (text, Vec::new())
                 };
                 groups
@@ -1342,6 +1345,9 @@ impl Emitter<'_> {
             }
         }
         let labeled_tail = region.label_scope().and_then(|scope| scope.head_tail(block));
+        // A default-only enum dispatch has no non-default label with which to
+        // distinguish its selector from an integer selector.
+        let numeric = numeric && groups.len() > 1 && labeled_tail.is_none();
         if labeled_tail.is_none() && let Some((condition, schedule)) = self.try_predicate_switch(
             block, region, machine, depth, &selector, &groups, default, &control,
         ) {
@@ -1397,12 +1403,35 @@ impl Emitter<'_> {
         );
         let mut arms = Vec::new();
         let scoped_arms = machine.switch_requires_case_scopes();
+        let mut ordered = numeric
+            .then(|| {
+                numeric_switch::order(
+                    mem::take(&mut groups),
+                    cases,
+                    default_offset,
+                    instruction.opcode == 0xaa,
+                    |target| self.offset(target),
+                    &self.layout,
+                    join,
+                )
+            })
+            .unwrap_or_default()
+            .into_iter();
+        let mut closing_return = None;
         let mut groups = groups.into_iter().peekable();
-        while let Some((target, keys)) = groups.next() {
-            let fallthrough = groups
-                .peek()
-                .map(|&(next, _)| next)
-                .filter(|&next| self.layout.can_fall_through(target, next, join));
+        while let Some((target, keys, fallthrough)) = ordered
+            .next()
+            .map(|arm| (arm.target, arm.labels, arm.fallthrough))
+            .or_else(|| {
+                let (target, keys) = groups.next()?;
+                let fallthrough = groups
+                    .peek()
+                    .map(|&(next, _)| next)
+                    .filter(|&next| self.layout.can_fall_through(target, next, join));
+                Some((target, keys, fallthrough))
+            })
+        {
+            let last = ordered.len() == 0 && groups.peek().is_none();
             let arm_region = if let Some(next) = fallthrough {
                 switch_region.branch(Some(next))
             } else {
@@ -1435,16 +1464,44 @@ impl Emitter<'_> {
                     }
                 } else {
                     arms.push(arm);
-                    if labeled_tail.is_none() || groups.peek().is_some() {
-                        self.syntax(depth + 2, "break;");
+                    if labeled_tail.is_none() || !last {
+                        let direct_exit = join
+                            .filter(|&join| {
+                                numeric && self.graph.blocks[target].successors.as_slice() == [join]
+                            })
+                            .map(|_| &instructions[self.graph.blocks[target].instructions.end - 1]);
+                        let jump = direct_exit.filter(|op| matches!(op.opcode, 0xa7 | 0xc8));
+                        if !last || direct_exit.is_none() || jump.is_some() {
+                            let mapped = jump.map_or_else(Vec::new, |op| {
+                                (op.offset..op.offset + op.len).collect()
+                            });
+                            self.push(depth + 2, "break;", mapped);
+                        }
                     }
                 }
+            } else if numeric
+                && last
+                && depth == 0
+                && region.stop.is_none()
+                && join.is_none()
+                && arm.start < arm.end
+                && self.lines.last().is_some_and(|line| {
+                    line.depth == depth + 2 && line.text == "return;"
+                })
+            {
+                // The last arm can reach the enclosing method's implicit
+                // void return. Retain its mapping for the method's closing brace.
+                closing_return = self.lines.pop();
             }
             if scoped_arms {
                 self.syntax(depth + 1, "}");
             }
         }
         self.syntax(depth, "}");
+        if let Some(mut line) = closing_return {
+            line.depth = depth;
+            self.lines.push(line);
+        }
         if arms.is_empty() {
             return Ok(None);
         }
