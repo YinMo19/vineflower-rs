@@ -38,6 +38,7 @@ const UNSUPPORTED_DEFAULTS: &str = include_str!("fixtures/UnsupportedDefaults.cl
 const DATA_CLASS: &str = include_str!("fixtures/TestDataClass.class.hex");
 const BRANCHES: &str = include_str!("fixtures/Branches.class.hex");
 const WHEN_BOOLEAN: &str = include_str!("fixtures/TestWhenBoolean.class.hex");
+const NULLABLE_OPERATOR: &str = include_str!("fixtures/TestNullableOperator.class.hex");
 const FOR_RANGE: &str = include_str!("fixtures/TestForRange.class.hex");
 const FOR_LOOPS: &str = include_str!("fixtures/ForLoops.class.hex");
 const TRY_REGIONS: &str = include_str!("fixtures/TryRegions.class.hex");
@@ -497,6 +498,78 @@ fn renders_value_joins_early_returns_and_short_circuit() {
             "}\n",
         )
     );
+}
+
+#[test]
+fn recovers_original_kotlin_nullable_operators_and_owns_their_offsets() {
+    let source = render(NULLABLE_OPERATOR);
+    for fragment in [
+        "fun test(x: Int?): Int = x ?: 0",
+        "fun test2(x: String?): String = x ?: \"default\"",
+        "fun test2_1(x: Any?): Any = x ?: \"default\"",
+        "fun test2_2(x: Any?): Any = x ?: \"default\"",
+        "fun test3(x: Int?): Int = x ?: throw kotlin.Exception()",
+        "      x?.printStackTrace()\n",
+        "      x?.printStackTrace() ?: throw kotlin.Exception()\n",
+        "      val y = x ?: return 0\n      System.out.println(y)\n      return y\n",
+        "      val y = x ?: return\n      System.out.println(y)\n",
+    ] {
+        assert!(source.contains(fragment), "missing {fragment:?} in {source}");
+    }
+    assert_eq!(source.matches("?.printStackTrace()").count(), 2);
+
+    let options = crate::Options {
+        decompile_kotlin: true,
+        include_line_mappings: true,
+        ..crate::Options::default()
+    };
+    let output = crate::decompile(&bytes(NULLABLE_OPERATOR), &options).unwrap();
+    let map = output.map.unwrap();
+    for (name, original, offsets, text) in [
+        ("test", 5, &[0, 2, 5, 12, 13][..], "return x ?: 0"),
+        ("test2_1", 13, &[0, 2, 6, 8], "return x ?: \"default\""),
+        ("test3", 21, &[0, 2, 12, 16, 19, 20], "return x ?: throw kotlin.Exception()"),
+        ("test4", 25, &[0, 2, 5, 7], "x?.printStackTrace()"),
+        ("test4", 26, &[12], "}"),
+        ("test5", 29, &[0, 2, 5, 12, 19], "x?.printStackTrace() ?: throw kotlin.Exception()"),
+        ("test5", 30, &[20], "}"),
+        ("test6", 33, &[0, 2, 12, 13, 14], "val y = x ?: return 0"),
+        ("test6", 35, &[15, 18, 19, 21], "System.out.println(y)"),
+        ("test6", 37, &[22, 23], "return y"),
+        ("test6_1", 41, &[0, 2, 12, 13], "val y = x ?: return"),
+        ("test6_1", 43, &[14, 17, 18, 20], "System.out.println(y)"),
+        ("test6_1", 44, &[21], "}"),
+    ] {
+        let method = map.methods.iter().find(|method| method.name == name).unwrap();
+        let line = method.offsets[&offsets[0]];
+        assert_eq!(output.text.lines().nth(line).unwrap().trim(), text);
+        assert_eq!(map.original_lines[&original], line + 1);
+        assert!(offsets.iter().all(|offset| method.offsets[offset] == line));
+    }
+    let method = map.methods.iter().find(|method| method.name == "test6").unwrap();
+    for offset in [1, 8, 9, 10, 11] {
+        assert!(!method.offsets.contains_key(&offset), "stack and branch glue at {offset}");
+    }
+}
+
+#[test]
+fn rejects_unproven_kotlin_nullable_edges_and_operands() {
+    for (name, offset, from, to) in [
+        ("test", 1, 0x59, 0x00), // lost retained reference
+        ("test", 2, 0xc6, 0xc7), // flipped null edge
+        ("test", 10, 0x05, 0x04), // non-null edge targets the fallback
+        ("test3", 15, 0x59, 0x00), // lost constructor allocation copy
+        ("test4", 5, 0xb6, 0xb7), // wrong receiver dispatch
+        ("test6", 13, 0xac, 0xb0), // early return has the wrong category
+        ("test6_1", 13, 0x3d, 0x3c), // store aliases the parameter
+    ] {
+        let mut data = bytes(NULLABLE_OPERATOR);
+        replace_function_opcode(&mut data, name, offset, from, to);
+        assert!(matches!(
+            decompile_class(&ClassFile::parse(&data).unwrap()),
+            Err(KotlinError::Unsupported { declaration, .. }) if declaration == name
+        ), "{name} at {offset}");
+    }
 }
 
 #[test]

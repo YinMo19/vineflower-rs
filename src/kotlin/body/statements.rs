@@ -6,8 +6,8 @@ use crate::classfile::LocalVariable;
 
 use super::{
     Bytecode, Code, Expected, Expr, ExprKind, Instruction, JvmType, KotlinError, Literal, Locals,
-    Primitive, ScopedLocal, StackValue, ValueParameter, extensions::{Value, exact_type}, identifier,
-    invocations::Call, load_opcode, local_load, local_store, pop_value,
+    Primitive, ScopedLocal, StackValue, Type, ValueParameter, extensions::{Value, exact_type},
+    identifier, invocations::Call, load_opcode, local_load, local_store, nullable, pop_value,
 };
 
 /// Statements and their original bytecode spans. Stack shuffles do not have
@@ -16,6 +16,7 @@ pub(in crate::kotlin) struct StatementBlock<'a> {
     pub statements: Vec<Statement<'a>>,
     pub lines: Vec<(u16, u16)>,
     pub instructions: Vec<Instruction>,
+    pub implicit_return: bool,
 }
 
 pub(in crate::kotlin) struct Statement<'a> {
@@ -30,6 +31,8 @@ enum Kind<'a> {
     },
     Declare(Rc<Binding<'a>>, Expr<'a>),
     Evaluate(Box<Call<'a>>),
+    EvaluateNullable(Box<nullable::Expression<'a>>),
+    Return(Expr<'a>, Value),
 }
 
 #[derive(Debug)]
@@ -69,6 +72,16 @@ impl Statement<'_> {
                 return value.write(out, &local.value.ty, &local.value.jvm, parameters, declaration);
             }
             Kind::Evaluate(call) => return call.write(out, parameters, declaration),
+            Kind::EvaluateNullable(expression) => {
+                let result = expression.result();
+                return expression.write(
+                    out, Expected::Type(&result.ty, &result.jvm), parameters, declaration, 0,
+                );
+            }
+            Kind::Return(value, result) => {
+                out.push_str("return ");
+                return value.write(out, &result.ty, &result.jvm, parameters, declaration);
+            }
         };
         out.push_str(if argument_first { "kotlin.io.println(" } else { "System.out.println(" });
         if let Some((expr, expected)) = argument {
@@ -137,9 +150,16 @@ impl Statement<'_> {
         instructions: &[Instruction],
         mut visit: impl FnMut(&Instruction),
     ) -> Result<(), KotlinError> {
+        let nullable = matches!(
+            self.kind,
+            Kind::EvaluateNullable(_)
+                | Kind::Declare(_, Expr { kind: ExprKind::Nullable(_), .. })
+                | Kind::Return(Expr { kind: ExprKind::Nullable(_), .. }, _)
+        );
         let mut instructions = instructions[self.instructions.clone()]
             .iter()
-            .filter(|instruction| !matches!(instruction.opcode, 0x00 | 0x5f))
+            .filter(|instruction| !matches!(instruction.opcode, 0x00 | 0x5f)
+                && (!nullable || !nullable::elided_trace(instruction)))
             .peekable();
         while let Some(instruction) = instructions.next() {
             if !super::templates::elided_trace(bytecode, instruction, instructions.peek().copied())? {
@@ -164,8 +184,58 @@ pub(super) fn lower<'a, 'data>(
     } else {
         DebugLocals::default()
     };
-    let (statements, value) = lower_block(bytecode, instructions, range, locals, declaration, &[], &debug)?;
+    let (statements, value) = lower_block(bytecode, instructions, range, locals, declaration, &[], &debug, None)?;
     closed(statements, value, declaration)
+}
+
+pub(super) fn lower_nullable<'a, 'data>(
+    bytecode: &Bytecode<'a, 'data>,
+    instructions: &[Instruction],
+    start: usize,
+    join: usize,
+    code: &Code<'data>,
+    locals: &Locals<'_>,
+    expression: Expr<'a>,
+    returning: (&Type, &JvmType),
+    declaration: &str,
+) -> Result<Vec<Statement<'a>>, KotlinError> {
+    let last = instructions.len() - 1;
+    let (ty, jvm) = returning;
+    let invalid = || KotlinError::unsupported(declaration, "unproven Kotlin nullable continuation");
+    if instructions[last].opcode != super::return_opcode(jvm) {
+        return Err(invalid());
+    }
+    if join == last {
+        return if *jvm == JvmType::Void {
+            let ExprKind::Nullable(expression) = expression.kind else { return Err(invalid()); };
+            Ok(vec![Statement { instructions: start..join, kind: Kind::EvaluateNullable(expression) }])
+        } else {
+            Ok(vec![Statement {
+                instructions: start..last + 1,
+                kind: Kind::Return(expression, Value { ty: ty.clone(), jvm: jvm.clone() }),
+            }])
+        };
+    }
+    let debug = DebugLocals {
+        entries: code.local_variables(&bytecode.class.pool)?,
+        max: code.max_locals,
+    };
+    let (mut statements, value) = lower_block(
+        bytecode, instructions, start..last, locals, declaration, &[], &debug,
+        Some((join, expression)),
+    )?;
+    if !matches!(statements.first(), Some(Statement { kind: Kind::Declare(_, _), instructions }) if instructions.end == join + 1) {
+        return Err(invalid());
+    }
+    if *jvm == JvmType::Void {
+        return closed(statements, value, declaration);
+    }
+    let value = value.filter(|tail| tail.expr.stack_load() == Some(load_opcode(jvm))).ok_or_else(invalid)?;
+    statements.push(Statement {
+        instructions: value.instructions.start..last + 1,
+        kind: Kind::Return(value.expr, Value { ty: ty.clone(), jvm: jvm.clone() }),
+    });
+    Ok(statements)
 }
 
 pub(super) fn lower_range<'a>(
@@ -219,7 +289,7 @@ pub(super) fn lower_open<'a>(
     declaration: &str,
     scoped: &[ScopedLocal<'a>],
 ) -> Result<(Vec<Statement<'a>>, Option<TailValue<'a>>), KotlinError> {
-    lower_block(bytecode, instructions, range, locals, declaration, scoped, &DebugLocals::default())
+    lower_block(bytecode, instructions, range, locals, declaration, scoped, &DebugLocals::default(), None)
 }
 
 fn lower_block<'a>(
@@ -230,13 +300,18 @@ fn lower_block<'a>(
     declaration: &str,
     scoped: &[ScopedLocal<'a>],
     debug: &DebugLocals<'a>,
+    initial: Option<(usize, Expr<'a>)>,
 ) -> Result<(Vec<Statement<'a>>, Option<TailValue<'a>>), KotlinError> {
     let mut statements = Vec::new();
     let mut stack = Vec::new();
     let mut declared: Vec<Rc<Binding<'a>>> = Vec::new();
     let mut argument_first = false;
     let mut index = range.start;
-    let mut first = index;
+    if let Some((join, value)) = initial {
+        index = join;
+        stack.push(StackValue::Value(value));
+    }
+    let mut first = range.start;
     let invalid = || KotlinError::unsupported(declaration, "unsupported Kotlin statement bytecode");
     let first_free = scoped.iter().map(|local| local.first_free())
         .fold(locals.next_slot(), u16::max);

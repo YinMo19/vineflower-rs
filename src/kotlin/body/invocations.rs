@@ -140,6 +140,51 @@ pub(super) fn lower<'a>(
     Ok(true)
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(super) enum GuardedMember {
+    PrintStackTrace,
+}
+
+impl GuardedMember {
+    pub(super) fn write(self, out: &mut String) {
+        match self {
+            Self::PrintStackTrace => out.push_str("?.printStackTrace()"),
+        }
+    }
+}
+
+pub(super) fn throwable_owner(ty: &Type, jvm: &JvmType) -> Option<&'static str> {
+    match (jvm, ty.class_id()) {
+        (JvmType::Object(owner), Some("kotlin/Exception" | "java/lang/Exception"))
+            if owner == "java/lang/Exception" => Some("java/lang/Exception"),
+        (JvmType::Object(owner), Some("kotlin/Throwable" | "java/lang/Throwable"))
+            if owner == "java/lang/Throwable" => Some("java/lang/Throwable"),
+        _ => None,
+    }
+}
+
+/// External calls without metadata require an exact, known Java signature.
+/// The nullable region has already proved that this call gets the retained
+/// receiver and no other operands.
+pub(super) fn guarded_member(
+    bytecode: &Bytecode<'_, '_>,
+    instruction: &Instruction,
+    ty: &Type,
+    jvm: &JvmType,
+    declaration: &str,
+) -> Result<GuardedMember, KotlinError> {
+    let owner = throwable_owner(ty, jvm).ok_or_else(|| invalid(declaration))?;
+    if !matches!(instruction.operand, Operand::Constant(index)
+        if matches!(bytecode.class.pool.get(index)?, Constant::Methodref { .. }))
+        || !matches!(bytecode.reference(instruction, 0xb6)?,
+            Some((target, "printStackTrace", "()V"))
+                if target == owner || target == "java/lang/Throwable")
+    {
+        return Err(invalid(declaration));
+    }
+    Ok(GuardedMember::PrintStackTrace)
+}
+
 fn constructor<'a>(
     bytecode: &Bytecode<'a, '_>,
     context: &Context<'_>,
@@ -156,6 +201,24 @@ fn constructor<'a>(
             && !first.duplicate && second.duplicate)
     {
         return Err(invalid());
+    }
+    if owner == "java/lang/Exception" && descriptor.return_type == JvmType::Void
+        && descriptor.parameters.is_empty()
+    {
+        if context.parameters.iter().any(|parameter| parameter.name == "kotlin")
+            || context.members.properties.iter().any(|property| property.name == "kotlin")
+        {
+            return Err(invalid());
+        }
+        stack.truncate(base);
+        return Ok(Call {
+            target: Target::Constructor,
+            arguments: Vec::new(),
+            result: Value {
+                ty: class_type(ClassName { id: "kotlin/Exception".into(), local: false }),
+                jvm: JvmType::Object(owner.into()),
+            },
+        });
     }
     let class = if owner == bytecode.owner { bytecode.class } else {
         context.group.and_then(|group| group.get(owner)).ok_or_else(invalid)?

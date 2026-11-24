@@ -766,7 +766,7 @@ fn plan_property<'a, 'data, 'metadata>(
                 return Err(invalid("non-abstract property without backing field"));
             }
             let Body::Expression(expr, _) =
-                bytecode.function(getter, descriptor, &[], properties, None, name, false)?
+                bytecode.function(getter, descriptor, &[], &property.ty, properties, None, name, false)?
             else {
                 return Err(invalid("getter has no return expression"));
             };
@@ -1196,6 +1196,7 @@ fn render_function<'a, 'data>(
             method,
             descriptor,
             &function.parameters,
+            &function.returns,
             plan.metadata_properties,
             Some(body::Extension::new(function, signature, method, members, group)?),
             name,
@@ -1255,13 +1256,15 @@ fn render_function<'a, 'data>(
                 out.push_str(indent);
                 out.push('}');
                 if let (Some(mut trace), Some((map, _))) = (trace, location) {
-                    trace.instruction(
-                        block
-                            .instructions
-                            .last()
-                            .expect("statement block ends with return"),
-                        line,
-                    );
+                    if block.implicit_return {
+                        trace.instruction(
+                            block
+                                .instructions
+                                .last()
+                                .expect("statement block ends with return"),
+                            line,
+                        );
+                    }
                     trace.finish(map, block.lines);
                 }
             }

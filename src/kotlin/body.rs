@@ -23,6 +23,7 @@ mod extensions;
 mod invocations;
 mod logic;
 mod loops;
+mod nullable;
 mod statements;
 mod switches;
 mod templates;
@@ -97,6 +98,7 @@ enum ExprKind<'a> {
     ThisProperty { name: &'a str, primitive: Primitive },
     ClassLiteral(&'a str),
     Conditional(Box<Conditional<'a>>),
+    Nullable(Box<nullable::Expression<'a>>),
 }
 
 #[derive(Debug)]
@@ -353,6 +355,7 @@ impl<'a, 'data> Bytecode<'a, 'data> {
         member: &Member<'data>,
         descriptor: &MethodDescriptor,
         parameters: &[ValueParameter],
+        returns: &Type,
         properties: &[Property],
         extension: Option<Extension<'_>>,
         declaration: &str,
@@ -413,10 +416,42 @@ impl<'a, 'data> Bytecode<'a, 'data> {
             return loops::lower(self, decoded, start, &code, &locals, parameters, declaration, trace)
                 .map(Body::Loop);
         }
-        if instructions
+        if let Some(branch) = instructions
             .iter()
-            .any(|instruction| matches!(instruction.operand, Operand::Branch(_)))
+            .position(|instruction| matches!(instruction.operand, Operand::Branch(_)))
         {
+            if let Some(plan) = nullable::lower(
+                self,
+                &decoded,
+                start,
+                start + branch,
+                &locals,
+                (returns, &descriptor.return_type),
+                declaration,
+            )? {
+                return match plan {
+                    nullable::Plan::Expression(expr) => {
+                        self.return_expression(expr, instructions, &code, trace, None)
+                    }
+                    nullable::Plan::Statements { expression, join } => {
+                        let statements = statements::lower_nullable(
+                            self, &decoded, start, join, &code, &locals, expression,
+                            (returns, &descriptor.return_type), declaration,
+                        )?;
+                        let lines = if trace {
+                            code.line_numbers(&self.class.pool)?
+                        } else {
+                            Vec::new()
+                        };
+                        Ok(Body::Statements(statements::StatementBlock {
+                            statements,
+                            instructions: decoded,
+                            lines,
+                            implicit_return: descriptor.return_type == JvmType::Void,
+                        }))
+                    }
+                };
+            }
             let instructions = if let Some(alias) = subject_alias(instructions, &locals) {
                 locals.alias = Some(alias);
                 start += 2;
@@ -470,6 +505,7 @@ impl<'a, 'data> Bytecode<'a, 'data> {
                 statements,
                 instructions: decoded,
                 lines,
+                implicit_return: true,
             }));
         }
         let mut stack = Vec::new();
@@ -501,11 +537,13 @@ impl<'a, 'data> Bytecode<'a, 'data> {
     ) -> Result<Body<'a>, KotlinError> {
         let mapping = if trace {
             let mut offsets = Vec::new();
+            let nullable = matches!(expr.kind, ExprKind::Nullable(_));
             for instruction in instructions {
                 // Resugared intrinsics and materialization arms emit no
                 // independent operations in the Kotlin return expression.
                 if instruction.opcode != 0x00
                     && !self.reference_are_equal(instruction)?
+                    && (!nullable || !nullable::elided_trace(instruction))
                     && materialized
                         .is_none_or(|(yes, no)| instruction.offset < yes || instruction.offset > no)
                 {
@@ -1180,7 +1218,10 @@ impl<'a> Expr<'a> {
             ExprKind::Template(_) | ExprKind::ClassLiteral(_) => Some(0x19),
             ExprKind::ThisProperty { primitive, .. } => Some(load_opcode(&JvmType::Primitive(*primitive))),
             ExprKind::Binary(_, primitive, _) => Some(load_opcode(&JvmType::Primitive(*primitive))),
-            ExprKind::Conditional(_) => None,
+            ExprKind::Nullable(expression) if expression.result().jvm != JvmType::Void => {
+                Some(load_opcode(&expression.result().jvm))
+            }
+            ExprKind::Conditional(_) | ExprKind::Nullable(_) => None,
         }
     }
 
@@ -1193,6 +1234,7 @@ impl<'a> Expr<'a> {
             ExprKind::BoundGetter(read) => read.value(),
             ExprKind::Local(local) => &local.value,
             ExprKind::Invocation(call) => call.result(),
+            ExprKind::Nullable(expression) => expression.result(),
             _ => return None,
         };
         Some((&value.ty, &value.jvm))
@@ -1216,6 +1258,7 @@ impl<'a> Expr<'a> {
             ExprKind::BoxedInt(_) => None,
             ExprKind::Template(_) | ExprKind::ClassLiteral(_) => None,
             ExprKind::ThisProperty { primitive, .. } => Some(*primitive),
+            ExprKind::Nullable(expression) => expression.result().primitive(),
             ExprKind::Conditional(conditional) => conditional.primitive_hint(parameters),
             ExprKind::Binary(operator, primitive, pair) => {
                 if *primitive == Primitive::Int
@@ -1368,6 +1411,9 @@ impl<'a> Expr<'a> {
             }
             ExprKind::Conditional(conditional) => {
                 conditional.write(out, expected, parameters, declaration, binding)?
+            }
+            ExprKind::Nullable(expression) => {
+                expression.write(out, expected, parameters, declaration, binding)?
             }
             ExprKind::TypeTest {
                 operand,
