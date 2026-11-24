@@ -71,17 +71,31 @@ fn archive_is_lazy_and_names_are_exact() {
             (SAMPLE_FILE, &bytes),
             ("example/Broken.class", b"broken body"),
             ("example/WrongName.class", &bytes),
-            ("META-INF/versions/21/example/Versioned.class", b"not a base entry"),
+            (
+                "META-INF/versions/21/example/Versioned.class",
+                b"not a base entry",
+            ),
         ],
     );
     let mut cp = ClassPath::new();
     cp.add(archive).unwrap();
     assert_eq!(cp.load(SAMPLE).unwrap().unwrap().as_ref(), bytes);
-    for absent in ["example/tiny", "example/Absent", "example/Versioned", "META-INF/versions/21/example/Versioned"] {
+    for absent in [
+        "example/tiny",
+        "example/Absent",
+        "example/Versioned",
+        "META-INF/versions/21/example/Versioned",
+    ] {
         assert!(cp.load(absent).unwrap().is_none());
     }
-    assert!(matches!(cp.load("example/Broken"), Err(ClassPathError::InvalidClass { .. })));
-    assert!(matches!(cp.load("example/WrongName"), Err(ClassPathError::WrongClassName { .. })));
+    assert!(matches!(
+        cp.load("example/Broken"),
+        Err(ClassPathError::InvalidClass { .. })
+    ));
+    assert!(matches!(
+        cp.load("example/WrongName"),
+        Err(ClassPathError::WrongClassName { .. })
+    ));
 
     let metadata = cp.metadata(SAMPLE).unwrap().unwrap();
     assert_eq!(metadata.name, SAMPLE);
@@ -95,7 +109,10 @@ fn archive_is_lazy_and_names_are_exact() {
     assert_eq!(metadata.methods[0].descriptor, "()Ljava/lang/Object;");
     assert_eq!(metadata.methods[0].signature.as_deref(), Some("()TT;"));
     assert_eq!(metadata.methods[0].access_flags, 0x0401);
-    assert!(Arc::ptr_eq(&metadata, &cp.metadata(SAMPLE).unwrap().unwrap()));
+    assert!(Arc::ptr_eq(
+        &metadata,
+        &cp.metadata(SAMPLE).unwrap().unwrap()
+    ));
 }
 
 #[test]
@@ -114,8 +131,20 @@ fn directory_and_archive_use_insertion_order() {
     cp.add(&archive).unwrap();
     let first = cp.metadata(SAMPLE).unwrap().unwrap();
     assert_eq!(first.super_name.as_deref(), Some("example/First"));
-    for invalid in ["", "/example/Tiny", "example//Tiny", "example/../Tiny", "example/Tiny.class", "[Lexample/Tiny;", "C:\\Tiny", "example\0/Tiny"] {
-        assert!(matches!(cp.load(invalid), Err(ClassPathError::InvalidName { .. })));
+    for invalid in [
+        "",
+        "/example/Tiny",
+        "example//Tiny",
+        "example/../Tiny",
+        "example/Tiny.class",
+        "[Lexample/Tiny;",
+        "C:\\Tiny",
+        "example\0/Tiny",
+    ] {
+        assert!(matches!(
+            cp.load(invalid),
+            Err(ClassPathError::InvalidName { .. })
+        ));
     }
 
     let mut cp = ClassPath::new();
@@ -132,22 +161,43 @@ fn directory_does_not_follow_paths_outside_its_root() {
     let dir = tempdir().unwrap();
     let root = dir.path().join("classes");
     fs::create_dir(&root).unwrap();
-    fs::write(dir.path().join("Tiny.class"), class_bytes(SAMPLE, "java/lang/Object")).unwrap();
+    fs::write(
+        dir.path().join("Tiny.class"),
+        class_bytes(SAMPLE, "java/lang/Object"),
+    )
+    .unwrap();
     symlink(dir.path(), root.join("example")).unwrap();
     let mut cp = ClassPath::new();
     cp.add(root).unwrap();
-    assert!(matches!(cp.load(SAMPLE), Err(ClassPathError::OutsideDirectory { .. })));
+    assert!(matches!(
+        cp.load(SAMPLE),
+        Err(ClassPathError::OutsideDirectory { .. })
+    ));
 }
 
 #[test]
 fn java_8_home_or_jre_root() {
     for lib in ["jre/lib", "lib"] {
         let home = tempdir().unwrap();
-        assert!(matches!(ClassPath::for_java_home(home.path()), Err(ClassPathError::RuntimeNotFound { .. })));
+        assert!(matches!(
+            ClassPath::for_java_home(home.path()),
+            Err(ClassPathError::RuntimeNotFound { .. })
+        ));
         let rt = class_bytes(SAMPLE, "java/lang/Object");
         let sibling = class_bytes("example/Extra", "java/lang/Object");
-        write_archive(&home.path().join(lib).join("rt.jar"), &[], &[(SAMPLE_FILE, &rt)]);
-        write_archive(&home.path().join(lib).join("first.jar"), &[], &[(SAMPLE_FILE, b"not the runtime class"), ("example/Extra.class", &sibling)]);
+        write_archive(
+            &home.path().join(lib).join("rt.jar"),
+            &[],
+            &[(SAMPLE_FILE, &rt)],
+        );
+        write_archive(
+            &home.path().join(lib).join("first.jar"),
+            &[],
+            &[
+                (SAMPLE_FILE, b"not the runtime class"),
+                ("example/Extra.class", &sibling),
+            ],
+        );
         let cp = ClassPath::for_java_home(home.path()).unwrap();
         assert_eq!(cp.load(SAMPLE).unwrap().unwrap().as_ref(), rt);
         assert_eq!(cp.load("example/Extra").unwrap().unwrap().as_ref(), sibling);
@@ -162,14 +212,21 @@ fn standalone_jmods_use_the_classes_namespace() {
     write_archive(
         &jmod,
         b"JM\x01\x00",
-        &[("classes/example/Tiny.class", &bytes), ("example/Tiny.class", b"not a class"), ("bin/Hidden.class", &bytes)],
+        &[
+            ("classes/example/Tiny.class", &bytes),
+            ("example/Tiny.class", b"not a class"),
+            ("bin/Hidden.class", &bytes),
+        ],
     );
     let cp = ClassPath::for_java_home(home.path()).unwrap();
     assert_eq!(cp.load(SAMPLE).unwrap().unwrap().as_ref(), bytes);
     assert!(cp.load("bin/Hidden").unwrap().is_none());
     let bad = home.path().join("bad.jmod");
     write_archive(&bad, &[], &[]);
-    assert!(matches!(ClassPath::new().add(bad), Err(ClassPathError::InvalidJmod { .. })));
+    assert!(matches!(
+        ClassPath::new().add(bad),
+        Err(ClassPathError::InvalidJmod { .. })
+    ));
 }
 
 #[test]
@@ -192,7 +249,10 @@ fn providers_are_lazy_and_share_bytes() {
     let bytes: Arc<[u8]> = class_bytes(SAMPLE, "java/lang/Object").into();
     let calls = Arc::new(AtomicUsize::new(0));
     let mut cp = ClassPath::new();
-    cp.add_provider(Provider { bytes: bytes.clone(), calls: calls.clone() });
+    cp.add_provider(Provider {
+        bytes: bytes.clone(),
+        calls: calls.clone(),
+    });
     let dir = tempdir().unwrap();
     let later = dir.path().join("later.jar");
     write_archive(&later, &[], &[(SAMPLE_FILE, b"not the provider class")]);
@@ -202,7 +262,10 @@ fn providers_are_lazy_and_share_bytes() {
     assert!(cp.metadata(SAMPLE).unwrap().is_some());
     assert_eq!(calls.load(Ordering::Relaxed), 1);
     assert!(cp.load("example/Missing").unwrap().is_none());
-    assert!(matches!(cp.load("example/Unreadable"), Err(ClassPathError::Provider { .. })));
+    assert!(matches!(
+        cp.load("example/Unreadable"),
+        Err(ClassPathError::Provider { .. })
+    ));
 }
 
 fn write_image(home: &Path, bytes: &[u8], compression: Option<(&str, &[u8])>) {
@@ -228,7 +291,17 @@ fn write_image(home: &Path, bytes: &[u8], compression: Option<(&str, &[u8])>) {
     attr.extend((bytes.len() as u16).to_be_bytes());
     attr.push(0);
     let mut image = Vec::new();
-    for n in [0xCAFE_DADA, 0x0001_0000, 0, 1, 1, attr.len() as u32, strings.len() as u32, u32::MAX, 1] {
+    for n in [
+        0xCAFE_DADA,
+        0x0001_0000,
+        0,
+        1,
+        1,
+        attr.len() as u32,
+        strings.len() as u32,
+        u32::MAX,
+        1,
+    ] {
         image.extend(n.to_le_bytes());
     }
     image.extend(attr);
@@ -256,13 +329,19 @@ fn zlib_stored(bytes: &[u8]) -> Vec<u8> {
 fn runtime_image_resources_are_loaded_and_decompressed_on_demand() {
     let bytes = class_bytes(SAMPLE, "java/lang/Object");
     let zlib = zlib_stored(&bytes);
-    for compression in [None, Some(("zip", zlib.as_slice())), Some(("compact-cp", b"".as_slice()))] {
+    for compression in [
+        None,
+        Some(("zip", zlib.as_slice())),
+        Some(("compact-cp", b"".as_slice())),
+    ] {
         let home = tempdir().unwrap();
         write_image(home.path(), &bytes, compression);
         let cp = ClassPath::for_java_home(home.path()).unwrap();
         assert!(cp.load("example/Absent").unwrap().is_none());
         if compression.is_some_and(|(algorithm, _)| algorithm == "compact-cp") {
-            assert!(matches!(cp.load(SAMPLE), Err(ClassPathError::UnsupportedImageCompression { algorithm, .. }) if algorithm == "compact-cp"));
+            assert!(
+                matches!(cp.load(SAMPLE), Err(ClassPathError::UnsupportedImageCompression { algorithm, .. }) if algorithm == "compact-cp")
+            );
         } else {
             assert_eq!(cp.load(SAMPLE).unwrap().unwrap().as_ref(), bytes);
         }
@@ -271,7 +350,9 @@ fn runtime_image_resources_are_loaded_and_decompressed_on_demand() {
 
 #[test]
 fn selected_installed_runtime_when_available() {
-    let Some(home) = std::env::var_os("JAVA_HOME").map(PathBuf::from) else { return };
+    let Some(home) = std::env::var_os("JAVA_HOME").map(PathBuf::from) else {
+        return;
+    };
     let cp = match ClassPath::for_java_home(&home) {
         Ok(cp) => cp,
         Err(ClassPathError::RuntimeNotFound { .. }) => return,
@@ -284,14 +365,37 @@ fn selected_installed_runtime_when_available() {
     };
     assert_eq!(object.name, "java/lang/Object");
     assert!(object.super_name.is_none());
-    assert!(object.methods.iter().any(|m| m.name == "hashCode" && m.descriptor == "()I"));
-    assert!(cp.load("java/lang/DoesNotExistVineflower").unwrap().is_none());
-    assert_eq!(cp.metadata("java/lang/String").unwrap().unwrap().super_name.as_deref(), Some("java/lang/Object"));
+    assert!(
+        object
+            .methods
+            .iter()
+            .any(|m| m.name == "hashCode" && m.descriptor == "()I")
+    );
+    assert!(
+        cp.load("java/lang/DoesNotExistVineflower")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        cp.metadata("java/lang/String")
+            .unwrap()
+            .unwrap()
+            .super_name
+            .as_deref(),
+        Some("java/lang/Object")
+    );
 
     let jmod = home.join("jmods/java.base.jmod");
     if jmod.is_file() {
         let mut jmods = ClassPath::new();
         jmods.add(jmod).unwrap();
-        assert_eq!(jmods.metadata("java/lang/Object").unwrap().unwrap().as_ref(), object.as_ref());
+        assert_eq!(
+            jmods
+                .metadata("java/lang/Object")
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            object.as_ref()
+        );
     }
 }

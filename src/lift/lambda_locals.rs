@@ -4,19 +4,22 @@ use std::rc::Rc;
 
 use crate::descriptor::MethodDescriptor;
 
-use super::Locals;
 use super::super::expr::{Expr, Source};
+use super::Locals;
 
 impl Locals<'_> {
     pub(in crate::lift) fn capture_slot(&self, value: &Expr) -> Option<(u16, bool)> {
-        if value.order.is_none() || value.observable || !matches!(value.source, Source::Plain) {
+        let Source::Local(index) = value.source else {
+            return None;
+        };
+        if value.order.is_none() || value.observable {
             return None;
         }
-        let (index, local) = self.slots.iter().enumerate().find_map(|(index, local)| {
-            local.as_ref().filter(|local| local.name == value.text && local.ty == value.ty)
-                .map(|local| (index, local))
-        })?;
-        Some((index as u16, self.parameter_names.contains(&local.name)))
+        let local = self.slots.get(usize::from(index))?.as_ref()?;
+        if local.name != value.text || local.ty != value.ty {
+            return None;
+        }
+        Some((index, self.parameter_names.contains(&local.name)))
     }
 
     pub(in crate::lift) fn bind_lambda_scope(
@@ -36,7 +39,11 @@ impl Locals<'_> {
             child.inherit(parent);
         }
         let parameters = Rc::make_mut(&mut self.parameter_names);
-        for (ordinal, (parameter, ty)) in parameters.iter_mut().zip(&descriptor.parameters).enumerate() {
+        for (ordinal, (parameter, ty)) in parameters
+            .iter_mut()
+            .zip(&descriptor.parameters)
+            .enumerate()
+        {
             let local = self.slots[slot].as_mut().expect("bound lambda parameter");
             let name = if let Some(capture) = captures.get(ordinal) {
                 (*capture).into()

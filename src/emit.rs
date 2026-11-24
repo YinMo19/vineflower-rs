@@ -22,13 +22,21 @@ use thiserror::Error;
 use crate::{
     Options, bytecode,
     cfg::ControlFlowGraph,
-    classfile::{ClassError, ClassFile, Code, Member, RecordComponent, Supertype, TypeTarget, find_attribute},
+    classfile::{
+        ClassError, ClassFile, Code, Member, RecordComponent, Supertype, TypeTarget, find_attribute,
+    },
     context::{ClassGroup, ClassGroupBuilder},
-    descriptor::{ClassSignature, DescriptorError, FieldSignature, MethodDescriptor, MethodSignature, Type},
+    descriptor::{
+        ClassSignature, DescriptorError, FieldSignature, MethodDescriptor, MethodSignature, Type,
+    },
     javadoc::JavadocTarget,
     lift::{DynamicHelpers, Machine, constant_literal_with_options},
     naming::MemberRenames,
-    structure::{Line, structure_with_handlers},
+    structure::{
+        Line, StructureError,
+        assertions::{Guard, Sites, interface_guards, is_guard_field},
+        structure_with_assertions,
+    },
 };
 use enumeration::Enumeration;
 use layout::Document;
@@ -133,26 +141,71 @@ pub(crate) fn decompile_class(
     let class = group.get(class_name).expect("source class is registered");
     let class_name = class.pool.class_name(class.this_class)?;
     if options.decompile_kotlin
-        && let Some(source) = crate::kotlin::decompile_class(class)?
+        && let Some((source, mut map)) =
+            crate::kotlin::decompile_with_options(class, group, options)?
     {
-        let text = finish_source(class_name, options.banner.clone(), &source, None, options);
+        let text = finish_source(
+            class_name,
+            options.banner.clone(),
+            &source,
+            map.as_mut(),
+            options,
+        );
         return Ok(Source {
             class_name: class_name.into(),
             renamed_name: None,
             text,
             file_extension: "kt",
-            map: None,
+            map,
         });
     }
+    let mut guards = BTreeMap::new();
+    if options.decompile_assert {
+        let mut pending = vec![class_name];
+        while let Some(owner) = pending.pop() {
+            if let Some(class) = group.get(owner)
+                && let Some(guard) = Guard::prove(group, class, class_name)
+            {
+                guards.insert(owner, guard);
+            }
+            if options.decompile_inner {
+                pending.extend(group.children(owner).map(|(child, _)| child));
+            }
+        }
+        if options.decompile_inner {
+            guards.extend(interface_guards(group, class_name));
+        }
+    }
+    let source = decompile_java(group, class, class_name, options, renames, &guards);
+    if matches!(&source, Err(DecompileError::Method { source, .. })
+        if matches!(source.downcast_ref::<StructureError>(), Some(StructureError::Assertion)))
+    {
+        // A raw CFG proof may still fail expression lifting. Start a fresh
+        // compilation unit so the original field and initializer remain.
+        return decompile_java(group, class, class_name, options, renames, &BTreeMap::new());
+    }
+    source
+}
+
+fn decompile_java<'a>(
+    group: &ClassGroup<'a>,
+    class: &ClassFile<'a>,
+    class_name: &str,
+    options: &Options,
+    renames: &MemberRenames,
+    guards: &BTreeMap<&str, Guard<'_>>,
+) -> Result<Source, DecompileError> {
     let source_name = renames.class_name(class_name);
-    let names = Names::new(group, class_name, options.remove_imports, renames);
+    let names = Names::new(group, class_name, options, renames);
     let mut writer = Writer {
         class,
         owner: class_name,
         flags: class.access_flags,
         depth: 0,
         group,
+        assertion_guards: guards,
         dynamic_helpers: DynamicHelpers::default(),
+        anonymous_bindings: None,
         names: &names,
         type_nesting: Rc::new(TypeNesting::new(class)?),
         options,
@@ -194,7 +247,13 @@ pub(crate) fn decompile_class(
             }
         }
     }
-    let text = finish_source(class_name, prefix, &writer.body, writer.mapping.as_mut(), options);
+    let text = finish_source(
+        class_name,
+        prefix,
+        &writer.body,
+        writer.mapping.as_mut(),
+        options,
+    );
     Ok(Source {
         class_name: class_name.into(),
         renamed_name: (source_name != class_name).then(|| source_name.into()),
@@ -235,12 +294,14 @@ fn finish_source(
 struct Writer<'a, 'c> {
     class: &'c ClassFile<'a>,
     group: &'c ClassGroup<'a>,
+    assertion_guards: &'c BTreeMap<&'c str, Guard<'c>>,
     owner: &'c str,
     flags: u16,
     depth: usize,
     names: &'c Names<'a, 'c>,
     type_nesting: Rc<TypeNesting<'c>>,
     dynamic_helpers: DynamicHelpers,
+    anonymous_bindings: Option<crate::lift::AnonymousBindings>,
     options: &'c Options,
     body: String,
     lines: usize,
@@ -266,7 +327,10 @@ impl<'a, 'c> Writer<'a, 'c> {
             self.body.push_str(&self.options.indent);
         }
         self.lines += doc.render_with_crlf(
-            &mut self.body, self.options.preferred_line_length, &self.options.indent, self.options.crlf,
+            &mut self.body,
+            self.options.preferred_line_length,
+            &self.options.indent,
+            self.options.crlf,
         );
         self.body.push('\n');
         self.lines += 1;
@@ -275,15 +339,22 @@ impl<'a, 'c> Writer<'a, 'c> {
     fn class(&mut self, name: &str) -> Result<(), DecompileError> {
         let flags = self.flags;
         let is_enum = flags & ENUM != 0;
-        let enumeration = is_enum
-            .then(|| Enumeration::recover(self.class, self.options.ascii_strings))
-            .transpose()?;
+        let enumeration = is_enum.then(|| Enumeration::recover(self)).transpose()?;
         let is_interface = flags & INTERFACE != 0;
         let is_annotation = flags & ANNOTATION != 0;
         let components = self.class.record_components()?;
         let permitted = self.class.permitted_subclasses()?;
-        if self.depth == 0 && self.names.renames().simple_class_alias(self.owner).is_some() {
-            self.line(0, &format!("// $VF: renamed from: {}", self.owner.replace('/', ".")));
+        if self.depth == 0
+            && self
+                .names
+                .renames()
+                .simple_class_alias(self.owner)
+                .is_some()
+        {
+            self.line(
+                0,
+                &format!("// $VF: renamed from: {}", self.owner.replace('/', ".")),
+            );
         }
         self.sourcefile_comment()?;
         self.javadoc(0, JavadocTarget::Class(self.class));
@@ -303,8 +374,15 @@ impl<'a, 'c> Writer<'a, 'c> {
         modifier(&mut head, flags, STRICT, "strictfp ");
         if !is_enum && !permitted.is_empty() {
             head.push_str("sealed ");
-        } else if !is_enum && flags & FINAL == 0 && components.is_none()
-            && crate::hierarchy::is_permitted_subclass(self.group, self.options, self.class, self.owner)?
+        } else if !is_enum
+            && flags & FINAL == 0
+            && components.is_none()
+            && crate::hierarchy::is_permitted_subclass(
+                self.group,
+                self.options,
+                self.class,
+                self.owner,
+            )?
         {
             head.push_str("non-sealed ");
         }
@@ -330,14 +408,20 @@ impl<'a, 'c> Writer<'a, 'c> {
         let mut annotations = self.class.type_annotations(true)?;
         annotations.extend(self.class.type_annotations(false)?);
         if let Some(sig) = &sig {
-            self.type_parameters(&mut head, &sig.type_parameters, &annotations, TypeTarget::ClassTypeParameter)?;
+            self.type_parameters(
+                &mut head,
+                &sig.type_parameters,
+                &annotations,
+                TypeTarget::ClassTypeParameter,
+            )?;
         }
         let record_components = if let Some(components) = &components {
             Some((head.len(), self.record_components_source(components)?))
         } else {
             None
         };
-        if components.is_none() && !is_enum
+        if components.is_none()
+            && !is_enum
             && !is_interface
             && self.class.super_class != 0
             && self.class.pool.class_name(self.class.super_class)? != "java/lang/Object"
@@ -359,9 +443,13 @@ impl<'a, 'c> Writer<'a, 'c> {
                 " implements "
             });
             for (index, &interface) in self.class.interfaces.iter().enumerate() {
-                if index != 0 { head.push_str(", "); }
+                if index != 0 {
+                    head.push_str(", ");
+                }
                 let target = TypeTarget::Supertype(Supertype::Interface(index as u16));
-                let ty = if let Some(interface) = sig.as_ref().and_then(|sig| sig.interfaces.get(index)) {
+                let ty = if let Some(interface) =
+                    sig.as_ref().and_then(|sig| sig.interfaces.get(index))
+                {
                     self.render_type_target(interface, &annotations, target, &[], false)?
                 } else {
                     let ty = Type::Object(pool.class_name(interface)?.into());
@@ -372,7 +460,9 @@ impl<'a, 'c> Writer<'a, 'c> {
         }
         if !is_enum && !permitted.is_empty() {
             head.push_str(" permits ");
-            push_class_list(&mut head, &permitted, self.class, &|name| self.names.render(name))?;
+            push_class_list(&mut head, &permitted, self.class, &|name| {
+                self.names.render(name)
+            })?;
         }
         head.push_str(" {");
         if let Some((at, components)) = record_components {
@@ -388,33 +478,23 @@ impl<'a, 'c> Writer<'a, 'c> {
         let mut needs_gap = false;
         let emit_fields = self.options.method_to_decompile.is_empty();
         if let Some(info) = enumeration.as_ref().filter(|_| emit_fields) {
-            let declarations = info.declarations();
-            for (index, declaration) in declarations.iter().enumerate() {
-                let separator = if index + 1 == declarations.len() {
-                    ';'
-                } else {
-                    ','
-                };
-                self.line(1, &format!("{declaration}{separator}"));
-            }
-            if declarations.is_empty() {
-                self.line(1, ";");
-            }
+            self.emit_enum_constants(info)?;
             needs_gap = true;
         }
         let mut wrote_field = false;
-        let mut interface_inits = (is_interface && emit_fields)
-            .then(|| self.interface_initializers())
-            .transpose()?;
-        let mut interface_offsets = BTreeMap::new();
+        let mut initializers =
+            self.field_initializers(emit_fields, is_enum || components.is_some())?;
         for field in self.class.fields.iter().filter(|_| emit_fields) {
             let pool = &self.class.pool;
             if self.has_lexical_owner()
-                && self.group.outer_field(
-                    self.owner,
-                    pool.utf8(field.name_index)?,
-                    pool.utf8(field.descriptor_index)?,
-                ).is_some()
+                && self
+                    .group
+                    .outer_field(
+                        self.owner,
+                        pool.utf8(field.name_index)?,
+                        pool.utf8(field.descriptor_index)?,
+                    )
+                    .is_some()
             {
                 continue;
             }
@@ -424,57 +504,77 @@ impl<'a, 'c> Writer<'a, 'c> {
                     continue;
                 }
             }
-            if !self.hidden(field)? && !self.is_component_field(field, components.as_deref())? {
+            if !self.hidden_field(field)?
+                && !self.is_component_field(field, components.as_deref())?
+            {
                 if is_enum && !wrote_field {
                     self.line(0, "");
                 }
-                let initializer = if let Some(inits) = &mut interface_inits {
-                    inits.values.remove(self.class.pool.utf8(field.name_index)?)
-                } else {
-                    None
-                };
-                let source_line = self.field(
-                    field,
-                    is_interface,
-                    initializer.as_ref().map(|init| init.expression.as_str()),
-                )?;
-                if let Some(init) = initializer {
-                    interface_offsets
-                        .extend(init.offsets.into_iter().map(|offset| (offset, source_line)));
-                }
+                let source_line =
+                    self.field(field, is_interface, initializers.expression(field))?;
+                initializers.record_line(field, source_line);
                 wrote_field = true;
                 needs_gap = true;
             }
         }
-        if let Some(inits) = interface_inits {
-            if !inits.values.is_empty() {
-                return Err(initializers::unsupported());
-            }
-            if let Some(mapping) = &mut self.mapping
-                && !interface_offsets.is_empty()
-            {
-                mapping.add(
-                    MethodMap {
-                        class_name: self.owner.into(),
-                        name: "<clinit>".into(),
-                        descriptor: "()V".into(),
-                        offsets: interface_offsets,
-                    },
-                    inits.original_lines,
-                );
-            }
-        }
         let mut constructors = 0;
         for method in &self.class.methods {
-            constructors += usize::from(self.class.pool.utf8(method.name_index)? == "<init>");
+            let pool = &self.class.pool;
+            if pool.utf8(method.name_index)? == "<init>"
+                && !enumeration.as_ref().is_some_and(|enumeration| {
+                    pool.utf8(method.descriptor_index).is_ok_and(|descriptor| {
+                        enumeration.hides_method(self.owner, "<init>", descriptor, method)
+                    })
+                })
+            {
+                constructors += 1;
+            }
         }
-        self.write_methods(name, components.as_deref(), enumeration.as_ref(), constructors, &mut needs_gap)?;
+        self.write_methods(
+            name,
+            components.as_deref(),
+            enumeration.as_ref(),
+            constructors,
+            &mut needs_gap,
+            &initializers,
+        )?;
+        initializers.finish(self)?;
         self.member_classes(needs_gap)?;
         self.line(0, "}");
         Ok(())
     }
 
+    fn assertion_guard(&self) -> Option<&'c Guard<'c>> {
+        self.assertion_guards.get(self.owner)
+    }
+
+    fn hidden_field(&self, field: &Member<'a>) -> Result<bool, DecompileError> {
+        if is_guard_field(self.class, field) {
+            let pool = &self.class.pool;
+            let name = pool.utf8(field.name_index)?;
+            let descriptor = pool.utf8(field.descriptor_index)?;
+            Ok(self
+                .assertion_guard()
+                .is_some_and(|guard| guard.hides_field(name, descriptor)))
+        } else {
+            self.hidden(field)
+        }
+    }
+
     fn hidden(&self, member: &Member<'a>) -> Result<bool, DecompileError> {
+        let pool = &self.class.pool;
+        let name = pool.utf8(member.name_index)?;
+        if name.starts_with("$SWITCH_TABLE$") || name.starts_with("$SwitchMap$") {
+            let descriptor = pool.utf8(member.descriptor_index)?;
+            if let Some(consumed) = self
+                .group
+                .enum_switches()
+                .member_visibility(self.owner, name, descriptor)
+            {
+                return Ok(consumed
+                    && (self.options.decompile_inner || name.starts_with("$SWITCH_TABLE$")));
+            }
+        }
         Ok(self.options.remove_synthetic
             && (member.access_flags & SYNTHETIC != 0
                 || find_attribute(&member.attributes, &self.class.pool, "Synthetic")?.is_some()))
@@ -505,13 +605,28 @@ impl<'a, 'c> Writer<'a, 'c> {
         declarations.extend(field.annotations(pool, false)?);
         if let Some(signature) = self.member_signature(field)? {
             let ty = parse(signature, FieldSignature::parse)?;
-            out.push_str(&self.render_type_target(&ty.field_type, &annotations, TypeTarget::Field, &declarations, false)?);
+            out.push_str(&self.render_type_target(
+                &ty.field_type,
+                &annotations,
+                TypeTarget::Field,
+                &declarations,
+                false,
+            )?);
         } else {
-            out.push_str(&self.render_type_target(&ty, &annotations, TypeTarget::Field, &declarations, false)?);
+            out.push_str(&self.render_type_target(
+                &ty,
+                &annotations,
+                TypeTarget::Field,
+                &declarations,
+                false,
+            )?);
         }
         out.push(' ');
         let name = pool.utf8(field.name_index)?;
-        let renamed = self.names.renames().field_alias(self.owner, name, descriptor);
+        let renamed = self
+            .names
+            .renames()
+            .field_alias(self.owner, name, descriptor);
         out.push_str(renamed.unwrap_or(name));
         if let Some(value) = find_attribute(&field.attributes, pool, "ConstantValue")? {
             let index = u16::from_be_bytes(
@@ -521,12 +636,11 @@ impl<'a, 'c> Writer<'a, 'c> {
             );
             out.push_str(" = ");
             out.push_str(
-                &constant_literal_with_options(pool, index, Some(&ty), self.options, map_name).map_err(
-                    |source| DecompileError::Render {
+                &constant_literal_with_options(pool, index, Some(&ty), self.options, map_name)
+                    .map_err(|source| DecompileError::Render {
                         context: "constant field initializer",
                         source: Box::new(source),
-                    },
-                )?,
+                    })?,
             );
         } else if let Some(initializer) = initializer {
             out.push_str(" = ");
@@ -562,6 +676,7 @@ impl<'a, 'c> Writer<'a, 'c> {
         enumeration: Option<&Enumeration<'_>>,
         constructors: usize,
         needs_gap: bool,
+        initializers: &initializers::FieldInitializers<'_>,
     ) -> Result<bool, DecompileError> {
         let pool = &self.class.pool;
         let name = pool.utf8(method.name_index)?;
@@ -577,7 +692,10 @@ impl<'a, 'c> Writer<'a, 'c> {
             return Ok(false);
         }
         let ty = parse(descriptor, MethodDescriptor::parse)?;
-        let renamed = self.names.renames().method_alias(self.owner, name, descriptor);
+        let renamed = self
+            .names
+            .renames()
+            .method_alias(self.owner, name, descriptor);
         let code = method.code(pool)?;
         let anonymous_sites = code.as_ref().and_then(|_| self.anonymous_sites());
         let constructor = name == "<init>";
@@ -585,8 +703,14 @@ impl<'a, 'c> Writer<'a, 'c> {
         let implicit_parameters = if constructor && enumeration.is_some() {
             2
         } else {
-            usize::from(constructor && self.has_lexical_owner()
-                && self.group.constructor_outer(self.owner, descriptor).is_some())
+            usize::from(
+                constructor
+                    && self.has_lexical_owner()
+                    && self
+                        .group
+                        .constructor_outer(self.owner, descriptor)
+                        .is_some(),
+            )
         };
         let names = self.names;
         let map_name = |name: &str| names.render(name);
@@ -619,15 +743,30 @@ impl<'a, 'c> Writer<'a, 'c> {
             {
                 return Ok(false);
             }
+            let guard = self.assertion_guard();
             let prefix = enumeration
                 .map(|info| info.method_prefix(self.class, name, descriptor, &instructions))
                 .transpose()?
                 .unwrap_or(0);
+            let implicit_enum_super = constructor && prefix != 0;
             if self.options.idea_notnull {
-                crate::idea_notnull::strip_guards(self.class, method, code, &ty, &mut instructions)?;
+                crate::idea_notnull::strip_guards(
+                    self.class,
+                    method,
+                    code,
+                    &ty,
+                    &mut instructions,
+                )?;
             }
-            let uses_subroutines =
-                instructions[prefix..].iter().any(|op| matches!(op.opcode, 0xa8 | 0xa9 | 0xc9));
+            let prefix = if initializer {
+                prefix + guard.map_or(0, |guard| guard.initializer_prefix(name, descriptor))
+            } else {
+                prefix
+            };
+            initializers.strip(name, descriptor, &mut instructions);
+            let uses_subroutines = instructions[prefix..]
+                .iter()
+                .any(|op| matches!(op.opcode, 0xa8 | 0xa9 | 0xc9));
             let normalized;
             let (instructions, handlers) = if self.options.force_jsr_inline || uses_subroutines {
                 if prefix != 0 {
@@ -648,13 +787,19 @@ impl<'a, 'c> Writer<'a, 'c> {
             let mut machine = Machine::new(self.class, method, code, &ty, self.options, &map_name)
                 .map_err(|source| method_error(Box::new(source)))?
                 .with_group(self.group);
+            if implicit_enum_super {
+                machine.mark_initialized_this();
+            }
             if uses_subroutines && let Some(normalized) = &normalized {
                 machine = machine.with_normalized_offsets(normalized);
             }
             let mut code_annotations = code.type_annotations(pool, true)?;
             code_annotations.extend(code.type_annotations(pool, false)?);
             let render_code_annotation = |ty: &Type, target: TypeTarget| {
-                let mut matching = code_annotations.iter().filter(|entry| entry.target == target).peekable();
+                let mut matching = code_annotations
+                    .iter()
+                    .filter(|entry| entry.target == target)
+                    .peekable();
                 if matching.peek().is_none() {
                     return Ok(None);
                 }
@@ -665,18 +810,36 @@ impl<'a, 'c> Writer<'a, 'c> {
                     |name| self.names.render(name),
                     |annotation| self.annotation(annotation),
                     false,
-                ).map(Some).map_err(|error| crate::lift::LiftError::TypeAnnotation(Box::new(error)))
+                )
+                .map(Some)
+                .map_err(|error| crate::lift::LiftError::TypeAnnotation(Box::new(error)))
             };
             if !code_annotations.is_empty() {
                 machine.set_code_type_renderer(&render_code_annotation);
             }
             machine.set_member_renames(self.names.renames());
             machine.set_dynamic_helpers(Rc::clone(&self.dynamic_helpers));
+            if self.anonymous_bindings.is_some() {
+                machine.set_anonymous_bindings(self.anonymous_bindings.clone());
+            }
             if let Some(sites) = &anonymous_sites {
                 machine.set_anonymous_sites(Rc::clone(sites));
+                machine.set_anonymous_source(instructions);
             }
             let parameters = machine.parameter_names().to_vec();
-                .map_err(|source| method_error(Box::new(source)))?;
+            let assertions = guard
+                .map(|guard| Sites::for_method(self.class, method, guard, instructions, &graph))
+                .transpose()
+                .map_err(|source| method_error(Box::new(source)))?
+                .flatten();
+            let mut lines = structure_with_assertions(
+                instructions,
+                &graph,
+                machine,
+                handlers,
+                assertions.as_ref(),
+            )
+            .map_err(|source| method_error(Box::new(source)))?;
             if uses_subroutines && let Some(code) = normalized {
                 for line in &mut lines {
                     line.offsets.retain_mut(|offset| {
@@ -701,24 +864,14 @@ impl<'a, 'c> Writer<'a, 'c> {
         if parameters.len() != ty.parameters.len() || parameters.len() < implicit_parameters {
             return Err(DecompileError::InvalidAttribute("method parameters"));
         }
-        if constructor {
-            if enumeration.is_some() {
-                if !lines
-                    .first()
-                    .is_some_and(|line| line.depth == 0 && line.text.starts_with("super("))
-                {
-                    return Err(DecompileError::Unsupported {
-                        feature: "enum constructor has no recoverable super call",
-                    });
-                }
-                lines.remove(0);
-            } else if self.options.hide_empty_super
-                && lines
-                    .first()
-                    .is_some_and(|line| line.depth == 0 && line.text == "super();")
-            {
-                lines.remove(0);
-            }
+        if constructor
+            && enumeration.is_none()
+            && self.options.hide_empty_super
+            && lines
+                .first()
+                .is_some_and(|line| line.depth == 0 && line.text == "super();")
+        {
+            lines.remove(0);
         }
         let closing = if lines
             .last()
@@ -751,8 +904,7 @@ impl<'a, 'c> Writer<'a, 'c> {
                 && ty.parameters.len() == implicit_parameters
                 && exceptions.is_empty()
                 && annotations.is_empty()
-                && (enumeration.is_some()
-                    || flags & VISIBILITY == self.flags & VISIBILITY)
+                && (enumeration.is_some() || flags & VISIBILITY == self.flags & VISIBILITY)
                 && lines.is_empty()
             {
                 return Ok(false);
@@ -762,13 +914,39 @@ impl<'a, 'c> Writer<'a, 'c> {
             }
             if renamed.is_some() {
                 let java_name = |name: &str| name.replace('/', ".");
-                let args = ty.parameters.iter().map(|param| param.render(java_name)).collect::<Vec<_>>().join(", ");
+                let args = ty
+                    .parameters
+                    .iter()
+                    .map(|param| param.render(java_name))
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 let result = ty.return_type.render(java_name);
-                self.line(1, &format!("// $VF: renamed from: {name} ({args}) {result}"));
+                self.line(
+                    1,
+                    &format!("// $VF: renamed from: {name} ({args}) {result}"),
+                );
             }
             self.javadoc(1, JavadocTarget::Method(self.class, method));
             for annotation in &annotations {
                 self.write_annotation(1, annotation)?;
+            }
+            if self.options.override_annotation
+                && self.class.major_version >= 49
+                && !constructor
+                && flags & (PRIVATE | STATIC) == 0
+                && !annotations.iter().any(|annotation| {
+                    pool.utf8(annotation.type_index).ok() == Some("Ljava/lang/Override;")
+                })
+                && crate::hierarchy::overrides(
+                    self.group,
+                    self.options,
+                    self.class,
+                    self.owner,
+                    name,
+                    descriptor,
+                )?
+            {
+                self.line(1, "@Override");
             }
             if !is_interface || flags & PUBLIC == 0 {
                 visibility(&mut head, flags);
@@ -796,7 +974,12 @@ impl<'a, 'c> Writer<'a, 'c> {
             if let Some(sig) = signature
                 && !sig.type_parameters.is_empty()
             {
-                self.type_parameters(&mut head, &sig.type_parameters, &type_annotations, TypeTarget::MethodTypeParameter)?;
+                self.type_parameters(
+                    &mut head,
+                    &sig.type_parameters,
+                    &type_annotations,
+                    TypeTarget::MethodTypeParameter,
+                )?;
                 head.push(' ');
             }
             if constructor {
@@ -804,16 +987,30 @@ impl<'a, 'c> Writer<'a, 'c> {
             } else {
                 let declarations = &annotations;
                 let result = if let Some(sig) = signature {
-                    self.render_type_target(&sig.return_type, &type_annotations, TypeTarget::MethodReturn, declarations, false)?
+                    self.render_type_target(
+                        &sig.return_type,
+                        &type_annotations,
+                        TypeTarget::MethodReturn,
+                        declarations,
+                        false,
+                    )?
                 } else {
-                    self.render_type_target(&ty.return_type, &type_annotations, TypeTarget::MethodReturn, declarations, false)?
+                    self.render_type_target(
+                        &ty.return_type,
+                        &type_annotations,
+                        TypeTarget::MethodReturn,
+                        declarations,
+                        false,
+                    )?
                 };
                 head.push_str(&result);
                 head.push(' ');
                 if let Some(renamed) = renamed {
                     head.push_str(renamed);
                 } else {
-                    head.push_str(&crate::lift::source_method_name(self.class, name, descriptor));
+                    head.push_str(&crate::lift::source_method_name(
+                        self.class, name, descriptor,
+                    ));
                 }
             }
             let arguments_start = head.len();
@@ -823,7 +1020,11 @@ impl<'a, 'c> Writer<'a, 'c> {
             }
             let annot_visible = method.parameter_annotations(pool, true)?;
             let annot_invisible = method.parameter_annotations(pool, false)?;
-            let method_parameters = if self.options.use_method_parameters { method.method_parameters(pool)? } else { Vec::new() };
+            let method_parameters = if self.options.use_method_parameters {
+                method.method_parameters(pool)?
+            } else {
+                Vec::new()
+            };
             for (index, (param, name)) in ty
                 .parameters
                 .iter()
@@ -843,16 +1044,31 @@ impl<'a, 'c> Writer<'a, 'c> {
                         }
                     }
                 }
-                if method_parameters.get(index).is_some_and(|entry| entry.access_flags & FINAL != 0) {
+                if method_parameters
+                    .get(index)
+                    .is_some_and(|entry| entry.access_flags & FINAL != 0)
+                {
                     parameter.push_str("final ");
                 }
                 let target = TypeTarget::MethodParameter((index - implicit_parameters) as u8);
                 let varargs = flags & VARARGS != 0 && index + 1 == ty.parameters.len();
                 let rendered = if let Some(sig) = signature {
                     let skip = ty.parameters.len() - sig.parameters.len();
-                    self.render_type_target(&sig.parameters[index - skip], &type_annotations, target, &declarations, varargs)?
+                    self.render_type_target(
+                        &sig.parameters[index - skip],
+                        &type_annotations,
+                        target,
+                        &declarations,
+                        varargs,
+                    )?
                 } else {
-                    self.render_type_target(param, &type_annotations, target, &declarations, varargs)?
+                    self.render_type_target(
+                        param,
+                        &type_annotations,
+                        target,
+                        &declarations,
+                        varargs,
+                    )?
                 };
                 parameter.push_str(&rendered);
                 parameter.push_str(" ");
@@ -865,10 +1081,18 @@ impl<'a, 'c> Writer<'a, 'c> {
                 head.push_str(" throws ");
                 let count = generic_throws.map_or(exceptions.len(), |sig| sig.throws.len());
                 for index in 0..count {
-                    if index != 0 { head.push_str(", "); }
+                    if index != 0 {
+                        head.push_str(", ");
+                    }
                     let target = TypeTarget::Throws(index as u16);
                     let rendered = if let Some(sig) = generic_throws {
-                        self.render_type_target(&sig.throws[index], &type_annotations, target, &[], false)?
+                        self.render_type_target(
+                            &sig.throws[index],
+                            &type_annotations,
+                            target,
+                            &[],
+                            false,
+                        )?
                     } else {
                         let ty = Type::Object(pool.class_name(exceptions[index])?.into());
                         self.render_type_target(&ty, &type_annotations, target, &[], false)?
@@ -895,7 +1119,14 @@ impl<'a, 'c> Writer<'a, 'c> {
             self.line(1, &head);
         }
         if let Some(code) = &code {
-            self.method_body(name, descriptor, code, lines, closing, anonymous_sites.as_ref())?;
+            self.method_body(
+                name,
+                descriptor,
+                code,
+                lines,
+                closing,
+                anonymous_sites.as_ref(),
+            )?;
         }
         Ok(true)
     }
@@ -910,8 +1141,10 @@ impl<'a, 'c> Writer<'a, 'c> {
         anonymous_sites: Option<&crate::lift::AnonymousSites>,
     ) -> Result<(), DecompileError> {
         let line_count = lines.len();
-        let mut declarations = self.local_declarations(name, descriptor, code, &lines)?
-            .into_iter().peekable();
+        let mut declarations = self
+            .local_declarations(name, descriptor, code, &lines)?
+            .into_iter()
+            .peekable();
         let mapping = self.mapping.is_some();
         let mut offsets = BTreeMap::new();
         let mut closed_block = None;
@@ -941,7 +1174,12 @@ impl<'a, 'c> Writer<'a, 'c> {
             mapping.add(
                 MethodMap {
                     class_name: self.owner.into(),
-                    name: self.names.renames().method_alias(self.owner, name, descriptor).unwrap_or(name).into(),
+                    name: self
+                        .names
+                        .renames()
+                        .method_alias(self.owner, name, descriptor)
+                        .unwrap_or(name)
+                        .into(),
                     descriptor: descriptor.into(),
                     offsets,
                 },

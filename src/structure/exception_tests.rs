@@ -7,11 +7,16 @@ use crate::descriptor::MethodDescriptor;
 use crate::lift::Machine;
 use crate::options::Options;
 
-use super::{Line, StructureError, structure_with_handlers};
 use super::protected::Exceptions;
+use super::{Line, StructureError, structure_with_handlers};
 
 fn handler(start_pc: u16, end_pc: u16, handler_pc: u16, catch_type: u16) -> ExceptionHandler {
-    ExceptionHandler { start_pc, end_pc, handler_pc, catch_type }
+    ExceptionHandler {
+        start_pc,
+        end_pc,
+        handler_pc,
+        catch_type,
+    }
 }
 
 fn classify(
@@ -28,16 +33,20 @@ fn classify(
 fn equal_ranges_merge_alternatives_and_preserve_table_order() {
     let bytes = [
         0xb8, 0, 1, // 0: invokestatic
-        0xa7, 0, 11, // 3: goto 14
+        0xa7, 0, 11,   // 3: goto 14
         0x4b, // 6: astore_0
-        0xa7, 0, 7, // 7: goto 14
+        0xa7, 0, 7,    // 7: goto 14
         0x4b, // 10: astore_0
-        0xa7, 0, 3, // 11: goto 14
+        0xa7, 0, 3,    // 11: goto 14
         0xb1, // 14: return
     ];
     let (graph, regions) = classify(
         &bytes,
-        &[handler(0, 3, 10, 2), handler(0, 3, 10, 3), handler(0, 3, 6, 4)],
+        &[
+            handler(0, 3, 10, 2),
+            handler(0, 3, 10, 3),
+            handler(0, 3, 6, 4),
+        ],
     );
     let regions = regions.unwrap();
     let shape = regions.region(regions.at_start(None, 0).unwrap());
@@ -56,9 +65,9 @@ fn nested_same_start_regions_include_inner_handler_in_outer_body() {
         0xa7, 0, 6, // 3: goto 9
         0x4b, 0, 0, // 6: astore_0; nop; nop
         0xb8, 0, 1, // 9: invokestatic
-        0xa7, 0, 7, // 12: goto 19
+        0xa7, 0, 7,    // 12: goto 19
         0x4c, // 15: astore_1
-        0xa7, 0, 3, // 16: goto 19
+        0xa7, 0, 3,    // 16: goto 19
         0xb1, // 19: return
     ];
     let inner = handler(0, 3, 6, 1);
@@ -77,12 +86,12 @@ fn nested_same_start_regions_include_inner_handler_in_outer_body() {
 fn reversed_dispatch_order_cannot_be_rendered_as_that_nesting() {
     let bytes = [
         0xb8, 0, 1, // 0: invokestatic
-        0xa7, 0, 4, // 3: goto 7
+        0xa7, 0, 4,    // 3: goto 7
         0x4b, // 6: astore_0
         0xb8, 0, 1, // 7: invokestatic
-        0xa7, 0, 7, // 10: goto 17
+        0xa7, 0, 7,    // 10: goto 17
         0x4c, // 13: astore_1
-        0xa7, 0, 3, // 14: goto 17
+        0xa7, 0, 3,    // 14: goto 17
         0xb1, // 17: return
     ];
     let (_, regions) = classify(&bytes, &[handler(0, 10, 13, 2), handler(0, 3, 6, 1)]);
@@ -93,13 +102,13 @@ fn reversed_dispatch_order_cannot_be_rendered_as_that_nesting() {
 fn disjoint_ranges_with_distinct_handlers_are_separate_statements() {
     let bytes = [
         0xb8, 0, 1, // 0: invokestatic
-        0xa7, 0, 7, // 3: goto 10
+        0xa7, 0, 7,    // 3: goto 10
         0x4b, // 6: astore_0
         0xa7, 0, 3, // 7: goto 10
         0xb8, 0, 1, // 10: invokestatic
-        0xa7, 0, 7, // 13: goto 20
+        0xa7, 0, 7,    // 13: goto 20
         0x4b, // 16: astore_0
-        0xa7, 0, 3, // 17: goto 20
+        0xa7, 0, 3,    // 17: goto 20
         0xb1, // 20: return
     ];
     let (graph, regions) = classify(&bytes, &[handler(0, 3, 6, 1), handler(10, 13, 16, 1)]);
@@ -116,9 +125,9 @@ fn split_rows_of_one_range_can_cross_an_unprotected_goto() {
         0xb8, 0, 1, // 0: invokestatic
         0xa7, 0, 3, // 3: goto 6
         0xb8, 0, 1, // 6: invokestatic
-        0xa7, 0, 7, // 9: goto 16
+        0xa7, 0, 7,    // 9: goto 16
         0x4b, // 12: astore_0
-        0xa7, 0, 3, // 13: goto 16
+        0xa7, 0, 3,    // 13: goto 16
         0xb1, // 16: return
     ];
     let (graph, regions) = classify(&bytes, &[handler(0, 3, 12, 1), handler(6, 9, 12, 1)]);
@@ -136,7 +145,7 @@ fn only_identical_normal_and_exceptional_cleanup_forms_finally() {
     let mut bytes = [
         0xb8, 0, 1, // 0: invokestatic (body)
         0xb8, 0, 2, // 3: invokestatic (normal cleanup)
-        0xa7, 0, 9, // 6: goto 15
+        0xa7, 0, 9,    // 6: goto 15
         0x4b, // 9: astore_0
         0xb8, 0, 2, // 10: invokestatic (exceptional cleanup)
         0x2a, 0xbf, // 13: aload_0; athrow
@@ -148,7 +157,10 @@ fn only_identical_normal_and_exceptional_cleanup_forms_finally() {
     let finally = shape.finally.as_ref().unwrap();
     assert_eq!(shape.join, graph.block_at(15));
     assert_eq!(Some(finally.start()), graph.block_at(9));
-    assert_eq!(regions.finally_range(Some(finally.arm), finally.block()), Some(4..5));
+    assert_eq!(
+        regions.finally_range(Some(finally.arm), finally.block()),
+        Some(4..5)
+    );
     assert_eq!(regions.cleanup_prefix(graph.block_at(3).unwrap()), 1);
 
     bytes[12] = 3;
@@ -161,11 +173,11 @@ fn catch_all_ranges_can_cover_inner_catches_and_their_own_initial_store() {
     let bytes = [
         0xb8, 0, 22, // 0: invokestatic (body)
         0xb8, 0, 22, // 3: invokestatic (normal cleanup)
-        0xa7, 0, 19, // 6: goto 25
+        0xa7, 0, 19,   // 6: goto 25
         0x4c, // 9: astore_1 (typed handler)
         0xb8, 0, 22, // 10: invokestatic (catch body)
         0xb8, 0, 22, // 13: invokestatic (catch cleanup)
-        0xa7, 0, 9, // 16: goto 25
+        0xa7, 0, 9,    // 16: goto 25
         0x4d, // 19: astore_2 (finally handler)
         0xb8, 0, 22, // 20: invokestatic (exceptional cleanup)
         0x2c, 0xbf, // 23: aload_2; athrow
@@ -190,30 +202,103 @@ fn catch_all_ranges_can_cover_inner_catches_and_their_own_initial_store() {
 
     let lines = test_method(&bytes, &handlers, &[]).unwrap();
     let text: Vec<_> = lines.iter().map(|line| line.text.as_str()).collect();
-    assert_eq!(text, [
-        "try {",
-        "C.work();",
-        "} catch (java.lang.RuntimeException var1) {",
-        "C.work();",
-        "} finally {",
-        "C.work();",
-        "}",
-        "return;",
-    ]);
+    assert_eq!(
+        text,
+        [
+            "try {",
+            "C.work();",
+            "} catch (java.lang.RuntimeException var1) {",
+            "C.work();",
+            "} finally {",
+            "C.work();",
+            "}",
+            "return;",
+        ]
+    );
+}
+
+#[test]
+fn cleanup_copies_can_rename_an_unread_category_two_temporary() {
+    let code = [
+        0xb8, 0, 22, // 0: invokestatic C.work()
+        0x0a, 0x40, // 3: lconst_1; lstore_1
+        0xa7, 0, 9,    // 5: goto 14
+        0x4e, // 8: astore_3
+        0x0a, 0x37, 4, // 9: lconst_1; lstore 4
+        0x2d, 0xbf, // 12: aload_3; athrow
+    ];
+    let handlers = [handler(0, 3, 8, 0)];
+    let mut bytes = code.to_vec();
+    bytes.push(0xb1);
+    let lines = test_method(&bytes, &handlers, &[]).unwrap();
+    assert!(lines.iter().any(|line| line.text == "long var4 = 1L;"));
+    assert!(!lines.iter().any(|line| line.text.contains("var1")));
+
+    // Reading either alias invalidates the dead-store proof.
+    let mut bytes = code.to_vec();
+    bytes.extend([0x1f, 0x58, 0xb1]); // lload_1; pop2; return
+    let (_, regions) = classify(&bytes, &handlers);
+    assert!(matches!(regions, Err(StructureError::ExceptionHandlers)));
+}
+
+#[test]
+fn copied_cleanup_can_finish_a_try_return_while_the_catch_falls_through() {
+    let mut bytes = [
+        0x04, 0x3c, // 0: iconst_1; istore_1
+        0xb8, 0, 22, // 2: invokestatic C.work() (return cleanup)
+        0x1b, 0xac, // 5: iload_1; ireturn
+        0x4c, // 7: astore_1 (typed catch)
+        0xb8, 0, 22, // 8: invokestatic C.work() (catch statement)
+        0xb8, 0, 22, // 11: invokestatic C.work() (catch cleanup)
+        0xa7, 0, 9,    // 14: goto 23
+        0x4d, // 17: astore_2
+        0xb8, 0, 22, // 18: invokestatic C.work() (exceptional cleanup)
+        0x2c, 0xbf, // 21: aload_2; athrow
+        0x02, 0xac, // 23: iconst_m1; ireturn
+    ];
+    let handlers = [
+        handler(0, 2, 7, 26),
+        handler(0, 2, 17, 0),
+        handler(7, 11, 17, 0),
+    ];
+    let lines = test_method_with_descriptor(&bytes, &handlers, &[], "(Ljava/lang/AutoCloseable;)I")
+        .unwrap();
+    let text: Vec<_> = lines.iter().map(|line| line.text.as_str()).collect();
+    assert_eq!(
+        text,
+        [
+            "try {",
+            "return 1;",
+            "} catch (java.lang.RuntimeException var1) {",
+            "C.work();",
+            "} finally {",
+            "C.work();",
+            "}",
+            "return -1;",
+        ]
+    );
+    assert_eq!(lines[1].offsets, [0, 1]);
+
+    // The pending return must not move before cleanup that accesses its slot.
+    for start in [2, 11, 18] {
+        bytes[start..start + 3].copy_from_slice(&[0x05, 0x3c, 0x00]);
+    }
+    let (_, regions) = classify(&bytes, &handlers);
+    assert!(matches!(regions, Err(StructureError::ExceptionHandlers)));
 }
 
 #[test]
 fn branched_finally_matches_each_edge_and_preserves_an_overriding_return() {
     let mut bytes = [
-        0xb8, 0, 22, // 0: invokestatic C.work() (try)
+        0xb8, 0, 22,   // 0: invokestatic C.work() (try)
         0x2a, // 3: aload_0 (normal cleanup)
         0xc6, 0, 7, // 4: ifnull 11
-        0xb8, 0, 22, // 7: invokestatic C.work()
+        0xb8, 0, 22,   // 7: invokestatic C.work()
         0xb1, // 10: return (overrides the original transfer)
         0xa7, 0, 14, // 11: goto 25
         0x4c, 0x2a, // 14: astore_1; aload_0 (exceptional cleanup)
         0xc6, 0, 7, // 16: ifnull 23
-        0xb8, 0, 22, // 19: invokestatic C.work()
+        0xb8, 0, 22,   // 19: invokestatic C.work()
         0xb1, // 22: return (overrides the exception)
         0x2b, 0xbf, // 23: aload_1; athrow
         0xb1, // 25: return
@@ -222,8 +307,15 @@ fn branched_finally_matches_each_edge_and_preserves_an_overriding_return() {
     let lines = test_method(&bytes, &handlers, &[]).unwrap();
     assert_eq!(lines[0].text, "try {");
     assert_eq!(lines[2].text, "} finally {");
-    assert!(lines.iter().any(|line| line.depth == 2 && line.text == "return;"));
-    assert_eq!(lines.iter().filter(|line| line.text == "C.work();").count(), 2);
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.depth == 2 && line.text == "return;")
+    );
+    assert_eq!(
+        lines.iter().filter(|line| line.text == "C.work();").count(),
+        2
+    );
     assert!(!lines.iter().any(|line| line.text.starts_with("throw ")));
 
     bytes[4] = 0xc7; // The paired branch takes the different path on null.
@@ -232,17 +324,72 @@ fn branched_finally_matches_each_edge_and_preserves_an_overriding_return() {
 }
 
 #[test]
+fn each_branched_finally_copy_projects_to_one_proven_continuation() {
+    let mut bytes = vec![
+        0x2a, // 0: aload_0
+        0xc6, 0, 20, // 1: ifnull 21 (try)
+        0xb8, 0, 22, // 4: invokestatic C.work()
+        0xa7, 0, 3,    // 7: goto 10
+        0x2a, // 10: aload_0 (normal copy A)
+        0xc6, 0, 7, // 11: ifnull 18
+        0xb8, 0, 22,   // 14: invokestatic C.work()
+        0xb1, // 17: return
+        0xa7, 0, 25,   // 18: goto 43
+        0x2a, // 21: aload_0 (normal copy B)
+        0xc6, 0, 7, // 22: ifnull 29
+        0xb8, 0, 22,   // 25: invokestatic C.work()
+        0xb1, // 28: return
+        0xa7, 0, 14, // 29: goto 43
+        0x4c, 0x2a, // 32: astore_1; aload_0 (exceptional cleanup)
+        0xc6, 0, 7, // 34: ifnull 41
+        0xb8, 0, 22,   // 37: invokestatic C.work()
+        0xb1, // 40: return
+        0x2b, 0xbf, // 41: aload_1; athrow
+        0xb1, // 43: return (common continuation)
+    ];
+    let handlers = [handler(0, 10, 32, 0)];
+    let (graph, regions) = classify(&bytes, &handlers);
+    let regions = regions.unwrap();
+    let join = graph.block_at(43).unwrap();
+    assert_eq!(regions.bypass_cleanup(graph.block_at(10).unwrap()), join);
+    assert_eq!(regions.bypass_cleanup(graph.block_at(21).unwrap()), join);
+    let lines = test_method(&bytes, &handlers, &[]).unwrap();
+    assert_eq!(
+        lines.iter().filter(|line| line.text == "C.work();").count(),
+        2
+    );
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.text == "} finally {")
+            .count(),
+        1
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.depth == 2 && line.text == "return;")
+    );
+
+    // A different observable continuation cannot be projected to 43.
+    bytes[31] = 15;
+    bytes.extend([0xb8, 0, 22, 0xb1]); // 44: invokestatic C.work(); return
+    let (_, regions) = classify(&bytes, &handlers);
+    assert!(matches!(regions, Err(StructureError::ExceptionHandlers)));
+}
+
+#[test]
 fn resource_fold_requires_suppression_on_the_original_exception() {
     let mut bytes = [
         0x2a, 0x4c, // 0: aload_0; astore_1
-        0xb8, 0, 22, // 2: invokestatic C.work()
+        0xb8, 0, 22,   // 2: invokestatic C.work()
         0x2b, // 5: aload_1
-        0xc6, 0, 34, // 6: ifnull 40
+        0xc6, 0, 34,   // 6: ifnull 40
         0x2b, // 9: aload_1
         0xb9, 0, 13, 1, 0, // 10: invokeinterface AutoCloseable.close()
         0xa7, 0, 25, // 15: goto 40
         0x4d, 0x2b, // 18: astore_2; aload_1
-        0xc6, 0, 18, // 20: ifnull 38
+        0xc6, 0, 18,   // 20: ifnull 38
         0x2b, // 23: aload_1
         0xb9, 0, 13, 1, 0, // 24: invokeinterface AutoCloseable.close()
         0xa7, 0, 9, // 29: goto 38
@@ -254,14 +401,24 @@ fn resource_fold_requires_suppression_on_the_original_exception() {
     let handlers = [handler(2, 5, 18, 15), handler(23, 29, 32, 15)];
     let lines = test_method(&bytes, &handlers, &[]).unwrap();
     assert_eq!(lines[0].text, "try (java.lang.AutoCloseable var1 = var0) {");
-    assert!(lines.iter().any(|line| line.depth == 1 && line.text == "C.work();"));
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.depth == 1 && line.text == "C.work();")
+    );
     assert!(!lines.iter().any(|line| line.text.contains("close()")));
 
     // An addSuppressed self-call does not have the semantics of resources.
     bytes[34] = 0x2c;
     let lines = test_method(&bytes, &handlers, &[]).unwrap();
     assert_eq!(lines[1].text, "try {");
-    assert_eq!(lines.iter().filter(|line| line.text.contains("close()")).count(), 2);
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.text.contains("close()"))
+            .count(),
+        2
+    );
 }
 
 #[test]
@@ -330,10 +487,10 @@ fn monitor_head_cannot_be_entered_without_acquisition() {
 fn multicatch_binds_the_verifier_type_without_narrowing_the_union() {
     let bytes = [
         0xb8, 0, 22, // 0: invokestatic C.work()
-        0xa7, 0, 9, // 3: goto 12
+        0xa7, 0, 9,    // 3: goto 12
         0x4c, // 6: astore_1
         0x2b, // 7: aload_1
-        0xb6, 0, 33, // 8: invokevirtual Exception.getMessage()
+        0xb6, 0, 33,   // 8: invokevirtual Exception.getMessage()
         0x57, // 11: pop
         0xb1, // 12: return
     ];
@@ -350,6 +507,15 @@ fn test_method(
     bytes: &[u8],
     handlers: &[ExceptionHandler],
     stack_map: &[u8],
+) -> Result<Vec<Line>, StructureError> {
+    test_method_with_descriptor(bytes, handlers, stack_map, "(Ljava/lang/AutoCloseable;)V")
+}
+
+fn test_method_with_descriptor(
+    bytes: &[u8],
+    handlers: &[ExceptionHandler],
+    stack_map: &[u8],
+    descriptor: &str,
 ) -> Result<Vec<Line>, StructureError> {
     fn words(buffer: &mut Vec<u8>, values: &[u16]) {
         buffer.extend(values.iter().flat_map(|value| value.to_be_bytes()));
@@ -372,7 +538,7 @@ fn test_method(
     utf8(&mut class, "java/lang/Object");
     entry(&mut class, 7, &[3]);
     utf8(&mut class, "m");
-    utf8(&mut class, "(Ljava/lang/AutoCloseable;)V");
+    utf8(&mut class, descriptor);
     utf8(&mut class, "Code");
     utf8(&mut class, "java/lang/AutoCloseable"); // #8
     entry(&mut class, 7, &[8]);
@@ -403,12 +569,20 @@ fn test_method(
     words(&mut class, &[0x0021, 2, 4, 0, 0, 2]); // public class, two methods
     words(&mut class, &[0x0009, 5, 6, 1, 7]); // public static m, Code
     let mut code = Vec::new();
-    words(&mut code, &[2, 4]); // max_stack, max_locals
+    words(&mut code, &[2, 6]); // max_stack, max_locals
     code.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
     code.extend_from_slice(bytes);
     words(&mut code, &[handlers.len() as u16]);
     for handler in handlers {
-        words(&mut code, &[handler.start_pc, handler.end_pc, handler.handler_pc, handler.catch_type]);
+        words(
+            &mut code,
+            &[
+                handler.start_pc,
+                handler.end_pc,
+                handler.handler_pc,
+                handler.catch_type,
+            ],
+        );
     }
     if stack_map.is_empty() {
         words(&mut code, &[0]);
@@ -423,7 +597,7 @@ fn test_method(
 
     let class = ClassFile::parse(&class).unwrap();
     let method = &class.methods[0];
-    let descriptor = MethodDescriptor::parse("(Ljava/lang/AutoCloseable;)V").unwrap();
+    let descriptor = MethodDescriptor::parse(descriptor).unwrap();
     let code = method.code(&class.pool).unwrap().unwrap();
     let instructions = decode(code.bytes).unwrap();
     let graph = ControlFlowGraph::build(&instructions, &code.exceptions).unwrap();

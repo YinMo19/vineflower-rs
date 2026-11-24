@@ -112,7 +112,7 @@ fn duplicated_call_runs_once() {
 }
 
 #[test]
-fn captures_loaded_locals_before_iinc() {
+fn recovers_postincrement_of_the_loaded_local_without_a_spill() {
     with_machine(|mut machine| {
         let instructions = decode(&[0x04, 0x3b, 0x1a, 0x84, 0, 1, 0xac]).unwrap();
         machine.step(&instructions[0]).unwrap();
@@ -121,13 +121,13 @@ fn captures_loaded_locals_before_iinc() {
         };
         assert_eq!(initial, "int var0 = 1;");
         machine.step(&instructions[2]).unwrap();
-        let Effect::Statement(increment) = machine.step(&instructions[3]).unwrap() else {
-            panic!()
-        };
-        assert_eq!(machine.take_prelude(), ["int stack3 = var0;"]);
-        assert_eq!(increment, "var0++;");
+        assert!(matches!(
+            machine.step(&instructions[3]).unwrap(),
+            Effect::None
+        ));
+        assert!(machine.take_prelude().is_empty());
         assert!(
-            matches!(machine.step(&instructions[4]).unwrap(), Effect::Return(Some(text)) if text == "stack3")
+            matches!(machine.step(&instructions[4]).unwrap(), Effect::Return(Some(text)) if text == "var0++")
         );
     });
 }

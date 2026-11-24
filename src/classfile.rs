@@ -6,16 +6,19 @@
 mod attributes;
 mod pool;
 mod stack_map;
-mod type_annotations;
 #[cfg(test)]
 mod tests;
+mod type_annotations;
 
 pub use attributes::{
     Annotation, BootstrapMethod, ElementValue, InnerClass, MethodParameter, RecordComponent,
 };
 pub use pool::{Constant, ConstantPool, ModifiedUtf8};
 pub use stack_map::{StackMapError, StackMapFrame, VerificationType, initial_stack_map_locals};
-pub use type_annotations::{LocalTypeRange, OffsetTarget, Supertype, TypeAnnotation, TypeArgumentTarget, TypePathStep, TypeTarget};
+pub use type_annotations::{
+    LocalTypeRange, OffsetTarget, Supertype, TypeAnnotation, TypeArgumentTarget, TypePathStep,
+    TypeTarget,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClassError {

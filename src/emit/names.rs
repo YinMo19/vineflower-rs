@@ -6,6 +6,7 @@ use std::{
 };
 
 use crate::{
+    Options,
     context::{ClassGroup, NestedKind},
     descriptor::Type,
     naming::MemberRenames,
@@ -19,17 +20,20 @@ pub(super) struct Names<'a, 'c> {
     group: &'c ClassGroup<'a>,
     renames: &'c MemberRenames,
     qualify: bool,
+    include_inner: bool,
 }
 
 impl<'a, 'c> Names<'a, 'c> {
     pub(super) fn new(
         group: &'c ClassGroup<'a>,
         name: &'c str,
-        qualify: bool,
+        options: &Options,
         renames: &'c MemberRenames,
     ) -> Self {
         let effective = renames.class_name(name);
-        let package = effective.rsplit_once('/').map_or("", |(package, _)| package);
+        let package = effective
+            .rsplit_once('/')
+            .map_or("", |(package, _)| package);
         let mut bindings = HashMap::new();
         bindings.insert(simple(effective).into(), effective.into());
         Self {
@@ -39,7 +43,8 @@ impl<'a, 'c> Names<'a, 'c> {
             bindings: RefCell::new(bindings),
             group,
             renames,
-            qualify,
+            qualify: options.remove_imports,
+            include_inner: options.decompile_inner,
         }
     }
 
@@ -60,12 +65,28 @@ impl<'a, 'c> Names<'a, 'c> {
             && let Some(class) = self.group.nested_class(name)
             && let NestedKind::Local(simple) = &class.kind
         {
-            return self.renames.simple_class_alias(name).unwrap_or(simple).into();
+            return self
+                .renames
+                .simple_class_alias(name)
+                .unwrap_or(simple)
+                .into();
         }
         let mut base = name;
         let mut chain = Vec::new();
         while let Some(member) = self.group.member_class(base) {
-            chain.push(self.renames.simple_class_alias(base).unwrap_or(member.simple_name));
+            if !self.include_inner
+                && self
+                    .group
+                    .nested_class(base)
+                    .is_some_and(|class| matches!(class.kind, NestedKind::Anonymous))
+            {
+                break;
+            }
+            chain.push(
+                self.renames
+                    .simple_class_alias(base)
+                    .unwrap_or(member.simple_name),
+            );
             base = member.outer;
             if base == self.owner {
                 break;
@@ -74,7 +95,11 @@ impl<'a, 'c> Names<'a, 'c> {
                 && let Some(class) = self.group.nested_class(base)
                 && let NestedKind::Local(simple) = &class.kind
             {
-                let mut result = self.renames.simple_class_alias(base).unwrap_or(simple).to_owned();
+                let mut result = self
+                    .renames
+                    .simple_class_alias(base)
+                    .unwrap_or(simple)
+                    .to_owned();
                 append_members(&mut result, chain);
                 return result;
             }

@@ -1,11 +1,15 @@
 // Based on Vineflower ClassesProcessor and StructContext (Apache-2.0).
 // Copyright 2000-2021 JetBrains s.r.o.
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::OnceLock,
+};
 
 use crate::{
     Options,
     classfile::{ClassError, ClassFile, find_attribute},
     emit::{self, DecompileError, Source},
+    lift::enum_switch,
     naming::MemberRenames,
 };
 
@@ -48,7 +52,11 @@ impl<'a> ClassGroupBuilder<'a> {
         let class = ClassFile::parse(bytes)?;
         let name = class.pool.class_name(class.this_class)?.to_owned();
         let source = source(&name);
-        if self.entries.get(&name).is_none_or(|old| source && !old.source) {
+        if self
+            .entries
+            .get(&name)
+            .is_none_or(|old| source && !old.source)
+        {
             self.entries.insert(name.clone(), Entry { class, source });
         }
         Ok(name)
@@ -73,7 +81,10 @@ impl<'a> ClassGroupBuilder<'a> {
                     .transpose()?;
                 let priority = (name == inner, outer == Some(name.as_str()), entry.source);
                 if claims.get(inner).is_none_or(|(old, _)| priority > *old) {
-                    claims.insert(inner.to_owned(), (priority, (outer, simple, row.access_flags)));
+                    claims.insert(
+                        inner.to_owned(),
+                        (priority, (outer, simple, row.access_flags)),
+                    );
                 }
             }
         }
@@ -92,7 +103,9 @@ impl<'a> ClassGroupBuilder<'a> {
             } else if let Some(outer) = outer {
                 NestedClass {
                     outer: outer.into(),
-                    kind: simple.map_or(NestedKind::Anonymous, |simple| NestedKind::Member(simple.into())),
+                    kind: simple.map_or(NestedKind::Anonymous, |simple| {
+                        NestedKind::Member(simple.into())
+                    }),
                     access_flags,
                     method: None,
                 }
@@ -106,12 +119,15 @@ impl<'a> ClassGroupBuilder<'a> {
         // EnclosingMethod is authoritative even if an emitter omitted InnerClasses.
         for (name, enclosing) in enclosing {
             if name != enclosing.owner {
-                nesting.insert(name, NestedClass {
-                    outer: enclosing.owner,
-                    kind: NestedKind::Anonymous,
-                    access_flags: 0,
-                    method: enclosing.method,
-                });
+                nesting.insert(
+                    name,
+                    NestedClass {
+                        outer: enclosing.owner,
+                        kind: NestedKind::Anonymous,
+                        access_flags: 0,
+                        method: enclosing.method,
+                    },
+                );
             }
         }
         // Malformed ownership cycles must not hide all source files in the cycle.
@@ -142,16 +158,29 @@ impl<'a> ClassGroupBuilder<'a> {
         let mut outer_fields = BTreeMap::new();
         let mut local_instances = BTreeSet::new();
         for (name, node) in &nesting {
-            let Some(entry) = self.entries.get(name) else { continue };
-            if entry.source && self.entries.get(&node.outer).is_some_and(|parent| parent.source) {
+            let Some(entry) = self.entries.get(name) else {
+                continue;
+            };
+            if entry.source
+                && self
+                    .entries
+                    .get(&node.outer)
+                    .is_some_and(|parent| parent.source)
+            {
                 // BTreeMap iteration matches Vineflower's qualified-name ordering.
-                children.entry(node.outer.clone()).or_default().push(name.clone());
+                children
+                    .entry(node.outer.clone())
+                    .or_default()
+                    .push(name.clone());
             }
             if node.access_flags & (STATIC | 0x0200 | 0x4000) != 0 {
                 continue;
             }
             let class = &entry.class;
             let mut field_name = None;
+            let mut candidates = 0;
+            let mut canonical_count = 0;
+            let mut canonical_name = None;
             for field in &class.fields {
                 if field.access_flags & (STATIC | FINAL) != FINAL {
                     continue;
@@ -161,16 +190,27 @@ impl<'a> ClassGroupBuilder<'a> {
                     && (field.access_flags & SYNTHETIC != 0
                         || find_attribute(&field.attributes, &class.pool, "Synthetic")?.is_some())
                 {
-                    if field_name.is_some() {
-                        field_name = None;
-                        break;
+                    let name = class.pool.utf8(field.name_index)?;
+                    candidates += 1;
+                    field_name = Some(name);
+                    if Self::outer_field_name(name) {
+                        canonical_name = Some(name);
+                        canonical_count += 1;
                     }
-                    field_name = Some(class.pool.utf8(field.name_index)?);
                 }
             }
+            let field_name = if canonical_count == 1 {
+                canonical_name
+            } else if candidates == 1 {
+                field_name
+            } else {
+                None
+            };
             if !matches!(node.kind, NestedKind::Member(_)) {
                 if let Some((method_name, descriptor)) = &node.method {
-                    let Some(parent) = self.entries.get(&node.outer) else { continue };
+                    let Some(parent) = self.entries.get(&node.outer) else {
+                        continue;
+                    };
                     let mut instance = false;
                     for method in &parent.class.methods {
                         let pool = &parent.class.pool;
@@ -195,7 +235,14 @@ impl<'a> ClassGroupBuilder<'a> {
                 outer_fields.insert(name.clone(), field.to_owned());
             }
         }
-        Ok(ClassGroup { entries: self.entries, nesting, children, outer_fields, local_instances })
+        Ok(ClassGroup {
+            entries: self.entries,
+            nesting,
+            children,
+            outer_fields,
+            local_instances,
+            enum_switches: OnceLock::new(),
+        })
     }
 
     fn outer_field_name(name: &str) -> bool {
@@ -212,6 +259,7 @@ pub struct ClassGroup<'a> {
     children: BTreeMap<String, Vec<String>>,
     outer_fields: BTreeMap<String, String>,
     local_instances: BTreeSet<String>,
+    enum_switches: OnceLock<enum_switch::Plan>,
 }
 
 impl<'a> ClassGroup<'a> {
@@ -233,16 +281,23 @@ impl<'a> ClassGroup<'a> {
         self.entries.get(name).map(|entry| &entry.class)
     }
 
+    pub(crate) fn enum_switches(&self) -> &enum_switch::Plan {
+        self.enum_switches
+            .get_or_init(|| enum_switch::Plan::build(self))
+    }
+
     /// All source and library entries in internal JVM name order.
     pub(crate) fn classes(&self) -> impl Iterator<Item = (&str, &ClassFile<'a>)> {
-        self.entries.iter().map(|(name, entry)| (name.as_str(), &entry.class))
+        self.entries
+            .iter()
+            .map(|(name, entry)| (name.as_str(), &entry.class))
     }
 
     /// Source entries in internal JVM name order.
     pub(crate) fn sources(&self) -> impl Iterator<Item = (&str, &ClassFile<'a>)> {
-        self.entries.iter().filter_map(|(name, entry)| {
-            entry.source.then_some((name.as_str(), &entry.class))
-        })
+        self.entries
+            .iter()
+            .filter_map(|(name, entry)| entry.source.then_some((name.as_str(), &entry.class)))
     }
 
     /// Determine the source file extension without decompiling the class.
@@ -251,14 +306,23 @@ impl<'a> ClassGroup<'a> {
         name: &str,
         options: &Options,
     ) -> Result<&'static str, DecompileError> {
-        let name = if options.decompile_inner { self.compilation_root(name) } else { name };
-        let class = self.entries.get(name).filter(|entry| entry.source)
-            .ok_or_else(|| DecompileError::MissingClass(name.into()))?;
-        Ok(if options.decompile_kotlin && crate::kotlin::has_metadata(&class.class)? {
-            "kt"
+        let name = if options.decompile_inner {
+            self.compilation_root(name)
         } else {
-            "java"
-        })
+            name
+        };
+        let class = self
+            .entries
+            .get(name)
+            .filter(|entry| entry.source)
+            .ok_or_else(|| DecompileError::MissingClass(name.into()))?;
+        Ok(
+            if options.decompile_kotlin && crate::kotlin::has_metadata(&class.class)? {
+                "kt"
+            } else {
+                "java"
+            },
+        )
     }
 
     /// Render one compilation unit in the context of all registered classes.
@@ -278,7 +342,11 @@ impl<'a> ClassGroup<'a> {
         if !self.entries.get(name).is_some_and(|entry| entry.source) {
             return Err(DecompileError::MissingClass(name.into()));
         }
-        let name = if options.decompile_inner { self.compilation_root(name) } else { name };
+        let name = if options.decompile_inner {
+            self.compilation_root(name)
+        } else {
+            name
+        };
         emit::decompile_class(self, name, options, renames)
     }
 
@@ -287,15 +355,19 @@ impl<'a> ClassGroup<'a> {
     }
 
     pub(crate) fn children(&self, name: &str) -> impl Iterator<Item = (&str, &NestedClass)> {
-        self.children.get(name).into_iter().flatten().map(|child| {
-            (child.as_str(), &self.nesting[child])
-        })
+        self.children
+            .get(name)
+            .into_iter()
+            .flatten()
+            .map(|child| (child.as_str(), &self.nesting[child]))
     }
 
     pub(crate) fn is_attached(&self, name: &str) -> bool {
         self.nesting.get(name).is_some_and(|node| {
             self.children.get(&node.outer).is_some_and(|children| {
-                children.binary_search_by(|child| child.as_str().cmp(name)).is_ok()
+                children
+                    .binary_search_by(|child| child.as_str().cmp(name))
+                    .is_ok()
             })
         })
     }
@@ -309,11 +381,22 @@ impl<'a> ClassGroup<'a> {
 
     pub(crate) fn member_class(&self, name: &str) -> Option<MemberClass<'_>> {
         let node = self.nesting.get(name)?;
-        let NestedKind::Member(simple_name) = &node.kind else { return None };
+        let (simple_name, access_flags) = match &node.kind {
+            NestedKind::Member(name) => (name.as_str(), node.access_flags),
+            NestedKind::Anonymous
+                if self.enum_switches().auxiliary_visibility(name) == Some(false) =>
+            {
+                (
+                    self.entries.get_key_value(name)?.0.rsplit('/').next()?,
+                    node.access_flags | STATIC,
+                )
+            }
+            _ => return None,
+        };
         Some(MemberClass {
             outer: &node.outer,
             simple_name,
-            access_flags: node.access_flags,
+            access_flags,
         })
     }
 
@@ -327,14 +410,19 @@ impl<'a> ClassGroup<'a> {
         if let Some(member) = self.member_class(owner) {
             return (member.access_flags & STATIC == 0).then_some(member.outer);
         }
-        self.local_instances.contains(owner).then(|| self.nesting[owner].outer.as_str())
+        self.local_instances
+            .contains(owner)
+            .then(|| self.nesting[owner].outer.as_str())
     }
 
     pub(crate) fn outer_field(&self, owner: &str, field: &str, descriptor: &str) -> Option<&str> {
         let enclosing = self.enclosing_instance(owner)?;
-        (self.outer_fields.get(owner).is_some_and(|name| name == field)
+        (self
+            .outer_fields
+            .get(owner)
+            .is_some_and(|name| name == field)
             && object_name(descriptor) == Some(enclosing))
-            .then_some(enclosing)
+        .then_some(enclosing)
     }
 
     /// Test ancestry using the available hierarchy; absent class files are not guessed.
@@ -351,9 +439,14 @@ impl<'a> ClassGroup<'a> {
             if !visited.insert(name) {
                 continue;
             }
-            let Some(class) = self.get(name) else { continue };
-            for index in std::iter::once(class.super_class).chain(class.interfaces.iter().copied()) {
-                if index != 0 && let Ok(parent) = class.pool.class_name(index) {
+            let Some(class) = self.get(name) else {
+                continue;
+            };
+            for index in std::iter::once(class.super_class).chain(class.interfaces.iter().copied())
+            {
+                if index != 0
+                    && let Ok(parent) = class.pool.class_name(index)
+                {
                     if parent == to {
                         return true;
                     }
@@ -395,10 +488,16 @@ fn enclosing_method(class: &ClassFile<'_>) -> Result<Option<EnclosingMethod>, Cl
     };
     let [a, b, c, d] = *data else {
         return Err(if data.len() < 4 {
-            ClassError::UnexpectedEof { offset: 0, needed: 4, remaining: data.len() }
+            ClassError::UnexpectedEof {
+                offset: 0,
+                needed: 4,
+                remaining: data.len(),
+            }
         } else {
             ClassError::TrailingBytes {
-                context: "EnclosingMethod", offset: 4, remaining: data.len() - 4,
+                context: "EnclosingMethod",
+                offset: 4,
+                remaining: data.len() - 4,
             }
         });
     };
@@ -420,7 +519,8 @@ mod tests {
     use super::*;
 
     const OUTER: &[u8] = include_bytes!("../tests/smoke/java8/TestSingleMethodInInnerClass.class");
-    const INNER: &[u8] = include_bytes!("../tests/smoke/java8/TestSingleMethodInInnerClass$Inner.class");
+    const INNER: &[u8] =
+        include_bytes!("../tests/smoke/java8/TestSingleMethodInInnerClass$Inner.class");
     const OTHER: &[u8] = include_bytes!("../tests/smoke/java8/TestJavadoc.class");
     const OUTER_NAME: &str = "pkg/TestSingleMethodInInnerClass";
     const INNER_NAME: &str = "pkg/TestSingleMethodInInnerClass$Inner";
@@ -442,12 +542,24 @@ mod tests {
         let source = group.decompile(OUTER_NAME, &options).unwrap();
         assert_eq!(source.class_name, OUTER_NAME);
         assert_eq!(source.file_extension, "java");
-        assert!(source.text.contains("\n   static class Inner {\n      void test() {\n"));
+        assert!(
+            source
+                .text
+                .contains("\n   static class Inner {\n      void test() {\n")
+        );
         assert!(!source.text.contains("TestJavadoc"));
         assert_eq!(source.text.matches("package pkg;").count(), 1);
         let map = source.map.unwrap();
-        let outer = map.methods.iter().find(|method| method.class_name == OUTER_NAME).unwrap();
-        let inner = map.methods.iter().find(|method| method.class_name == INNER_NAME).unwrap();
+        let outer = map
+            .methods
+            .iter()
+            .find(|method| method.class_name == OUTER_NAME)
+            .unwrap();
+        let inner = map
+            .methods
+            .iter()
+            .find(|method| method.class_name == INNER_NAME)
+            .unwrap();
         assert!(outer.offsets.values().max() < inner.offsets.values().min());
         let outer_index = source.text.find(&format!("class '{OUTER_NAME}'")).unwrap();
         let inner_index = source.text.find(&format!("class '{INNER_NAME}'")).unwrap();
@@ -459,7 +571,9 @@ mod tests {
         let mut builder = ClassGroupBuilder::new();
         builder.add_library(OUTER).unwrap();
         builder.add(INNER).unwrap();
-        builder.add_with_source_filter(OTHER, |name| name != OTHER_NAME).unwrap();
+        builder
+            .add_with_source_filter(OTHER, |name| name != OTHER_NAME)
+            .unwrap();
         let group = builder.build().unwrap();
         assert!(!group.is_root(OUTER_NAME));
         assert!(!group.is_root(OTHER_NAME));
@@ -474,15 +588,29 @@ mod tests {
 
     #[test]
     fn removes_legacy_synthetic_constructor_markers() {
-        const PRIMARY: &[u8] = include_bytes!("../tests/upstream/testData/classes/custom/v11/TestInnerClassConstructor.class");
-        const MARKER: &[u8] = include_bytes!("../tests/upstream/testData/classes/custom/v11/TestInnerClassConstructor$1.class");
-        const ANOTHER: &[u8] = include_bytes!("../tests/upstream/testData/classes/custom/v11/TestInnerClassConstructor$Another.class");
-        const INNER: &[u8] = include_bytes!("../tests/upstream/testData/classes/custom/v11/TestInnerClassConstructor$Inner.class");
+        const PRIMARY: &[u8] = include_bytes!(
+            "../tests/upstream/testData/classes/custom/v11/TestInnerClassConstructor.class"
+        );
+        const MARKER: &[u8] = include_bytes!(
+            "../tests/upstream/testData/classes/custom/v11/TestInnerClassConstructor$1.class"
+        );
+        const ANOTHER: &[u8] = include_bytes!(
+            "../tests/upstream/testData/classes/custom/v11/TestInnerClassConstructor$Another.class"
+        );
+        const INNER: &[u8] = include_bytes!(
+            "../tests/upstream/testData/classes/custom/v11/TestInnerClassConstructor$Inner.class"
+        );
 
         let group = ClassGroup::new([PRIMARY, MARKER, ANOTHER, INNER]).unwrap();
         assert!(!group.is_root("pkg/TestInnerClassConstructor$1"));
-        let source = group.decompile("pkg/TestInnerClassConstructor", &Options::default()).unwrap();
-        assert!(source.text.contains("new TestInnerClassConstructor.Inner(\"text\");"));
+        let source = group
+            .decompile("pkg/TestInnerClassConstructor", &Options::default())
+            .unwrap();
+        assert!(
+            source
+                .text
+                .contains("new TestInnerClassConstructor.Inner(\"text\");")
+        );
         assert!(source.text.contains("TestInnerClassConstructor.this.n("));
         assert!(!source.text.contains("TestInnerClassConstructor$1"));
         assert!(!source.text.contains("this$0"));

@@ -1,26 +1,41 @@
 // Based on Vineflower enum handling in ClassWriter and InitializerProcessor (Apache-2.0).
-use std::fmt::Write;
+use std::{collections::BTreeSet, fmt::Write, rc::Rc};
 
-use super::{DecompileError, ENUM, FINAL, PRIVATE, PUBLIC, STATIC, SYNTHETIC, parse};
+use super::{DecompileError, ENUM, FINAL, PRIVATE, PUBLIC, STATIC, SYNTHETIC, Writer, parse};
 use crate::{
     bytecode::{Instruction, Operand, decode},
     classfile::{ClassFile, Constant, Member},
     descriptor::{MethodDescriptor, Type},
-    lift::constant_literal,
+    lift::{AnonymousSites, Machine},
 };
+
+#[path = "enumeration_subclasses.rs"]
+mod subclasses;
+
+#[cfg(test)]
+#[path = "enumeration_tests.rs"]
+mod tests;
+
+struct ConstantInit<'a> {
+    name: &'a str,
+    arguments: String,
+    subclass: Option<usize>,
+}
 
 const CONSTRUCTOR_PREFIX: &str = "(Ljava/lang/String;I";
 
 pub(super) struct Enumeration<'a> {
-    names: Vec<&'a str>,
-    declarations: Vec<String>,
+    constants: Vec<ConstantInit<'a>>,
+    sites: Option<AnonymousSites>,
+    constructor_bridges: BTreeSet<&'a str>,
     values_field: Option<&'a str>,
     helper: Option<&'a str>,
     skip_initializer: usize,
 }
 
 impl<'a> Enumeration<'a> {
-    pub(super) fn recover(class: &'a ClassFile<'_>, ascii: bool) -> Result<Self, DecompileError> {
+    pub(super) fn recover(writer: &Writer<'_, 'a>) -> Result<Self, DecompileError> {
+        let class = writer.class;
         let pool = &class.pool;
         if class.super_class == 0 || pool.class_name(class.super_class)? != "java/lang/Enum" {
             return Err(unsupported("enum with nonstandard superclass"));
@@ -47,8 +62,9 @@ impl<'a> Enumeration<'a> {
             .iter()
             .find(|method| matches!(pool.utf8(method.name_index), Ok("<clinit>")));
         let mut result = Self {
-            names,
-            declarations: Vec::new(),
+            constants: Vec::with_capacity(names.len()),
+            sites: writer.anonymous_sites(),
+            constructor_bridges: BTreeSet::new(),
             values_field,
             helper: None,
             skip_initializer: 0,
@@ -56,8 +72,13 @@ impl<'a> Enumeration<'a> {
         let Some(initializer) = initializer else {
             // Some assemblers provide enum-flagged fields without a generated initializer.
             result
-                .declarations
-                .extend(result.names.iter().map(|name| (*name).into()));
+                .constants
+                .extend(names.iter().map(|&name| ConstantInit {
+                    name,
+                    arguments: String::new(),
+                    subclass: None,
+                }));
+            verify_generated_lookup_methods(class, owner, None, &values_type)?;
             return Ok(result);
         };
         let values =
@@ -72,97 +93,108 @@ impl<'a> Enumeration<'a> {
             descriptor: "()V".into(),
             source: Box::new(source),
         })?;
+        let initializer_type = parse("()V", MethodDescriptor::parse)?;
+        let render_class = |name: &str| writer.names.render(name);
+        let mut allocated_subclasses = BTreeSet::new();
         let mut cursor = instructions.as_slice();
-        for (ordinal, &name) in result.names.iter().enumerate() {
+        for (ordinal, &name) in names.iter().enumerate() {
             let Some(([new, duplicate, name_load, order], tail)) = cursor.split_first_chunk::<4>()
             else {
                 return Err(pattern());
             };
-            if !class_is(class, new, 0xbb, owner)?
+            let Operand::Constant(index) = new.operand else {
+                return Err(pattern());
+            };
+            if new.opcode != 0xbb
                 || duplicate.opcode != 0x59
                 || string_value(class, name_load)? != Some(name)
                 || integer(class, order)? != Some(ordinal as i32)
             {
+                return Err(pattern());
+            }
+            let allocated = pool.class_name(index)?;
+            let mut constructor = None;
+            for (at, pair) in tail.windows(2).enumerate() {
+                let (call, store) = (&pair[0], &pair[1]);
+                if let Some((call_owner, "<init>", raw)) = member(class, call, 0xb7)?
+                    && call_owner == allocated
+                    && member(class, store, 0xb3)? == Some((owner, name, field_type))
+                {
+                    constructor = Some((at, raw));
+                    break;
+                }
+            }
+            let (constructor_at, raw) = constructor.ok_or_else(pattern)?;
+            let mut descriptor = parse(raw, MethodDescriptor::parse)?;
+            if !raw.starts_with(CONSTRUCTOR_PREFIX) || descriptor.return_type != Type::Void {
+                return Err(pattern());
+            }
+            let subclass = if allocated != owner {
+                if !allocated_subclasses.insert(allocated) {
+                    return Err(unsupported(
+                        "enum subclass reused by more than one constant",
+                    ));
+                }
+                let sites = result
+                    .sites
+                    .as_ref()
+                    .ok_or_else(|| unsupported("detached enum constant subclass"))?;
+                let recovered =
+                    subclasses::recover(writer.group, class, owner, allocated, raw, &descriptor)?;
+                result.constructor_bridges.extend(recovered.bridge);
+                let mut sites = sites.borrow_mut();
+                let id = sites.len();
+                sites.push(recovered.site);
+                Some(id)
+            } else {
+                let target = subclasses::find_constructor(class, raw)?.ok_or_else(pattern)?;
+                if target.access_flags & SYNTHETIC != 0 {
+                    return Err(pattern());
+                }
+                None
+            };
+            descriptor.parameters.drain(..2);
+            let arg_ops = &tail[..constructor_at];
+            if arg_ops.iter().any(|op| {
+                member(class, op, 0xb2)
+                    .is_ok_and(|reference| reference == Some((owner, values, values_type.as_str())))
+            }) {
                 return Err(unsupported(
-                    "enum constants with custom subclasses or initialization",
+                    "enum constant references the hidden values array",
                 ));
             }
-            let constructor_at = tail
-                .iter()
-                .position(|op| op.opcode == 0xb7)
-                .ok_or_else(pattern)?;
-            let call = &tail[constructor_at];
-            let Some((call_owner, "<init>", raw)) = member(class, call, 0xb7)? else {
-                return Err(pattern());
-            };
-            if call_owner != owner || !raw.starts_with(CONSTRUCTOR_PREFIX) {
-                return Err(pattern());
-            }
-            let descriptor = parse(raw, MethodDescriptor::parse)?;
-            let arguments = &descriptor.parameters[2..];
-            if arguments.len() != constructor_at || descriptor.return_type != Type::Void {
-                return Err(unsupported("nonliteral enum arguments"));
-            }
-            let mut declaration = String::from(name);
-            if !arguments.is_empty() {
-                declaration.push('(');
-                for (index, (ty, op)) in arguments.iter().zip(tail).enumerate() {
-                    if index != 0 {
-                        declaration.push_str(", ");
-                    }
-                    if let Some(value) = integer(class, op)? {
-                        match ty {
-                            Type::Primitive(crate::descriptor::Primitive::Boolean)
-                                if matches!(value, 0 | 1) =>
-                            {
-                                declaration.push_str(if value != 0 { "true" } else { "false" });
-                            }
-                            Type::Primitive(crate::descriptor::Primitive::Byte) => {
-                                let _ = write!(declaration, "(byte){value}");
-                            }
-                            Type::Primitive(crate::descriptor::Primitive::Short) => {
-                                let _ = write!(declaration, "(short){value}");
-                            }
-                            Type::Primitive(crate::descriptor::Primitive::Char) => {
-                                let _ = write!(declaration, "(char){value}");
-                            }
-                            Type::Primitive(crate::descriptor::Primitive::Int) => {
-                                let _ = write!(declaration, "{value}");
-                            }
-                            _ => return Err(unsupported("nonliteral enum arguments")),
-                        }
-                    } else if op.opcode == 0x01 && matches!(ty, Type::Object(_) | Type::Array(_)) {
-                        // A bare null could resolve to a different constructor overload.
-                        return Err(unsupported("null enum constructor argument"));
-                    } else if let Some(index) = load_constant(op) {
-                        declaration.push_str(
-                            &constant_literal(pool, index, Some(ty), ascii).map_err(|source| {
-                                DecompileError::Render {
-                                    context: "enum argument",
-                                    source: Box::new(source),
-                                }
-                            })?,
-                        );
-                    } else {
-                        declaration.push_str(match op.opcode {
-                            0x09 => "0L",
-                            0x0a => "1L",
-                            0x0b => "0.0F",
-                            0x0c => "1.0F",
-                            0x0d => "2.0F",
-                            0x0e => "0.0",
-                            0x0f => "1.0",
-                            _ => return Err(unsupported("nonliteral enum arguments")),
-                        });
-                    }
+            let arguments = if arg_ops.is_empty() && descriptor.parameters.is_empty() {
+                String::new()
+            } else {
+                let wrap = |source| DecompileError::Method {
+                    name: "<clinit>".into(),
+                    descriptor: "()V".into(),
+                    source: Box::new(source),
+                };
+                let mut machine = Machine::new(
+                    class,
+                    initializer,
+                    &code,
+                    &initializer_type,
+                    writer.options,
+                    &render_class,
+                )
+                .map_err(wrap)?
+                .with_group(writer.group);
+                machine.set_member_renames(writer.names.renames());
+                machine.set_dynamic_helpers(Rc::clone(&writer.dynamic_helpers));
+                if let Some(sites) = &result.sites {
+                    machine.set_anonymous_sites(Rc::clone(sites));
                 }
-                declaration.push(')');
-            }
-            let store = tail.get(constructor_at + 1).ok_or_else(pattern)?;
-            if member(class, store, 0xb3)? != Some((owner, name, field_type)) {
-                return Err(pattern());
-            }
-            result.declarations.push(declaration);
+                machine
+                    .enum_constant_arguments(arg_ops, &descriptor)
+                    .map_err(wrap)?
+            };
+            result.constants.push(ConstantInit {
+                name,
+                arguments,
+                subclass,
+            });
             cursor = &tail[constructor_at + 2..];
         }
         let values_method = format!("(){values_type}");
@@ -181,7 +213,7 @@ impl<'a> Enumeration<'a> {
                 {
                     let code = method.code(pool)?.ok_or_else(pattern)?;
                     let instructions = decode(code.bytes).map_err(|_| pattern())?;
-                    let tail = values_array(class, &result.names, field_type, &instructions)?;
+                    let tail = values_array(class, &names, field_type, &instructions)?;
                     found =
                         matches!(tail, [ret] if ret.opcode == 0xb0) && code.exceptions.is_empty();
                     break;
@@ -193,7 +225,7 @@ impl<'a> Enumeration<'a> {
             result.helper = Some(helper);
             cursor = &cursor[1..];
         } else {
-            cursor = values_array(class, &result.names, field_type, cursor)?;
+            cursor = values_array(class, &names, field_type, cursor)?;
         }
         let Some((store, tail)) = cursor.split_first() else {
             return Err(pattern());
@@ -205,18 +237,11 @@ impl<'a> Enumeration<'a> {
         }
         result.skip_initializer = instructions.len() - tail.len();
         let start = tail[0].offset;
-        if code
-            .exceptions
-            .iter()
-            .any(|ex| u32::from(ex.start_pc) < start || u32::from(ex.handler_pc) < start)
-        {
-            return Err(unsupported("exception handler covers enum construction"));
+        if subclasses::enters_prefix(&code, tail, start) {
+            return Err(unsupported("control flow enters enum construction"));
         }
+        verify_generated_lookup_methods(class, owner, Some(values), &values_type)?;
         Ok(result)
-    }
-
-    pub(super) fn declarations(&self) -> &[String] {
-        &self.declarations
     }
 
     pub(super) fn hides_field(&self, field: &Member<'_>, name: &str) -> bool {
@@ -230,8 +255,10 @@ impl<'a> Enumeration<'a> {
         desc: &str,
         method: &Member<'_>,
     ) -> bool {
-        self.helper == Some(name)
-            && method.access_flags & (PRIVATE | STATIC | SYNTHETIC) == PRIVATE | STATIC | SYNTHETIC
+        name == "<init>" && self.constructor_bridges.contains(desc)
+            || self.helper == Some(name)
+                && method.access_flags & (PRIVATE | STATIC | SYNTHETIC)
+                    == PRIVATE | STATIC | SYNTHETIC
             || method.access_flags & (PUBLIC | STATIC) == PUBLIC | STATIC
                 && match name {
                     "values" => {
@@ -258,34 +285,77 @@ impl<'a> Enumeration<'a> {
         match name {
             "<clinit>" => Ok(self.skip_initializer),
             "<init>" if desc.starts_with(CONSTRUCTOR_PREFIX) => {
-                let Some(([receiver, label, position, super_call], tail)) =
-                    instructions.split_first_chunk::<4>()
+                let Some(([receiver, label, position], tail)) =
+                    instructions.split_first_chunk::<3>()
                 else {
                     return Err(pattern());
                 };
-                let init = member(class, super_call, 0xb7)?;
                 if !local(receiver, 0x19, 0)
                     || !local(label, 0x19, 1)
                     || !local(position, 0x15, 2)
-                    || init != Some(("java/lang/Enum", "<init>", "(Ljava/lang/String;I)V"))
-                    || tail.is_empty()
-                {
-                    return Err(unsupported("enum constructor delegation"));
-                }
-                // A source enum cannot read the two implicit constructor parameters.
-                if tail
-                    .iter()
-                    .any(|insn| local(insn, 0x19, 1) || local(insn, 0x15, 2))
+                    || tail
+                        .iter()
+                        .any(|op| matches!(subclasses::local_slot(op), Some(1 | 2)))
                 {
                     return Err(unsupported(
                         "explicit use of JVM enum constructor parameters",
                     ));
                 }
-                Ok(4)
+                let owner = class.pool.class_name(class.this_class)?;
+                for (at, op) in tail.iter().enumerate() {
+                    let Some((target, "<init>", raw)) = member(class, op, 0xb7)? else {
+                        continue;
+                    };
+                    if target == "java/lang/Enum" {
+                        return if at == 0 && raw == "(Ljava/lang/String;I)V" && tail.len() > 1 {
+                            Ok(4)
+                        } else {
+                            Err(pattern())
+                        };
+                    }
+                    if target == owner {
+                        let target =
+                            subclasses::find_constructor(class, raw)?.ok_or_else(pattern)?;
+                        return if raw != desc
+                            && raw.starts_with(CONSTRUCTOR_PREFIX)
+                            && target.access_flags & SYNTHETIC == 0
+                            && at + 1 < tail.len()
+                        {
+                            Ok(0)
+                        } else {
+                            Err(pattern())
+                        };
+                    }
+                }
+                Err(unsupported("enum constructor without verified delegation"))
             }
             "<init>" => Err(pattern()),
             _ => Ok(0),
         }
+    }
+}
+
+impl Writer<'_, '_> {
+    pub(super) fn emit_enum_constants(
+        &mut self,
+        enumeration: &Enumeration<'_>,
+    ) -> Result<(), DecompileError> {
+        let count = enumeration.constants.len();
+        if count == 0 {
+            self.line(1, ";");
+        }
+        for (index, constant) in enumeration.constants.iter().enumerate() {
+            let mut head = String::from(constant.name);
+            if !constant.arguments.is_empty() {
+                let _ = write!(head, "({})", constant.arguments);
+            }
+            if let Some(id) = constant.subclass {
+                let _ = write!(head, "\0{id}\0");
+            }
+            head.push(if index + 1 == count { ';' } else { ',' });
+            self.line_with_anonymous(1, &head, enumeration.sites.as_ref())?;
+        }
+        Ok(())
     }
 }
 
@@ -316,6 +386,129 @@ fn values_array<'i>(
         tail = rest;
     }
     Ok(tail)
+}
+
+/// Only the language-defined lookup methods may disappear with the backing
+/// array. javac clones it; Eclipse allocates and copies the same array.
+fn verify_generated_lookup_methods(
+    class: &ClassFile<'_>,
+    owner: &str,
+    values: Option<&str>,
+    array_type: &str,
+) -> Result<(), DecompileError> {
+    let pool = &class.pool;
+    for method in &class.methods {
+        let name = pool.utf8(method.name_index)?;
+        let desc = pool.utf8(method.descriptor_index)?;
+        let copy = name == "values" && desc.strip_prefix("()") == Some(array_type);
+        let lookup = name == "valueOf"
+            && desc
+                .strip_prefix("(Ljava/lang/String;)L")
+                .and_then(|ty| ty.strip_suffix(';'))
+                == Some(owner);
+        if !copy && !lookup {
+            continue;
+        }
+        let fail = || unsupported("nonstandard enum lookup method");
+        if method.access_flags & !SYNTHETIC != PUBLIC | STATIC {
+            return Err(fail());
+        }
+        let code = method.code(pool)?.ok_or_else(fail)?;
+        let ops = decode(code.bytes).map_err(|_| fail())?;
+        if !code.exceptions.is_empty() {
+            return Err(fail());
+        }
+        let verified = if copy {
+            match values {
+                Some(values) => verify_values_copy(class, &ops, owner, values, array_type)?,
+                None => false,
+            }
+        } else if let [load, name, call, cast, ret] = ops.as_slice() {
+            load_constant(load).is_some()
+                && class_is(class, load, load.opcode, owner)?
+                && local(name, 0x19, 0)
+                && member(class, call, 0xb8)?
+                    == Some((
+                        "java/lang/Enum",
+                        "valueOf",
+                        "(Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/Enum;",
+                    ))
+                && class_is(class, cast, 0xc0, owner)?
+                && ret.opcode == 0xb0
+        } else {
+            false
+        };
+        if !verified {
+            return Err(fail());
+        }
+    }
+    Ok(())
+}
+
+fn verify_values_copy(
+    class: &ClassFile<'_>,
+    instructions: &[Instruction],
+    owner: &str,
+    values: &str,
+    array_type: &str,
+) -> Result<bool, DecompileError> {
+    let Some((load, tail)) = instructions.split_first() else {
+        return Ok(false);
+    };
+    if member(class, load, 0xb2)? != Some((owner, values, array_type)) {
+        return Ok(false);
+    }
+    Ok(match tail {
+        [clone, cast, ret] => {
+            member(class, clone, 0xb6)? == Some((array_type, "clone", "()Ljava/lang/Object;"))
+                && class_is(class, cast, 0xc0, array_type)?
+                && ret.opcode == 0xb0
+        }
+        [
+            dup,
+            save_array,
+            from_start,
+            load_array,
+            length,
+            dup_len,
+            save_len,
+            allocate,
+            dup_target,
+            save_target,
+            to_start,
+            load_len,
+            copy,
+            result,
+            ret,
+        ] => {
+            dup.opcode == 0x59
+                && store_local(save_array, 0x3a, 0)
+                && integer(class, from_start)? == Some(0)
+                && local(load_array, 0x19, 0)
+                && length.opcode == 0xbe
+                && dup_len.opcode == 0x59
+                && store_local(save_len, 0x36, 1)
+                && class_is(class, allocate, 0xbd, owner)?
+                && dup_target.opcode == 0x59
+                && store_local(save_target, 0x3a, 2)
+                && integer(class, to_start)? == Some(0)
+                && local(load_len, 0x15, 1)
+                && member(class, copy, 0xb8)?
+                    == Some((
+                        "java/lang/System",
+                        "arraycopy",
+                        "(Ljava/lang/Object;ILjava/lang/Object;II)V",
+                    ))
+                && local(result, 0x19, 2)
+                && ret.opcode == 0xb0
+        }
+        _ => false,
+    })
+}
+
+fn store_local(op: &Instruction, opcode: u8, slot: u16) -> bool {
+    (op.opcode == opcode && op.operand == Operand::Local(slot))
+        || (slot < 4 && op.opcode == 0x3b + (opcode - 0x36) * 4 + slot as u8)
 }
 
 fn load_constant(op: &Instruction) -> Option<u16> {
@@ -373,6 +566,14 @@ fn member<'a>(
 ) -> Result<Option<(&'a str, &'a str, &'a str)>, DecompileError> {
     match (op.opcode, &op.operand) {
         (code, Operand::Constant(index)) if code == opcode => {
+            let constant = class.pool.get(*index)?;
+            if !matches!(
+                (code, constant),
+                (0xb2 | 0xb3, Constant::Fieldref { .. })
+                    | (0xb6..=0xb8, Constant::Methodref { .. })
+            ) {
+                return Err(pattern());
+            }
             Ok(Some(class.pool.member_ref(*index)?))
         }
         _ => Ok(None),

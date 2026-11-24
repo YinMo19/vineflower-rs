@@ -15,7 +15,10 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter};
 
 use super::{Destination, is_archive};
-use crate::{ClassGroup, ClassGroupBuilder, DecompileError, Options, classfile::ClassError, naming::MemberRenames};
+use crate::{
+    ClassGroup, ClassGroupBuilder, DecompileError, Options, classfile::ClassError,
+    naming::MemberRenames,
+};
 
 const MANIFEST: &str = "META-INF/MANIFEST.MF";
 
@@ -212,7 +215,10 @@ impl Inputs {
             classes: Vec::new(),
             renames: MemberRenames::default(),
             legacy: matches!(destination, Destination::Legacy(_)),
-            archive_output: matches!(destination, Destination::Archive(_) | Destination::Legacy(_)),
+            archive_output: matches!(
+                destination,
+                Destination::Archive(_) | Destination::Legacy(_)
+            ),
             skip_extra_files,
         }
     }
@@ -227,7 +233,10 @@ impl Inputs {
         if path.extension().is_some_and(|ext| ext == "class") {
             self.classes.push(ClassInput {
                 entry_name: None,
-                input: Input::File { path, size: metadata.len() },
+                input: Input::File {
+                    path,
+                    size: metadata.len(),
+                },
                 own,
             });
             return Ok(());
@@ -248,10 +257,14 @@ impl Inputs {
             self.add_archive(path, reader, name, own)
         } else if own && !self.skip_extra_files {
             let name = basename(&path)?.to_owned();
-            insert(&mut self.entries, name, Entry::Resource(Input::File {
-                path,
-                size: metadata.len(),
-            }))
+            insert(
+                &mut self.entries,
+                name,
+                Entry::Resource(Input::File {
+                    path,
+                    size: metadata.len(),
+                }),
+            )
         } else {
             Ok(())
         }
@@ -278,8 +291,9 @@ impl Inputs {
             } else if file_type.is_file() {
                 if is_archive(&path) {
                     let file = File::open(&path).map_err(|error| io_error("open", &path, error))?;
-                    let reader = ZipArchive::new(BufReader::new(file))
-                        .map_err(|error| archive_error("read", path.display().to_string(), error))?;
+                    let reader = ZipArchive::new(BufReader::new(file)).map_err(|error| {
+                        archive_error("read", path.display().to_string(), error)
+                    })?;
                     let legacy_name = (self.legacy && own).then_some(name);
                     self.add_archive(path, reader, legacy_name, own)?;
                     continue;
@@ -325,13 +339,19 @@ impl Inputs {
                 continue;
             }
             if file.is_symlink() {
-                return Err(FrontendError::UnsupportedEntry(archive_location(&path, name)));
+                return Err(FrontendError::UnsupportedEntry(archive_location(
+                    &path, name,
+                )));
             }
             if file.is_dir() {
                 if own {
                     let name = name.strip_suffix('/').unwrap_or(name);
                     validate_entry_name(name, &path)?;
-                    insert(self.output_entries(Some(archive)), name.to_owned(), Entry::Directory)?;
+                    insert(
+                        self.output_entries(Some(archive)),
+                        name.to_owned(),
+                        Entry::Directory,
+                    )?;
                 }
             } else {
                 validate_entry_name(name, &path)?;
@@ -341,11 +361,15 @@ impl Inputs {
                         insert(entries, parent.to_owned(), Entry::Directory)?;
                     }
                 }
-                self.add_entry(name.to_owned(), Input::Archive {
-                    archive,
-                    index,
-                    size: file.size(),
-                }, own)?;
+                self.add_entry(
+                    name.to_owned(),
+                    Input::Archive {
+                        archive,
+                        index,
+                        size: file.size(),
+                    },
+                    own,
+                )?;
             }
         }
         self.archives.push(ArchiveInput { path, reader });
@@ -357,13 +381,21 @@ impl Inputs {
             // Vineflower currently loads only the base archive view. Versioned
             // resources still retain their original physical input names.
             if !is_versioned(&name) {
-                self.classes.push(ClassInput { entry_name: Some(name), input, own });
+                self.classes.push(ClassInput {
+                    entry_name: Some(name),
+                    input,
+                    own,
+                });
             }
         } else if own
             && (!self.skip_extra_files
                 || self.archive_output && input.archive().is_some() && name == MANIFEST)
         {
-            insert(self.output_entries(input.archive()), name, Entry::Resource(input))?;
+            insert(
+                self.output_entries(input.archive()),
+                name,
+                Entry::Resource(input),
+            )?;
         }
         Ok(())
     }
@@ -383,7 +415,8 @@ impl Inputs {
         options: &Options,
         only: &[String],
     ) -> Result<ClassGroup<'a>> {
-        let selected = |name: &str| only.is_empty() || only.iter().any(|prefix| name.starts_with(prefix));
+        let selected =
+            |name: &str| only.is_empty() || only.iter().any(|prefix| name.starts_with(prefix));
         let mut builder = ClassGroupBuilder::new();
         let mut sources = BTreeMap::new();
         for (class, bytes) in classes.into_iter().zip(bytes) {
@@ -401,7 +434,13 @@ impl Inputs {
         }
         let group = builder.build().map_err(FrontendError::ClassGroup)?;
         self.renames = MemberRenames::build(&group, options).map_err(FrontendError::ClassGroup)?;
-        for (name, ClassInput { entry_name, input, .. }) in sources {
+        for (
+            name,
+            ClassInput {
+                entry_name, input, ..
+            },
+        ) in sources
+        {
             if options.decompile_inner && !group.is_root(&name) {
                 continue;
             }
@@ -425,11 +464,17 @@ impl Inputs {
                 // Like Vineflower, standalone inputs are written at the output root,
                 // using the declared binary name instead of the input file name.
                 // `basename` is derived from the class declaration, not the input path.
-                let Input::File { path, .. } = &input else { unreachable!() };
+                let Input::File { path, .. } = &input else {
+                    unreachable!()
+                };
                 validate_entry_name(basename, path)?;
                 format!("{basename}.{extension}")
             };
-            insert(self.output_entries(input.archive()), output_name, Entry::Class { name, input })?;
+            insert(
+                self.output_entries(input.archive()),
+                output_name,
+                Entry::Class { name, input },
+            )?;
         }
         Ok(group)
     }
@@ -454,7 +499,9 @@ impl Inputs {
                         && !entries
                             .range::<str, _>((Included(name.as_str()), Unbounded))
                             .take_while(|(path, _)| path.starts_with(name.as_str()))
-                            .any(|(_, entry)| matches!(entry, Entry::Resource(_) | Entry::GeneratedArchive(_)))
+                            .any(|(_, entry)| {
+                                matches!(entry, Entry::Resource(_) | Entry::GeneratedArchive(_))
+                            })
                 })
                 .map(|(name, _)| name.clone())
                 .collect();
@@ -464,7 +511,12 @@ impl Inputs {
         }
     }
 
-    fn write_directory(mut self, root: &Path, group: &ClassGroup<'_>, options: &Options) -> Result<()> {
+    fn write_directory(
+        mut self,
+        root: &Path,
+        group: &ClassGroup<'_>,
+        options: &Options,
+    ) -> Result<()> {
         let directories = directories(&self.entries)?;
         fs::create_dir_all(root)
             .map_err(|error| io_error("create output directory", root, error))?;
@@ -488,7 +540,10 @@ impl Inputs {
             }
             let path = root.join(name);
             if let Entry::GeneratedArchive(archive) = entry {
-                let entries = self.archive_outputs.remove(&archive).expect("indexed archive");
+                let entries = self
+                    .archive_outputs
+                    .remove(&archive)
+                    .expect("indexed archive");
                 self.write_archive(entries, &path, group, options)?;
                 continue;
             }
@@ -507,9 +562,10 @@ impl Inputs {
         options: &Options,
     ) -> Result<()> {
         if let Ok(target) = fs::canonicalize(path)
-            && self.archives.iter().any(|archive| {
-                fs::canonicalize(&archive.path).is_ok_and(|source| source == target)
-            })
+            && self
+                .archives
+                .iter()
+                .any(|archive| fs::canonicalize(&archive.path).is_ok_and(|source| source == target))
         {
             return Err(FrontendError::SameArchive(path.to_owned()));
         }
@@ -584,12 +640,16 @@ impl Inputs {
     ) -> Result<()> {
         match entry {
             Entry::Class { name, input } => {
-                let source = group.decompile_with_renames(name, options, &self.renames)
+                let source = group
+                    .decompile_with_renames(name, options, &self.renames)
                     .map_err(|error| self.class_error(input, error))?;
-                out.write_all(source.text.as_bytes()).map_err(|error| io_error("write", path, error))
+                out.write_all(source.text.as_bytes())
+                    .map_err(|error| io_error("write", path, error))
             }
             Entry::Resource(input) => input
-                .read(&mut self.archives, "copy resource", |file| io::copy(file, out))
+                .read(&mut self.archives, "copy resource", |file| {
+                    io::copy(file, out)
+                })
                 .map(|_| ()),
             Entry::Directory | Entry::GeneratedArchive(_) => unreachable!("not a streamed file"),
         }
@@ -621,7 +681,10 @@ fn directories(entries: &Entries) -> Result<BTreeSet<&str>> {
             if !directories.insert(parent) {
                 break;
             }
-            if entries.get(parent).is_some_and(|entry| !entry.is_directory()) {
+            if entries
+                .get(parent)
+                .is_some_and(|entry| !entry.is_directory())
+            {
                 return Err(FrontendError::EntryTypeConflict(parent.to_owned()));
             }
             current = parent;
@@ -631,7 +694,9 @@ fn directories(entries: &Entries) -> Result<BTreeSet<&str>> {
 }
 
 fn basename(path: &Path) -> Result<&str> {
-    let name = path.file_name().and_then(|name| name.to_str())
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
         .ok_or_else(|| FrontendError::NonUnicodeEntry(path.to_owned()))?;
     validate_entry_name(name, path)?;
     Ok(name)
@@ -726,7 +791,9 @@ pub(super) fn decompile_paths(
 ) -> Result<()> {
     if let Destination::Archive(path) = &destination
         && let Ok(target) = fs::canonicalize(path)
-        && paths.iter().chain(&selection.libraries)
+        && paths
+            .iter()
+            .chain(&selection.libraries)
             .any(|source| fs::canonicalize(source).is_ok_and(|path| path == target))
     {
         return Err(FrontendError::SameArchive(path.clone()));
@@ -753,9 +820,11 @@ pub(super) fn decompile_paths(
     let mut class_bytes = Vec::with_capacity(classes.len());
     for class in &classes {
         let mut bytes = Vec::with_capacity(class.input.size().min(64 * 1024) as usize);
-        class.input.read(&mut inputs.archives, "read class", |file| {
-            file.read_to_end(&mut bytes)
-        })?;
+        class
+            .input
+            .read(&mut inputs.archives, "read class", |file| {
+                file.read_to_end(&mut bytes)
+            })?;
         class_bytes.push(bytes);
     }
     let group = inputs.prepare_sources(classes, &class_bytes, options, &selection.only)?;

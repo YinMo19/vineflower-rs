@@ -90,17 +90,29 @@ impl MonitorPlan {
         }
         let slot = handler.slot;
         let mut heads = body.iter().filter_map(|&block| {
-            graph.blocks[block].predecessors.iter().copied().find(|&pred| {
-                !body.contains(&pred) && graph.blocks[pred].successors == [block]
-                    && instructions[graph.blocks[pred].instructions.end - 1].opcode == 0xc2
-            }).map(|pred| (block, pred))
+            graph.blocks[block]
+                .predecessors
+                .iter()
+                .copied()
+                .find(|&pred| {
+                    !body.contains(&pred)
+                        && graph.blocks[pred].successors == [block]
+                        && instructions[graph.blocks[pred].instructions.end - 1].opcode == 0xc2
+                })
+                .map(|pred| (block, pred))
         });
         let (head, acquisition) = heads.next()?;
         if heads.next().is_some()
-            || !graph.blocks[head].predecessors.iter().copied()
+            || !graph.blocks[head]
+                .predecessors
+                .iter()
+                .copied()
                 .filter(|pred| !body.contains(pred))
                 .eq(std::iter::once(acquisition))
-            || graph.blocks[head].exception_predecessors.iter().any(|pred| !body.contains(pred))
+            || graph.blocks[head]
+                .exception_predecessors
+                .iter()
+                .any(|pred| !body.contains(pred))
         {
             return None;
         }
@@ -145,7 +157,10 @@ impl MonitorPlan {
                 let range = outside.instructions.clone();
                 if !outside.exception_predecessors.is_empty()
                     || outside.predecessors.iter().any(|pred| !body.contains(pred))
-                    || outside.successors.iter().any(|successor| body.contains(successor))
+                    || outside
+                        .successors
+                        .iter()
+                        .any(|successor| body.contains(successor))
                     || release_of(&instructions[range.clone()], slot)? != Some(0)
                 {
                     return None;
@@ -157,11 +172,21 @@ impl MonitorPlan {
         if unlocked.iter().any(|block| releases.contains_key(block)) {
             return None;
         }
-        unlocked.extend(graph.blocks[handler.rethrow].exception_successors.iter().copied());
+        unlocked.extend(
+            graph.blocks[handler.rethrow]
+                .exception_successors
+                .iter()
+                .copied(),
+        );
         if escapes(instructions, graph, slot, unlocked) {
             return None;
         }
-        Some(Self { acquisition, scaffold, releases, handler })
+        Some(Self {
+            acquisition,
+            scaffold,
+            releases,
+            handler,
+        })
     }
 
     pub(in crate::structure) fn enter_index(&self) -> usize {
@@ -173,9 +198,8 @@ impl MonitorPlan {
     }
 
     pub(in crate::structure) fn handler_blocks(&self) -> impl Iterator<Item = usize> {
-        std::iter::once(self.handler.start).chain(
-            (self.handler.rethrow != self.handler.start).then_some(self.handler.rethrow),
-        )
+        std::iter::once(self.handler.start)
+            .chain((self.handler.rethrow != self.handler.start).then_some(self.handler.rethrow))
     }
 }
 
@@ -193,7 +217,10 @@ fn release_of(code: &[Instruction], slot: u16) -> Option<Option<usize>> {
             || code.get(index + 1)?.opcode != 0xc3
             || !matches!(
                 &code[index + 2..],
-                [] | [Instruction { opcode: 0xa7 | 0xc8 | 0xac..=0xb1, .. }]
+                [] | [Instruction {
+                    opcode: 0xa7 | 0xc8 | 0xac..=0xb1,
+                    ..
+                }]
             )
         {
             return None;
@@ -216,7 +243,10 @@ fn escapes(
             continue;
         }
         let node = &graph.blocks[block];
-        match instructions[node.instructions.clone()].iter().find(|op| local_touches(op, slot)) {
+        match instructions[node.instructions.clone()]
+            .iter()
+            .find(|op| local_touches(op, slot))
+        {
             Some(op) if matches!(op.opcode, 0x36..=0x4e) => {}
             Some(_) => return true,
             None => pending.extend(node.successors.iter().copied()),

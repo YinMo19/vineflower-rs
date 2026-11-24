@@ -15,6 +15,9 @@ use super::{
 
 impl Machine<'_, '_> {
     pub(super) fn lexical_parameter(&self, index: u16) -> Option<Expr> {
+        if let Some(capture) = self.captured_parameter(index) {
+            return Some(capture);
+        }
         let group = self.group.filter(|_| self.options.decompile_inner)?;
         if index != 1 || self.method_name != "<init>" || !group.is_attached(self.owner) {
             return None;
@@ -29,7 +32,10 @@ impl Machine<'_, '_> {
     fn outer_this(&self, outer: &str) -> Expr {
         Expr {
             source: Source::OuterThis,
-            ..Expr::atom(Type::Object(outer.into()), format!("{}.this", (self.class_name)(outer)))
+            ..Expr::atom(
+                Type::Object(outer.into()),
+                format!("{}.this", (self.class_name)(outer)),
+            )
         }
     }
 
@@ -53,7 +59,9 @@ impl Machine<'_, '_> {
         let lexical_receiver = matches!(receiver.source, Source::This | Source::OuterThis)
             && matches!(&receiver.ty, Type::Object(receiver_owner) if receiver_owner == owner);
         if !lexical_receiver {
-            return Err(self.unsupported("access to a different object's synthetic enclosing instance"));
+            return Err(
+                self.unsupported("access to a different object's synthetic enclosing instance")
+            );
         }
         if let Some(value) = value {
             if self.method_name != "<init>"
@@ -78,7 +86,12 @@ impl Machine<'_, '_> {
         args: &'args [Expr],
         target: Option<&str>,
     ) -> Result<(String, &'args [Expr]), LiftError> {
-        let plain = || target.map_or_else(|| format!("new {}", (self.class_name)(owner)), str::to_owned);
+        let plain = || {
+            target.map_or_else(
+                || format!("new {}", (self.class_name)(owner)),
+                str::to_owned,
+            )
+        };
         let Some(group) = self.group.filter(|_| self.options.decompile_inner) else {
             return Ok((plain(), args));
         };
@@ -86,7 +99,8 @@ impl Machine<'_, '_> {
             return Ok((plain(), args));
         }
         let args = self.legacy_constructor_arguments(owner, descriptor, args)?;
-        if target.is_none() && group.is_attached(owner)
+        if target.is_none()
+            && group.is_attached(owner)
             && let Some(class) = group.nested_class(owner)
         {
             match class.kind {
@@ -117,7 +131,12 @@ impl Machine<'_, '_> {
         }
         let implicit = matches!(receiver.source, Source::This | Source::OuterThis)
             && matches!(&receiver.ty, Type::Object(ty) if Some(ty.as_str()) == default_instance);
-        if implicit {
+        if implicit
+            && (target.is_some()
+                || matches!(receiver.source, Source::This)
+                || self.unnamed_enclosing_receiver(receiver)
+                || group.member_class(owner).is_none())
+        {
             return Ok((plain(), visible_args));
         }
         let head = match target {
@@ -127,9 +146,13 @@ impl Machine<'_, '_> {
             }
             None => {
                 let Some(member) = group.member_class(owner) else {
-                    return Err(self.unsupported("local class construction changes enclosing instance"));
+                    return Err(
+                        self.unsupported("local class construction changes enclosing instance")
+                    );
                 };
-                let name = self.renames.and_then(|plan| plan.simple_class_alias(owner))
+                let name = self
+                    .renames
+                    .and_then(|plan| plan.simple_class_alias(owner))
                     .unwrap_or(member.simple_name);
                 format!("{}.new {name}", receiver.at(PRIMARY))
             }
@@ -145,10 +168,34 @@ impl Machine<'_, '_> {
         descriptor: &str,
         args: &'args [Expr],
     ) -> Result<&'args [Expr], LiftError> {
-        let Some(group) = self.group else { return Ok(args) };
-        let Some(class) = group.get(owner) else { return Ok(args) };
-        if group.compilation_root(self.owner) != group.compilation_root(owner) {
+        if self
+            .legacy_constructor_descriptor(owner, descriptor)?
+            .is_none()
+        {
             return Ok(args);
+        }
+        let Some((marker_value, args)) = args.split_last() else {
+            return Err(self.invalid_operand("missing synthetic constructor argument"));
+        };
+        if marker_value.observable {
+            return Err(self.unsupported("observable synthetic constructor marker"));
+        }
+        Ok(args)
+    }
+
+    pub(super) fn legacy_constructor_descriptor(
+        &self,
+        owner: &str,
+        descriptor: &str,
+    ) -> Result<Option<&str>, LiftError> {
+        let Some(group) = self.group else {
+            return Ok(None);
+        };
+        let Some(class) = group.get(owner) else {
+            return Ok(None);
+        };
+        if group.compilation_root(self.owner) != group.compilation_root(owner) {
+            return Ok(None);
         }
         let pool = &class.pool;
         let mut code = None;
@@ -162,54 +209,66 @@ impl Machine<'_, '_> {
                 break;
             }
         }
-        let Some(code) = code else { return Ok(args) };
+        let Some(code) = code else { return Ok(None) };
         if !code.exceptions.is_empty() {
-            return Ok(args);
+            return Ok(None);
         }
         let signature = MethodDescriptor::parse(descriptor)?;
         let Some((Type::Object(marker), parameters)) = signature.parameters.split_last() else {
-            return Ok(args);
+            return Ok(None);
         };
-        let Some(marker_class) = group.get(marker) else { return Ok(args) };
+        // Older javac may use an empty synthetic marker or an actual
+        // anonymous class already in the nest. The complete trivial bridge
+        // body below, not absence of methods on the marker type, is the proof.
         if group.compilation_root(marker) != group.compilation_root(owner)
-            || !(marker_class.access_flags & 0x1000 != 0
-                || find_attribute(&marker_class.attributes, &marker_class.pool, "Synthetic")?.is_some())
-            || !marker_class.fields.is_empty()
-            || !marker_class.methods.is_empty()
-            || !group.nested_class(marker).is_some_and(|node| matches!(node.kind, NestedKind::Anonymous))
+            || !group
+                .nested_class(marker)
+                .is_some_and(|node| matches!(node.kind, NestedKind::Anonymous))
         {
-            return Ok(args);
+            return Ok(None);
         }
-        let Ok(instructions) = bytecode::decode(code.bytes) else { return Ok(args) };
-        let [receiver, loads @ .., call, ret] = instructions.as_slice() else { return Ok(args) };
-        if receiver.opcode != 0x2a || call.opcode != 0xb7 || ret.opcode != 0xb1
+        let Ok(instructions) = bytecode::decode(code.bytes) else {
+            return Ok(None);
+        };
+        let [receiver, loads @ .., call, ret] = instructions.as_slice() else {
+            return Ok(None);
+        };
+        if receiver.opcode != 0x2a
+            || call.opcode != 0xb7
+            || ret.opcode != 0xb1
             || loads.len() != parameters.len()
         {
-            return Ok(args);
+            return Ok(None);
         }
         let mut slot = 1;
         for (load, ty) in loads.iter().zip(parameters) {
-            if parameter_load_slot(load, ty) != Some(slot) {
-                return Ok(args);
+            if parameter_load_slot(load, ty).map(usize::from) != Some(slot) {
+                return Ok(None);
             }
-            slot += ty.slots();
+            slot += usize::from(ty.slots());
         }
-        let Operand::Constant(index) = call.operand else { return Ok(args) };
+        let Operand::Constant(index) = call.operand else {
+            return Ok(None);
+        };
         let (target_owner, target, desc) = pool.member_ref(index)?;
-        if target_owner != owner || target != "<init>" || !private_instance_method(class, target, desc)? {
-            return Ok(args);
+        if target_owner != owner
+            || target != "<init>"
+            || !private_instance_method(class, target, desc)?
+        {
+            return Ok(None);
         }
         let target = MethodDescriptor::parse(desc)?;
         if target.parameters.as_slice() != parameters || target.return_type != Type::Void {
-            return Ok(args);
+            return Ok(None);
         }
-        let Some((marker_value, args)) = args.split_last() else {
-            return Err(self.invalid_operand("missing synthetic constructor argument"));
-        };
-        if marker_value.observable {
-            return Err(self.unsupported("observable synthetic constructor marker"));
-        }
-        Ok(args)
+        Ok(Some(desc))
+    }
+
+    pub(super) fn unnamed_enclosing_receiver(&self, receiver: &Expr) -> bool {
+        matches!(receiver.source, Source::OuterThis)
+            && matches!(&receiver.ty, Type::Object(owner)
+                if self.group.is_some_and(|group| group.is_attached(owner)
+                    && group.nested_class(owner).is_some_and(|node| matches!(node.kind, NestedKind::Anonymous))))
     }
 
     pub(super) fn synthetic_nest_accessor(
@@ -228,7 +287,9 @@ impl Machine<'_, '_> {
         {
             return Ok(None);
         }
-        let Some(class) = group.get(owner) else { return Ok(None) };
+        let Some(class) = group.get(owner) else {
+            return Ok(None);
+        };
         let pool = &class.pool;
         let mut accessor = None;
         for method in &class.methods {
@@ -242,16 +303,21 @@ impl Machine<'_, '_> {
                 break;
             }
         }
-        let Some(code) = accessor else { return Ok(None) };
+        let Some(code) = accessor else {
+            return Ok(None);
+        };
         let fail = || self.unsupported("synthetic nest accessor is not a direct forwarding member");
         if !code.exceptions.is_empty() {
             return Err(fail());
         }
         let instructions = bytecode::decode(code.bytes).map_err(|_| fail())?;
-        let Some((before_return, ret)) = instructions.split_last().map(|(ret, body)| (body, ret)) else {
+        let Some((before_return, ret)) = instructions.split_last().map(|(ret, body)| (body, ret))
+        else {
             return Err(fail());
         };
-        let Some((member, loads)) = before_return.split_last() else { return Err(fail()) };
+        let Some((member, loads)) = before_return.split_last() else {
+            return Err(fail());
+        };
         if return_opcode(&signature.return_type) != ret.opcode
             || loads.len() != signature.parameters.len()
             || !matches!(member.opcode, 0xb2..=0xb9)
@@ -280,7 +346,9 @@ impl Machine<'_, '_> {
         let (qualifier, passed) = if is_static {
             ((self.class_name)(owner), args)
         } else {
-            let Some((receiver, passed)) = args.split_first() else { return Err(fail()) };
+            let Some((receiver, passed)) = args.split_first() else {
+                return Err(fail());
+            };
             if !matches!(signature.parameters.first(), Some(Type::Object(ty)) if ty == owner) {
                 return Err(fail());
             }
@@ -291,13 +359,18 @@ impl Machine<'_, '_> {
             let name = self.source_field_name(owner, name, target_descriptor);
             let target = format!("{qualifier}.{name}");
             if matches!(member.opcode, 0xb3 | 0xb5) {
-                if signature.parameters[skip..] != [field_type] || signature.return_type != Type::Void {
+                if signature.parameters[skip..] != [field_type]
+                    || signature.return_type != Type::Void
+                {
                     return Err(fail());
                 }
                 let [value] = passed else { return Err(fail()) };
                 let order = self.order_of(args, true)?;
                 self.before_statement(order)?;
-                return Ok(Some(Effect::FieldAssignment { target, value: value.text.clone() }));
+                return Ok(Some(Effect::FieldAssignment {
+                    target,
+                    value: value.text.clone(),
+                }));
             }
             if !passed.is_empty() || signature.return_type != field_type {
                 return Err(fail());
@@ -306,7 +379,8 @@ impl Machine<'_, '_> {
             return Ok(Some(Effect::None));
         }
         let target = MethodDescriptor::parse(target_descriptor)?;
-        if signature.parameters[skip..] != target.parameters || signature.return_type != target.return_type
+        if signature.parameters[skip..] != target.parameters
+            || signature.return_type != target.return_type
             || (member.opcode == 0xb7 && !private_instance_method(class, name, target_descriptor)?)
         {
             return Err(fail());
@@ -320,7 +394,10 @@ impl Machine<'_, '_> {
             return Ok(Some(Effect::Statement(format!("{text};"))));
         }
         let expression = self.expression(target.return_type, text, PRIMARY, args, true)?;
-        self.push(Expr { statement: true, ..expression })?;
+        self.push(Expr {
+            statement: true,
+            ..expression
+        })?;
         Ok(Some(Effect::None))
     }
 }
@@ -340,7 +417,9 @@ pub(super) fn parameter_load_slot(instruction: &Instruction, ty: &Type) -> Optio
         return None;
     }
     let base = 0x1a + 4 * category;
-    (base..base + 4).contains(&instruction.opcode).then(|| u16::from(instruction.opcode - base))
+    (base..base + 4)
+        .contains(&instruction.opcode)
+        .then(|| u16::from(instruction.opcode - base))
 }
 
 fn return_opcode(ty: &Type) -> u8 {

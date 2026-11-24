@@ -51,7 +51,11 @@ pub(crate) fn lines(doc: &Javadoc, mut emit: impl FnMut(&str)) {
         // A provider controls documentation, not the surrounding Java syntax.
         // Escaping both a literal terminator and all backslashes prevents a
         // Java Unicode escape in a comment from injecting uncommented source.
-        for part in text.strip_suffix('\r').unwrap_or(text).split_inclusive("*/") {
+        for part in text
+            .strip_suffix('\r')
+            .unwrap_or(text)
+            .split_inclusive("*/")
+        {
             if let Some(text) = part.strip_suffix("*/") {
                 escape(&mut line, text);
                 line.push_str("*&#47;");

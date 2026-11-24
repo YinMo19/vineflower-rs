@@ -155,12 +155,20 @@ impl ControlFlowGraph {
     /// Natural loops from reachable normal back edges, grouped by dominating header.
     /// Exceptional entries are considered when testing dominance, but are not loop edges.
     pub fn natural_loops(&self) -> Vec<NaturalLoop> {
+        self.natural_loops_with_dominators(&self.immediate_dominators())
+    }
+
+    pub(crate) fn natural_loops_with_dominators(
+        &self,
+        immediate_dominators: &[Option<usize>],
+    ) -> Vec<NaturalLoop> {
         let len = self.blocks.len();
+        debug_assert_eq!(immediate_dominators.len(), len);
         if len == 0 {
             return Vec::new();
         }
         let mut children = vec![Vec::new(); len];
-        for (node, parent) in self.immediate_dominators().into_iter().enumerate() {
+        for (node, &parent) in immediate_dominators.iter().enumerate() {
             if let Some(parent) = parent {
                 children[parent].push(node);
             }

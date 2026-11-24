@@ -41,7 +41,14 @@ fn is_builder(owner: &str) -> bool {
 fn printable(ty: &Type) -> bool {
     matches!(
         ty,
-        Type::Primitive(Primitive::Boolean | Primitive::Char | Primitive::Int | Primitive::Long | Primitive::Float | Primitive::Double)
+        Type::Primitive(
+            Primitive::Boolean
+                | Primitive::Char
+                | Primitive::Int
+                | Primitive::Long
+                | Primitive::Float
+                | Primitive::Double
+        )
     ) || matches!(ty, Type::Object(name) if name == "java/lang/Object")
 }
 
@@ -68,16 +75,21 @@ pub(super) fn call_source(
         return Source::Plain;
     };
     match receiver {
-        Some(Expr { source: Source::StringBuilder(mut parts), .. })
-            if name == "append" && is_builder(owner)
-                && matches!(&descriptor.return_type, Type::Object(result) if result == owner)
-                && (printable(parameter) || is_string(parameter)) =>
+        Some(Expr {
+            source: Source::StringBuilder(mut parts),
+            ..
+        }) if name == "append"
+            && is_builder(owner)
+            && matches!(&descriptor.return_type, Type::Object(result) if result == owner)
+            && (printable(parameter) || is_string(parameter)) =>
         {
             Arc::make_mut(&mut parts).push(args.pop().unwrap().into());
             Source::StringBuilder(parts)
         }
-        None if owner == "java/lang/String" && name == "valueOf"
-            && is_string(&descriptor.return_type) && printable(parameter) =>
+        None if owner == "java/lang/String"
+            && name == "valueOf"
+            && is_string(&descriptor.return_type)
+            && printable(parameter) =>
         {
             Source::StringConversion(Box::new(args.pop().unwrap()))
         }
@@ -93,11 +105,15 @@ impl Machine<'_, '_> {
         descriptor: &str,
         receiver: Option<&Expr>,
     ) -> Result<Option<Effect>, LiftError> {
-        let Some(receiver) = receiver else { return Ok(None) };
+        let Some(receiver) = receiver else {
+            return Ok(None);
+        };
         if !is_builder(owner) || name != "toString" || descriptor != "()Ljava/lang/String;" {
             return Ok(None);
         }
-        let Source::StringBuilder(parts) = &receiver.source else { return Ok(None) };
+        let Source::StringBuilder(parts) = &receiver.source else {
+            return Ok(None);
+        };
         if parts.is_empty() || parts.iter().all(|part| part.constant) {
             return Ok(None);
         }
@@ -116,7 +132,13 @@ impl Machine<'_, '_> {
             // evaluated path, unlike simply returning the String operand.
             text.push_str(" + \"\"");
         }
-        self.push(self.expression(Type::Object("java/lang/String".into()), text, ADDITIVE, [receiver], true)?)?;
+        self.push(self.expression(
+            Type::Object("java/lang/String".into()),
+            text,
+            ADDITIVE,
+            [receiver],
+            true,
+        )?)?;
         Ok(Some(Effect::None))
     }
 }
@@ -124,24 +146,43 @@ impl Machine<'_, '_> {
 /// Move eager javac conversions into the infix expression only when the
 /// operation cannot pass any delayed conversion or observable argument.
 pub(super) fn inline_value_of(args: &mut [Expr]) {
-    let mut future_observable = args.iter().filter(|arg| arg.observable).count();
-    let mut earlier_delayed = false;
+    let eager_reference = |arg: &Expr| {
+        matches!(&arg.source, Source::StringConversion(value)
+        if Category::of(&value.ty) == Some(Category::Ref))
+    };
+    let can_move_references = if let Some(first) = args.iter().position(eager_reference) {
+        let last = args
+            .iter()
+            .rposition(eager_reference)
+            .expect("first conversion exists");
+        // Either move all eager reference conversions in order or keep all
+        // of them; retaining a later one could move it ahead of an earlier
+        // converted operand.
+        let no_intervening_evaluation = args[first + 1..].iter().all(|arg| match &arg.source {
+            Source::StringConversion(value) => !value.observable,
+            _ => !arg.observable,
+        });
+        let no_delayed_conversion_overtakes = args[..last].iter().all(|arg| {
+            matches!(arg.source, Source::StringConversion(_) | Source::Null)
+                || Category::of(&arg.ty) != Some(Category::Ref)
+                || is_string(&arg.ty)
+        });
+        no_intervening_evaluation && no_delayed_conversion_overtakes
+    } else {
+        false
+    };
     for arg in args {
-        future_observable -= usize::from(arg.observable);
-        if let Source::StringConversion(inner) = &arg.source {
-            if Category::of(&inner.ty) != Some(Category::Ref)
-                || (!earlier_delayed && future_observable == 0)
-            {
-                let Source::StringConversion(inner) = std::mem::replace(&mut arg.source, Source::Plain) else {
-                    unreachable!();
-                };
-                let mut inner = *inner;
-                inner.order = arg.order;
-                inner.observable = arg.observable;
-                *arg = inner;
-            }
-        } else if Category::of(&arg.ty) == Some(Category::Ref) && !is_string(&arg.ty) {
-            earlier_delayed = true;
+        if matches!(arg.source, Source::StringConversion(_))
+            && (can_move_references || !eager_reference(arg))
+        {
+            let Source::StringConversion(inner) = std::mem::replace(&mut arg.source, Source::Plain)
+            else {
+                unreachable!();
+            };
+            let mut inner = *inner;
+            inner.order = arg.order;
+            inner.observable = arg.observable;
+            *arg = inner;
         }
     }
 }

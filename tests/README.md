@@ -51,6 +51,7 @@ Exact upstream comparison with all fixture bytecode and required JDKs:
 | --- | ---: | ---: | ---: | ---: |
 | Initial native pipeline | 37 | 537 | 123 | 0 |
 | Class groups and structured recovery | 73 | 254 | 370 | 0 |
+| Assertions, switch dispatch and array literals | 85 | 227 | 385 | 0 |
 
 All eight upstream CLI and bulk cases match. The full test remains failing
 until all 697 comparisons match.

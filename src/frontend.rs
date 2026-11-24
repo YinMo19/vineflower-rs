@@ -38,11 +38,22 @@ struct Cli {
     legacy_saving: bool,
 
     /// Class, directory or archive used for resolution but not decompiled. Repeatable.
-    #[arg(short = 'e', long, require_equals = true, value_delimiter = ',', value_name = "PATH")]
+    #[arg(
+        short = 'e',
+        long,
+        require_equals = true,
+        value_delimiter = ',',
+        value_name = "PATH"
+    )]
     add_external: Vec<PathBuf>,
 
     /// Decompile only classes whose internal names start with a given prefix. Repeatable.
-    #[arg(long, require_equals = true, value_delimiter = ',', value_name = "PREFIX")]
+    #[arg(
+        long,
+        require_equals = true,
+        value_delimiter = ',',
+        value_name = "PREFIX"
+    )]
     only: Vec<String>,
 
     /// Only report errors.
@@ -85,7 +96,12 @@ impl Setting {
 }
 
 const fn flag(name: &'static str, alternate: &'static str, help: &'static str) -> Setting {
-    Setting { name, alternate, value_name: None, help }
+    Setting {
+        name,
+        alternate,
+        value_name: None,
+        help,
+    }
 }
 
 const fn text(
@@ -94,44 +110,176 @@ const fn text(
     value_name: &'static str,
     help: &'static str,
 ) -> Setting {
-    Setting { name, alternate, value_name: Some(value_name), help }
+    Setting {
+        name,
+        alternate,
+        value_name: Some(value_name),
+        help,
+    }
 }
 
 const SETTINGS: &[Setting] = &[
-    text("indent-string", "ind", "INDENT", "Set the indentation string (default: three spaces)"),
-    text("banner", "ban", "TEXT", "Add text at the beginning of each decompiled file"),
-    flag("use-lvt-names", "udv", "Use names from the local variable table"),
-    flag("use-method-parameters", "ump", "Use names from the MethodParameters attribute"),
+    text(
+        "indent-string",
+        "ind",
+        "INDENT",
+        "Set the indentation string (default: three spaces)",
+    ),
+    text(
+        "banner",
+        "ban",
+        "TEXT",
+        "Add text at the beginning of each decompiled file",
+    ),
+    flag(
+        "use-lvt-names",
+        "udv",
+        "Use names from the local variable table",
+    ),
+    flag(
+        "use-method-parameters",
+        "ump",
+        "Use names from the MethodParameters attribute",
+    ),
     flag("remove-synthetic", "rsy", "Omit synthetic declarations"),
     flag("remove-bridge", "rbr", "Omit bridge methods"),
     flag("decompile-generics", "dgs", "Read generic signatures"),
-    flag("ascii-strings", "asc", "Escape non-ASCII characters in literals"),
-    flag("hide-default-constructor", "hdc", "Omit redundant default constructors"),
+    flag(
+        "ascii-strings",
+        "asc",
+        "Escape non-ASCII characters in literals",
+    ),
+    flag(
+        "hide-default-constructor",
+        "hdc",
+        "Omit redundant default constructors",
+    ),
     flag("hide-empty-super", "hes", "Omit redundant super() calls"),
-    flag("bytecode-source-mapping", "bsm", "Include bytecode-to-source line mappings"),
-    flag("dump-original-lines", "__dump_original_lines__", "Include original source line numbers"),
-    flag("unit-test-mode", "__unit_test_mode__", "Append source maps for test comparisons"),
-    flag("new-line-separator", "nls", "Use LF when enabled or CRLF when disabled"),
-    flag("remove-imports", "rim", "Use fully qualified class names rather than imports"),
-    flag("decompile-inner", "din", "Include nested classes in their enclosing compilation units"),
-    flag("sourcefile-comments", "sfc", "Include the SourceFile attribute in a comment"),
-    text("method-to-decompile", "", "METHOD", "Decompile only the specified JVM method"),
-    flag("resugar-idea-notnull", "inn", "Resugar IntelliJ IDEA's generated @NotNull checks"),
-    flag("force-jsr-inline", "fji", "Inline legacy subroutines regardless of class version"),
-    flag("decompile-kotlin", "kt-enable", "Recover Kotlin source from Kotlin class files"),
-    flag("keep-literals", "lit", "Keep special floating-point literals without resugaring"),
-    flag("rename-members", "ren", "Rename classes and members with unusable identifiers"),
-    text("preferred-line-length", "pll", "WIDTH", "Preferred maximum line length before wrapping"),
-    text("include-runtime", "jrt", "JDK", "Use a JDK's class library; 1/current reads JAVA_HOME"),
+    flag(
+        "bytecode-source-mapping",
+        "bsm",
+        "Include bytecode-to-source line mappings",
+    ),
+    flag(
+        "dump-original-lines",
+        "__dump_original_lines__",
+        "Include original source line numbers",
+    ),
+    flag(
+        "unit-test-mode",
+        "__unit_test_mode__",
+        "Append source maps for test comparisons",
+    ),
+    flag(
+        "new-line-separator",
+        "nls",
+        "Use LF when enabled or CRLF when disabled",
+    ),
+    flag(
+        "remove-imports",
+        "rim",
+        "Use fully qualified class names rather than imports",
+    ),
+    flag(
+        "decompile-inner",
+        "din",
+        "Include nested classes in their enclosing compilation units",
+    ),
+    flag(
+        "sourcefile-comments",
+        "sfc",
+        "Include the SourceFile attribute in a comment",
+    ),
+    flag(
+        "decompile-assert",
+        "das",
+        "Recover assert statements from compiler-generated guards",
+    ),
+    flag(
+        "override-annotation",
+        "",
+        "Restore @Override when the overridden declaration is available",
+    ),
+    text(
+        "method-to-decompile",
+        "",
+        "METHOD",
+        "Decompile only the specified JVM method",
+    ),
+    flag(
+        "resugar-idea-notnull",
+        "inn",
+        "Resugar IntelliJ IDEA's generated @NotNull checks",
+    ),
+    flag(
+        "force-jsr-inline",
+        "fji",
+        "Inline legacy subroutines regardless of class version",
+    ),
+    flag(
+        "decompile-kotlin",
+        "kt-enable",
+        "Recover Kotlin source from Kotlin class files",
+    ),
+    flag(
+        "kt-decompile-facades",
+        "",
+        "Recover Kotlin multifile facades and their source parts",
+    ),
+    flag(
+        "keep-literals",
+        "lit",
+        "Keep special floating-point literals without resugaring",
+    ),
+    flag(
+        "rename-members",
+        "ren",
+        "Rename classes and members with unusable identifiers",
+    ),
+    text(
+        "preferred-line-length",
+        "pll",
+        "WIDTH",
+        "Preferred maximum line length before wrapping",
+    ),
+    text(
+        "include-runtime",
+        "jrt",
+        "JDK",
+        "Use a JDK's class library; 1/current reads JAVA_HOME",
+    ),
     flag("include-classpath", "iec", "Read libraries from CLASSPATH"),
-    text("variable-renaming", "", "SCHEME", "Rename local variables using jad or tiny naming"),
-    flag("rename-parameters", "", "Include parameters when renaming local variables"),
-    flag("jad-style-variable-naming", "jvn", "Use legacy JAD naming for local variables"),
-    flag("jad-style-parameter-naming", "jpr", "Use legacy JAD naming for parameters"),
-    flag("skip-extra-files", "sef", "Do not copy non-class files to the output"),
+    text(
+        "variable-renaming",
+        "",
+        "SCHEME",
+        "Rename local variables using jad or tiny naming",
+    ),
+    flag(
+        "rename-parameters",
+        "",
+        "Include parameters when renaming local variables",
+    ),
+    flag(
+        "jad-style-variable-naming",
+        "jvn",
+        "Use legacy JAD naming for local variables",
+    ),
+    flag(
+        "jad-style-parameter-naming",
+        "jpr",
+        "Use legacy JAD naming for parameters",
+    ),
+    flag(
+        "skip-extra-files",
+        "sef",
+        "Do not copy non-class files to the output",
+    ),
 ];
 
-fn expand_config(args: impl IntoIterator<Item = OsString>) -> Result<Vec<OsString>, files::FrontendError> {
+fn expand_config(
+    args: impl IntoIterator<Item = OsString>,
+) -> Result<Vec<OsString>, files::FrontendError> {
     let mut expanded = Vec::new();
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -141,9 +289,13 @@ fn expand_config(args: impl IntoIterator<Item = OsString>) -> Result<Vec<OsStrin
             break;
         }
         let config = if arg == "-cfg" {
-            Some(PathBuf::from(args.next().ok_or(files::FrontendError::MissingConfig)?))
+            Some(PathBuf::from(
+                args.next().ok_or(files::FrontendError::MissingConfig)?,
+            ))
         } else {
-            arg.to_str().and_then(|arg| arg.strip_prefix("-cfg=")).map(PathBuf::from)
+            arg.to_str()
+                .and_then(|arg| arg.strip_prefix("-cfg="))
+                .map(PathBuf::from)
         };
         if let Some(config) = config {
             let content = fs::read_to_string(&config)
@@ -185,9 +337,10 @@ fn normalize_args(args: impl IntoIterator<Item = OsString>) -> impl Iterator<Ite
             if short == "only" {
                 return OsString::from(format!("--only={value}"));
             }
-            if let Some(setting) = SETTINGS.iter().find(|setting| {
-                short.len() == 3 && setting.alternate == short
-            }) {
+            if let Some(setting) = SETTINGS
+                .iter()
+                .find(|setting| short.len() == 3 && setting.alternate == short)
+            {
                 return OsString::from(format!("--{}={value}", setting.name));
             }
         }
@@ -216,10 +369,17 @@ impl Cli {
 
     fn options(&self) -> Result<Options, crate::OptionError> {
         let mut options = Options::default();
-        for setting in SETTINGS.iter().filter(|setting| setting.name != "skip-extra-files") {
+        for setting in SETTINGS
+            .iter()
+            .filter(|setting| setting.name != "skip-extra-files")
+        {
             if let Some(value) = self.settings.get_one::<String>(setting.name) {
                 let value = if setting.value_name.is_none() {
-                    if value == "1" || value.eq_ignore_ascii_case("true") { "1" } else { "0" }
+                    if value == "1" || value.eq_ignore_ascii_case("true") {
+                        "1"
+                    } else {
+                        "0"
+                    }
                 } else {
                     value
                 };
@@ -230,7 +390,8 @@ impl Cli {
     }
 
     fn skip_extra_files(&self) -> bool {
-        self.settings.get_one::<String>("skip-extra-files")
+        self.settings
+            .get_one::<String>("skip-extra-files")
             .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
     }
 
@@ -263,20 +424,36 @@ fn is_archive(path: &Path) -> bool {
 }
 
 fn is_archive_destination(path: &Path) -> bool {
-    is_archive(path) || path.file_name().and_then(OsStr::to_str)
-        .is_some_and(|name| name.contains(".jar") || name.contains(".zip"))
+    is_archive(path)
+        || path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| name.contains(".jar") || name.contains(".zip"))
 }
 
 fn write_plugins(stdout: &mut impl Write) -> io::Result<()> {
     const PLUGINS: &[(&str, &str)] = &[
-        ("IdeaNotNull", "Decompiles code inserted by IntelliJ IDEA's @NotNull annotation."),
+        (
+            "IdeaNotNull",
+            "Decompiles code inserted by IntelliJ IDEA's @NotNull annotation.",
+        ),
         ("Kotlin", "Detects and decompiles Kotlin class files."),
-        ("VariableRenaming", "Allows automatic renaming of variables with a common naming scheme."),
+        (
+            "VariableRenaming",
+            "Allows automatic renaming of variables with a common naming scheme.",
+        ),
     ];
-    writeln!(stdout, "=== Vineflower Decompiler {} ===\n", env!("CARGO_PKG_VERSION"))?;
+    writeln!(
+        stdout,
+        "=== Vineflower Decompiler {} ===\n",
+        env!("CARGO_PKG_VERSION")
+    )?;
     writeln!(stdout, "Loaded {} plugins:", PLUGINS.len())?;
     for (name, description) in PLUGINS {
-        writeln!(stdout, "{name} (loaded from native code)\n - {description}\n")?;
+        writeln!(
+            stdout,
+            "{name} (loaded from native code)\n - {description}\n"
+        )?;
     }
     stdout.flush()
 }

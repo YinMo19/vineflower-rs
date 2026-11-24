@@ -18,14 +18,20 @@ impl Image {
     pub(super) fn open(path: &Path) -> Result<Self, ClassPathError> {
         let image = JImage::open(path).map_err(|source| match source {
             JImageError::Io { source, .. } => ClassPathError::io(path, source),
-            source => ClassPathError::Image { path: path.into(), source },
+            source => ClassPathError::Image {
+                path: path.into(),
+                source,
+            },
         })?;
         // jimage-rs's layout reader uses unchecked slice indexing in a few places.
         // Turn a malformed image offset into a lookup error rather than unwinding
         // through the classpath API. No resource bodies are read by the iterator.
         let modules = catch_unwind(|| module_index(&image))
             .map_err(|_| ClassPathError::InvalidImage { path: path.into() })?
-            .map_err(|source| ClassPathError::Image { path: path.into(), source })?;
+            .map_err(|source| ClassPathError::Image {
+                path: path.into(),
+                source,
+            })?;
         Ok(Self { image, modules })
     }
 
@@ -49,7 +55,10 @@ impl Image {
                 JImageError::UnsupportedDecompressor { decompressor_name } => {
                     unsupported(path, name, decompressor_name)
                 }
-                source => ClassPathError::Image { path: path.into(), source },
+                source => ClassPathError::Image {
+                    path: path.into(),
+                    source,
+                },
             })?;
         match data {
             // A name in the location table must also be in the hash table.
@@ -114,5 +123,9 @@ fn module_index(image: &JImage) -> Result<HashMap<Box<str>, Arc<str>>, JImageErr
 }
 
 fn unsupported(path: &Path, name: &str, algorithm: String) -> ClassPathError {
-    ClassPathError::UnsupportedImageCompression { path: path.into(), name: name.into(), algorithm }
+    ClassPathError::UnsupportedImageCompression {
+        path: path.into(),
+        name: name.into(),
+        algorithm,
+    }
 }

@@ -65,14 +65,19 @@ impl FileSource {
         let stat = fs::metadata(path).map_err(|e| ClassPathError::io(path, e))?;
         if stat.is_dir() {
             let path = fs::canonicalize(path).map_err(|e| ClassPathError::io(path, e))?;
-            return Ok(Self { path, reader: Reader::Directory });
+            return Ok(Self {
+                path,
+                reader: Reader::Directory,
+            });
         }
         if !stat.is_file() {
             return Err(ClassPathError::InvalidSource { path: path.into() });
         }
         let file = File::open(path).map_err(|e| ClassPathError::io(path, e))?;
         let mut reader = BufReader::new(file);
-        let jmod = path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("jmod"));
+        let jmod = path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("jmod"));
         if jmod {
             let mut magic = [0; 4];
             match reader.read_exact(&mut magic) {
@@ -90,7 +95,10 @@ impl FileSource {
         })?;
         Ok(Self {
             path: path.into(),
-            reader: Reader::Archive { archive: Mutex::new(archive), jmod },
+            reader: Reader::Archive {
+                archive: Mutex::new(archive),
+                jmod,
+            },
         })
     }
 
@@ -107,7 +115,9 @@ impl FileSource {
         let resource = &jmod_resource[JMOD_PREFIX.len()..];
         match &self.reader {
             Reader::Image(image) => image.load(&self.path, name, resource),
-            Reader::Directory => self.load_directory(resource).map(|bytes| bytes.map(Cow::Owned)),
+            Reader::Directory => self
+                .load_directory(resource)
+                .map(|bytes| bytes.map(Cow::Owned)),
             Reader::Archive { archive, jmod } => {
                 if name.starts_with("META-INF/versions/") {
                     return Ok(None);
@@ -117,13 +127,23 @@ impl FileSource {
                 let mut entry = match archive.by_name(archive_name) {
                     Ok(entry) => entry,
                     Err(ZipError::FileNotFound) => return Ok(None),
-                    Err(source) => return Err(ClassPathError::Archive { path: self.path.clone(), source }),
+                    Err(source) => {
+                        return Err(ClassPathError::Archive {
+                            path: self.path.clone(),
+                            source,
+                        });
+                    }
                 };
-                if !entry.is_file() || entry.is_symlink() || entry.name_raw() != archive_name.as_bytes() {
+                if !entry.is_file()
+                    || entry.is_symlink()
+                    || entry.name_raw() != archive_name.as_bytes()
+                {
                     return Ok(None);
                 }
                 let mut bytes = Vec::new();
-                entry.read_to_end(&mut bytes).map_err(|e| ClassPathError::io(&self.path, e))?;
+                entry
+                    .read_to_end(&mut bytes)
+                    .map_err(|e| ClassPathError::io(&self.path, e))?;
                 Ok(Some(Cow::Owned(bytes)))
             }
         }
@@ -133,17 +153,27 @@ impl FileSource {
         let path = self.path.join(resource);
         let resolved = match fs::canonicalize(&path) {
             Ok(resolved) => resolved,
-            Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => {
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
                 return Ok(None);
             }
             Err(e) => return Err(ClassPathError::io(&path, e)),
         };
         if !resolved.starts_with(&self.path) {
-            return Err(ClassPathError::OutsideDirectory { path, root: self.path.clone() });
+            return Err(ClassPathError::OutsideDirectory {
+                path,
+                root: self.path.clone(),
+            });
         }
         if !optional_stat(&resolved)?.is_some_and(|stat| stat.is_file()) {
             return Ok(None);
         }
-        fs::read(&resolved).map(Some).map_err(|e| ClassPathError::io(&path, e))
+        fs::read(&resolved)
+            .map(Some)
+            .map_err(|e| ClassPathError::io(&path, e))
     }
 }

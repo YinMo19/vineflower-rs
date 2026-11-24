@@ -24,7 +24,9 @@ impl Machine<'_, '_> {
             return Err(self.invalid_operand("field opcode requires a Fieldref"));
         }
         let (owner, name, descriptor) = pool.member_ref(index)?;
-        let source_name = self.renames.map_or(name, |renames| renames.field_name(owner, name, descriptor));
+        let source_name = self
+            .renames
+            .map_or(name, |renames| renames.field_name(owner, name, descriptor));
         let ty = Type::parse(descriptor)?;
         let write = matches!(op.opcode, 0xb3 | 0xb5);
         let value = if write {
@@ -49,6 +51,11 @@ impl Machine<'_, '_> {
             {
                 return Ok(effect);
             }
+            if let Some(effect) =
+                self.synthetic_anonymous_capture(owner, name, descriptor, &expr, value.as_ref())?
+            {
+                return Ok(effect);
+            }
             if expr.is_uninitialized(self.initialized_this) {
                 return Err(self.invalid_stack("uninitialized receiver used before invokespecial"));
             }
@@ -56,7 +63,14 @@ impl Machine<'_, '_> {
                 format!("super.{source_name}")
             } else {
                 let expr = self.member_receiver(expr, owner, false)?;
-                let access = format!("{}.{source_name}", expr.at(PRIMARY));
+                let access = if self.unnamed_enclosing_receiver(&expr) {
+                    if self.current_member_named(source_name, false)? {
+                        return Err(self.unsupported("an unnameable enclosing field is shadowed"));
+                    }
+                    source_name.to_owned()
+                } else {
+                    format!("{}.{source_name}", expr.at(PRIMARY))
+                };
                 receiver = Some(expr);
                 access
             }
@@ -126,28 +140,24 @@ impl Machine<'_, '_> {
                 self.invalid_operand("invokeinterface slot count does not match descriptor")
             );
         }
-        let generic = self.generic_call(owner, name, method_type, op.opcode == 0xb8);
-        let args = self.arguments_with_types(&descriptor, Some((owner, name, method_type)), generic.as_ref())?;
+        let member = (owner, name, method_type);
+        let mut args = self.raw_arguments(&descriptor)?;
         if name == "<init>" {
             if op.opcode != 0xb7 || descriptor.return_type != Type::Void {
                 return Err(
                     self.invalid_operand("constructor needs a void invokespecial descriptor")
                 );
             }
+            let omit = self.omit_invocation_casts(owner, member, &descriptor, &args, op.opcode);
+            self.coerce_arguments(&mut args, &descriptor, Some(member), None, omit)?;
             return self.construct(owner, method_type, args);
         }
         if name.starts_with('<') {
             return Err(self.invalid_operand("invalid method invocation name"));
         }
-        if op.opcode == 0xb8
-            && let Some(effect) = self.synthetic_nest_accessor(owner, name, method_type, &descriptor, &args)?
-        {
-            return Ok(effect);
-        }
         let mut receiver = None;
-        let qualifier = if op.opcode == 0xb8 {
-            (self.class_name)(owner)
-        } else {
+        let mut super_call = false;
+        if op.opcode != 0xb8 {
             let expr = self.pop_category(Category::Ref)?;
             if op.opcode == 0xb7 && owner != self.owner {
                 if !matches!(expr.source, Source::This) {
@@ -155,6 +165,7 @@ impl Machine<'_, '_> {
                         self.unsupported("non-this invokespecial needs a nonvirtual Java dispatch")
                     );
                 }
+                super_call = true;
                 if matches!(tag, Constant::InterfaceMethodref { .. }) {
                     if !self.class.interfaces.iter().any(|index| {
                         pool.class_name(*index)
@@ -162,10 +173,7 @@ impl Machine<'_, '_> {
                     }) {
                         return Err(self.unsupported("indirect interface super invocation"));
                     }
-                    format!("{}.super", (self.class_name)(owner))
-                } else if self.super_class.is_some() {
-                    "super".into()
-                } else {
+                } else if self.super_class.is_none() {
                     return Err(
                         self.invalid_operand("special super invocation without a superclass")
                     );
@@ -177,24 +185,57 @@ impl Machine<'_, '_> {
                     ));
                 }
                 let expr = self.member_receiver(expr, owner, true)?;
-                let qualifier = expr.at(PRIMARY).into_owned();
                 receiver = Some(expr);
-                qualifier
             }
+        }
+        let lookup_owner = match receiver.as_ref().map(|expr| &expr.ty) {
+            Some(Type::Object(owner)) => owner.as_str(),
+            _ => owner,
         };
-        if let Some(effect) = self.emit_builder_concat(owner, name, method_type, receiver.as_ref())? {
+        let generic = self.generic_call(owner, name, method_type, op.opcode == 0xb8);
+        let omit = self.omit_invocation_casts(lookup_owner, member, &descriptor, &args, op.opcode);
+        self.coerce_arguments(&mut args, &descriptor, Some(member), generic.as_ref(), omit)?;
+        if op.opcode == 0xb8
+            && let Some(effect) =
+                self.synthetic_nest_accessor(owner, name, method_type, &descriptor, &args)?
+        {
             return Ok(effect);
         }
+        if let Some(effect) =
+            self.emit_builder_concat(owner, name, method_type, receiver.as_ref())?
+        {
+            return Ok(effect);
+        }
+        let qualifier = if let Some(receiver) = &receiver {
+            receiver.at(PRIMARY)
+        } else if !super_call {
+            (self.class_name)(owner).into()
+        } else if matches!(tag, Constant::InterfaceMethodref { .. }) {
+            format!("{}.super", (self.class_name)(owner)).into()
+        } else {
+            std::borrow::Cow::Borrowed("super")
+        };
         self.record_synthetic_invocation(owner, name, method_type);
         let source_name = self.source_invocation_name(owner, name, method_type);
-        let text = format!("{qualifier}.{source_name}({})", render_arguments(&args));
+        let text = if receiver
+            .as_ref()
+            .is_some_and(|receiver| self.unnamed_enclosing_receiver(receiver))
+        {
+            if self.current_member_named(&source_name, true)? {
+                return Err(self.unsupported("an unnameable enclosing method is shadowed"));
+            }
+            format!("{source_name}({})", render_arguments(&args))
+        } else {
+            format!("{qualifier}.{source_name}({})", render_arguments(&args))
+        };
         let operands = receiver.iter().chain(&args);
         if descriptor.return_type == Type::Void {
             let order = self.order_of(operands, true)?;
             self.before_statement(order)?;
             Ok(Effect::Statement(format!("{text};")))
         } else {
-            let result = generic.and_then(|call| call.return_type(&args))
+            let result = generic
+                .and_then(|call| call.return_type(&args))
                 .filter(|result| self.known_assignable(result, &descriptor.return_type))
                 .unwrap_or_else(|| descriptor.return_type.clone());
             let mut expression = self.expression(result, text, PRIMARY, operands, true)?;
@@ -261,13 +302,35 @@ impl Machine<'_, '_> {
         if !matches!(receiver.source, Source::Null)
             && (receiver.ty == ty
                 || (virtual_call
-                    && matches!(receiver.source, Source::This)
+                    && matches!(receiver.source, Source::This | Source::OuterThis)
                     && self.known_assignable(&receiver.ty, &ty)))
         {
             Ok(receiver)
         } else {
             self.reference_cast(receiver, ty, false)
         }
+    }
+
+    fn current_member_named(&self, source_name: &str, method: bool) -> Result<bool, LiftError> {
+        let pool = &self.class.pool;
+        let members = if method {
+            &self.class.methods
+        } else {
+            &self.class.fields
+        };
+        for member in members {
+            let name = pool.utf8(member.name_index)?;
+            let descriptor = pool.utf8(member.descriptor_index)?;
+            let same_name = if method {
+                self.source_invocation_name(self.owner, name, descriptor) == source_name
+            } else {
+                self.source_field_name(self.owner, name, descriptor) == source_name
+            };
+            if same_name {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub(super) fn own_method_is_private(
@@ -292,18 +355,32 @@ impl Machine<'_, '_> {
         descriptor: &MethodDescriptor,
         member: Option<(&str, &str, &str)>,
     ) -> Result<Vec<Expr>, LiftError> {
-        self.arguments_with_types(descriptor, member, None)
+        let mut args = self.raw_arguments(descriptor)?;
+        self.coerce_arguments(&mut args, descriptor, member, None, false)?;
+        Ok(args)
     }
 
-    fn arguments_with_types(
-        &mut self,
+    fn raw_arguments(&mut self, descriptor: &MethodDescriptor) -> Result<Vec<Expr>, LiftError> {
+        let mut args = Vec::with_capacity(descriptor.parameters.len());
+        for ty in descriptor.parameters.iter().rev() {
+            args.push(self.pop_category(Category::of(ty).expect("parameter type is not void"))?);
+        }
+        args.reverse();
+        Ok(args)
+    }
+
+    fn coerce_arguments(
+        &self,
+        args: &mut [Expr],
         descriptor: &MethodDescriptor,
         member: Option<(&str, &str, &str)>,
         generic: Option<&super::generics::GenericCall>,
-    ) -> Result<Vec<Expr>, LiftError> {
-        let mut args = Vec::with_capacity(descriptor.parameters.len());
-        for (index, ty) in descriptor.parameters.iter().enumerate().rev() {
-            let value = self.pop_category(Category::of(ty).expect("parameter type is not void"))?;
+        omit_widening: bool,
+    ) -> Result<(), LiftError> {
+        for (index, (value, ty)) in args.iter_mut().zip(&descriptor.parameters).enumerate() {
+            if value.ty == *ty && !matches!(value.source, Source::Null) {
+                continue;
+            }
             // The core Throwable family exposes one cause-taking overload of
             // each arity. A statically known exception can widen implicitly
             // without risking selection of a different overload.
@@ -321,18 +398,17 @@ impl Machine<'_, '_> {
                                 && self.known_assignable(&value.ty, ty)
                         })
                 });
-            let value = if enclosing_constructor
+            if enclosing_constructor
                 || throwable_constructor && throwable_parameter && known_throwable
-                || generic.is_some_and(|call| call.argument_fits(index, &value, ty, self))
+                || generic.is_some_and(|call| call.argument_fits(index, value, ty, self))
+                || omit_widening && self.invocation_argument_widens(value, ty)
             {
-                value
-            } else {
-                self.coerce(value, ty, true)?
-            };
-            args.push(value);
+                continue;
+            }
+            let operand = std::mem::replace(value, Expr::atom(Type::Void, String::new()));
+            *value = self.coerce(operand, ty, true)?;
         }
-        args.reverse();
-        Ok(args)
+        Ok(())
     }
 
     fn construct(
@@ -359,6 +435,22 @@ impl Machine<'_, '_> {
                 };
                 let (target, visible_args) =
                     self.constructor_target(owner, method_type, &args, Some(target))?;
+                let visible_args = if self.class.access_flags & 0x4000 != 0 && owner == self.owner {
+                    let [label, ordinal, visible @ ..] = visible_args else {
+                        return Err(
+                            self.invalid_operand("missing implicit enum constructor arguments")
+                        );
+                    };
+                    if !matches!(label.source, Source::Local(1))
+                        || !matches!(ordinal.source, Source::Local(2))
+                        || !method_type.starts_with("(Ljava/lang/String;I")
+                    {
+                        return Err(self.unsupported("noncanonical enum constructor delegation"));
+                    }
+                    visible
+                } else {
+                    visible_args
+                };
                 self.initialized_this = true;
                 Ok(Effect::Statement(format!(
                     "{target}({});",
@@ -373,13 +465,14 @@ impl Machine<'_, '_> {
                     .order_of(&args, true)?
                     .expect("constructor has effects");
                 let order = Some(self.join_order(Some(Order::at(allocation)), order)?);
-                let text = if let Some(text) = self.anonymous_construction(owner, method_type, &args)? {
-                    text
-                } else {
-                    let (target, visible_args) =
-                        self.constructor_target(owner, method_type, &args, None)?;
-                    format!("{target}({})", render_arguments(visible_args))
-                };
+                let text =
+                    if let Some(text) = self.anonymous_construction(owner, method_type, &args)? {
+                        text
+                    } else {
+                        let (target, visible_args) =
+                            self.constructor_target(owner, method_type, &args, None)?;
+                        format!("{target}({})", render_arguments(visible_args))
+                    };
                 let mut value = Expr {
                     order,
                     observable: true,

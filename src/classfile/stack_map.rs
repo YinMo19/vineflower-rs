@@ -110,20 +110,25 @@ pub fn initial_stack_map_locals<'types>(
         };
         locals.push(receiver);
     }
-    locals.extend(descriptor.parameters.iter().map(|parameter| match parameter {
-        Type::Primitive(primitive) => match primitive {
-            Primitive::Boolean
-            | Primitive::Byte
-            | Primitive::Char
-            | Primitive::Short
-            | Primitive::Int => Integer,
-            Primitive::Float => Float,
-            Primitive::Double => Double,
-            Primitive::Long => Long,
-        },
-        Type::Object(_) | Type::Array(_) => DescriptorReference(parameter),
-        Type::Void => unreachable!("void is not a parsed parameter type"),
-    }));
+    locals.extend(
+        descriptor
+            .parameters
+            .iter()
+            .map(|parameter| match parameter {
+                Type::Primitive(primitive) => match primitive {
+                    Primitive::Boolean
+                    | Primitive::Byte
+                    | Primitive::Char
+                    | Primitive::Short
+                    | Primitive::Int => Integer,
+                    Primitive::Float => Float,
+                    Primitive::Double => Double,
+                    Primitive::Long => Long,
+                },
+                Type::Object(_) | Type::Array(_) => DescriptorReference(parameter),
+                Type::Void => unreachable!("void is not a parsed parameter type"),
+            }),
+    );
     Ok(locals)
 }
 
@@ -224,13 +229,19 @@ impl Context<'_, '_, '_> {
         if usize::from(pc) >= self.code_length {
             return Err(StackMapError::FrameOutOfBounds(offset));
         }
-        if self.instructions.is_some_and(|code| instruction_at(code, pc).is_none()) {
+        if self
+            .instructions
+            .is_some_and(|code| instruction_at(code, pc).is_none())
+        {
             return Err(StackMapError::FrameNotInstruction(pc));
         }
         Ok(pc)
     }
 
-    fn read_type(&self, reader: &mut Reader<'_>) -> Result<VerificationType<'static>, StackMapError> {
+    fn read_type(
+        &self,
+        reader: &mut Reader<'_>,
+    ) -> Result<VerificationType<'static>, StackMapError> {
         use VerificationType::*;
 
         Ok(match reader.u8()? {
@@ -252,7 +263,10 @@ impl Context<'_, '_, '_> {
                     return Err(StackMapError::UninitializedOutOfBounds(offset));
                 }
                 if self.instructions.is_some_and(|code| {
-                    !matches!(instruction_at(code, offset), Some(Instruction { opcode: 0xbb, .. }))
+                    !matches!(
+                        instruction_at(code, offset),
+                        Some(Instruction { opcode: 0xbb, .. })
+                    )
                 }) {
                     return Err(StackMapError::UninitializedNotNew(offset));
                 }
@@ -309,7 +323,10 @@ impl<'entries, 'types> Types<'entries, 'types> {
         let remaining = available
             .checked_sub(count)
             .ok_or(StackMapError::InvalidChop { count, available })?;
-        self.slots -= self.entries[remaining..].iter().map(|ty| ty.slots()).sum::<u16>();
+        self.slots -= self.entries[remaining..]
+            .iter()
+            .map(|ty| ty.slots())
+            .sum::<u16>();
         self.truncate(remaining);
         Ok(())
     }

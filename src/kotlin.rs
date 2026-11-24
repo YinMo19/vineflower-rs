@@ -15,13 +15,20 @@ mod syntax;
 mod tests;
 pub use metadata::{Metadata, MetadataHeader, has_metadata, read_metadata};
 pub use model::{
-    ClassDeclaration, ClassKind, ClassName, Classifier, Constructor, Declaration, Flags,
-    Function, JvmFieldSignature, JvmMethodSignature, JvmPropertySignature, MemberKind,
-    Modality, PackageDeclaration, Property, Type, TypeAlias, TypeArgument, TypeParameter,
-    ValueParameter, Variance, Visibility,
+    ClassDeclaration, ClassKind, ClassName, Classifier, Constructor, Declaration, Flags, Function,
+    JvmFieldSignature, JvmMethodSignature, JvmPropertySignature, MemberKind, Modality,
+    PackageDeclaration, Property, Type, TypeAlias, TypeArgument, TypeParameter, ValueParameter,
+    Variance, Visibility,
 };
 
-use crate::{bytecode::BytecodeError, classfile::{ClassError, ClassFile}, descriptor::DescriptorError};
+use crate::{
+    Options,
+    bytecode::BytecodeError,
+    classfile::{ClassError, ClassFile},
+    context::ClassGroup,
+    descriptor::DescriptorError,
+    emit::SourceMap,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum KotlinError {
@@ -38,17 +45,35 @@ pub enum KotlinError {
     #[error("unsupported Kotlin metadata version {0:?}")]
     Version(Vec<i32>),
     #[error("unsupported Kotlin declaration {declaration}: {feature}")]
-    Unsupported { declaration: String, feature: &'static str },
+    Unsupported {
+        declaration: String,
+        feature: &'static str,
+    },
 }
 
 impl KotlinError {
     fn unsupported(declaration: &str, feature: &'static str) -> Self {
-        Self::Unsupported { declaration: declaration.to_owned(), feature }
+        Self::Unsupported {
+            declaration: declaration.to_owned(),
+            feature,
+        }
     }
 }
 
 /// Decompile a class selected by its `kotlin.Metadata` annotation. `None`
 /// means the class is not Kotlin, never that Kotlin parsing or rendering failed.
 pub fn decompile_class(class: &ClassFile<'_>) -> Result<Option<String>, KotlinError> {
-    read_metadata(class)?.map(|metadata| emit::render(class, &metadata)).transpose()
+    read_metadata(class)?
+        .map(|metadata| emit::render(class, &metadata, None, None).map(|(text, _)| text))
+        .transpose()
+}
+
+pub(crate) fn decompile_with_options(
+    class: &ClassFile<'_>,
+    group: &ClassGroup<'_>,
+    options: &Options,
+) -> Result<Option<(String, Option<SourceMap>)>, KotlinError> {
+    read_metadata(class)?
+        .map(|metadata| emit::render(class, &metadata, Some(group), Some(options)))
+        .transpose()
 }

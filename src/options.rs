@@ -4,7 +4,10 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::{classpath::{ClassPath, ClassPathError}, javadoc::JavadocProvider};
+use crate::{
+    classpath::{ClassPath, ClassPathError},
+    javadoc::JavadocProvider,
+};
 
 /// Settings controlling JVM names, source formatting and source maps.
 #[derive(Debug, Clone)]
@@ -26,7 +29,10 @@ pub struct Options {
     pub remove_imports: bool,
     pub banner: String,
     pub decompile_inner: bool,
+    pub decompile_assert: bool,
+    pub override_annotation: bool,
     pub decompile_kotlin: bool,
+    pub decompile_kotlin_facades: bool,
     pub sourcefile_comments: bool,
     pub method_to_decompile: String,
     pub javadoc: Option<Arc<dyn JavadocProvider>>,
@@ -62,7 +68,10 @@ impl Default for Options {
             remove_imports: false,
             banner: String::new(),
             decompile_inner: true,
+            decompile_assert: true,
+            override_annotation: true,
             decompile_kotlin: false,
+            decompile_kotlin_facades: false,
             sourcefile_comments: false,
             method_to_decompile: String::new(),
             javadoc: None,
@@ -130,7 +139,10 @@ impl Options {
             "new-line-separator" => self.crlf = !flag()?,
             "remove-imports" => self.remove_imports = flag()?,
             "decompile-inner" => self.decompile_inner = flag()?,
+            "decompile-assert" => self.decompile_assert = flag()?,
+            "override-annotation" => self.override_annotation = flag()?,
             "decompile-kotlin" => self.decompile_kotlin = flag()?,
+            "kt-decompile-facades" => self.decompile_kotlin_facades = flag()?,
             "sourcefile-comments" => self.sourcefile_comments = flag()?,
             "method-to-decompile" => self.method_to_decompile = value.into(),
             "resugar-idea-notnull" => self.idea_notnull = flag()?,
@@ -138,7 +150,10 @@ impl Options {
             "keep-literals" => self.keep_literals = flag()?,
             "rename-members" => self.rename_members = flag()?,
             "preferred-line-length" => {
-                self.preferred_line_length = value.parse().ok().filter(|&width| width != 0)
+                self.preferred_line_length = value
+                    .parse()
+                    .ok()
+                    .filter(|&width| width != 0)
                     .ok_or_else(|| invalid("a positive integer"))?;
             }
             "include-classpath" => {
@@ -146,7 +161,11 @@ impl Options {
                     let mut path = ClassPath::new();
                     if let Some(roots) = env::var_os("CLASSPATH") {
                         for root in env::split_paths(&roots) {
-                            path.add(if root.as_os_str().is_empty() { PathBuf::from(".") } else { root })?;
+                            path.add(if root.as_os_str().is_empty() {
+                                PathBuf::from(".")
+                            } else {
+                                root
+                            })?;
                         }
                     } else {
                         path.add(".")?;

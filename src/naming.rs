@@ -6,6 +6,8 @@ mod identifiers;
 mod members;
 mod variables;
 
-pub use identifiers::{IdentifierKind, MemberRenamer, is_valid_identifier, is_valid_local_identifier};
+pub use identifiers::{
+    IdentifierKind, MemberRenamer, is_valid_identifier, is_valid_local_identifier,
+};
 pub use members::MemberRenames;
 pub use variables::{VariableBinding, VariableNamer, VariableRenamer};

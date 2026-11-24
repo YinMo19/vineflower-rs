@@ -65,7 +65,7 @@ pub struct VariableBinding<'a> {
 
 /// Per-method provider state. Proposed names still need to be checked against
 /// names reserved by the enclosing source scope, such as fields and temporaries.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct VariableNamer {
     provider: Provider,
     rename_parameters: bool,
@@ -152,7 +152,7 @@ impl VariableNamer {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum Provider {
     Jad(Jad),
     Tiny(Tiny),
@@ -228,7 +228,13 @@ impl Jad {
         } else {
             key.replace('.', "")
         };
-        self.other.insert(key, JadStem { base: base.clone(), uses: 1 });
+        self.other.insert(
+            key,
+            JadStem {
+                base: base.clone(),
+                uses: 1,
+            },
+        );
         base
     }
 
@@ -244,22 +250,22 @@ impl Jad {
 
     fn preset(&mut self, cast: &str) -> Option<String> {
         let (index, first, skip_zero, names): (_, _, _, &[_]) = match cast {
-            "int"     => (0, 0, true, &["i", "j", "k", "l"]),
-            "byte"    => (1, 0, false, &["b"]),
-            "char"    => (2, 0, false, &["c"]),
-            "short"   => (3, 1, false, &["short"]),
+            "int" => (0, 0, true, &["i", "j", "k", "l"]),
+            "byte" => (1, 0, false, &["b"]),
+            "char" => (2, 0, false, &["c"]),
+            "short" => (3, 1, false, &["short"]),
             "boolean" => (4, 0, true, &["flag"]),
-            "double"  => (5, 0, false, &["d"]),
-            "float"   => (6, 0, true, &["f"]),
-            "File"    => (7, 1, true, &["file"]),
-            "String"  => (8, 0, true, &["s"]),
-            "Class"   => (9, 0, true, &["oclass"]),
-            "Long"    => (10, 0, true, &["olong"]),
-            "Byte"    => (11, 0, true, &["obyte"]),
-            "Short"   => (12, 0, true, &["oshort"]),
+            "double" => (5, 0, false, &["d"]),
+            "float" => (6, 0, true, &["f"]),
+            "File" => (7, 1, true, &["file"]),
+            "String" => (8, 0, true, &["s"]),
+            "Class" => (9, 0, true, &["oclass"]),
+            "Long" => (10, 0, true, &["olong"]),
+            "Byte" => (11, 0, true, &["obyte"]),
+            "Short" => (12, 0, true, &["oshort"]),
             "Boolean" => (13, 0, true, &["obool"]),
             "Package" => (14, 0, true, &["opackage"]),
-            "Enum"    => (15, 0, true, &["oenum"]),
+            "Enum" => (15, 0, true, &["oenum"]),
             _ => return None,
         };
         let next = &mut self.used_preset[index];
@@ -267,7 +273,11 @@ impl Jad {
         *next += 1;
         let name = names[id % names.len()];
         let suffix = id / names.len();
-        Some(if suffix == 0 && skip_zero { name.into() } else { format!("{name}{suffix}") })
+        Some(if suffix == 0 && skip_zero {
+            name.into()
+        } else {
+            format!("{name}{suffix}")
+        })
     }
 }
 
@@ -282,7 +292,7 @@ fn single_array(cast: &str) -> Cow<'_, str> {
     Cow::Owned(result)
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct Tiny {
     used: HashSet<String>,
     letter_next: [usize; 7],
@@ -293,7 +303,11 @@ impl Tiny {
     fn name(&mut self, ty: &Type, cast: &str, major: u16) -> Option<String> {
         let cast = cast.rsplit_once('$').map_or(cast, |(_, leaf)| leaf);
         let cast = cast.trim_end_matches("[]");
-        let cast = if cast.contains("[]") { Cow::Owned(cast.replace("[]", "")) } else { Cow::Borrowed(cast) };
+        let cast = if cast.contains("[]") {
+            Cow::Owned(cast.replace("[]", ""))
+        } else {
+            Cow::Borrowed(cast)
+        };
         let mut element = ty;
         while let Type::Array(inner) = element {
             element = inner;
@@ -321,7 +335,8 @@ impl Tiny {
                     first
                 };
                 let rest = &cast[first.len_utf8()..];
-                let mut base = String::with_capacity(rest.len() + lower.len_utf8() + usize::from(plural));
+                let mut base =
+                    String::with_capacity(rest.len() + lower.len_utf8() + usize::from(plural));
                 base.push(lower);
                 base.push_str(rest);
                 if plural {

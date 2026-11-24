@@ -7,16 +7,19 @@ use crate::{
     context::NestedKind,
     descriptor::MethodDescriptor,
     lift::{AnonymousSite, AnonymousSites, Machine},
-    structure::structure_with_handlers,
+    structure::{assertions::Sites, structure_with_assertions},
 };
 
 use super::{DecompileError, Writer, parse};
 
 impl<'a, 'c> Writer<'a, 'c> {
     pub(super) fn anonymous_sites(&self) -> Option<AnonymousSites> {
-        (self.options.decompile_inner && self.group.children(self.owner).any(|(_, class)| {
-            matches!(class.kind, NestedKind::Anonymous)
-        })).then(AnonymousSites::default)
+        (self.options.decompile_inner
+            && self
+                .group
+                .children(self.owner)
+                .any(|(_, class)| matches!(class.kind, NestedKind::Anonymous)))
+        .then(AnonymousSites::default)
     }
 
     pub(super) fn line_with_anonymous(
@@ -34,7 +37,8 @@ impl<'a, 'c> Writer<'a, 'c> {
         let mut fragments = text.split('\0');
         let depth = self.depth + depth;
         self.indent_anonymous(depth);
-        self.body.push_str(fragments.next().expect("split yields initial fragment"));
+        self.body
+            .push_str(fragments.next().expect("split yields initial fragment"));
         while let Some(id) = fragments.next() {
             let id = id.parse::<usize>().map_err(|_| invalid())?;
             let site = sites.get(id).ok_or_else(invalid)?;
@@ -44,7 +48,13 @@ impl<'a, 'c> Writer<'a, 'c> {
             let opening = self.body.len();
             self.body.push('\n');
             self.lines += 1;
-            self.with_nested(&site.class, node, depth, |writer| writer.anonymous_members(site))?;
+            let bindings = site.capture_bindings(self.anonymous_bindings.clone());
+            let previous = std::mem::replace(&mut self.anonymous_bindings, bindings);
+            let result = self.with_nested(&site.class, node, depth, |writer| {
+                writer.anonymous_members(site)
+            });
+            self.anonymous_bindings = previous;
+            result?;
             if self.body.len() == opening + 1 {
                 // An empty anonymous class is printed as a single-line `{}`.
                 self.body.pop();
@@ -73,7 +83,13 @@ impl<'a, 'c> Writer<'a, 'c> {
             for field in &self.class.fields {
                 let name = pool.utf8(field.name_index)?;
                 let descriptor = pool.utf8(field.descriptor_index)?;
-                if self.group.outer_field(self.owner, name, descriptor).is_none() && !self.hidden_field(field)? {
+                if !site.captures_field(name, descriptor)
+                    && self
+                        .group
+                        .outer_field(self.owner, name, descriptor)
+                        .is_none()
+                    && !self.hidden_field(field)?
+                {
                     self.field(field, false, None)?;
                     needs_gap = true;
                 }
@@ -82,7 +98,14 @@ impl<'a, 'c> Writer<'a, 'c> {
         if self.anonymous_initializer(site, needs_gap)? {
             needs_gap = true;
         }
-        self.write_methods("", None, None, 0, &mut needs_gap)?;
+        self.write_methods(
+            "",
+            None,
+            None,
+            0,
+            &mut needs_gap,
+            &super::initializers::FieldInitializers::default(),
+        )?;
         self.member_classes(needs_gap)
     }
 
@@ -114,27 +137,43 @@ impl<'a, 'c> Writer<'a, 'c> {
             source,
         };
         let desc = parse(&site.descriptor, MethodDescriptor::parse)?;
-        let graph = ControlFlowGraph::build(tail, &code.exceptions).map_err(|error| wrap(Box::new(error)))?;
+        let graph = ControlFlowGraph::build(tail, &code.exceptions)
+            .map_err(|error| wrap(Box::new(error)))?;
+        let assertions = self
+            .assertion_guard()
+            .map(|guard| Sites::for_method(self.class, method, guard, tail, &graph))
+            .transpose()
+            .map_err(|error| wrap(Box::new(error)))?
+            .flatten();
         let names = self.names;
         let map = |name: &str| names.render(name);
         let mut machine = Machine::new(self.class, method, &code, &desc, self.options, &map)
-            .map_err(|error| wrap(Box::new(error)))?.with_group(self.group);
+            .map_err(|error| wrap(Box::new(error)))?
+            .with_group(self.group);
         machine.mark_initialized_this();
         machine.set_member_renames(self.names.renames());
         machine.set_dynamic_helpers(Rc::clone(&self.dynamic_helpers));
+        machine.set_anonymous_bindings(self.anonymous_bindings.clone());
         let sites = self.anonymous_sites();
         if let Some(sites) = &sites {
             machine.set_anonymous_sites(Rc::clone(sites));
+            machine.set_anonymous_source(tail);
         }
-        let mut lines = structure_with_handlers(tail, &graph, machine, &code.exceptions)
-            .map_err(|error| wrap(Box::new(error)))?;
-        let closing = if lines.last().is_some_and(|line| line.depth == 0 && line.text == "return;") {
+        let mut lines =
+            structure_with_assertions(tail, &graph, machine, &code.exceptions, assertions.as_ref())
+                .map_err(|error| wrap(Box::new(error)))?;
+        let closing = if lines
+            .last()
+            .is_some_and(|line| line.depth == 0 && line.text == "return;")
+        {
             lines.pop().map(|line| line.offsets)
         } else {
             None
         };
         if lines.iter().any(|line| line.text == "return;") {
-            return Err(DecompileError::Unsupported { feature: "nonlocal return from anonymous initializer" });
+            return Err(DecompileError::Unsupported {
+                feature: "nonlocal return from anonymous initializer",
+            });
         }
         if lines.is_empty() {
             return Ok(false);
@@ -143,7 +182,14 @@ impl<'a, 'c> Writer<'a, 'c> {
             self.line(0, "");
         }
         self.line(1, "{");
-        self.method_body("<init>", &site.descriptor, &code, lines, closing, sites.as_ref())?;
+        self.method_body(
+            "<init>",
+            &site.descriptor,
+            &code,
+            lines,
+            closing,
+            sites.as_ref(),
+        )?;
         Ok(true)
     }
 }

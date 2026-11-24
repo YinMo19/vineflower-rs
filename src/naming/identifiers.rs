@@ -73,13 +73,58 @@ pub(super) fn local_keyword(name: &str, major_version: u16) -> bool {
 fn keyword(name: &str) -> bool {
     matches!(
         name,
-        "abstract" | "assert" | "boolean" | "break" | "byte" | "case" | "catch" | "char"
-            | "class" | "const" | "continue" | "default" | "do" | "double" | "else" | "extends"
-            | "false" | "final" | "finally" | "float" | "for" | "goto" | "if" | "implements"
-            | "import" | "instanceof" | "int" | "interface" | "long" | "native" | "new" | "null"
-            | "package" | "private" | "protected" | "public" | "return" | "short" | "static"
-            | "strictfp" | "super" | "switch" | "synchronized" | "this" | "throw" | "throws"
-            | "transient" | "true" | "try" | "void" | "volatile" | "while"
+        "abstract"
+            | "assert"
+            | "boolean"
+            | "break"
+            | "byte"
+            | "case"
+            | "catch"
+            | "char"
+            | "class"
+            | "const"
+            | "continue"
+            | "default"
+            | "do"
+            | "double"
+            | "else"
+            | "extends"
+            | "false"
+            | "final"
+            | "finally"
+            | "float"
+            | "for"
+            | "goto"
+            | "if"
+            | "implements"
+            | "import"
+            | "instanceof"
+            | "int"
+            | "interface"
+            | "long"
+            | "native"
+            | "new"
+            | "null"
+            | "package"
+            | "private"
+            | "protected"
+            | "public"
+            | "return"
+            | "short"
+            | "static"
+            | "strictfp"
+            | "super"
+            | "switch"
+            | "synchronized"
+            | "this"
+            | "throw"
+            | "throws"
+            | "transient"
+            | "true"
+            | "try"
+            | "void"
+            | "volatile"
+            | "while"
     )
 }
 
@@ -190,36 +235,92 @@ mod tests {
     #[test]
     fn converter_helper_contract() {
         let cases = [
-            (Some("ValidClassName"), Some("validFieldName"), Some("validMethodName"), [false; 3]),
+            (
+                Some("ValidClassName"),
+                Some("validFieldName"),
+                Some("validMethodName"),
+                [false; 3],
+            ),
             (None, None, None, [true; 3]),
             (Some(""), Some(""), Some(""), [true; 3]),
             (Some("C"), Some("f"), Some("m"), [true; 3]),
             (Some("_"), Some("_"), Some("_"), [true; 3]),
             (Some("public"), Some("public"), Some("public"), [true; 3]),
             (Some("nul"), Some("nul"), Some("nul"), [true, false, false]),
-            (Some("4identifier"), Some("4identifier"), Some("4identifier"), [true; 3]),
-            (Some("\u{feff}ClassName"), Some("\u{feff}fieldName"), Some("\u{feff}methodName"), [true; 3]),
-            (Some("Class\u{feff}Name"), Some("field\u{feff}Name"), Some("method\u{feff}Name"), [true; 3]),
-            (Some("ClassName\u{feff}"), Some("fieldName\u{feff}"), Some("methodName\u{feff}"), [true; 3]),
-            (Some("<init>"), Some("<init>"), Some("<init>"), [true, true, false]),
-            (Some("<clinit>"), Some("<clinit>"), Some("<clinit>"), [true, true, false]),
+            (
+                Some("4identifier"),
+                Some("4identifier"),
+                Some("4identifier"),
+                [true; 3],
+            ),
+            (
+                Some("\u{feff}ClassName"),
+                Some("\u{feff}fieldName"),
+                Some("\u{feff}methodName"),
+                [true; 3],
+            ),
+            (
+                Some("Class\u{feff}Name"),
+                Some("field\u{feff}Name"),
+                Some("method\u{feff}Name"),
+                [true; 3],
+            ),
+            (
+                Some("ClassName\u{feff}"),
+                Some("fieldName\u{feff}"),
+                Some("methodName\u{feff}"),
+                [true; 3],
+            ),
+            (
+                Some("<init>"),
+                Some("<init>"),
+                Some("<init>"),
+                [true, true, false],
+            ),
+            (
+                Some("<clinit>"),
+                Some("<clinit>"),
+                Some("<clinit>"),
+                [true, true, false],
+            ),
         ];
         for (class, field, method, expected) in cases {
             for ((kind, name), result) in [(Class, class), (Field, field), (Method, method)]
                 .into_iter()
                 .zip(expected)
             {
-                assert_eq!(MemberRenamer::to_be_renamed(kind, name), result, "{kind:?}: {name:?}");
+                assert_eq!(
+                    MemberRenamer::to_be_renamed(kind, name),
+                    result,
+                    "{kind:?}: {name:?}"
+                );
             }
         }
     }
 
     #[test]
     fn java_categories_and_keyword_context() {
-        for name in ["€value", "_value", "‿value", "Ⅻvalue", "a\u{300}\u{903}٢", "日本語", "a$b"] {
+        for name in [
+            "€value",
+            "_value",
+            "‿value",
+            "Ⅻvalue",
+            "a\u{300}\u{903}٢",
+            "日本語",
+            "a$b",
+        ] {
             assert!(is_valid_identifier(Field, name), "{name:?}");
         }
-        for name in ["٢value", "\u{300}value", "a²", "a·b", "a\u{200d}b", "a\u{7f}b", "a\0b", "𐐀value"] {
+        for name in [
+            "٢value",
+            "\u{300}value",
+            "a²",
+            "a·b",
+            "a\u{200d}b",
+            "a\u{7f}b",
+            "a\0b",
+            "𐐀value",
+        ] {
             assert!(!is_valid_identifier(Field, name), "{name:?}");
         }
         assert!(is_valid_local_identifier("enum", 48));
@@ -251,10 +352,16 @@ mod tests {
     #[test]
     fn generated_names_avoid_collisions_and_keep_independent_counters() {
         let mut renamer = MemberRenamer::default();
-        assert_eq!(renamer.next_available(Class, Some("٢foo"), |name| name == "Innerfoo"), "Innerfoo_0");
+        assert_eq!(
+            renamer.next_available(Class, Some("٢foo"), |name| name == "Innerfoo"),
+            "Innerfoo_0"
+        );
         assert_eq!(renamer.next_name(Class, Some("3foo")), "Innerfoo_1");
         assert_eq!(renamer.next_name(Class, Some("7")), "class_2");
-        assert_eq!(renamer.next_available(Field, Some("f"), |name| name == "field_0"), "field_1");
+        assert_eq!(
+            renamer.next_available(Field, Some("f"), |name| name == "field_0"),
+            "field_1"
+        );
         assert_eq!(renamer.next_name(Method, Some("m")), "method_0");
     }
 }

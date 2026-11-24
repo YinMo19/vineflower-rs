@@ -25,7 +25,11 @@ impl<'a> Writer<'a, '_> {
         Ok(result)
     }
 
-    pub(super) fn write_annotation(&mut self, depth: usize, annotation: &Annotation) -> Result<(), DecompileError> {
+    pub(super) fn write_annotation(
+        &mut self,
+        depth: usize,
+        annotation: &Annotation,
+    ) -> Result<(), DecompileError> {
         let doc = self.annotation_document(annotation, Some(self.depth + depth))?;
         self.document_line(depth, &doc);
         Ok(())
@@ -35,7 +39,11 @@ impl<'a> Writer<'a, '_> {
         Ok(self.annotation_document(annotation, None)?.into_flat())
     }
 
-    pub(super) fn annotation_document(&self, annotation: &Annotation, depth: Option<usize>) -> Result<Document, DecompileError> {
+    pub(super) fn annotation_document(
+        &self,
+        annotation: &Annotation,
+        depth: Option<usize>,
+    ) -> Result<Document, DecompileError> {
         let pool = &self.class.pool;
         let name = self.annotation_type(pool.utf8(annotation.type_index)?)?;
         let mut elements = Vec::with_capacity(annotation.elements.len());
@@ -47,7 +55,9 @@ impl<'a> Writer<'a, '_> {
                 doc.push_str(" = ");
             }
             match value {
-                ElementValue::Annotation(nested) => doc.append(self.annotation_document(nested, None)?),
+                ElementValue::Annotation(nested) => {
+                    doc.append(self.annotation_document(nested, None)?)
+                }
                 _ => doc.push_str(&self.annotation_value(value)?),
             }
             elements.push(doc);
@@ -77,7 +87,13 @@ impl<'a> Writer<'a, '_> {
                     b'Z' => Primitive::Boolean,
                     _ => return Err(DecompileError::InvalidAttribute("annotation constant")),
                 };
-                constant_literal_with_options(pool, *index, Some(&Type::Primitive(primitive)), self.options, |name| self.names.render(name))
+                constant_literal_with_options(
+                    pool,
+                    *index,
+                    Some(&Type::Primitive(primitive)),
+                    self.options,
+                    |name| self.names.render(name),
+                )
                 .map_err(|source| DecompileError::Render {
                     context: "annotation constant",
                     source: Box::new(source),

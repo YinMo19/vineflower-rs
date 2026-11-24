@@ -33,7 +33,10 @@ impl ClassMetadata {
             source: error,
         };
         let class = ClassFile::parse(bytes).map_err(invalid_class)?;
-        let declared = class.pool.class_name(class.this_class).map_err(invalid_class)?;
+        let declared = class
+            .pool
+            .class_name(class.this_class)
+            .map_err(invalid_class)?;
         if declared != name {
             return Err(ClassPathError::WrongClassName {
                 location: source.location(),
@@ -53,16 +56,27 @@ impl ClassMetadata {
             } else {
                 Some(pool.class_name(class.super_class)?.into())
             },
-            interfaces: class.interfaces.iter().map(|&index| pool.class_name(index).map(str::to_owned))
+            interfaces: class
+                .interfaces
+                .iter()
+                .map(|&index| pool.class_name(index).map(str::to_owned))
                 .collect::<Result<_, _>>()?,
-            permitted_subclasses: class.permitted_subclasses()?.into_iter()
+            permitted_subclasses: class
+                .permitted_subclasses()?
+                .into_iter()
                 .map(|index| pool.class_name(index).map(str::to_owned))
                 .collect::<Result<_, _>>()?,
             access_flags: class.access_flags,
             signature: class.signature()?.map(str::to_owned),
-            methods: class.methods.iter().map(|m| MemberMetadata::from_member(m, pool))
+            methods: class
+                .methods
+                .iter()
+                .map(|m| MemberMetadata::from_member(m, pool))
                 .collect::<Result<_, _>>()?,
-            fields: class.fields.iter().map(|m| MemberMetadata::from_member(m, pool))
+            fields: class
+                .fields
+                .iter()
+                .map(|m| MemberMetadata::from_member(m, pool))
                 .collect::<Result<_, _>>()?,
         })
     }

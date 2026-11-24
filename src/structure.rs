@@ -1,19 +1,22 @@
 // Copyright 2000-2020 JetBrains s.r.o. Use of this source code is governed by the Apache 2.0 license that can be found in the LICENSE file.
 
+pub(crate) mod assertions;
 mod exception_emit;
 #[cfg(test)]
 mod exception_tests;
 mod flow;
-mod protected;
 #[cfg(test)]
 mod join_tests;
+mod protected;
+mod string_switch;
+mod switch_expression;
 #[cfg(test)]
 mod tests;
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::mem;
-use std::ops::RangeInclusive;
+use std::ops::{Range, RangeInclusive};
 
 use thiserror::Error;
 
@@ -22,8 +25,9 @@ use crate::cfg::ControlFlowGraph;
 use crate::classfile::ExceptionHandler;
 use crate::lift::{Effect, LiftError, Machine};
 
-use self::flow::{Layout, LoopScope, Region, Transfer, While};
+use self::flow::{Layout, Loop, LoopScope, Region, Transfer, While};
 use self::protected::Exceptions;
+use self::switch_expression::CaseLabel;
 
 #[derive(Debug)]
 pub(crate) struct Line {
@@ -35,7 +39,12 @@ pub(crate) struct Line {
 
 impl Line {
     fn new(depth: usize, text: String, offsets: Vec<u32>) -> Self {
-        Self { depth, text, offsets, loop_break: None }
+        Self {
+            depth,
+            text,
+            offsets,
+            loop_break: None,
+        }
     }
 }
 
@@ -51,6 +60,8 @@ pub(crate) enum StructureError {
     Lift(#[from] LiftError),
     #[error("unsupported exception handling region")]
     ExceptionHandlers,
+    #[error("cannot represent a proven Java assertion without moving side effects")]
+    Assertion,
     #[error("unsupported control flow at bytecode offset {offset}")]
     Flow { offset: u32 },
     #[error("nonempty operand stack at control-flow boundary at bytecode offset {offset}")]
@@ -63,19 +74,13 @@ pub(crate) enum StructureError {
     Nesting,
 }
 
+#[cfg(test)]
 pub(crate) fn structure(
     instructions: &[Instruction],
     graph: &ControlFlowGraph,
     machine: Machine<'_, '_>,
 ) -> Result<Vec<Line>, StructureError> {
-    if graph
-        .blocks
-        .iter()
-        .any(|block| !block.exception_successors.is_empty())
-    {
-        return Err(StructureError::ExceptionHandlers);
-    }
-    structure_regions(instructions, graph, machine, &Exceptions::default())
+    structure_with_assertions(instructions, graph, machine, &[], None)
 }
 
 pub(crate) fn structure_with_handlers(
@@ -84,11 +89,26 @@ pub(crate) fn structure_with_handlers(
     machine: Machine<'_, '_>,
     handlers: &[ExceptionHandler],
 ) -> Result<Vec<Line>, StructureError> {
-    if handlers.is_empty() {
-        return structure(instructions, graph, machine);
+    structure_with_assertions(instructions, graph, machine, handlers, None)
+}
+
+pub(crate) fn structure_with_assertions(
+    instructions: &[Instruction],
+    graph: &ControlFlowGraph,
+    machine: Machine<'_, '_>,
+    handlers: &[ExceptionHandler],
+    assertions: Option<&assertions::Sites>,
+) -> Result<Vec<Line>, StructureError> {
+    if handlers.is_empty()
+        && graph
+            .blocks
+            .iter()
+            .any(|block| !block.exception_successors.is_empty())
+    {
+        return Err(StructureError::ExceptionHandlers);
     }
     let exceptions = Exceptions::new(instructions, graph, handlers)?;
-    structure_regions(instructions, graph, machine, &exceptions)
+    structure_regions(instructions, graph, machine, &exceptions, assertions)
 }
 
 fn structure_regions(
@@ -96,6 +116,7 @@ fn structure_regions(
     graph: &ControlFlowGraph,
     mut machine: Machine<'_, '_>,
     exceptions: &Exceptions,
+    assertions: Option<&assertions::Sites>,
 ) -> Result<Vec<Line>, StructureError> {
     if graph.blocks.is_empty() {
         return Ok(Vec::new());
@@ -103,12 +124,16 @@ fn structure_regions(
     let mut emitter = Emitter {
         instructions,
         graph,
-        layout: Layout::new(graph, instructions)?,
+        layout: Layout::new(graph, instructions, assertions)?,
         exceptions,
+        assertions,
         emitted: vec![false; graph.blocks.len()],
         lines: Vec::new(),
     };
     emitter.region(0, Region::METHOD, &mut machine, 0)?;
+    if assertions.is_some_and(|sites| !sites.all_emitted(&emitter.emitted)) {
+        return Err(StructureError::Assertion);
+    }
     for (block, reachable) in graph.reachable().into_iter().enumerate() {
         if reachable && !emitter.emitted[block] {
             return Err(emitter.unstructured(block));
@@ -122,6 +147,7 @@ struct Emitter<'a> {
     graph: &'a ControlFlowGraph,
     layout: Layout,
     exceptions: &'a Exceptions,
+    assertions: Option<&'a assertions::Sites>,
     emitted: Vec<bool>,
     lines: Vec<Line>,
 }
@@ -185,13 +211,16 @@ impl Emitter<'_> {
             return Err(StructureError::Nesting);
         }
         loop {
+            block = self.exceptions.bypass_cleanup(block);
             let first_header = mem::take(&mut enter_loop);
             if !first_header {
                 if region.stop == Some(block) {
                     return Ok(true);
                 }
                 if let Some((scope, transfer)) = region.loop_transfer(block) {
-                    self.emit_loop_transfer(block, region, scope, transfer, machine, depth, pending)?;
+                    self.emit_loop_transfer(
+                        block, region, scope, transfer, machine, depth, pending,
+                    )?;
                     return Ok(false);
                 }
             }
@@ -201,7 +230,8 @@ impl Emitter<'_> {
             {
                 return Err(self.unstructured(block));
             }
-            if !first_header && let Some(id) = self.exceptions.at_start(region.exception_arm, block) {
+            if !first_header && let Some(id) = self.exceptions.at_start(region.exception_arm, block)
+            {
                 let Some(next) = self.emit_exception(id, region, machine, depth, pending)? else {
                     return Ok(false);
                 };
@@ -212,21 +242,27 @@ impl Emitter<'_> {
                 if !machine.this_is_initialized() {
                     return Err(self.unstructured(block));
                 }
-                if let Some(test) = loop_shape.test {
-                    self.emitted[block] = true;
-                    self.emit_while(block, test, region, machine, depth, pending)?;
-                    block = test.exit;
-                } else {
-                    let Some(exit) = self.emit_general_loop(block, loop_shape.exit, region, machine, depth, pending)? else {
-                        return Ok(false);
-                    };
-                    block = exit;
-                }
+                let Some(exit) =
+                    self.emit_loop(block, loop_shape, region, machine, depth, pending)?
+                else {
+                    return Ok(false);
+                };
+                block = exit;
+                continue;
+            }
+            if let Some(next) =
+                self.try_emit_string_switch(block, region, machine, depth, pending)?
+            {
+                let Some(next) = next else { return Ok(false) };
+                block = next;
                 continue;
             }
             self.emitted[block] = true;
-            let Tail { effect, mut offsets, control } =
-                self.lift_block(block, machine, region, depth, mem::take(pending))?;
+            let Tail {
+                effect,
+                mut offsets,
+                control,
+            } = self.lift_block(block, machine, region, depth, mem::take(pending))?;
             match effect {
                 Effect::None => {
                     block = self.single_successor(block)?;
@@ -253,8 +289,15 @@ impl Emitter<'_> {
                         when_false,
                     };
                     let control = control.expect("conditional control schedule");
-                    let Some(next) =
-                        self.emit_if(block, region, machine, depth, condition, &mut offsets, control)?
+                    let Some(next) = self.emit_if(
+                        block,
+                        region,
+                        machine,
+                        depth,
+                        condition,
+                        &mut offsets,
+                        control,
+                    )?
                     else {
                         return Ok(false);
                     };
@@ -263,12 +306,21 @@ impl Emitter<'_> {
                 }
                 Effect::Switch { selector } => {
                     let control = control.expect("switch control schedule");
-                    let Some(next) =
-                        self.emit_switch(block, region, machine, depth, selector, offsets, control)?
+                    let Some(next) = self.emit_switch(
+                        block,
+                        region,
+                        machine,
+                        depth,
+                        selector,
+                        &mut offsets,
+                        control,
+                        None,
+                    )?
                     else {
                         return Ok(false);
                     };
                     block = next;
+                    *pending = offsets;
                 }
                 Effect::Return(value) => {
                     let text = value
@@ -293,17 +345,46 @@ impl Emitter<'_> {
         machine: &mut Machine<'a, 'c>,
         region: Region<'_, 'a, 'c>,
         depth: usize,
-        mut offsets: Vec<u32>,
+        offsets: Vec<u32>,
     ) -> Result<Tail, StructureError> {
         let mut range = self.graph.blocks[block].instructions.clone();
         self.exception_range(block, region, &mut range)?;
+        self.lift_range(block, range, machine, region, depth, offsets)
+    }
+
+    fn lift_range<'a, 'c>(
+        &mut self,
+        block: usize,
+        range: Range<usize>,
+        machine: &mut Machine<'a, 'c>,
+        region: Region<'_, 'a, 'c>,
+        depth: usize,
+        mut offsets: Vec<u32>,
+    ) -> Result<Tail, StructureError> {
         let mut tail = Effect::None;
         let mut control = None;
-        for index in range.clone() {
+        let mut index = range.start;
+        while index < range.end {
             if self.exceptions.skips_instruction(index) {
+                index += 1;
                 continue;
             }
             let instruction = &self.instructions[index];
+            if matches!(instruction.opcode, 0xbc | 0xbd)
+                && let Some(consumed) = machine
+                    .try_array_initializer(&self.instructions[index..range.end], |relative, _| {
+                        !self.exceptions.skips_instruction(index + relative)
+                    })
+            {
+                offsets.extend(
+                    self.instructions[index..index + consumed]
+                        .iter()
+                        .filter(|op| op.opcode != 0)
+                        .flat_map(|op| op.offset..op.offset + op.len),
+                );
+                index += consumed;
+                continue;
+            }
             if index + 1 == range.end {
                 control = machine.control_order(instruction)?;
             }
@@ -341,6 +422,7 @@ impl Emitter<'_> {
                 transfer if index + 1 == range.end => tail = transfer,
                 _ => return Err(self.unstructured(block)),
             }
+            index += 1;
         }
         Ok(Tail {
             effect: tail,
@@ -359,10 +441,26 @@ impl Emitter<'_> {
         offsets: &mut Vec<u32>,
         mut control: RangeInclusive<u32>,
     ) -> Result<Option<usize>, StructureError> {
+        if self.assertion_starts(block) {
+            return self.emit_assertion(block, region, machine, depth, offsets);
+        }
         let held = machine.hold_control_stack(&control)?;
         let prelude = machine.take_prelude();
-        self.collapse_condition(block, region, machine, depth, &mut condition, offsets, &mut control)?;
-        let Condition { taken, fallthrough, when_true, when_false } = condition;
+        self.collapse_condition(
+            block,
+            region,
+            machine,
+            depth,
+            &mut condition,
+            offsets,
+            &mut control,
+        )?;
+        let Condition {
+            taken,
+            fallthrough,
+            when_true,
+            when_false,
+        } = condition;
         if taken == fallthrough {
             if machine.has_uninitialized_stack() {
                 return Err(self.unstructured(block));
@@ -406,9 +504,8 @@ impl Emitter<'_> {
             && let (Some(yes), Some(no)) = (&then.exit, &otherwise.exit)
             && yes.same_locals(machine)
             && no.same_locals(machine)
-            && let Some(restored) = machine.merge_conditional_stack(
-                yes, no, &condition, &inverse, &control, held,
-            )?
+            && let Some(restored) =
+                machine.merge_conditional_stack(yes, no, &condition, &inverse, &control, held)?
         {
             if !restored {
                 for statement in prelude {
@@ -423,7 +520,10 @@ impl Emitter<'_> {
             return Err(self.unstructured(block));
         }
 
-        let exits = [&then, &otherwise].into_iter().filter(|arm| arm.exit.is_some()).collect::<Vec<_>>();
+        let exits = [&then, &otherwise]
+            .into_iter()
+            .filter(|arm| arm.exit.is_some())
+            .collect::<Vec<_>>();
         let (declarations, assignments) = if exits.is_empty() {
             (Vec::new(), Vec::new())
         } else {
@@ -431,8 +531,10 @@ impl Emitter<'_> {
         };
         let mut assignments = assignments.into_iter();
         let mut assignment_lines = |falls: bool, mut offsets: Vec<u32>| {
-            falls.then(|| assignments.next().expect("one assignment list per arm"))
-                .unwrap_or_default().into_iter()
+            falls
+                .then(|| assignments.next().expect("one assignment list per arm"))
+                .unwrap_or_default()
+                .into_iter()
                 .map(|text| Line::new(depth + 1, text, mem::take(&mut offsets)))
                 .collect::<Vec<_>>()
         };
@@ -451,8 +553,16 @@ impl Emitter<'_> {
         for statement in prelude {
             header.push(Line::new(depth, statement, mem::take(offsets)));
         }
-        header.extend(declarations.into_iter().map(|text| Line::new(depth, text, Vec::new())));
-        header.push(Line::new(depth, format!("if ({condition}) {{"), mem::take(offsets)));
+        header.extend(
+            declarations
+                .into_iter()
+                .map(|text| Line::new(depth, text, Vec::new())),
+        );
+        header.push(Line::new(
+            depth,
+            format!("if ({condition}) {{"),
+            mem::take(offsets),
+        ));
         self.lines.splice(start..start, header);
         self.syntax(depth, "}");
         Ok(if then_falls || else_falls { join } else { None })
@@ -469,19 +579,29 @@ impl Emitter<'_> {
         control: &mut RangeInclusive<u32>,
     ) -> Result<(), StructureError> {
         while condition.taken != condition.fallthrough {
-            let candidate = [(condition.fallthrough, condition.taken), (condition.taken, condition.fallthrough)]
-                .into_iter().find(|&(next, shared)| {
-                    let node = &self.graph.blocks[next];
-                    node.predecessors.as_slice() == [head]
-                        && node.successors.len() == 2
-                        && node.successors.contains(&shared)
-                        && !self.emitted[next]
-                        && self.layout.loops[next].is_none()
-                        && self.layout.inside(next, region)
-                        && region.exception_arm.is_none()
-                        && self.exceptions.at_start(region.exception_arm, next).is_none()
-                });
-            let Some((next, shared)) = candidate else { break };
+            let candidate = [
+                (condition.fallthrough, condition.taken),
+                (condition.taken, condition.fallthrough),
+            ]
+            .into_iter()
+            .find(|&(next, shared)| {
+                let node = &self.graph.blocks[next];
+                node.predecessors.as_slice() == [head]
+                    && node.successors.len() == 2
+                    && node.successors.contains(&shared)
+                    && !self.emitted[next]
+                    && !self.assertion_starts(next)
+                    && self.layout.loops[next].is_none()
+                    && self.layout.inside(next, region)
+                    && region.exception_arm.is_none()
+                    && self
+                        .exceptions
+                        .at_start(region.exception_arm, next)
+                        .is_none()
+            });
+            let Some((next, shared)) = candidate else {
+                break;
+            };
             let start = self.lines.len();
             let mut along = machine.clone();
             // A candidate must compute only the next condition. In
@@ -492,11 +612,20 @@ impl Emitter<'_> {
                 break;
             }
             let Ok(Tail {
-                effect: Effect::Branch { target, when_true, when_false },
+                effect:
+                    Effect::Branch {
+                        target,
+                        when_true,
+                        when_false,
+                    },
                 offsets: inner_offsets,
                 control: Some(inner_control),
-            }) = tail else { break };
-            if !along.same_locals(machine) || !along.same_control_stack(machine)
+            }) = tail
+            else {
+                break;
+            };
+            if !along.same_locals(machine)
+                || !along.same_control_stack(machine)
                 || *inner_control.start() <= *control.end()
             {
                 break;
@@ -524,25 +653,21 @@ impl Emitter<'_> {
         Ok(())
     }
 
-    fn emit_while<'a, 'c>(
+    fn emit_loop_test<'a, 'c>(
         &mut self,
-        header: usize,
-        loop_shape: While,
+        scope: &LoopScope<'a, 'c>,
+        test: While,
         region: Region<'_, 'a, 'c>,
-        machine: &mut Machine<'a, 'c>,
+        iteration: &mut Machine<'a, 'c>,
         depth: usize,
-        pending: &mut Vec<u32>,
-    ) -> Result<(), StructureError> {
-        for statement in machine.bind_edge_stack(self.offset(header), None)? {
-            self.push(depth, statement, mem::take(pending));
-        }
-        pending.clear();
-        let scope = Self::loop_scope(header, None, region, machine);
-        let head_line = self.lines.len();
-        self.syntax(depth, "while (true) {");
-        let mut iteration = machine.clone();
-        let Tail { effect, mut offsets, control } =
-            self.lift_block(header, &mut iteration, region, depth + 1, Vec::new())?;
+    ) -> Result<(usize, usize, String), StructureError> {
+        let header = scope.header;
+        self.emitted[header] = true;
+        let Tail {
+            effect,
+            mut offsets,
+            control,
+        } = self.lift_block(header, iteration, region, depth, Vec::new())?;
         let Effect::Branch {
             target,
             when_true,
@@ -551,58 +676,62 @@ impl Emitter<'_> {
         else {
             return Err(self.unstructured(header));
         };
-        iteration.freeze_control_stack(&control.expect("loop condition schedule"))?;
+        let (taken, fallthrough) = self.branch_targets(header, target)?;
+        if !matches!((taken, fallthrough), (a, b)
+            if (a == test.body && b == test.exit) || (a == test.exit && b == test.body))
+        {
+            return Err(self.unstructured(header));
+        }
+        let mut control = control.expect("loop condition schedule");
+        iteration.freeze_control_stack(&control)?;
         for statement in iteration.take_prelude() {
-            self.push(depth + 1, statement, mem::take(&mut offsets));
+            self.push(depth, statement, mem::take(&mut offsets));
         }
-        let (taken, _) = self.branch_targets(header, target)?;
-        let (condition, exit_condition) = if taken == loop_shape.body {
-            (when_true, when_false)
-        } else {
-            (when_false, when_true)
+        let mut condition = Condition {
+            taken,
+            fallthrough,
+            when_true,
+            when_false,
         };
-        let stack = machine.merge_stack(&[&iteration], self.offset(loop_shape.exit))?;
-        let locals = machine.merge_locals(&[&iteration], self.offset(loop_shape.exit), |slot| {
-            self.local_is_live(loop_shape.exit, slot)
-        })?;
-        let exit_stack = stack.arms.into_iter().next().expect("one loop exit edge");
-        let exit_locals = locals.arms.into_iter().next().expect("one loop exit edge");
-        if self.lines.len() == head_line + 1 && exit_stack.is_empty() && exit_locals.is_empty() {
-            let line = &mut self.lines[head_line];
-            line.text = format!("while ({condition}) {{");
-            line.offsets = offsets;
+        self.collapse_condition(
+            header,
+            region,
+            iteration,
+            depth,
+            &mut condition,
+            &mut offsets,
+            &mut control,
+        )?;
+        let (body, condition, exit_condition) = if condition.taken == test.exit {
+            (
+                condition.fallthrough,
+                condition.when_false,
+                condition.when_true,
+            )
+        } else if condition.fallthrough == test.exit {
+            (condition.taken, condition.when_true, condition.when_false)
         } else {
-            // A header that emits statements must execute them on every test,
-            // including the iteration on which the condition fails.
-            self.push(depth + 1, format!("if ({exit_condition}) {{"), offsets);
-            for statement in exit_stack.into_iter().chain(exit_locals.into_iter().map(|copy| copy.statement)) {
-                self.push(depth + 2, statement, Vec::new());
-            }
-            self.syntax(depth + 2, "break;");
-            self.syntax(depth + 1, "}");
-        }
-
-        let mut backedge_offsets = Vec::new();
-        if self.region_with_offsets(
-            loop_shape.body,
-            region.loop_body(&scope),
-            &mut iteration,
+            return Err(self.unstructured(header));
+        };
+        let guard = self.lines.len();
+        self.push(depth, format!("if ({exit_condition}) {{"), offsets);
+        self.emit_loop_transfer(
+            test.exit,
+            region,
+            scope,
+            Transfer::Break,
+            iteration,
             depth + 1,
-            &mut backedge_offsets,
-        )? {
-            self.emit_backedge(&scope, &iteration, depth + 1, &mut backedge_offsets)?;
-        }
+            &mut Vec::new(),
+        )?;
         self.syntax(depth, "}");
-        self.label_loop(head_line, &scope);
-        self.lines.splice(head_line..head_line, stack.declarations.into_iter().chain(locals.declarations)
-            .map(|text| Line::new(depth, text, Vec::new())));
-        Ok(())
+        Ok((body, guard, condition))
     }
 
-    fn emit_general_loop<'a, 'c>(
+    fn emit_loop<'a, 'c>(
         &mut self,
         header: usize,
-        exit: Option<usize>,
+        shape: Loop,
         region: Region<'_, 'a, 'c>,
         machine: &mut Machine<'a, 'c>,
         depth: usize,
@@ -612,31 +741,71 @@ impl Emitter<'_> {
             self.push(depth, statement, mem::take(pending));
         }
         pending.clear();
-        let scope = Self::loop_scope(header, exit, region, machine);
+        let scope = Self::loop_scope(header, shape.exit, region, machine);
         let head_line = self.lines.len();
         self.syntax(depth, "while (true) {");
         let mut iteration = machine.clone();
-        if self.run_region(header, region.loop_body(&scope), &mut iteration, depth + 1, pending, true)? {
+        let body_region = region.loop_body(&scope);
+        let (repeats, guard) = if let Some(test) = shape.test {
+            let (body, guard, condition) =
+                self.emit_loop_test(&scope, test, body_region, &mut iteration, depth + 1)?;
+            let repeats =
+                self.region_with_offsets(body, body_region, &mut iteration, depth + 1, pending)?;
+            (repeats, Some((guard, condition)))
+        } else {
+            (
+                self.run_region(
+                    header,
+                    body_region,
+                    &mut iteration,
+                    depth + 1,
+                    pending,
+                    true,
+                )?,
+                None,
+            )
+        };
+        if repeats {
             self.emit_backedge(&scope, &iteration, depth + 1, pending)?;
         }
         pending.clear();
         self.syntax(depth, "}");
-        self.label_loop(head_line, &scope);
 
         let breaks = scope.breaks.borrow();
-        let Some(exit) = exit.filter(|_| !breaks.is_empty()) else { return Ok(None) };
+        let Some(exit) = shape.exit.filter(|_| !breaks.is_empty()) else {
+            self.label_loop(head_line, &scope);
+            return Ok(None);
+        };
         let exits = breaks.iter().collect::<Vec<_>>();
         let offset = self.offset(exit);
         let stack = machine.merge_stack(&exits, offset)?;
         let locals = machine.merge_locals(&exits, offset, |slot| self.local_is_live(exit, slot))?;
-        let mut assignments = stack.arms.into_iter().zip(locals.arms).map(|(mut stack, locals)| {
-            stack.extend(locals.into_iter().map(|copy| copy.statement));
-            stack
-        }).collect::<Vec<_>>();
+        let mut assignments = stack
+            .arms
+            .into_iter()
+            .zip(locals.arms)
+            .map(|(mut stack, locals)| {
+                stack.extend(locals.into_iter().map(|copy| copy.statement));
+                stack
+            })
+            .collect::<Vec<_>>();
+        if let Some((guard_line, condition)) = guard
+            && guard_line == head_line + 1
+            && assignments[0].is_empty()
+        {
+            let offsets = mem::take(&mut self.lines[guard_line].offsets);
+            self.lines[head_line] = Line::new(depth, format!("while ({condition}) {{"), offsets);
+            self.lines.drain(guard_line..guard_line + 3);
+        }
+        self.label_loop(head_line, &scope);
         if assignments.iter().any(|edge| !edge.is_empty()) {
             let body = self.lines.split_off(head_line + 1);
             for mut line in body {
-                if line.loop_break.as_ref().is_some_and(|edge| edge.header == header) {
+                if line
+                    .loop_break
+                    .as_ref()
+                    .is_some_and(|edge| edge.header == header)
+                {
                     let edge = line.loop_break.take().unwrap();
                     for statement in mem::take(&mut assignments[edge.edge]) {
                         self.push(line.depth, statement, mem::take(&mut line.offsets));
@@ -646,13 +815,23 @@ impl Emitter<'_> {
             }
         } else {
             for line in &mut self.lines[head_line + 1..] {
-                if line.loop_break.as_ref().is_some_and(|edge| edge.header == header) {
+                if line
+                    .loop_break
+                    .as_ref()
+                    .is_some_and(|edge| edge.header == header)
+                {
                     line.loop_break = None;
                 }
             }
         }
-        self.lines.splice(head_line..head_line, stack.declarations.into_iter().chain(locals.declarations)
-            .map(|text| Line::new(depth, text, Vec::new())));
+        self.lines.splice(
+            head_line..head_line,
+            stack
+                .declarations
+                .into_iter()
+                .chain(locals.declarations)
+                .map(|text| Line::new(depth, text, Vec::new())),
+        );
         Ok(Some(exit))
     }
 
@@ -688,7 +867,8 @@ impl Emitter<'_> {
         offsets: &mut Vec<u32>,
     ) -> Result<(), StructureError> {
         let stack = machine.update_edge_stack(&scope.entry, self.offset(scope.header))?;
-        let locals = machine.update_edge_locals(&scope.entry, |slot| self.local_is_live(scope.header, slot))?;
+        let locals = machine
+            .update_edge_locals(&scope.entry, |slot| self.local_is_live(scope.header, slot))?;
         for statement in stack.into_iter().chain(locals) {
             self.push(depth, statement, mem::take(offsets));
         }
@@ -730,7 +910,10 @@ impl Emitter<'_> {
                 let edge = states.len();
                 states.push(machine.clone());
                 let mut line = Line::new(depth, text, mem::take(offsets));
-                line.loop_break = Some(LoopBreak { header: scope.header, edge });
+                line.loop_break = Some(LoopBreak {
+                    header: scope.header,
+                    edge,
+                });
                 self.lines.push(line);
             }
         }
@@ -744,21 +927,23 @@ impl Emitter<'_> {
         machine: &mut Machine<'a, 'c>,
         depth: usize,
         selector: String,
-        offsets: Vec<u32>,
+        offsets: &mut Vec<u32>,
         control: RangeInclusive<u32>,
+        dispatch: Option<&string_switch::Dispatch>,
     ) -> Result<Option<usize>, StructureError> {
-        if machine.has_uninitialized_stack() {
-            return Err(self.unstructured(block));
-        }
         let instruction = &self.instructions[self.graph.blocks[block].instructions.end - 1];
-        let Operand::Switch { default, cases } = &instruction.operand else {
-            return Err(self.unstructured(block));
+        let (default, cases) = match dispatch {
+            Some(dispatch) => (dispatch.default, dispatch.cases.as_slice()),
+            None => match &instruction.operand {
+                Operand::Switch { default, cases } => (*default, cases.as_slice()),
+                _ => return Err(self.unstructured(block)),
+            },
         };
         let default = self
             .graph
-            .block_at(*default)
+            .block_at(default)
             .ok_or_else(|| self.unstructured(block))?;
-        let mut groups = BTreeMap::<usize, Vec<i32>>::new();
+        let mut groups = BTreeMap::<usize, Vec<CaseLabel>>::new();
         groups.entry(default).or_default();
         for &(key, target) in cases {
             let target = self
@@ -766,8 +951,20 @@ impl Emitter<'_> {
                 .block_at(target)
                 .ok_or_else(|| self.unstructured(block))?;
             // tableswitch pads missing keys with the default target.
-            if target != default {
-                groups.entry(target).or_default().push(key);
+            if target != default || dispatch.is_some() {
+                let (text, offsets) = if let Some(dispatch) = dispatch {
+                    let (text, offsets) = dispatch.label(key);
+                    (text.to_owned(), offsets)
+                } else {
+                    let text = machine
+                        .enum_switch_label(instruction.offset, key)
+                        .map_or_else(|| key.to_string(), str::to_owned);
+                    (text, Vec::new())
+                };
+                groups
+                    .entry(target)
+                    .or_default()
+                    .push(CaseLabel { text, offsets });
             }
         }
         let join = self
@@ -786,26 +983,36 @@ impl Emitter<'_> {
                 self.layout.common_join(self.graph, region, arms)
             })
             .or(region.stop);
+        if let Some(join) = join
+            && self.try_switch_expression(
+                block, region, machine, depth, &selector, &groups, default, join, offsets, &control,
+            )
+        {
+            return Ok(Some(join));
+        }
+        if machine.has_uninitialized_stack() {
+            return Err(self.unstructured(block));
+        }
         let switch_region = region.switch_body(join);
-        let mut offsets = offsets;
         let has_fallthrough = || {
             let targets = groups.keys().copied();
-            targets.clone().zip(targets.skip(1)).any(|(target, next)| {
-                self.layout.can_fall_through(target, next, join)
-            })
+            targets
+                .clone()
+                .zip(targets.skip(1))
+                .any(|(target, next)| self.layout.can_fall_through(target, next, join))
         };
         if !machine.stack_is_empty() && has_fallthrough() {
             for statement in machine.bind_edge_stack(self.offset(block), Some(*control.start()))? {
-                self.push(depth, statement, mem::take(&mut offsets));
+                self.push(depth, statement, mem::take(offsets));
             }
         } else {
             machine.freeze_control_stack(&control)?;
         }
         for statement in machine.take_prelude() {
-            self.push(depth, statement, mem::take(&mut offsets));
+            self.push(depth, statement, mem::take(offsets));
         }
         let start = self.lines.len();
-        self.push(depth, format!("switch ({selector}) {{"), offsets);
+        self.push(depth, format!("switch ({selector}) {{"), mem::take(offsets));
         let mut arms = Vec::new();
         let mut groups = groups.into_iter().peekable();
         while let Some((target, keys)) = groups.next() {
@@ -819,12 +1026,14 @@ impl Emitter<'_> {
                 switch_region
             };
             let mut keys = keys.into_iter().peekable();
-            while let Some(key) = keys.next() {
-                if keys.peek().is_none() {
-                    self.push(depth + 1, format!("case {key}: {{"), Vec::new());
+            while let Some(CaseLabel { mut text, offsets }) = keys.next() {
+                text.insert_str(0, "case ");
+                text.push_str(if keys.peek().is_none() && target != default {
+                    ": {"
                 } else {
-                    self.push(depth + 1, format!("case {key}:"), Vec::new());
-                }
+                    ":"
+                });
+                self.push(depth + 1, text, offsets);
             }
             if target == default {
                 self.syntax(depth + 1, "default: {");
@@ -836,7 +1045,8 @@ impl Emitter<'_> {
                     for statement in end.update_edge_stack(machine, self.offset(next))? {
                         self.push(depth + 2, statement, mem::take(&mut offsets));
                     }
-                    let updates = end.update_edge_locals(machine, |slot| self.local_is_live(next, slot))?;
+                    let updates =
+                        end.update_edge_locals(machine, |slot| self.local_is_live(next, slot))?;
                     for statement in updates {
                         self.push(depth + 2, statement, mem::take(&mut offsets));
                     }
@@ -856,10 +1066,19 @@ impl Emitter<'_> {
         let (declarations, assignments) = self.merge_arms(machine, join, &exits)?;
         for (arm, assignments) in arms.into_iter().zip(assignments).rev() {
             let mut offsets = arm.offsets;
-            self.lines.splice(arm.end..arm.end, assignments.into_iter()
-                .map(|text| Line::new(depth + 2, text, mem::take(&mut offsets))));
+            self.lines.splice(
+                arm.end..arm.end,
+                assignments
+                    .into_iter()
+                    .map(|text| Line::new(depth + 2, text, mem::take(&mut offsets))),
+            );
         }
-        self.lines.splice(start..start, declarations.into_iter().map(|text| Line::new(depth, text, Vec::new())));
+        self.lines.splice(
+            start..start,
+            declarations
+                .into_iter()
+                .map(|text| Line::new(depth, text, Vec::new())),
+        );
         Ok(Some(join))
     }
 
@@ -874,7 +1093,12 @@ impl Emitter<'_> {
         let mut arm = baseline.clone();
         let mut offsets = Vec::new();
         let reaches = self.region_with_offsets(start, region, &mut arm, depth, &mut offsets)?;
-        Ok(Arm { exit: reaches.then_some(arm), offsets, start: start_line, end: self.lines.len() })
+        Ok(Arm {
+            exit: reaches.then_some(arm),
+            offsets,
+            start: start_line,
+            end: self.lines.len(),
+        })
     }
 
     fn merge_arms<'a, 'c>(
@@ -884,12 +1108,16 @@ impl Emitter<'_> {
         arms: &[&Arm<'a, 'c>],
     ) -> Result<(Vec<String>, Vec<Vec<String>>), StructureError> {
         let offset = self.offset(join);
-        let exits = arms.iter().map(|arm| arm.exit.as_ref().expect("arm reached the join")).collect::<Vec<_>>();
+        let exits = arms
+            .iter()
+            .map(|arm| arm.exit.as_ref().expect("arm reached the join"))
+            .collect::<Vec<_>>();
         let mut code = machine.merge_stack(&exits, offset)?;
         let locals = machine.merge_locals(&exits, offset, |slot| self.local_is_live(join, slot))?;
         code.declarations.extend(locals.declarations);
         for ((arm, stack), locals) in arms.iter().zip(&mut code.arms).zip(locals.arms) {
-            let mut last = (stack.is_empty() && arm.start < arm.end).then(|| &mut self.lines[arm.end - 1].text);
+            let mut last = (stack.is_empty() && arm.start < arm.end)
+                .then(|| &mut self.lines[arm.end - 1].text);
             for copy in locals {
                 if !last.as_deref_mut().is_some_and(|line| copy.fuse(line)) {
                     stack.push(copy.statement);
@@ -900,14 +1128,21 @@ impl Emitter<'_> {
     }
 
     fn local_is_live(&mut self, block: usize, slot: u16) -> bool {
-        self.layout.local_is_live(self.graph, self.instructions, block, slot)
+        self.layout
+            .local_is_live(self.graph, self.instructions, block, slot)
     }
 
-    fn require_empty_stack(&self, machine: &Machine<'_, '_>, block: usize) -> Result<(), StructureError> {
+    fn require_empty_stack(
+        &self,
+        machine: &Machine<'_, '_>,
+        block: usize,
+    ) -> Result<(), StructureError> {
         if machine.stack_is_empty() {
             Ok(())
         } else {
-            Err(StructureError::StackJoin { offset: self.offset(block) })
+            Err(StructureError::StackJoin {
+                offset: self.offset(block),
+            })
         }
     }
     fn scoped_arm<'a, 'c>(

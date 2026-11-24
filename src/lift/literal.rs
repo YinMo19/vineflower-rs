@@ -34,7 +34,9 @@ pub(crate) fn constant_literal_with_options(
     options: &Options,
     name: impl Fn(&str) -> String,
 ) -> Result<String, LiftError> {
-    if !options.keep_literals && let Some(symbolic) = super::numeric::named(pool.get(index)?, expected, name) {
+    if !options.keep_literals
+        && let Some(symbolic) = super::numeric::named(pool.get(index)?, expected, name)
+    {
         return Ok(symbolic.text);
     }
     constant_literal(pool, index, expected, options.ascii_strings)

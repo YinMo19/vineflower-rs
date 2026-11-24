@@ -62,10 +62,17 @@ pub fn normalize(
     handlers: Vec<ExceptionHandler>,
     pool: &ConstantPool<'_>,
 ) -> Result<NormalizedCode, LegacyError> {
-    if instructions.iter().any(|op| matches!(op.opcode, 0xa8 | 0xa9 | 0xc9)) {
+    if instructions
+        .iter()
+        .any(|op| matches!(op.opcode, 0xa8 | 0xa9 | 0xc9))
+    {
         expand::expand(&instructions, &handlers, pool)
     } else {
-        Ok(NormalizedCode { instructions, handlers, origins: None })
+        Ok(NormalizedCode {
+            instructions,
+            handlers,
+            origins: None,
+        })
     }
 }
 

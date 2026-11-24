@@ -90,10 +90,22 @@ impl<'a> Writer<'a, '_> {
             let varargs = varargs && index + 1 == components.len();
             let ty = if let Some(sig) = sig {
                 let ty = parse(sig, FieldSignature::parse)?;
-                self.render_type_target(&ty.field_type, &annotations, TypeTarget::Field, &declarations, varargs)?
+                self.render_type_target(
+                    &ty.field_type,
+                    &annotations,
+                    TypeTarget::Field,
+                    &declarations,
+                    varargs,
+                )?
             } else {
                 let ty = parse(descriptor, Type::parse)?;
-                self.render_type_target(&ty, &annotations, TypeTarget::Field, &declarations, varargs)?
+                self.render_type_target(
+                    &ty,
+                    &annotations,
+                    TypeTarget::Field,
+                    &declarations,
+                    varargs,
+                )?
             };
             out.push_str(&ty);
             out.push(' ');
@@ -122,8 +134,8 @@ pub(super) fn is_generated(
 ) -> Result<bool, DecompileError> {
     let pool = &class.pool;
     let owner = pool.class_name(class.this_class)?;
-    let annotated = !method.annotations(pool, true)?.is_empty()
-        || !method.annotations(pool, false)?.is_empty();
+    let annotated =
+        !method.annotations(pool, true)?.is_empty() || !method.annotations(pool, false)?.is_empty();
     if !method.exceptions(pool)?.is_empty() {
         return Ok(false);
     }

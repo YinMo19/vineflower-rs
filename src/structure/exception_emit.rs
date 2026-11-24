@@ -38,13 +38,19 @@ impl Emitter<'_> {
         self.require_empty_stack(machine, shape.start)?;
         pending.clear();
         if let Some(resource) = self.prove_resource(shape, region, machine, depth)? {
-            return self.emit_resource(shape, resource, region, machine, depth).map(Some);
+            return self
+                .emit_resource(shape, resource, region, machine, depth)
+                .map(Some);
         }
         let (clauses, scope) = if let Some(inner) = exceptions.catches_of_finally(shape) {
-            (inner, region.exception(shape.join, shape.body, Some(machine)))
+            (
+                inner,
+                region.exception(shape.join, shape.body, Some(machine)),
+            )
         } else {
             (shape, region)
         };
+        let body_lines = self.lines.len();
         self.syntax(depth, "try {");
         let mut reaches_join = self.scoped_arm(
             clauses.start,
@@ -61,7 +67,8 @@ impl Emitter<'_> {
                     // The verifier supplies the handler's actual local type;
                     // using an arbitrary alternative can incorrectly narrow
                     // later expressions referring to the catch parameter.
-                    let common = body.caught_exception_stack_type(store.offset)?
+                    let common = body
+                        .caught_exception_stack_type(store.offset)?
                         .ok_or(StructureError::ExceptionHandlers)?;
                     let (_, name) = body.bind_caught_exception(common, store)?;
                     let mut union = String::new();
@@ -92,6 +99,17 @@ impl Emitter<'_> {
         }
         let mut continuation = shape.join;
         if let Some(finally) = &shape.finally {
+            for &(returned, stored) in finally.spill_offsets() {
+                let returned = self.instructions[returned].offset;
+                let store = &self.instructions[stored];
+                for line in &mut self.lines[body_lines..] {
+                    if let Some(at) = line.offsets.iter().position(|&offset| offset == returned) {
+                        line.offsets
+                            .splice(at..=at, store.offset..store.offset + store.len);
+                        break;
+                    }
+                }
+            }
             self.syntax(depth, "} finally {");
             let mut body = machine.clone();
             let mut offsets = Vec::new();
@@ -249,7 +267,9 @@ impl Emitter<'_> {
             || line.depth != depth
             || !line.offsets.contains(&initialization.offset)
             || !line.text.ends_with(';')
-            || line.text.strip_prefix(&ty)
+            || line
+                .text
+                .strip_prefix(&ty)
                 .and_then(|text| text.strip_prefix(' '))
                 .and_then(|text| text.strip_prefix(name))
                 .is_none_or(|text| !text.starts_with(" = "))
@@ -280,7 +300,10 @@ impl Emitter<'_> {
             }
             _ => return Ok(None),
         };
-        let Some(inner) = self.exceptions.at_start(Some(primary.arm), exceptional_close) else {
+        let Some(inner) = self
+            .exceptions
+            .at_start(Some(primary.arm), exceptional_close)
+        else {
             return Ok(None);
         };
         let inner = self.exceptions.region(inner);
@@ -339,9 +362,16 @@ impl Emitter<'_> {
             || reference_load(suppressed_arg) != Some(suppressed)
             || add_suppressed.opcode != 0xb6
             || machine.exception_member(add_suppressed_index)?
-                != ("java/lang/Throwable", "addSuppressed", "(Ljava/lang/Throwable;)V")
+                != (
+                    "java/lang/Throwable",
+                    "addSuppressed",
+                    "(Ljava/lang/Throwable;)V",
+                )
             || self.after_prefix(suppression.start, 4) != Some(rethrow)
-            || !self.exceptions.arm_blocks(primary.arm).all(|block| skipped.contains(&block))
+            || !self
+                .exceptions
+                .arm_blocks(primary.arm)
+                .all(|block| skipped.contains(&block))
         {
             return Ok(None);
         }
@@ -378,30 +408,48 @@ impl Emitter<'_> {
         let ambient = &self.graph.blocks[normal_close].exception_successors;
         if self.graph.blocks[suppression.start].exception_successors != *ambient
             || self.graph.blocks[rethrow].exception_successors != *ambient
-            || !self.graph.blocks[exceptional_close].exception_successors.iter().copied()
-                .filter(|&handler| handler != suppression.start).eq(ambient.iter().copied())
+            || !self.graph.blocks[exceptional_close]
+                .exception_successors
+                .iter()
+                .copied()
+                .filter(|&handler| handler != suppression.start)
+                .eq(ambient.iter().copied())
             || skipped.contains(&continuation)
-            || self.exceptions.at_start(region.exception_arm, normal_cleanup).is_some()
-            || self.exceptions.at_start(region.exception_arm, normal_close).is_some()
+            || self
+                .exceptions
+                .at_start(region.exception_arm, normal_cleanup)
+                .is_some()
+            || self
+                .exceptions
+                .at_start(region.exception_arm, normal_close)
+                .is_some()
             || skipped.iter().any(|&block| {
                 self.emitted[block]
                     || self.exceptions.cleanup_prefix(block) != 0
                     || !self.exceptions.contains(region.exception_arm, block)
                     || self.graph.blocks[block].predecessors.iter().any(|pred| {
-                        !skipped.contains(pred) && !self.exceptions.contains(Some(shape.body), *pred)
+                        !skipped.contains(pred)
+                            && !self.exceptions.contains(Some(shape.body), *pred)
                     })
             })
             || self.exceptions.arm_blocks(shape.body).any(|block| {
                 self.block_instructions(block).iter().any(|instruction| {
-                    matches!(instruction.opcode, 0xac..=0xb1)
-                        || is_slot_write(instruction, slot)
+                    matches!(instruction.opcode, 0xac..=0xb1) || is_slot_write(instruction, slot)
                 })
             })
-            || self.layout.local_is_live(self.graph, self.instructions, continuation, slot)
+            || self
+                .layout
+                .local_is_live(self.graph, self.instructions, continuation, slot)
         {
             return Ok(None);
         }
-        Ok(Some(Resource { acquisition, slot, normal_cleanup, continuation, skipped }))
+        Ok(Some(Resource {
+            acquisition,
+            slot,
+            normal_cleanup,
+            continuation,
+            skipped,
+        }))
     }
 
     fn close_method(
@@ -420,8 +468,10 @@ impl Emitter<'_> {
             return Ok(None);
         };
         let (owner, name, descriptor) = machine.exception_member(index)?;
-        Ok((name == "close" && descriptor == "()V" && machine.is_auto_closeable(owner))
-            .then_some(index))
+        Ok(
+            (name == "close" && descriptor == "()V" && machine.is_auto_closeable(owner))
+                .then_some(index),
+        )
     }
 
     fn after_prefix(&self, block: usize, consumed: usize) -> Option<usize> {
@@ -454,7 +504,9 @@ impl Emitter<'_> {
             return Ok(false);
         };
         let (owner, method, _) = machine.exception_member(index)?;
-        let Some(start) = prefix.iter().rposition(|instruction| instruction.opcode == 0xbb)
+        let Some(start) = prefix
+            .iter()
+            .rposition(|instruction| instruction.opcode == 0xbb)
         else {
             return Ok(false);
         };
@@ -467,7 +519,9 @@ impl Emitter<'_> {
         Ok(method == "<init>"
             && machine.exception_class(class)? == owner
             && duplicate.opcode == 0x59
-            && arguments.iter().all(|instruction| matches!(instruction.opcode, 0x01..=0x2d)))
+            && arguments
+                .iter()
+                .all(|instruction| matches!(instruction.opcode, 0x01..=0x2d)))
     }
 
     pub(super) fn exception_range(
@@ -508,8 +562,10 @@ fn throwable_catch<'r>(
     let &[exception] = catch.alternatives.as_slice() else {
         return Ok(None);
     };
-    Ok((region.finally.is_none() && machine.exception_class(exception)? == "java/lang/Throwable")
-        .then_some(catch))
+    Ok(
+        (region.finally.is_none() && machine.exception_class(exception)? == "java/lang/Throwable")
+            .then_some(catch),
+    )
 }
 
 fn invocation_index(instruction: &Instruction) -> Option<u16> {

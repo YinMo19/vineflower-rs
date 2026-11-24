@@ -43,7 +43,11 @@ impl MemberRenames {
         let hierarchy = Hierarchy::build(group, options)?;
         let order = hierarchy.parent_first();
         let classes = class_aliases(group, options, &mut renamer)?;
-        let mut result = Self { classes, hierarchy, aliases: Vec::new() };
+        let mut result = Self {
+            classes,
+            hierarchy,
+            aliases: Vec::new(),
+        };
         result.assign_methods(&order, &mut renamer);
         result.assign_fields(&order, &mut renamer);
         Ok(result)
@@ -51,7 +55,9 @@ impl MemberRenames {
 
     /// Effective internal binary name, including a renamed enclosing class.
     pub fn class_name<'a>(&'a self, original: &'a str) -> &'a str {
-        self.classes.get(original).map_or(original, |alias| &alias.binary)
+        self.classes
+            .get(original)
+            .map_or(original, |alias| &alias.binary)
     }
 
     /// The changed simple name in a class declaration, if any.
@@ -67,23 +73,35 @@ impl MemberRenames {
 
     pub fn method_alias(&self, owner: &str, name: &str, descriptor: &str) -> Option<&str> {
         let index = *self.hierarchy.indices.get(owner)?;
-        self.alias(find(&self.hierarchy.entries[index].methods, name, descriptor)?)
+        self.alias(find(
+            &self.hierarchy.entries[index].methods,
+            name,
+            descriptor,
+        )?)
     }
 
     /// Name of a typed field reference. The constant-pool owner can inherit the
     /// field instead of declaring it; JVM field lookup visits interfaces first.
     pub fn field_name<'a>(&'a self, owner: &str, name: &'a str, descriptor: &str) -> &'a str {
-        let Some(&owner) = self.hierarchy.indices.get(owner) else { return name };
-        self.hierarchy.resolve_field(owner, name, descriptor)
-            .and_then(|member| self.alias(member)).unwrap_or(name)
+        let Some(&owner) = self.hierarchy.indices.get(owner) else {
+            return name;
+        };
+        self.hierarchy
+            .resolve_field(owner, name, descriptor)
+            .and_then(|member| self.alias(member))
+            .unwrap_or(name)
     }
 
     /// Name of a typed method reference. Direct declarations and superclasses
     /// take precedence over inherited interface methods.
     pub fn method_name<'a>(&'a self, owner: &str, name: &'a str, descriptor: &str) -> &'a str {
-        let Some(&owner) = self.hierarchy.indices.get(owner) else { return name };
-        self.hierarchy.resolve_method(owner, name, descriptor)
-            .and_then(|member| self.alias(member)).unwrap_or(name)
+        let Some(&owner) = self.hierarchy.indices.get(owner) else {
+            return name;
+        };
+        self.hierarchy
+            .resolve_method(owner, name, descriptor)
+            .and_then(|member| self.alias(member))
+            .unwrap_or(name)
     }
 
     fn alias(&self, declaration: &Declaration) -> Option<&str> {
@@ -150,8 +168,19 @@ impl MemberRenames {
         let mut occupied: HashMap<&str, Vec<usize>> = HashMap::new();
         for (owner, entry) in entries.iter().enumerate() {
             let mut names = HashSet::new();
-            names.extend(entry.methods.iter().map(|m| m.name.as_str()).filter(|n| n.starts_with("method_")));
-            names.extend(inherited[owner].keys().map(|&(name, _, _)| name).filter(|n| n.starts_with("method_")));
+            names.extend(
+                entry
+                    .methods
+                    .iter()
+                    .map(|m| m.name.as_str())
+                    .filter(|n| n.starts_with("method_")),
+            );
+            names.extend(
+                inherited[owner]
+                    .keys()
+                    .map(|&(name, _, _)| name)
+                    .filter(|n| n.starts_with("method_")),
+            );
             for name in names {
                 occupied.entry(name).or_default().push(owner);
             }
@@ -174,10 +203,14 @@ impl MemberRenames {
                 }
                 let index = *assigned[family].get_or_insert_with(|| {
                     let name = renamer.next_available(IdentifierKind::Method, None, |candidate| {
-                        occupied.get(candidate).is_some_and(|scopes| scopes.iter().any(|&scope| {
-                            scope == owner || inherited[scope].get(&method.signature())
-                                .is_some_and(|&id| families.root(id) == family)
-                        }))
+                        occupied.get(candidate).is_some_and(|scopes| {
+                            scopes.iter().any(|&scope| {
+                                scope == owner
+                                    || inherited[scope]
+                                        .get(&method.signature())
+                                        .is_some_and(|&id| families.root(id) == family)
+                            })
+                        })
                     });
                     let index = self.aliases.len();
                     self.aliases.push(name);
@@ -201,22 +234,44 @@ impl MemberRenames {
                 occupied.entry(&field.name).or_default().push(owner);
             }
         }
-        let assigned: Vec<_> = order.iter().filter_map(|&owner| {
-            let entry = &hierarchy.entries[owner];
-            entry.source.then(|| (owner, entry.fields.iter().map(|field| {
-                if !MemberRenamer::to_be_renamed(IdentifierKind::Field, Some(&field.name)) {
-                    return None;
-                }
-                let name = renamer.next_available(IdentifierKind::Field, None, |candidate| {
-                    occupied.get(candidate).is_some_and(|scopes| scopes.iter().any(|&scope| {
-                        hierarchy.reaches(owner, scope) || hierarchy.reaches(scope, owner)
-                    }))
-                });
-                let index = self.aliases.len();
-                self.aliases.push(name);
-                Some(index)
-            }).collect::<Vec<_>>()))
-        }).collect();
+        let assigned: Vec<_> = order
+            .iter()
+            .filter_map(|&owner| {
+                let entry = &hierarchy.entries[owner];
+                entry.source.then(|| {
+                    (
+                        owner,
+                        entry
+                            .fields
+                            .iter()
+                            .map(|field| {
+                                if !MemberRenamer::to_be_renamed(
+                                    IdentifierKind::Field,
+                                    Some(&field.name),
+                                ) {
+                                    return None;
+                                }
+                                let name = renamer.next_available(
+                                    IdentifierKind::Field,
+                                    None,
+                                    |candidate| {
+                                        occupied.get(candidate).is_some_and(|scopes| {
+                                            scopes.iter().any(|&scope| {
+                                                hierarchy.reaches(owner, scope)
+                                                    || hierarchy.reaches(scope, owner)
+                                            })
+                                        })
+                                    },
+                                );
+                                let index = self.aliases.len();
+                                self.aliases.push(name);
+                                Some(index)
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                })
+            })
+            .collect();
         for (owner, aliases) in assigned {
             for (field, alias) in self.hierarchy.entries[owner].fields.iter_mut().zip(aliases) {
                 field.alias = alias;
@@ -239,7 +294,12 @@ struct Declaration {
 
 impl Declaration {
     fn new(name: &str, descriptor: &str, flags: u16) -> Self {
-        Self { name: name.into(), descriptor: descriptor.into(), flags, alias: None }
+        Self {
+            name: name.into(),
+            descriptor: descriptor.into(),
+            flags,
+            alias: None,
+        }
     }
 
     fn signature(&self) -> (&str, &str, bool) {
@@ -247,8 +307,14 @@ impl Declaration {
     }
 }
 
-fn find<'a>(declarations: &'a [Declaration], name: &str, descriptor: &str) -> Option<&'a Declaration> {
-    declarations.iter().find(|member| member.name == name && member.descriptor == descriptor)
+fn find<'a>(
+    declarations: &'a [Declaration],
+    name: &str,
+    descriptor: &str,
+) -> Option<&'a Declaration> {
+    declarations
+        .iter()
+        .find(|member| member.name == name && member.descriptor == descriptor)
 }
 
 #[derive(Debug, Default)]
@@ -270,7 +336,9 @@ struct Entry {
 
 impl Entry {
     fn parents(&self) -> impl DoubleEndedIterator<Item = usize> + '_ {
-        self.parent.into_iter().chain(self.interfaces.iter().copied())
+        self.parent
+            .into_iter()
+            .chain(self.interfaces.iter().copied())
     }
 }
 
@@ -287,8 +355,8 @@ impl Hierarchy {
         for (_, class) in group.sources() {
             for constant in class.pool.iter() {
                 if let Constant::Fieldref { class_index, .. }
-                    | Constant::Methodref { class_index, .. }
-                    | Constant::InterfaceMethodref { class_index, .. } = constant
+                | Constant::Methodref { class_index, .. }
+                | Constant::InterfaceMethodref { class_index, .. } = constant
                 {
                     let owner = class.pool.class_name(*class_index)?;
                     if !owner.starts_with('[') {
@@ -302,27 +370,61 @@ impl Hierarchy {
             // Enqueueing parents can reallocate pending, so take the name.
             let name = std::mem::take(&mut pending[i]);
             let next_package = packages.len();
-            let package = *packages.entry(package(&name).to_owned()).or_insert(next_package);
-            let mut entry = Entry { package, ..Entry::default() };
+            let package = *packages
+                .entry(package(&name).to_owned())
+                .or_insert(next_package);
+            let mut entry = Entry {
+                package,
+                ..Entry::default()
+            };
             if let Some(class) = group.get(&name) {
                 entry.source = sources.contains(name.as_str());
                 entry.flags = class.access_flags;
                 if class.super_class != 0 {
-                    entry.parent = Some(graph.enqueue(class.pool.class_name(class.super_class)?, &mut pending));
+                    entry.parent = Some(
+                        graph.enqueue(class.pool.class_name(class.super_class)?, &mut pending),
+                    );
                 }
                 for &interface in &class.interfaces {
-                    entry.interfaces.push(graph.enqueue(class.pool.class_name(interface)?, &mut pending));
+                    entry
+                        .interfaces
+                        .push(graph.enqueue(class.pool.class_name(interface)?, &mut pending));
                 }
                 entry.fields = read_members(class, &class.fields)?;
                 entry.methods = read_members(class, &class.methods)?;
             } else {
-                let external = [options.library_classpath.as_deref(), options.runtime_classpath.as_deref()];
-                if let Some(metadata) = external.into_iter().flatten().find_map(|path| path.metadata(&name).ok().flatten()) {
+                let external = [
+                    options.library_classpath.as_deref(),
+                    options.runtime_classpath.as_deref(),
+                ];
+                if let Some(metadata) = external
+                    .into_iter()
+                    .flatten()
+                    .find_map(|path| path.metadata(&name).ok().flatten())
+                {
                     entry.flags = metadata.access_flags;
-                    entry.parent = metadata.super_name.as_deref().map(|name| graph.enqueue(name, &mut pending));
-                    entry.interfaces.extend(metadata.interfaces.iter().map(|name| graph.enqueue(name, &mut pending)));
-                    entry.fields.extend(metadata.fields.iter().map(|m| Declaration::new(&m.name, &m.descriptor, m.access_flags)));
-                    entry.methods.extend(metadata.methods.iter().map(|m| Declaration::new(&m.name, &m.descriptor, m.access_flags)));
+                    entry.parent = metadata
+                        .super_name
+                        .as_deref()
+                        .map(|name| graph.enqueue(name, &mut pending));
+                    entry.interfaces.extend(
+                        metadata
+                            .interfaces
+                            .iter()
+                            .map(|name| graph.enqueue(name, &mut pending)),
+                    );
+                    entry.fields.extend(
+                        metadata
+                            .fields
+                            .iter()
+                            .map(|m| Declaration::new(&m.name, &m.descriptor, m.access_flags)),
+                    );
+                    entry.methods.extend(
+                        metadata
+                            .methods
+                            .iter()
+                            .map(|m| Declaration::new(&m.name, &m.descriptor, m.access_flags)),
+                    );
                 }
             }
             graph.entries.push(entry);
@@ -449,12 +551,20 @@ impl Hierarchy {
     }
 }
 
-fn read_members(class: &ClassFile<'_>, members: &[Member<'_>]) -> Result<Vec<Declaration>, ClassError> {
-    members.iter().map(|member| Ok(Declaration::new(
-        class.pool.utf8(member.name_index)?,
-        class.pool.utf8(member.descriptor_index)?,
-        member.access_flags,
-    ))).collect()
+fn read_members(
+    class: &ClassFile<'_>,
+    members: &[Member<'_>],
+) -> Result<Vec<Declaration>, ClassError> {
+    members
+        .iter()
+        .map(|member| {
+            Ok(Declaration::new(
+                class.pool.utf8(member.name_index)?,
+                class.pool.utf8(member.descriptor_index)?,
+                member.access_flags,
+            ))
+        })
+        .collect()
 }
 
 struct Families(Vec<usize>);
@@ -491,10 +601,13 @@ fn class_aliases(
     let attached = |name: &str| options.decompile_inner && group.is_attached(name);
     let exists = |candidate: &str| {
         group.get(candidate).is_some()
-            || [options.library_classpath.as_deref(), options.runtime_classpath.as_deref()]
-                .into_iter()
-                .flatten()
-                .any(|path| path.metadata(candidate).is_ok_and(|class| class.is_some()))
+            || [
+                options.library_classpath.as_deref(),
+                options.runtime_classpath.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|path| path.metadata(candidate).is_ok_and(|class| class.is_some()))
     };
     let mut simple = HashMap::new();
     let mut allocated = HashSet::new();
@@ -520,7 +633,9 @@ fn class_aliases(
                 if !owned.contains(name) || !attached(name) || simple.contains_key(name) {
                     continue;
                 }
-                let Some(node) = group.nested_class(name) else { continue };
+                let Some(node) = group.nested_class(name) else {
+                    continue;
+                };
                 let leaf = match &node.kind {
                     NestedKind::Member(leaf) | NestedKind::Local(leaf) => leaf,
                     NestedKind::Anonymous => continue,
@@ -536,16 +651,21 @@ fn class_aliases(
                 } else {
                     ""
                 };
-                let alias = renamer.next_available(IdentifierKind::Class, Some(leaf), |candidate| {
-                    exists(&format!("{}${local_prefix}{candidate}", node.outer))
-                        || group.children(&node.outer).any(|(sibling, declaration)| {
-                            simple.get(sibling).is_some_and(|simple| simple == candidate)
-                                || match &declaration.kind {
-                                    NestedKind::Member(name) | NestedKind::Local(name) => name == candidate,
-                                    NestedKind::Anonymous => false,
-                                }
-                        })
-                });
+                let alias =
+                    renamer.next_available(IdentifierKind::Class, Some(leaf), |candidate| {
+                        exists(&format!("{}${local_prefix}{candidate}", node.outer))
+                            || group.children(&node.outer).any(|(sibling, declaration)| {
+                                simple
+                                    .get(sibling)
+                                    .is_some_and(|simple| simple == candidate)
+                                    || match &declaration.kind {
+                                        NestedKind::Member(name) | NestedKind::Local(name) => {
+                                            name == candidate
+                                        }
+                                        NestedKind::Anonymous => false,
+                                    }
+                            })
+                    });
                 simple.insert(name, alias);
             }
         }
@@ -558,7 +678,9 @@ fn class_aliases(
     for (name, _) in group.sources() {
         let mut path = vec![(name, simple.get(name))];
         let mut owner = name;
-        while attached(owner) && let Some(nested) = group.nested_class(owner) {
+        while attached(owner)
+            && let Some(nested) = group.nested_class(owner)
+        {
             owner = &nested.outer;
             if path.iter().any(|(seen, _)| *seen == owner) {
                 break;
@@ -577,10 +699,14 @@ fn class_aliases(
         let mut outer = root;
         for (nested, alias) in path.into_iter().rev() {
             binary.push('$');
-            let suffix = nested.strip_prefix(outer).and_then(|suffix| suffix.strip_prefix('$'))
+            let suffix = nested
+                .strip_prefix(outer)
+                .and_then(|suffix| suffix.strip_prefix('$'))
                 .unwrap_or_else(|| nested.rsplit('/').next().unwrap_or(nested));
             if let Some(alias) = alias {
-                if let Some(NestedKind::Local(leaf)) = group.nested_class(nested).map(|node| &node.kind) {
+                if let Some(NestedKind::Local(leaf)) =
+                    group.nested_class(nested).map(|node| &node.kind)
+                {
                     binary.push_str(suffix.strip_suffix(leaf.as_str()).unwrap_or(""));
                 }
                 binary.push_str(alias);
@@ -589,10 +715,19 @@ fn class_aliases(
             }
             outer = nested;
         }
-        result.insert(name.into(), ClassAlias { binary, simple: None });
+        result.insert(
+            name.into(),
+            ClassAlias {
+                binary,
+                simple: None,
+            },
+        );
     }
     for (name, alias) in simple {
-        result.get_mut(name).expect("each renamed class has a binary alias").simple = Some(alias);
+        result
+            .get_mut(name)
+            .expect("each renamed class has a binary alias")
+            .simple = Some(alias);
     }
     Ok(result)
 }

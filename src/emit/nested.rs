@@ -7,8 +7,9 @@ use crate::{
     context::{NestedClass, NestedKind},
 };
 
-use super::{DecompileError, Enumeration, INTERFACE, PUBLIC, STATIC, SYNTHETIC, SourceMap, Writer};
+use super::initializers::FieldInitializers;
 use super::type_annotations::TypeNesting;
+use super::{DecompileError, Enumeration, INTERFACE, PUBLIC, STATIC, SYNTHETIC, SourceMap, Writer};
 
 #[path = "local.rs"]
 mod local;
@@ -23,19 +24,28 @@ impl<'a, 'c> Writer<'a, 'c> {
             return Ok(());
         }
         for (name, node) in self.group.children(self.owner) {
-            let NestedKind::Member(simple) = &node.kind else { continue };
+            let Some(member) = self.group.member_class(name) else {
+                continue;
+            };
+            let auxiliary = matches!(node.kind, NestedKind::Anonymous)
+                .then(|| self.group.enum_switches().auxiliary_visibility(name))
+                .flatten();
             let class = self.group.get(name).expect("source member is registered");
             if !self.matches_member_class(name)
-                || (self.options.method_to_decompile.is_empty() && self.options.remove_synthetic
-                    && ((class.access_flags | node.access_flags) & SYNTHETIC != 0
-                        || find_attribute(&class.attributes, &class.pool, "Synthetic")?.is_some()))
+                || auxiliary.unwrap_or(
+                    self.options.method_to_decompile.is_empty()
+                        && self.options.remove_synthetic
+                        && ((class.access_flags | node.access_flags) & SYNTHETIC != 0
+                            || find_attribute(&class.attributes, &class.pool, "Synthetic")?
+                                .is_some()),
+                )
             {
                 continue;
             }
             if needs_gap {
                 self.line(0, "");
             }
-            self.write_nested(name, node, simple, self.depth + 1)?;
+            self.write_nested(name, node, member.simple_name, self.depth + 1)?;
             needs_gap = true;
         }
         Ok(())
@@ -48,7 +58,11 @@ impl<'a, 'c> Writer<'a, 'c> {
         simple: &str,
         depth: usize,
     ) -> Result<(), DecompileError> {
-        let simple = self.names.renames().simple_class_alias(name).unwrap_or(simple);
+        let simple = self
+            .names
+            .renames()
+            .simple_class_alias(name)
+            .unwrap_or(simple);
         self.with_nested(name, node, depth, |writer| writer.class(simple))
     }
 
@@ -60,13 +74,21 @@ impl<'a, 'c> Writer<'a, 'c> {
         write: impl FnOnce(&mut Self) -> Result<(), DecompileError>,
     ) -> Result<(), DecompileError> {
         if depth > 128 {
-            return Err(DecompileError::Unsupported { feature: "excessive class nesting" });
+            return Err(DecompileError::Unsupported {
+                feature: "excessive class nesting",
+            });
         }
-        let class = self.group.get(name).expect("nested source class is registered");
+        let class = self
+            .group
+            .get(name)
+            .expect("nested source class is registered");
         let name = class.pool.class_name(class.this_class)?;
         let type_nesting = Rc::new(TypeNesting::new(class)?);
-        let mut flags = node.access_flags;
-        if matches!(node.kind, NestedKind::Member(_)) && self.flags & INTERFACE != 0 {
+        let member = self.group.member_class(name);
+        let mut flags = member
+            .as_ref()
+            .map_or(node.access_flags, |member| member.access_flags);
+        if member.is_some() && self.flags & INTERFACE != 0 {
             // A type declared in an interface is implicitly public and static.
             flags &= !(PUBLIC | STATIC);
         } else if matches!(node.kind, NestedKind::Local(_)) {
@@ -95,6 +117,7 @@ impl<'a, 'c> Writer<'a, 'c> {
         enumeration: Option<&Enumeration<'_>>,
         constructors: usize,
         needs_gap: &mut bool,
+        initializers: &FieldInitializers<'_>,
     ) -> Result<(), DecompileError> {
         let class = self.class;
         let pool = &class.pool;
@@ -105,8 +128,12 @@ impl<'a, 'c> Writer<'a, 'c> {
         // Lambda recovery marks any synthetic methods still referenced by its
         // emitted expression. Stage only classes which may need that pass:
         // ordinary class methods stream directly in class-file order.
-        let stage = !explicitly_selected && self.options.remove_synthetic
-            && class.methods.iter().any(|method| method.access_flags & SYNTHETIC != 0)
+        let stage = !explicitly_selected
+            && self.options.remove_synthetic
+            && class
+                .methods
+                .iter()
+                .any(|method| method.access_flags & SYNTHETIC != 0)
             && pool.iter().any(|constant| {
                 matches!(constant, Constant::Class(index)
                     if pool.utf8(*index).ok() == Some("java/lang/invoke/LambdaMetafactory"))
@@ -114,7 +141,15 @@ impl<'a, 'c> Writer<'a, 'c> {
         if !stage {
             for method in &class.methods {
                 if self.should_write_method(method, explicitly_selected)?
-                    && self.method(name, method, components, enumeration, constructors, *needs_gap)?
+                    && self.method(
+                        name,
+                        method,
+                        components,
+                        enumeration,
+                        constructors,
+                        *needs_gap,
+                        initializers,
+                    )?
                 {
                     *needs_gap = true;
                 }
@@ -127,6 +162,7 @@ impl<'a, 'c> Writer<'a, 'c> {
         let mut buffer = Writer {
             class,
             group: self.group,
+            assertion_guards: self.assertion_guards,
             owner: self.owner,
             flags: self.flags,
             depth: self.depth,
@@ -134,6 +170,7 @@ impl<'a, 'c> Writer<'a, 'c> {
             type_nesting: Rc::clone(&self.type_nesting),
             options: self.options,
             dynamic_helpers: Rc::clone(&self.dynamic_helpers),
+            anonymous_bindings: self.anonymous_bindings.clone(),
             body: String::new(),
             lines: 0,
             mapping: self.mapping.as_ref().map(|_| SourceMap::default()),
@@ -144,7 +181,15 @@ impl<'a, 'c> Writer<'a, 'c> {
                 if output.is_some() || !self.should_write_method(method, false)? {
                     continue;
                 }
-                buffer.method(name, method, components, enumeration, constructors, false)?;
+                buffer.method(
+                    name,
+                    method,
+                    components,
+                    enumeration,
+                    constructors,
+                    false,
+                    initializers,
+                )?;
                 *output = Some(MethodOutput {
                     body: mem::take(&mut buffer.body),
                     lines: mem::take(&mut buffer.lines),
@@ -156,7 +201,11 @@ impl<'a, 'c> Writer<'a, 'c> {
                 break;
             }
         }
-        for output in staged.into_iter().flatten().filter(|method| method.lines != 0) {
+        for output in staged
+            .into_iter()
+            .flatten()
+            .filter(|method| method.lines != 0)
+        {
             if *needs_gap {
                 self.line(0, "");
             }
@@ -176,8 +225,12 @@ impl<'a, 'c> Writer<'a, 'c> {
         explicitly_selected: bool,
     ) -> Result<bool, DecompileError> {
         let name = self.class.pool.utf8(method.name_index)?;
-        if name == "<init>" && self.has_lexical_owner()
-            && self.group.nested_class(self.owner).is_some_and(|node| matches!(node.kind, NestedKind::Anonymous))
+        if name == "<init>"
+            && self.has_lexical_owner()
+            && self
+                .group
+                .nested_class(self.owner)
+                .is_some_and(|node| matches!(node.kind, NestedKind::Anonymous))
         {
             return Ok(false);
         }
@@ -191,10 +244,11 @@ impl<'a, 'c> Writer<'a, 'c> {
         if self.options.remove_bridge && method.access_flags & super::BRIDGE != 0 {
             return Ok(false);
         }
-        Ok(!self.hidden(method)? || self.dynamic_helpers.borrow().contains(&(
-            method.name_index,
-            method.descriptor_index,
-        )))
+        Ok(!self.hidden(method)?
+            || self
+                .dynamic_helpers
+                .borrow()
+                .contains(&(method.name_index, method.descriptor_index)))
     }
 }
 

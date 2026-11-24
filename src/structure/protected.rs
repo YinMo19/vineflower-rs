@@ -1,5 +1,6 @@
 // Copyright 2000-2020 JetBrains s.r.o. Use of this source code is governed by the Apache 2.0 license that can be found in the LICENSE file.
 
+mod cleanup_locals;
 mod finally_graph;
 mod monitor;
 
@@ -10,9 +11,9 @@ use crate::bytecode::{Instruction, Operand};
 use crate::cfg::ControlFlowGraph;
 use crate::classfile::ExceptionHandler;
 
-use super::StructureError;
 use self::finally_graph::BranchedFinally;
 use self::monitor::{MonitorHandler, MonitorPlan};
+use super::StructureError;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(super) struct ArmId(usize);
@@ -29,8 +30,12 @@ pub(super) struct Exceptions {
     return_splits: BTreeMap<usize, usize>,
     cleanup_prefixes: BTreeMap<usize, usize>,
     cleanup_copies: BTreeSet<usize>,
+    cleanup_returns: BTreeSet<usize>,
+    cleanup_forward: BTreeSet<usize>,
+    cleanup_bypasses: BTreeMap<usize, usize>,
+    cleanup_landings: BTreeSet<usize>,
     monitor_acquisitions: BTreeMap<usize, usize>,
-    monitor_releases: BTreeSet<usize>,
+    omitted_instructions: BTreeSet<usize>,
 }
 
 pub(super) struct ProtectedRegion {
@@ -64,6 +69,7 @@ struct Cleanup {
     block: usize,
     instructions: Range<usize>,
     branched: Option<BranchedFinally>,
+    spill_offsets: Vec<(usize, usize)>,
 }
 
 enum CleanupPlan {
@@ -82,6 +88,11 @@ impl Finally {
 
     pub(super) fn branched(&self) -> Option<&BranchedFinally> {
         self.plan.branched.as_ref()
+    }
+
+    /// (return opcode, original spill store) instruction indices.
+    pub(super) fn spill_offsets(&self) -> &[(usize, usize)] {
+        &self.plan.spill_offsets
     }
 }
 
@@ -133,7 +144,8 @@ impl Exceptions {
                     }
                     let monitor = MonitorPlan::prove(instructions, graph, &body, handler)
                         .ok_or_else(unsupported)?;
-                    if result.monitor_acquisitions
+                    if result
+                        .monitor_acquisitions
                         .insert(monitor.acquisition, monitor.scaffold.start)
                         .is_some()
                     {
@@ -141,16 +153,20 @@ impl Exceptions {
                     }
                     for release in monitor.releases.values() {
                         for instruction in release.clone() {
-                            if !result.monitor_releases.insert(instruction) {
+                            if !result.omitted_instructions.insert(instruction) {
                                 return Err(unsupported());
                             }
                         }
                     }
                     CleanupPlan::Monitor(monitor)
                 } else {
-                    CleanupPlan::Finally(
-                        result.prepare_cleanup(instructions, graph, &table, &body, route.handler)?,
-                    )
+                    CleanupPlan::Finally(result.prepare_cleanup(
+                        instructions,
+                        graph,
+                        &table,
+                        &body,
+                        route.handler,
+                    )?)
                 };
                 if cleanups.insert(route.handler, plan).is_some() {
                     return Err(unsupported());
@@ -158,7 +174,15 @@ impl Exceptions {
             }
         }
         for (covered, routes) in &table.by_range {
-            result.classify(instructions, graph, &dominators, &table, covered, routes, &mut cleanups)?;
+            result.classify(
+                instructions,
+                graph,
+                &dominators,
+                &table,
+                covered,
+                routes,
+                &mut cleanups,
+            )?;
         }
         let owners = result.link()?;
         result.verify_dispatch(&table, &owners)?;
@@ -195,7 +219,11 @@ impl Exceptions {
         // The hierarchy already proves that the inner arms are disjoint
         // subsets. Equal sizes mean no additional statement in the body.
         let count = self.arms[inner.body.0].blocks.len()
-            + inner.catches.iter().map(|catch| self.arms[catch.arm.0].blocks.len()).sum::<usize>();
+            + inner
+                .catches
+                .iter()
+                .map(|catch| self.arms[catch.arm.0].blocks.len())
+                .sum::<usize>();
         (count == self.arms[outer.body.0].blocks.len()).then_some(inner)
     }
 
@@ -209,7 +237,11 @@ impl Exceptions {
     }
 
     pub(super) fn skips_instruction(&self, index: usize) -> bool {
-        self.monitor_releases.contains(&index)
+        self.omitted_instructions.contains(&index)
+    }
+
+    pub(super) fn bypass_cleanup(&self, block: usize) -> usize {
+        self.cleanup_bypasses.get(&block).copied().unwrap_or(block)
     }
 
     pub(super) fn monitor_acquisition_end(&self, block: usize) -> Option<usize> {
@@ -223,7 +255,8 @@ impl Exceptions {
     pub(super) fn finally_range(&self, arm: Option<ArmId>, block: usize) -> Option<Range<usize>> {
         let arm = arm?;
         let finally = self.region(self.arms[arm.0].region).finally.as_ref()?;
-        (finally.arm == arm && finally.plan.block == block).then(|| finally.plan.instructions.clone())
+        (finally.arm == arm && finally.plan.block == block)
+            .then(|| finally.plan.instructions.clone())
     }
 
     fn add_arm(&mut self, region: ExceptionId, blocks: BTreeSet<usize>) -> ArmId {
@@ -246,11 +279,10 @@ impl Exceptions {
         let mut body: BTreeSet<_> = covered.iter().copied().collect();
         let finally_route = routes.iter().find(|route| route.catch_type == 0);
         if routes.iter().any(|route| {
-                route.handler == 0
-                    || body.contains(&route.handler)
-                    || !graph.blocks[route.handler].predecessors.is_empty()
-            })
-        {
+            route.handler == 0
+                || body.contains(&route.handler)
+                || !graph.blocks[route.handler].predecessors.is_empty()
+        }) {
             return Err(unsupported());
         }
         let mut finally = None;
@@ -282,6 +314,7 @@ impl Exceptions {
         // return. These instructions themselves cannot throw. Preserve their
         // source placement, particularly returns whose value is still stacked.
         while let Some(exit) = pending.pop_first() {
+            let exit = self.bypass_cleanup(exit);
             if body.contains(&exit) {
                 continue;
             }
@@ -297,7 +330,10 @@ impl Exceptions {
         let mut catches: Vec<Catch> = Vec::new();
         let mut handlers = BTreeSet::new();
         for &route in routes.iter().filter(|route| route.catch_type != 0) {
-            if let Some(catch) = catches.last_mut().filter(|catch| catch.start == route.handler) {
+            if let Some(catch) = catches
+                .last_mut()
+                .filter(|catch| catch.start == route.handler)
+            {
                 catch.alternatives.push(route.catch_type);
                 continue;
             }
@@ -307,8 +343,12 @@ impl Exceptions {
             {
                 return Err(unsupported());
             }
-            let blocks = catch_blocks(graph, dominators, &body, route.handler)?;
-            exits.extend(normal_exits(graph, &blocks));
+            let blocks = catch_blocks(graph, dominators, &body, route.handler, self)?;
+            exits.extend(
+                normal_exits(graph, &blocks)
+                    .map(|next| self.bypass_cleanup(next))
+                    .filter(|next| !blocks.contains(next)),
+            );
             let arm = self.add_arm(id, blocks);
             self.bindings.insert(route.handler);
             catches.push(Catch {
@@ -321,7 +361,7 @@ impl Exceptions {
             return Err(unsupported());
         }
         if let Some(branch) = finally.as_ref().and_then(Finally::branched)
-            && exits.first().copied() != branch.normal_entry
+            && exits.first().copied() != branch.body_join
         {
             return Err(unsupported());
         }
@@ -352,15 +392,21 @@ impl Exceptions {
             || !block.exception_predecessors.is_empty()
             || block.predecessors.iter().any(|pred| !body.contains(pred))
             || table.by_block[exit].iter().any(|route| {
-                !block.predecessors.iter().any(|&pred| table.by_block[pred].contains(route))
+                !block
+                    .predecessors
+                    .iter()
+                    .any(|&pred| table.by_block[pred].contains(route))
             })
         {
             return false;
         }
+        if self.cleanup_returns.contains(&exit) {
+            return true;
+        }
         let prefix = self.cleanup_prefix(exit);
         let start = block.instructions.start + prefix;
-        let mut remaining = (start..block.instructions.end)
-            .filter(|&index| !self.skips_instruction(index));
+        let mut remaining =
+            (start..block.instructions.end).filter(|&index| !self.skips_instruction(index));
         let Some(next) = remaining.next() else {
             return block.successors.len() == 1;
         };
@@ -407,22 +453,47 @@ impl Exceptions {
         if graph.blocks[head].successors.is_empty() {
             return self.prepare_finally(instructions, graph, table, body, handler);
         }
-        let mut branch = BranchedFinally::prove(instructions, graph, &table.by_block, body, handler)
-            .ok_or_else(unsupported)?;
+        let mut branch =
+            BranchedFinally::prove(instructions, graph, &table.by_block, body, handler)
+                .ok_or_else(unsupported)?;
         for &copy in &branch.removed {
-            if self.cleanup_prefixes.contains_key(&copy) || !self.cleanup_copies.insert(copy) {
+            if self.cleanup_prefixes.contains_key(&copy)
+                || self.cleanup_landings.contains(&copy)
+                || !self.cleanup_copies.insert(copy)
+            {
                 return Err(unsupported());
             }
         }
+        if !branch.projected_entries.is_empty() {
+            let next = branch.continuation.ok_or_else(unsupported)?;
+            if self.cleanup_copies.contains(&next) {
+                return Err(unsupported());
+            }
+            self.cleanup_landings.insert(next);
+            for entry in std::mem::take(&mut branch.projected_entries) {
+                if self.cleanup_bypasses.insert(entry, next).is_some() {
+                    return Err(unsupported());
+                }
+            }
+        }
         let instructions = std::mem::take(&mut branch.tail_code);
-        if let Some(next) = branch.continuation
+        if let Some(next) = branch.prefix_block
             && !instructions.is_empty()
             && (self.cleanup_copies.contains(&next)
-                || self.cleanup_prefixes.insert(next, instructions.len()).is_some())
+                || self
+                    .cleanup_prefixes
+                    .insert(next, instructions.len())
+                    .is_some())
         {
             return Err(unsupported());
         }
-        Ok(Cleanup { start: handler, block: branch.tail, instructions, branched: Some(branch) })
+        Ok(Cleanup {
+            start: handler,
+            block: branch.tail,
+            instructions,
+            branched: Some(branch),
+            spill_offsets: Vec::new(),
+        })
     }
 
     fn prepare_finally(
@@ -433,12 +504,13 @@ impl Exceptions {
         body: &BTreeSet<usize>,
         handler: usize,
     ) -> Result<Cleanup, StructureError> {
-        if handler == 0 || body.contains(&handler) || !graph.blocks[handler].predecessors.is_empty() {
+        if handler == 0 || body.contains(&handler) || !graph.blocks[handler].predecessors.is_empty()
+        {
             return Err(unsupported());
         }
         let entry = &graph.blocks[handler];
-        let throwable = reference_store(&instructions[entry.instructions.start])
-            .ok_or_else(unsupported)?;
+        let throwable =
+            reference_store(&instructions[entry.instructions.start]).ok_or_else(unsupported)?;
         // Some compilers emit a separate self-protected astore block. It is
         // not part of the cleanup; the matched copy starts at its successor.
         let (block, start) = if entry.instructions.len() == 1 {
@@ -453,7 +525,11 @@ impl Exceptions {
             (handler, entry.instructions.start + 1)
         };
         let cleanup = &graph.blocks[block];
-        let end = cleanup.instructions.end.checked_sub(2).ok_or_else(unsupported)?;
+        let end = cleanup
+            .instructions
+            .end
+            .checked_sub(2)
+            .ok_or_else(unsupported)?;
         if start > end
             || body.contains(&block)
             || !cleanup.successors.is_empty()
@@ -463,13 +539,17 @@ impl Exceptions {
                 .iter()
                 .any(|instruction| local_touches(instruction, throwable))
             || body.iter().any(|&member| {
-                matches!(instructions[graph.blocks[member].instructions.end - 1].opcode, 0xac..=0xb1)
+                matches!(
+                    instructions[graph.blocks[member].instructions.end - 1].opcode,
+                    0xac..=0xb1
+                )
             })
         {
             return Err(unsupported());
         }
         let count = end - start;
         let exits: BTreeSet<_> = normal_exits(graph, body).collect();
+        let mut spill_offsets = Vec::new();
         for exit in exits {
             let target = &graph.blocks[exit];
             if target.instructions.len() < count
@@ -477,10 +557,11 @@ impl Exceptions {
                 || target.predecessors.iter().any(|pred| !body.contains(pred))
                 || !target.exception_predecessors.is_empty()
                 || table.by_block[exit] != table.by_block[block]
-                || !instructions[target.instructions.start..target.instructions.start + count]
-                    .iter()
-                    .zip(&instructions[start..end])
-                    .all(|(left, right)| left.opcode == right.opcode && left.operand == right.operand)
+                || !cleanup_locals::same_cleanup(
+                    instructions,
+                    &instructions[start..end],
+                    &instructions[target.instructions.start..target.instructions.start + count],
+                )
             {
                 return Err(unsupported());
             }
@@ -489,8 +570,57 @@ impl Exceptions {
             if count != 0 && self.cleanup_prefixes.insert(exit, count).is_some() {
                 return Err(unsupported());
             }
+            let suffix = target.instructions.start + count;
+            match &instructions[suffix..target.instructions.end] {
+                [load, transfer] => {
+                    let Some(slot) = cleanup_locals::returned(load, transfer) else {
+                        continue;
+                    };
+                    if instructions[start..end].iter().any(|op| slot.touches(op))
+                        || instructions[target.instructions.start..suffix]
+                            .iter()
+                            .any(|op| slot.touches(op))
+                    {
+                        continue;
+                    }
+                    self.cleanup_returns.insert(exit);
+                    // A dedicated spill/reload has no source-level lifetime.
+                    // Its only observer is the return, provided an exception
+                    // thrown by the copied cleanup cannot reach another arm.
+                    if table.by_block[exit].is_empty()
+                        && let [pred] = target.predecessors.as_slice()
+                        && graph.blocks[*pred].successors == [exit]
+                        && graph.blocks[*pred].instructions.end == target.instructions.start
+                        && let store = graph.blocks[*pred].instructions.end - 1
+                        && cleanup_locals::store(&instructions[store]) == Some(slot)
+                    {
+                        if !self.omitted_instructions.insert(store)
+                            || !self.omitted_instructions.insert(suffix)
+                        {
+                            return Err(unsupported());
+                        }
+                        spill_offsets.push((suffix + 1, store));
+                    }
+                }
+                []
+                | [
+                    Instruction {
+                        opcode: 0xa7 | 0xc8,
+                        ..
+                    },
+                ] if target.successors.len() == 1 => {
+                    self.cleanup_forward.insert(exit);
+                }
+                _ => {}
+            }
         }
-        Ok(Cleanup { start: handler, block, instructions: start..end, branched: None })
+        Ok(Cleanup {
+            start: handler,
+            block,
+            instructions: start..end,
+            branched: None,
+            spill_offsets,
+        })
     }
 
     fn link(&mut self) -> Result<BTreeMap<usize, ArmId>, StructureError> {
@@ -511,7 +641,9 @@ impl Exceptions {
                 if candidate_arm.region == ExceptionId(index) {
                     continue;
                 }
-                if arms.clone().all(|arm| self.arms[arm.0].blocks.is_subset(&candidate_arm.blocks))
+                if arms
+                    .clone()
+                    .all(|arm| self.arms[arm.0].blocks.is_subset(&candidate_arm.blocks))
                     && region.monitor.as_ref().is_none_or(|monitor| {
                         candidate_arm.blocks.contains(&monitor.plan.acquisition)
                     })
@@ -523,23 +655,30 @@ impl Exceptions {
                 }
             }
             region.enclosing = enclosing;
-            if self.entries.insert((enclosing, region.start), ExceptionId(index)).is_some() {
+            if self
+                .entries
+                .insert((enclosing, region.start), ExceptionId(index))
+                .is_some()
+            {
                 return Err(unsupported());
             }
         }
-        memberships.into_iter().map(|(block, mut arms)| {
-            arms.sort_unstable_by_key(|arm| self.arms[arm.0].blocks.len());
-            // Every shared block must belong to a single ancestor chain.
-            // Crossing protected ranges and reused handlers outside that
-            // chain have no source-level nesting with these catch regions.
-            for pair in arms.windows(2) {
-                let region = &self.regions[self.arms[pair[0].0].region.0];
-                if region.enclosing != Some(pair[1]) {
-                    return Err(unsupported());
+        memberships
+            .into_iter()
+            .map(|(block, mut arms)| {
+                arms.sort_unstable_by_key(|arm| self.arms[arm.0].blocks.len());
+                // Every shared block must belong to a single ancestor chain.
+                // Crossing protected ranges and reused handlers outside that
+                // chain have no source-level nesting with these catch regions.
+                for pair in arms.windows(2) {
+                    let region = &self.regions[self.arms[pair[0].0].region.0];
+                    if region.enclosing != Some(pair[1]) {
+                        return Err(unsupported());
+                    }
                 }
-            }
-            Ok((block, arms[0]))
-        }).collect()
+                Ok((block, arms[0]))
+            })
+            .collect()
     }
 
     fn verify_dispatch(
@@ -556,18 +695,24 @@ impl Exceptions {
             while let Some(id) = owner {
                 let region = &self.regions[self.arms[id.0].region.0];
                 if region.body == id {
-                    for expected in region.catches.iter().flat_map(|catch| {
-                        catch.alternatives.iter().map(|&catch_type| Route {
-                            handler: catch.start,
-                            catch_type,
+                    for expected in region
+                        .catches
+                        .iter()
+                        .flat_map(|catch| {
+                            catch.alternatives.iter().map(|&catch_type| Route {
+                                handler: catch.start,
+                                catch_type,
+                            })
                         })
-                    }).chain(region.finally.iter().map(|finally| Route {
-                        handler: finally.start(),
-                        catch_type: 0,
-                    })).chain(region.monitor.iter().map(|monitor| Route {
-                        handler: monitor.plan.handler.start,
-                        catch_type: 0,
-                    })) {
+                        .chain(region.finally.iter().map(|finally| Route {
+                            handler: finally.start(),
+                            catch_type: 0,
+                        }))
+                        .chain(region.monitor.iter().map(|monitor| Route {
+                            handler: monitor.plan.handler.start,
+                            catch_type: 0,
+                        }))
+                    {
                         if remaining.as_slice().contains(&expected)
                             && remaining.next() != Some(&expected)
                         {
@@ -597,13 +742,19 @@ impl Table {
         let mut ranges: Vec<(Route, Vec<usize>)> = Vec::new();
         let mut monitor_handlers = BTreeMap::new();
         for entry in handlers {
-            let start = graph.block_at(entry.start_pc.into()).ok_or_else(unsupported)?;
+            let start = graph
+                .block_at(entry.start_pc.into())
+                .ok_or_else(unsupported)?;
             let end = if Some(entry.end_pc.into()) == code_end {
                 graph.blocks.len()
             } else {
-                graph.block_at(entry.end_pc.into()).ok_or_else(unsupported)?
+                graph
+                    .block_at(entry.end_pc.into())
+                    .ok_or_else(unsupported)?
             };
-            let handler = graph.block_at(entry.handler_pc.into()).ok_or_else(unsupported)?;
+            let handler = graph
+                .block_at(entry.handler_pc.into())
+                .ok_or_else(unsupported)?;
             if entry.catch_type == 0
                 && let std::collections::btree_map::Entry::Vacant(candidate) =
                     monitor_handlers.entry(handler)
@@ -624,15 +775,20 @@ impl Table {
             {
                 continue;
             }
-            let route = Route { handler, catch_type: entry.catch_type };
+            let route = Route {
+                handler,
+                catch_type: entry.catch_type,
+            };
             let index = *aggregate.entry(route).or_insert_with(|| {
                 let index = ranges.len();
                 ranges.push((route, Vec::new()));
                 index
             });
             for block in start..end {
-                if entry.catch_type == 0 && block == handler
-                    && monitor_handlers.get(&handler)
+                if entry.catch_type == 0
+                    && block == handler
+                    && monitor_handlers
+                        .get(&handler)
                         .is_some_and(MonitorHandler::has_self_protected_prefix)
                 {
                     continue;
@@ -654,7 +810,11 @@ impl Table {
         if by_range.is_empty() {
             return Err(unsupported());
         }
-        Ok(Self { by_block, by_range, monitor_handlers })
+        Ok(Self {
+            by_block,
+            by_range,
+            monitor_handlers,
+        })
     }
 }
 
@@ -662,7 +822,10 @@ fn single_entry(graph: &ControlFlowGraph, body: &BTreeSet<usize>) -> Result<usiz
     let mut entries = body.iter().copied().filter(|&block| {
         let node = &graph.blocks[block];
         block == 0
-            || node.predecessors.iter().chain(&node.exception_predecessors)
+            || node
+                .predecessors
+                .iter()
+                .chain(&node.exception_predecessors)
                 .any(|pred| !body.contains(pred))
     });
     let start = entries.next().ok_or_else(unsupported)?;
@@ -676,7 +839,9 @@ fn normal_exits<'a>(
     graph: &'a ControlFlowGraph,
     blocks: &'a BTreeSet<usize>,
 ) -> impl Iterator<Item = usize> + 'a {
-    blocks.iter().flat_map(|&block| graph.blocks[block].successors.iter().copied())
+    blocks
+        .iter()
+        .flat_map(|&block| graph.blocks[block].successors.iter().copied())
         .filter(|next| !blocks.contains(next))
 }
 
@@ -685,6 +850,7 @@ fn catch_blocks(
     dominance: &Dominance,
     body: &BTreeSet<usize>,
     handler: usize,
+    exceptions: &Exceptions,
 ) -> Result<BTreeSet<usize>, StructureError> {
     let mut blocks = BTreeSet::new();
     let mut pending = vec![handler];
@@ -696,7 +862,17 @@ fn catch_blocks(
             return Err(unsupported());
         }
         let node = &graph.blocks[block];
-        pending.extend(node.successors.iter().chain(&node.exception_successors).copied());
+        // A matched finally copy identifies the end of the handler even
+        // when that handler is the only arm that can complete normally.
+        if !exceptions.cleanup_forward.contains(&block) {
+            pending.extend(
+                node.successors
+                    .iter()
+                    .copied()
+                    .filter(|next| !exceptions.cleanup_bypasses.contains_key(next)),
+            );
+        }
+        pending.extend(node.exception_successors.iter().copied());
     }
     if blocks.is_empty() {
         return Err(unsupported());
@@ -739,12 +915,14 @@ impl Dominance {
 
 pub(super) fn reference_store(instruction: &Instruction) -> Option<u16> {
     matches!(instruction.opcode, 0x3a | 0x4b..=0x4e)
-        .then(|| local_access(instruction)).flatten()
+        .then(|| local_access(instruction))
+        .flatten()
 }
 
 pub(super) fn reference_load(instruction: &Instruction) -> Option<u16> {
     matches!(instruction.opcode, 0x19 | 0x2a..=0x2d)
-        .then(|| local_access(instruction)).flatten()
+        .then(|| local_access(instruction))
+        .flatten()
 }
 
 fn local_access(instruction: &Instruction) -> Option<u16> {

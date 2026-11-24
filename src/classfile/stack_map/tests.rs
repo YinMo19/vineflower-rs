@@ -171,8 +171,10 @@ fn initial_locals_use_descriptor_references_and_constructor_receiver() {
 
 #[test]
 fn reads_original_javac_loop_frames() {
-    let class =
-        ClassFile::parse(include_bytes!("../../../tests/smoke/java8/TestSimpleWhile.class")).unwrap();
+    let class = ClassFile::parse(include_bytes!(
+        "../../../tests/smoke/java8/TestSimpleWhile.class"
+    ))
+    .unwrap();
     let member = class
         .methods
         .iter()
@@ -200,14 +202,21 @@ fn missing_empty_and_duplicate_attributes_are_distinct() {
     let pool = pool();
     let mut code = code(&[0xb1], &[0, 0], 0, 0);
     let never = |_: StackMapFrame<'_, '_>| panic!("no frames expected");
-    assert!(code.visit_stack_map_frames(&pool, &[], None, never).unwrap());
+    assert!(
+        code.visit_stack_map_frames(&pool, &[], None, never)
+            .unwrap()
+    );
     code.attributes.push(code.attributes[0]);
     assert!(matches!(
         code.visit_stack_map_frames(&pool, &[], None, never),
         Err(StackMapError::DuplicateAttribute)
     ));
     code.attributes.clear();
-    assert!(!code.visit_stack_map_frames(&pool, &[], None, never).unwrap());
+    assert!(
+        !code
+            .visit_stack_map_frames(&pool, &[], None, never)
+            .unwrap()
+    );
 }
 
 #[test]
@@ -218,9 +227,7 @@ fn checks_frame_and_new_offsets_against_instruction_boundaries_when_supplied() {
     let pool = pool();
     let invalid = |data: &[u8]| {
         code(&bytes, data, 0, 1)
-            .visit_stack_map_frames(&pool, &[], Some(&instructions), |_| {
-                panic!("invalid frame")
-            })
+            .visit_stack_map_frames(&pool, &[], Some(&instructions), |_| panic!("invalid frame"))
             .unwrap_err()
     };
     assert!(matches!(
@@ -255,9 +262,16 @@ fn checks_frame_and_new_offsets_against_instruction_boundaries_when_supplied() {
 fn rejects_frame_offset_overflow_without_wrapping() {
     let bytes = vec![0; usize::from(u16::MAX)];
     let mut offsets = Vec::new();
-    let result = code(&bytes, &[0, 2, 251, 255, 254, 251, 0, 1], 0, 0)
-        .visit_stack_map_frames(&pool(), &[], None, |frame| offsets.push(frame.offset));
-    assert!(matches!(result, Err(StackMapError::FrameOutOfBounds(65536))));
+    let result = code(&bytes, &[0, 2, 251, 255, 254, 251, 0, 1], 0, 0).visit_stack_map_frames(
+        &pool(),
+        &[],
+        None,
+        |frame| offsets.push(frame.offset),
+    );
+    assert!(matches!(
+        result,
+        Err(StackMapError::FrameOutOfBounds(65536))
+    ));
     assert_eq!(offsets, [65534]);
 }
 
@@ -269,28 +283,50 @@ fn rejects_bad_tags_pool_indices_slot_counts_and_payload_boundaries() {
             .visit_stack_map_frames(&pool, &[], None, |_| panic!("invalid frame"))
             .unwrap_err()
     };
-    assert!(matches!(invalid(&[0, 2]), StackMapError::TooManyFrames { count: 2, .. }));
-    assert!(matches!(invalid(&[0, 1, 128]), StackMapError::ReservedFrameTag(128)));
-    assert!(matches!(invalid(&[0, 1, 64, 9]), StackMapError::InvalidTypeTag(9)));
+    assert!(matches!(
+        invalid(&[0, 2]),
+        StackMapError::TooManyFrames { count: 2, .. }
+    ));
+    assert!(matches!(
+        invalid(&[0, 1, 128]),
+        StackMapError::ReservedFrameTag(128)
+    ));
+    assert!(matches!(
+        invalid(&[0, 1, 64, 9]),
+        StackMapError::InvalidTypeTag(9)
+    ));
     assert!(matches!(
         invalid(&[0, 1, 64, 7, 0, 0]),
         StackMapError::Class(ClassError::InvalidConstantIndex(0))
     ));
     assert!(matches!(
         invalid(&[0, 1, 64, 7, 0, 2]),
-        StackMapError::Class(ClassError::WrongConstantType { index: 2, expected: "Class", .. })
+        StackMapError::Class(ClassError::WrongConstantType {
+            index: 2,
+            expected: "Class",
+            ..
+        })
     ));
     assert!(matches!(
         invalid(&[0, 1, 250, 0, 0]),
-        StackMapError::InvalidChop { count: 1, available: 0 }
+        StackMapError::InvalidChop {
+            count: 1,
+            available: 0
+        }
     ));
     assert!(matches!(
         invalid(&[0, 1, 252, 0, 0, 4]),
-        StackMapError::TooManySlots { kind: "locals", limit: 1 }
+        StackMapError::TooManySlots {
+            kind: "locals",
+            limit: 1
+        }
     ));
     assert!(matches!(
         invalid(&[0, 1, 64, 3]),
-        StackMapError::TooManySlots { kind: "operand stack entries", limit: 1 }
+        StackMapError::TooManySlots {
+            kind: "operand stack entries",
+            limit: 1
+        }
     ));
     assert!(matches!(
         invalid(&[0, 1, 64, 7, 0]),
@@ -298,6 +334,9 @@ fn rejects_bad_tags_pool_indices_slot_counts_and_payload_boundaries() {
     ));
     assert!(matches!(
         invalid(&[0, 0, 0]),
-        StackMapError::Class(ClassError::TrailingBytes { context: "StackMapTable", .. })
+        StackMapError::Class(ClassError::TrailingBytes {
+            context: "StackMapTable",
+            ..
+        })
     ));
 }

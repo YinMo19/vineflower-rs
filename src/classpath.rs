@@ -127,7 +127,9 @@ impl ClassPath {
             if !stat.is_file() {
                 return Err(ClassPathError::InvalidImage { path: modules });
             }
-            classpath.sources.push(Source::File(FileSource::image(modules)?));
+            classpath
+                .sources
+                .push(Source::File(FileSource::image(modules)?));
             return Ok(classpath);
         }
 
@@ -163,7 +165,8 @@ impl ClassPath {
     /// entries; this API does not select multi-release JAR versions. The first
     /// source with the requested name wins, including when it cannot be read.
     pub fn add(&mut self, path: impl AsRef<Path>) -> Result<(), ClassPathError> {
-        self.sources.push(Source::File(FileSource::open(path.as_ref())?));
+        self.sources
+            .push(Source::File(FileSource::open(path.as_ref())?));
         Ok(())
     }
 
@@ -215,7 +218,10 @@ impl ClassPath {
                 }
                 Source::Provider(provider) => provider
                     .load(name)
-                    .map_err(|source| ClassPathError::Provider { name: name.into(), source })?
+                    .map_err(|source| ClassPathError::Provider {
+                        name: name.into(),
+                        source,
+                    })?
                     .map(Content::Shared),
             };
             if let Some(bytes) = bytes {
@@ -274,7 +280,9 @@ fn archives_in(directory: &Path, extension: &str) -> Result<Vec<PathBuf>, ClassP
     let mut archives = Vec::new();
     for entry in entries {
         let path = entry.map_err(|e| ClassPathError::io(directory, e))?.path();
-        if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case(extension))
+        if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case(extension))
             && optional_stat(&path)?.is_some_and(|stat| stat.is_file())
         {
             archives.push(path);

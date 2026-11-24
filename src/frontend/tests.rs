@@ -35,7 +35,10 @@ fn nested_class(child: bool) -> Vec<u8> {
         bytes.extend_from_slice(&(value.len() as u16).to_be_bytes());
         bytes.extend_from_slice(value.as_bytes());
     };
-    for (i, name) in ["pkg/Parent", "pkg/Parent$Child", "java/lang/Object"].into_iter().enumerate() {
+    for (i, name) in ["pkg/Parent", "pkg/Parent$Child", "java/lang/Object"]
+        .into_iter()
+        .enumerate()
+    {
         utf8(&mut bytes, name);
         bytes.extend_from_slice(&[7, 0, (i * 2 + 1) as u8]);
     }
@@ -224,7 +227,10 @@ fn supported_flags_feed_shared_options_and_unsupported_flags_error() {
     )
     .unwrap();
     assert_eq!(cli.paths, [PathBuf::from("-example.class")]);
-    assert_eq!(cli.add_external, ["one.jar", "two.jar", "three"].map(PathBuf::from));
+    assert_eq!(
+        cli.add_external,
+        ["one.jar", "two.jar", "three"].map(PathBuf::from)
+    );
     assert_eq!(cli.only, ["pkg/One", "pkg/Two", "pkg/Three"]);
     let options = cli.options().unwrap();
     assert!(options.ascii_strings);
@@ -393,7 +399,10 @@ fn nested_class_group_writes_only_root_units_for_directory_and_archive() {
         out.as_os_str().to_owned(),
     ])
     .unwrap();
-    assert_eq!(fs::read(out.join("Parent.java")).unwrap(), contents["pkg/Parent.java"]);
+    assert_eq!(
+        fs::read(out.join("Parent.java")).unwrap(),
+        contents["pkg/Parent.java"]
+    );
     assert_eq!(fs::read_dir(out).unwrap().count(), 1);
 }
 
@@ -409,12 +418,19 @@ fn classpath_inputs_resolve_names_without_writing_library_files() {
     fs::write(library_dir.join("pkg/Parent$Child.class"), child).unwrap();
     fs::write(library_dir.join("library.txt"), RESOURCE).unwrap();
     let library_jar = work.path().join("library.jar");
-    write_zip(&library_jar, &[("pkg/Parent.class", &parent), ("archive.txt", RESOURCE)]);
+    write_zip(
+        &library_jar,
+        &[("pkg/Parent.class", &parent), ("archive.txt", RESOURCE)],
+    );
     let out = work.path().join("out");
     let config = work.path().join("vf.cfg");
     fs::write(
         &config,
-        format!("-e={}\n--add-external={}\n", library_jar.display(), library_dir.display()),
+        format!(
+            "-e={}\n--add-external={}\n",
+            library_jar.display(),
+            library_dir.display()
+        ),
     )
     .unwrap();
     run([
@@ -430,7 +446,11 @@ fn classpath_inputs_resolve_names_without_writing_library_files() {
 
     let mut stdout = Vec::new();
     run_with_output([source.into_os_string()], &mut stdout).unwrap();
-    assert!(String::from_utf8(stdout).unwrap().contains("public Parent$Child member;"));
+    assert!(
+        String::from_utf8(stdout)
+            .unwrap()
+            .contains("public Parent$Child member;")
+    );
 }
 
 #[test]
@@ -470,17 +490,30 @@ fn multi_release_classes_do_not_shadow_base_and_resources_keep_physical_names() 
     write_zip(
         &source,
         &[
-            ("META-INF/versions/11/pkg/Example.class", b"not the base class"),
-            ("META-INF/versions/11/pkg/VersionOnly.class", b"not a base class"),
+            (
+                "META-INF/versions/11/pkg/Example.class",
+                b"not the base class",
+            ),
+            (
+                "META-INF/versions/11/pkg/VersionOnly.class",
+                b"not a base class",
+            ),
             ("pkg/Example.class", CLASS),
             (VERSIONED_RESOURCE, RESOURCE),
-            ("META-INF/MANIFEST.MF", b"Manifest-Version: 1.0\r\nMulti-Release: true\r\n\r\n"),
+            (
+                "META-INF/MANIFEST.MF",
+                b"Manifest-Version: 1.0\r\nMulti-Release: true\r\n\r\n",
+            ),
         ],
     );
     let out = work.path().join("out.jar");
     run_paths(&source, &out).unwrap();
     let contents = read_zip(&fs::read(out).unwrap());
-    assert!(std::str::from_utf8(&contents["pkg/Example.java"]).unwrap().contains("return 4;"));
+    assert!(
+        std::str::from_utf8(&contents["pkg/Example.java"])
+            .unwrap()
+            .contains("return 4;")
+    );
     assert_eq!(contents[VERSIONED_RESOURCE], RESOURCE);
     assert_eq!(contents.len(), 3);
 }
@@ -498,5 +531,8 @@ fn skip_extra_files_keeps_source_files_without_copying_resources() {
     ])
     .unwrap();
     let files = read_directory(&out);
-    assert_eq!(files.keys().map(String::as_str).collect::<Vec<_>>(), ["pkg/Example.java"]);
+    assert_eq!(
+        files.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["pkg/Example.java"]
+    );
 }

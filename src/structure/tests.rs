@@ -99,12 +99,16 @@ fn switch_breaks_share_one_final_void_return() {
 fn guarded_return_preserves_stack_value_and_null_check() {
     let lines = method_lines(IDEA_NOT_NULL, "test").unwrap();
     for (guard, ret) in [(26, 29), (68, 71)] {
-        let guard = lines.iter().position(|line| {
-            line.offsets.contains(&guard) && line.text.contains("$$$reportNull$$$0(")
-        }).expect("guard must execute on the null path");
-        let ret = lines.iter().position(|line| {
-            line.offsets.contains(&ret) && line.text.starts_with("return ")
-        }).expect("return must consume the value carried across the guard");
+        let guard = lines
+            .iter()
+            .position(|line| {
+                line.offsets.contains(&guard) && line.text.contains("$$$reportNull$$$0(")
+            })
+            .expect("guard must execute on the null path");
+        let ret = lines
+            .iter()
+            .position(|line| line.offsets.contains(&ret) && line.text.starts_with("return "))
+            .expect("return must consume the value carried across the guard");
         assert!(guard < ret);
     }
 }

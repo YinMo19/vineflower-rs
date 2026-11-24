@@ -348,8 +348,8 @@ impl Machine<'_, '_> {
         self.push(self.expression(INT, text, PRIMARY, [&array], true)?)
     }
 
-    pub(super) fn new_array(&mut self, op: &Instruction) -> Result<(), LiftError> {
-        let (ty, dimensions) = match op.opcode {
+    pub(super) fn array_type(&self, op: &Instruction) -> Result<(Type, u8), LiftError> {
+        Ok(match op.opcode {
             0xbc => {
                 let Operand::NewArray(atype) = op.operand else {
                     return Err(self.invalid_operand("expected primitive array type"));
@@ -379,7 +379,11 @@ impl Machine<'_, '_> {
                 (self.class_type(index)?, dimensions)
             }
             _ => unreachable!(),
-        };
+        })
+    }
+
+    pub(super) fn new_array(&mut self, op: &Instruction) -> Result<(), LiftError> {
+        let (ty, dimensions) = self.array_type(op)?;
         let mut element = &ty;
         let mut rank = 0usize;
         while let Type::Array(component) = element {
@@ -412,9 +416,20 @@ impl Machine<'_, '_> {
         let ty = self.class_type(self.constant_index(op)?)?;
         let value = self.pop_category(Category::Ref)?;
         if op.opcode == 0xc0 {
-            let annotated = u16::try_from(self.debug_offset(op.offset)).ok().map(|offset| {
-                self.render_code_type(&ty, TypeTarget::TypeArgument { kind: TypeArgumentTarget::Cast, offset, argument: 0 })
-            }).transpose()?.flatten();
+            let annotated = u16::try_from(self.debug_offset(op.offset))
+                .ok()
+                .map(|offset| {
+                    self.render_code_type(
+                        &ty,
+                        TypeTarget::TypeArgument {
+                            kind: TypeArgumentTarget::Cast,
+                            offset,
+                            argument: 0,
+                        },
+                    )
+                })
+                .transpose()?
+                .flatten();
             if annotated.is_none() && value.ty == ty && !matches!(value.source, Source::Null) {
                 return self.push(value);
             }
@@ -429,14 +444,21 @@ impl Machine<'_, '_> {
             } else {
                 value
             };
-            let name = u16::try_from(self.debug_offset(op.offset)).ok().map(|offset| {
-                self.render_code_type(&ty, TypeTarget::Offset { kind: OffsetTarget::InstanceOf, offset })
-            }).transpose()?.flatten().unwrap_or_else(|| self.render_type(&ty));
-            let text = format!(
-                "{} instanceof {}",
-                value.at(RELATIONAL),
-                name
-            );
+            let name = u16::try_from(self.debug_offset(op.offset))
+                .ok()
+                .map(|offset| {
+                    self.render_code_type(
+                        &ty,
+                        TypeTarget::Offset {
+                            kind: OffsetTarget::InstanceOf,
+                            offset,
+                        },
+                    )
+                })
+                .transpose()?
+                .flatten()
+                .unwrap_or_else(|| self.render_type(&ty));
+            let text = format!("{} instanceof {}", value.at(RELATIONAL), name);
             self.push(self.expression(BOOLEAN, text, RELATIONAL, [&value], true)?)
         }
     }

@@ -26,16 +26,41 @@ impl ClassName {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ClassKind { Class, Interface, EnumClass, EnumEntry, Annotation, Object, CompanionObject }
+pub enum ClassKind {
+    Class,
+    Interface,
+    EnumClass,
+    EnumEntry,
+    Annotation,
+    Object,
+    CompanionObject,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Visibility { Internal, Private, Protected, Public, PrivateToThis, Local }
+pub enum Visibility {
+    Internal,
+    Private,
+    Protected,
+    Public,
+    PrivateToThis,
+    Local,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Modality { Final, Open, Abstract, Sealed }
+pub enum Modality {
+    Final,
+    Open,
+    Abstract,
+    Sealed,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MemberKind { Declaration, FakeOverride, Delegation, Synthesized }
+pub enum MemberKind {
+    Declaration,
+    FakeOverride,
+    Delegation,
+    Synthesized,
+}
 
 /// The flag word as defined by the Kotlin metadata schema. Kind-specific flags
 /// share bit positions and must be interpreted in the owning declaration kind.
@@ -43,9 +68,13 @@ pub enum MemberKind { Declaration, FakeOverride, Delegation, Synthesized }
 pub struct Flags(pub u32);
 
 impl Flags {
-    pub fn has(self, bit: u32) -> bool { self.0 & (1 << bit) != 0 }
+    pub fn has(self, bit: u32) -> bool {
+        self.0 & (1 << bit) != 0
+    }
 
-    pub fn has_annotations(self) -> bool { self.has(0) }
+    pub fn has_annotations(self) -> bool {
+        self.has(0)
+    }
 
     pub fn visibility(self) -> Result<Visibility, KotlinError> {
         Ok(match (self.0 >> 1) & 7 {
@@ -100,7 +129,11 @@ pub enum Classifier {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Variance { In, Out, Invariant }
+pub enum Variance {
+    In,
+    Out,
+    Invariant,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TypeArgument {
@@ -187,10 +220,18 @@ pub struct Property {
 }
 
 impl Property {
-    pub fn mutable(&self) -> bool { self.flags.has(8) }
-    pub fn constant(&self) -> bool { self.flags.has(11) }
-    pub fn late_init(&self) -> bool { self.flags.has(12) }
-    pub fn delegated(&self) -> bool { self.flags.has(15) }
+    pub fn mutable(&self) -> bool {
+        self.flags.has(8)
+    }
+    pub fn constant(&self) -> bool {
+        self.flags.has(11)
+    }
+    pub fn late_init(&self) -> bool {
+        self.flags.has(12)
+    }
+    pub fn delegated(&self) -> bool {
+        self.flags.has(15)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -32,8 +32,8 @@ struct Local {
     receiver: bool,
 }
 
-#[derive(Default)]
-struct Names {
+#[derive(Clone, Default)]
+pub(crate) struct Names {
     used: HashSet<String>,
     suffix: u32,
     version: u16,
@@ -172,7 +172,12 @@ impl<'a> Locals<'a> {
                 Rc::new(
                     entries
                         .into_iter()
-                        .map(|entry| ((entry.index, entry.start_pc, entry.length), entry.descriptor))
+                        .map(|entry| {
+                            (
+                                (entry.index, entry.start_pc, entry.length),
+                                entry.descriptor,
+                            )
+                        })
                         .collect(),
                 )
             })
@@ -276,7 +281,9 @@ impl<'a> Locals<'a> {
     }
 
     pub(super) fn temporary(&self, offset: u32) -> String {
-        self.names.borrow_mut().fresh_owned(format!("stack{offset}"))
+        self.names
+            .borrow_mut()
+            .fresh_owned(format!("stack{offset}"))
     }
 
     fn debug_at(&self, index: u16, offset: u32) -> Option<&LocalVariable<'a>> {
@@ -295,7 +302,10 @@ impl<'a> Locals<'a> {
 
     fn generic_cast(&self, debug: Option<&LocalVariable<'a>>) -> Option<String> {
         let entry = debug?;
-        let signature = self.generic.as_ref()?.get(&(entry.index, entry.start_pc, entry.length))?;
+        let signature = self
+            .generic
+            .as_ref()?
+            .get(&(entry.index, entry.start_pc, entry.length))?;
         let signature = FieldSignature::parse(signature).ok()?;
         Some(generic_cast_name(signature.field_type))
     }
@@ -420,6 +430,32 @@ impl Machine<'_, '_> {
         Ok((display_type, name))
     }
 
+    pub(crate) fn local_name_checkpoint(&self) -> Names {
+        self.locals.names.borrow().clone()
+    }
+
+    pub(crate) fn restore_local_names(&self, names: Names) {
+        *self.locals.names.borrow_mut() = names;
+    }
+
+    pub(crate) fn local_capture_binding(
+        &self,
+        index: u16,
+        name: &str,
+    ) -> Option<(Option<(u16, u16)>, bool)> {
+        let local = self.locals.slots.get(usize::from(index))?.as_ref()?;
+        if local.receiver || local.name != name {
+            return None;
+        }
+        Some((
+            local.debug_range,
+            self.locals
+                .parameters()
+                .iter()
+                .any(|parameter| parameter == name),
+        ))
+    }
+
     pub(super) fn load(&mut self, index: u16, category: Category) -> Result<(), LiftError> {
         let local = self
             .locals
@@ -439,6 +475,7 @@ impl Machine<'_, '_> {
         if local.receiver {
             expr.source = Source::This;
         } else {
+            expr.source = Source::Local(index);
             expr.order = Some(Order::at(self.offset));
         }
         self.push(expr)
@@ -525,6 +562,22 @@ impl Machine<'_, '_> {
         if local.ty != INT {
             return Err(self.invalid_local(index, "iinc requires an int local"));
         }
+        if matches!(amount, -1 | 1)
+            && self.stack.last().is_some_and(|value| {
+                matches!(value.source, Source::Local(slot) if slot == index)
+                    && value.text == local.name
+                    && value.ty == INT
+            })
+        {
+            let mut value = self.pop_category(Category::Int)?;
+            value.order = Some(self.join_order(value.order, Order::at(self.offset))?);
+            value.text.push_str(if amount == 1 { "++" } else { "--" });
+            value.source = Source::Plain;
+            value.observable = true;
+            value.statement = true;
+            self.push(value)?;
+            return Ok(Effect::None);
+        }
         let text = match amount {
             1 => format!("{}++;", local.name),
             -1 => format!("{}--;", local.name),
@@ -573,9 +626,15 @@ mod tests {
             let mut options = Options::default();
             options.variable_renaming = Some("jad".into());
             options.rename_parameters = rename_parameters;
-            let mut machine =
-                Machine::new(&class, &method, &code, &descriptor, &options, &str::to_owned)
-                    .unwrap();
+            let mut machine = Machine::new(
+                &class,
+                &method,
+                &code,
+                &descriptor,
+                &options,
+                &str::to_owned,
+            )
+            .unwrap();
             assert_eq!(machine.parameter_names(), ["i"]);
             machine.step(&instructions[0]).unwrap();
             match machine.step(&instructions[1]).unwrap() {

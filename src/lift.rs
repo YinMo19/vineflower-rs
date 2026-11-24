@@ -4,8 +4,11 @@
 //! the JVM's evaluation schedule cannot otherwise be represented in Java.
 
 mod anonymous;
+mod array_initializer;
 mod concat;
 mod dynamic;
+mod enum_constants;
+pub(crate) mod enum_switch;
 mod expr;
 mod generics;
 mod literal;
@@ -14,10 +17,12 @@ mod members;
 mod nested;
 mod numeric;
 mod operations;
+mod overloads;
+mod switch_expression;
 
-pub(crate) use anonymous::{AnonymousSite, AnonymousSites};
-pub(crate) use literal::{constant_literal, constant_literal_with_options, string_literal};
+pub(crate) use anonymous::{AnonymousBindings, AnonymousSite, AnonymousSites};
 pub(crate) use dynamic::source_method_name;
+pub(crate) use literal::{constant_literal, constant_literal_with_options, string_literal};
 
 #[cfg(test)]
 mod tests;
@@ -28,8 +33,8 @@ use crate::{
     ClassGroup,
     bytecode::{Instruction, Operand},
     classfile::{
-        BootstrapMethod, ClassError, ClassFile, Code, Constant, Member, StackMapError,
-        TypeTarget, VerificationType, initial_stack_map_locals,
+        BootstrapMethod, ClassError, ClassFile, Code, Constant, ConstantPool, Member,
+        StackMapError, TypeTarget, VerificationType, initial_stack_map_locals,
     },
     descriptor::{DescriptorError, MethodDescriptor, Primitive, Type},
     legacy::NormalizedCode,
@@ -95,7 +100,6 @@ pub(crate) enum Effect {
 pub(crate) type DynamicHelpers = Rc<RefCell<BTreeSet<(u16, u16)>>>;
 type CodeTypeRenderer<'c> = dyn Fn(&Type, TypeTarget) -> Result<Option<String>, LiftError> + 'c;
 
-
 #[derive(Clone)]
 pub(crate) struct Machine<'a, 'c> {
     class: &'c ClassFile<'a>,
@@ -118,8 +122,11 @@ pub(crate) struct Machine<'a, 'c> {
     bootstrap: Option<std::rc::Rc<[BootstrapMethod]>>,
     dynamic_helpers: Option<DynamicHelpers>,
     anonymous_sites: Option<AnonymousSites>,
+    anonymous_bindings: Option<AnonymousBindings>,
+    anonymous_source: Option<&'c [Instruction]>,
     code_type_renderer: Option<&'c CodeTypeRenderer<'c>>,
     lambda_depth: u8,
+    array_probe_depth: u8,
     initialized_this: bool,
     opcode: u8,
     offset: u32,
@@ -161,8 +168,11 @@ impl<'a, 'c> Machine<'a, 'c> {
             bootstrap: None,
             dynamic_helpers: None,
             anonymous_sites: None,
+            anonymous_bindings: None,
+            anonymous_source: None,
             code_type_renderer: None,
             lambda_depth: 0,
+            array_probe_depth: 0,
             initialized_this: method_name != "<init>" || super_class.is_none(),
             opcode: 0,
             offset: 0,
@@ -183,7 +193,8 @@ impl<'a, 'c> Machine<'a, 'c> {
     }
 
     fn source_field_name<'n>(&'n self, owner: &str, name: &'n str, descriptor: &str) -> &'n str {
-        self.renames.map_or(name, |plan| plan.field_name(owner, name, descriptor))
+        self.renames
+            .map_or(name, |plan| plan.field_name(owner, name, descriptor))
     }
 
     pub(crate) fn with_normalized_offsets(mut self, normalized: &'c NormalizedCode) -> Self {
@@ -192,7 +203,9 @@ impl<'a, 'c> Machine<'a, 'c> {
     }
 
     fn debug_offset(&self, offset: u32) -> u32 {
-        self.normalized.and_then(|code| code.source_offset(offset)).unwrap_or(offset)
+        self.normalized
+            .and_then(|code| code.source_offset(offset))
+            .unwrap_or(offset)
     }
 
     pub(crate) fn set_dynamic_helpers(&mut self, helpers: DynamicHelpers) {
@@ -215,16 +228,20 @@ impl<'a, 'c> Machine<'a, 'c> {
         crate::hierarchy::is_assignable(self.group, self.options, owner, "java/lang/AutoCloseable")
     }
 
-    pub(crate) fn caught_exception_stack_type(&self, handler_offset: u32) -> Result<Option<u16>, LiftError> {
+    pub(crate) fn caught_exception_stack_type(
+        &self,
+        handler_offset: u32,
+    ) -> Result<Option<u16>, LiftError> {
         let initial = initial_stack_map_locals(self.class, self.method, self.descriptor)?;
         let mut caught = None;
-        self.code.visit_stack_map_frames(&self.class.pool, &initial, None, |frame| {
-            if u32::from(frame.offset) == handler_offset
-                && let [VerificationType::Object(index)] = frame.stack
-            {
-                caught = Some(*index);
-            }
-        })?;
+        self.code
+            .visit_stack_map_frames(&self.class.pool, &initial, None, |frame| {
+                if u32::from(frame.offset) == handler_offset
+                    && let [VerificationType::Object(index)] = frame.stack
+                {
+                    caught = Some(*index);
+                }
+            })?;
         Ok(caught)
     }
 
@@ -234,6 +251,10 @@ impl<'a, 'c> Machine<'a, 'c> {
 
     pub(crate) fn stack_is_empty(&self) -> bool {
         self.stack.is_empty()
+    }
+
+    pub(crate) fn field_receiver_is_this(&self) -> bool {
+        matches!(self.stack.as_slice(), [receiver, _] if matches!(receiver.source, Source::This))
     }
 
     pub(crate) fn this_is_initialized(&self) -> bool {
@@ -260,19 +281,82 @@ impl<'a, 'c> Machine<'a, 'c> {
     }
 
     pub(crate) fn take_monitor_lock(&mut self, op: &Instruction) -> Result<String, LiftError> {
-        self.offset = op.offset;
-        self.opcode = op.opcode;
-        self.lower_pending_comparison()?;
-        let lock = self.pop_category(Category::Ref)?;
-        if !self.stack_is_empty() {
-            return Err(self.unsupported("pending operand across synchronized entry"));
-        }
-        self.before_statement(lock.order)?;
+        let lock = self.take_region_reference(op)?;
         Ok(if matches!(lock.source, Source::Null) {
-            format!("(Object){}", lock.text)
+            format!("({}){}", (self.class_name)("java/lang/Object"), lock.text)
         } else {
             lock.text
         })
+    }
+
+    pub(crate) fn constant_pool(&self) -> &'c ConstantPool<'a> {
+        &self.class.pool
+    }
+
+    pub(crate) fn ascii_strings(&self) -> bool {
+        self.options.ascii_strings
+    }
+
+    pub(crate) fn take_string_switch_selector(
+        &mut self,
+        op: &Instruction,
+    ) -> Result<String, LiftError> {
+        self.offset = op.offset;
+        self.opcode = op.opcode;
+        self.lower_pending_comparison()?;
+        let selector = self.pop_category(Category::Ref)?;
+        Ok(self
+            .coerce(selector, &Type::Object("java/lang/String".into()), true)?
+            .text)
+    }
+
+    fn take_region_reference(&mut self, op: &Instruction) -> Result<Expr, LiftError> {
+        self.offset = op.offset;
+        self.opcode = op.opcode;
+        self.lower_pending_comparison()?;
+        let value = self.pop_category(Category::Ref)?;
+        if !self.stack_is_empty() {
+            return Err(self.unsupported("pending operand across structured region entry"));
+        }
+        self.before_statement(value.order)?;
+        Ok(value)
+    }
+
+    pub(crate) fn take_assertion_detail(
+        &mut self,
+        constructor: &Instruction,
+        allocation: u32,
+        descriptor: &str,
+    ) -> Result<Option<String>, LiftError> {
+        self.offset = constructor.offset;
+        self.opcode = constructor.opcode;
+        self.lower_pending_comparison()?;
+        let descriptor = MethodDescriptor::parse(descriptor)?;
+        let detail = match descriptor.parameters.as_slice() {
+            [] => None,
+            [ty] => {
+                let category = Category::of(ty).expect("a constructor parameter is not void");
+                let value = self.pop_category(category)?;
+                // An assert detail of reference type already selects the
+                // Object constructor, including boxed values and null.
+                Some(self.coerce(value, ty, category != Category::Ref)?.text)
+            }
+            _ => return Err(self.invalid_operand("assertion constructor arity")),
+        };
+        if !self.initialized_this
+            || !self.prelude.is_empty()
+            || !matches!(&self.stack[..], [receiver, thrown] if [receiver, thrown].into_iter().all(
+                |value| matches!(value.source, Source::New(offset) if offset == allocation)
+                    && matches!(&value.ty, Type::Object(name) if name == "java/lang/AssertionError")
+            ))
+        {
+            return Err(
+                self.invalid_stack("assertion constructor and throw need the same allocation")
+            );
+        }
+        self.stack.clear();
+        self.stack_slots = 0;
+        Ok(detail)
     }
 
     pub(crate) fn step(&mut self, op: &Instruction) -> Result<Effect, LiftError> {
@@ -280,6 +364,17 @@ impl<'a, 'c> Machine<'a, 'c> {
         self.opcode = op.opcode;
         if !matches!(op.opcode, 0x00 | 0x99..=0x9e) {
             self.lower_pending_comparison()?;
+        }
+        if matches!(op.opcode, 0x2e | 0x57 | 0xaa..=0xab | 0xb2 | 0xb6 | 0xb8)
+            && let Some(action) = self.enum_switch_action(op.offset)
+        {
+            return match action {
+                enum_switch::Action::Skip => Ok(Effect::None),
+                enum_switch::Action::Switch(owner) => Ok(Effect::Switch {
+                    selector: self.enum_switch_selector(owner)?,
+                }),
+                enum_switch::Action::Empty(owner) => self.empty_enum_switch(owner),
+            };
         }
         match op.opcode {
             0x00 => {}
@@ -397,7 +492,8 @@ impl<'a, 'c> Machine<'a, 'c> {
         let constant = self.class.pool.get(index)?;
         let named = || {
             (!self.options.keep_literals)
-                .then(|| numeric::named(constant, None, self.class_name)).flatten()
+                .then(|| numeric::named(constant, None, self.class_name))
+                .flatten()
         };
         let value = match constant {
             Constant::Integer(value) => {
@@ -411,7 +507,9 @@ impl<'a, 'c> Machine<'a, 'c> {
                     Expr::integer(*value)
                 }
             }
-            Constant::Long(value) => numeric::expression(Primitive::Long, named(), || format!("{value}L")),
+            Constant::Long(value) => {
+                numeric::expression(Primitive::Long, named(), || format!("{value}L"))
+            }
             Constant::Float(value) if value.is_nan() && value.to_bits() != f32::NAN.to_bits() => {
                 let class = (self.class_name)("java/lang/Float");
                 Expr {
@@ -438,8 +536,12 @@ impl<'a, 'c> Machine<'a, 'c> {
                     )?
                 }
             }
-            Constant::Float(value) => numeric::expression(Primitive::Float, named(), || literal::float_literal(*value)),
-            Constant::Double(value) => numeric::expression(Primitive::Double, named(), || literal::double_literal(*value)),
+            Constant::Float(value) => {
+                numeric::expression(Primitive::Float, named(), || literal::float_literal(*value))
+            }
+            Constant::Double(value) => numeric::expression(Primitive::Double, named(), || {
+                literal::double_literal(*value)
+            }),
             Constant::String(_) => Expr::literal(
                 Type::Object("java/lang/String".into()),
                 constant_literal(&self.class.pool, index, None, self.options.ascii_strings)?,
@@ -608,6 +710,9 @@ impl<'a, 'c> Machine<'a, 'c> {
     }
 
     fn freeze_stack(&mut self, following: Option<Order>) -> Result<Option<Order>, LiftError> {
+        if self.array_probe_depth != 0 {
+            return Err(self.unsupported("array initializer element requires a spill"));
+        }
         if self
             .stack
             .iter()
@@ -659,7 +764,8 @@ impl<'a, 'c> Machine<'a, 'c> {
     }
 
     fn render_code_type(&self, ty: &Type, target: TypeTarget) -> Result<Option<String>, LiftError> {
-        self.code_type_renderer.map_or(Ok(None), |render| render(ty, target))
+        self.code_type_renderer
+            .map_or(Ok(None), |render| render(ty, target))
     }
 
     fn known_assignable(&self, from: &Type, to: &Type) -> bool {

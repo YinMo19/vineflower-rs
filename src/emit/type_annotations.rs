@@ -2,12 +2,14 @@
 
 use std::collections::HashMap;
 
-use std::fmt::Write;
 use super::{DecompileError, Writer};
 use crate::{
     classfile::{Annotation, ClassError, ClassFile, TypeAnnotation, TypePathStep, TypeTarget},
-    descriptor::{ClassSignature, ClassType, GenericType, NestedType, Type, TypeArgument, TypeParameter},
+    descriptor::{
+        ClassSignature, ClassType, GenericType, NestedType, Type, TypeArgument, TypeParameter,
+    },
 };
+use std::fmt::Write;
 
 /// An explicit, non-static membership edge adds one INNER_TYPE step. A `$` in
 /// the binary name alone does not establish such an edge (e.g. Map.Entry).
@@ -28,7 +30,10 @@ impl<'a> TypeNesting<'a> {
             {
                 members.insert(
                     pool.class_name(inner.inner_class)?,
-                    (pool.class_name(inner.outer_class)?, pool.utf8(inner.inner_name)?),
+                    (
+                        pool.class_name(inner.outer_class)?,
+                        pool.utf8(inner.inner_name)?,
+                    ),
                 );
             }
         }
@@ -43,11 +48,15 @@ pub(super) enum RenderType<'a> {
 }
 
 impl<'a> From<&'a Type> for RenderType<'a> {
-    fn from(ty: &'a Type) -> Self { Self::Erased(ty) }
+    fn from(ty: &'a Type) -> Self {
+        Self::Erased(ty)
+    }
 }
 
 impl<'a> From<&'a GenericType> for RenderType<'a> {
-    fn from(ty: &'a GenericType) -> Self { Self::Generic(ty) }
+    fn from(ty: &'a GenericType) -> Self {
+        Self::Generic(ty)
+    }
 }
 
 impl RenderType<'_> {
@@ -59,7 +68,10 @@ impl RenderType<'_> {
                     self = Self::Erased(element);
                     dimensions += 1;
                 }
-                Self::Generic(GenericType::Array { element, dimensions: rank }) => {
+                Self::Generic(GenericType::Array {
+                    element,
+                    dimensions: rank,
+                }) => {
                     self = Self::Generic(element);
                     dimensions += usize::from(*rank);
                 }
@@ -83,7 +95,10 @@ pub(super) fn render<'a, 'b, E>(
     let ty = ty.into();
     let mut by_path = HashMap::<_, Vec<_>>::new();
     for annotation in annotations {
-        by_path.entry(annotation.path.as_slice()).or_default().push(&annotation.annotation);
+        by_path
+            .entry(annotation.path.as_slice())
+            .or_default()
+            .push(&annotation.annotation);
     }
     if by_path.is_empty() && !varargs {
         return Ok(match ty {
@@ -135,7 +150,8 @@ impl<E> Renderer<'_, '_, '_, E> {
     fn write_type(&mut self, ty: RenderType<'_>, varargs: bool) -> Result<(), E> {
         let (element, dimensions) = ty.array_parts();
         let root = self.path.len();
-        self.path.resize(root + dimensions, TypePathStep::ArrayElement);
+        self.path
+            .resize(root + dimensions, TypePathStep::ArrayElement);
         match element {
             RenderType::Erased(Type::Object(name)) => self.write_class(name, &[], &[])?,
             RenderType::Generic(GenericType::Class(class)) => {
@@ -145,8 +161,12 @@ impl<E> Renderer<'_, '_, '_, E> {
                 self.write_annotations(false)?;
                 self.out.push_str(match element {
                     RenderType::Erased(Type::Primitive(primitive))
-                    | RenderType::Generic(GenericType::Primitive(primitive)) => primitive.java_name(),
-                    RenderType::Erased(Type::Void) | RenderType::Generic(GenericType::Void) => "void",
+                    | RenderType::Generic(GenericType::Primitive(primitive)) => {
+                        primitive.java_name()
+                    }
+                    RenderType::Erased(Type::Void) | RenderType::Generic(GenericType::Void) => {
+                        "void"
+                    }
                     RenderType::Generic(GenericType::Variable(name)) => name,
                     _ => unreachable!("array_parts returns the non-array element"),
                 });
@@ -155,7 +175,11 @@ impl<E> Renderer<'_, '_, '_, E> {
         self.path.truncate(root);
         for i in 0..dimensions {
             self.write_annotations(true)?;
-            self.out.push_str(if varargs && i + 1 == dimensions { "..." } else { "[]" });
+            self.out.push_str(if varargs && i + 1 == dimensions {
+                "..."
+            } else {
+                "[]"
+            });
             self.path.push(TypePathStep::ArrayElement);
         }
         self.path.truncate(root);
@@ -225,7 +249,8 @@ impl<E> Renderer<'_, '_, '_, E> {
             if let Ok(index) = u8::try_from(index) {
                 self.path.push(TypePathStep::TypeArgument(index));
             } else {
-                self.path.resize((root + 1).max(256), TypePathStep::ArrayElement);
+                self.path
+                    .resize((root + 1).max(256), TypePathStep::ArrayElement);
             }
             match argument {
                 TypeArgument::Exact(ty) => self.write_type(ty.into(), false)?,
@@ -235,7 +260,12 @@ impl<E> Renderer<'_, '_, '_, E> {
                 }
                 TypeArgument::Extends(ty) | TypeArgument::Super(ty) => {
                     self.write_annotations(false)?;
-                    self.out.push_str(if matches!(argument, TypeArgument::Extends(_)) { "? extends " } else { "? super " });
+                    self.out
+                        .push_str(if matches!(argument, TypeArgument::Extends(_)) {
+                            "? extends "
+                        } else {
+                            "? super "
+                        });
                     self.path.push(TypePathStep::WildcardBound);
                     self.write_type(ty.into(), false)?;
                 }
@@ -261,7 +291,8 @@ impl Writer<'_, '_> {
             ty,
             annotations.iter().filter(|annotation| {
                 annotation.target == target
-                    && (!annotation.path.is_empty() || !declarations.contains(&annotation.annotation))
+                    && (!annotation.path.is_empty()
+                        || !declarations.contains(&annotation.annotation))
             }),
             |name| self.names.render(name),
             |annotation| self.annotation(annotation),
@@ -276,12 +307,22 @@ impl Writer<'_, '_> {
         annotations: &[TypeAnnotation],
         target: impl Fn(u8) -> TypeTarget,
     ) -> Result<(), DecompileError> {
-        if parameters.is_empty() { return Ok(()); }
+        if parameters.is_empty() {
+            return Ok(());
+        }
         output.push('<');
         for (index, parameter) in parameters.iter().enumerate() {
-            if index != 0 { output.push_str(", "); }
-            let index = u8::try_from(index).map_err(|_| DecompileError::InvalidAttribute("annotated type parameter count"))?;
-            output.push_str(&self.render_annotated_type_parameter(&self.type_nesting, parameter, target(index), annotations)?);
+            if index != 0 {
+                output.push_str(", ");
+            }
+            let index = u8::try_from(index)
+                .map_err(|_| DecompileError::InvalidAttribute("annotated type parameter count"))?;
+            output.push_str(&self.render_annotated_type_parameter(
+                &self.type_nesting,
+                parameter,
+                target(index),
+                annotations,
+            )?);
         }
         output.push('>');
         Ok(())
@@ -293,36 +334,69 @@ impl Writer<'_, '_> {
         constructor: bool,
     ) -> Result<Option<String>, DecompileError> {
         let target = TypeTarget::MethodReceiver;
-        if !annotations.iter().any(|annotation| annotation.target == target) {
+        if !annotations
+            .iter()
+            .any(|annotation| annotation.target == target)
+        {
             return Ok(None);
         }
-        let unsupported = || DecompileError::Unsupported { feature: "annotated constructor receiver without enclosing member class" };
+        let unsupported = || DecompileError::Unsupported {
+            feature: "annotated constructor receiver without enclosing member class",
+        };
         let qualified = if constructor {
-            let member = self.group.member_class(self.owner).ok_or_else(unsupported)?;
-            if member.access_flags & super::STATIC != 0 { return Err(unsupported()); }
+            let member = self
+                .group
+                .member_class(self.owner)
+                .ok_or_else(unsupported)?;
+            if member.access_flags & super::STATIC != 0 {
+                return Err(unsupported());
+            }
             Some(member.outer)
-        } else { None };
+        } else {
+            None
+        };
         let receiver = qualified.unwrap_or(self.owner);
         let mut owner = receiver;
         let mut nested = Vec::new();
         let arguments = |owner| -> Result<Vec<TypeArgument>, DecompileError> {
-            if !self.options.decompile_generics { return Ok(Vec::new()); }
-            let Some(class) = self.group.get(owner) else { return Ok(Vec::new()); };
-            let Some(signature) = class.signature()? else { return Ok(Vec::new()); };
+            if !self.options.decompile_generics {
+                return Ok(Vec::new());
+            }
+            let Some(class) = self.group.get(owner) else {
+                return Ok(Vec::new());
+            };
+            let Some(signature) = class.signature()? else {
+                return Ok(Vec::new());
+            };
             let signature = super::parse(signature, ClassSignature::parse)?;
-            Ok(signature.type_parameters.into_iter()
-                .map(|parameter| TypeArgument::Exact(GenericType::Variable(parameter.name))).collect())
+            Ok(signature
+                .type_parameters
+                .into_iter()
+                .map(|parameter| TypeArgument::Exact(GenericType::Variable(parameter.name)))
+                .collect())
         };
         while let Some(member) = self.group.member_class(owner) {
-            if member.access_flags & super::STATIC != 0 { break; }
-            nested.push(NestedType { name: member.simple_name.into(), arguments: arguments(owner)? });
+            if member.access_flags & super::STATIC != 0 {
+                break;
+            }
+            nested.push(NestedType {
+                name: member.simple_name.into(),
+                arguments: arguments(owner)?,
+            });
             owner = member.outer;
         }
         nested.reverse();
-        let ty = GenericType::Class(ClassType { internal_name: owner.into(), arguments: arguments(owner)?, nested });
+        let ty = GenericType::Class(ClassType {
+            internal_name: owner.into(),
+            arguments: arguments(owner)?,
+            nested,
+        });
         let mut value = self.render_type_target(&ty, annotations, target, &[], false)?;
         if let Some(outer) = qualified {
-            let name = self.group.member_class(outer).map_or(super::simple(outer), |outer| outer.simple_name);
+            let name = self
+                .group
+                .member_class(outer)
+                .map_or(super::simple(outer), |outer| outer.simple_name);
             let _ = write!(value, " {name}.this");
         } else {
             value.push_str(" this");
@@ -360,12 +434,19 @@ pub(super) fn render_parameter<E>(
     mut map_annotation: impl FnMut(&Annotation) -> Result<String, E>,
 ) -> Result<String, E> {
     let bound_target = |bound| match target {
-        TypeTarget::ClassTypeParameter(parameter) => Some(TypeTarget::ClassTypeParameterBound { parameter, bound }),
-        TypeTarget::MethodTypeParameter(parameter) => Some(TypeTarget::MethodTypeParameterBound { parameter, bound }),
+        TypeTarget::ClassTypeParameter(parameter) => {
+            Some(TypeTarget::ClassTypeParameterBound { parameter, bound })
+        }
+        TypeTarget::MethodTypeParameter(parameter) => {
+            Some(TypeTarget::MethodTypeParameterBound { parameter, bound })
+        }
         _ => None,
     };
     let mut out = String::new();
-    for annotation in annotations.iter().filter(|a| a.target == target && a.path.is_empty()) {
+    for annotation in annotations
+        .iter()
+        .filter(|a| a.target == target && a.path.is_empty())
+    {
         let java = map_annotation(&annotation.annotation)?;
         if !java.is_empty() {
             out.push_str(&java);
@@ -380,12 +461,26 @@ pub(super) fn render_parameter<E>(
     {
         let Some(bound) = bound else { continue };
         let target = u8::try_from(index).ok().and_then(bound_target);
-        let mut selected = annotations.iter().filter(|a| target.as_ref() == Some(&a.target)).peekable();
-        if index == 0 && bound.is_java_lang_object() && parameter.interface_bounds.is_empty() && selected.peek().is_none() {
+        let mut selected = annotations
+            .iter()
+            .filter(|a| target.as_ref() == Some(&a.target))
+            .peekable();
+        if index == 0
+            && bound.is_java_lang_object()
+            && parameter.interface_bounds.is_empty()
+            && selected.peek().is_none()
+        {
             continue;
         }
         out.push_str(separator);
-        out.push_str(&render(nesting, bound, selected, &mut map_class, &mut map_annotation, false)?);
+        out.push_str(&render(
+            nesting,
+            bound,
+            selected,
+            &mut map_class,
+            &mut map_annotation,
+            false,
+        )?);
         separator = " & ";
     }
     Ok(out)
@@ -401,7 +496,10 @@ mod tests {
         TypeAnnotation {
             target: TypeTarget::Field,
             path: path.to_vec(),
-            annotation: Annotation { type_index: index, elements: Vec::new() },
+            annotation: Annotation {
+                type_index: index,
+                elements: Vec::new(),
+            },
         }
     }
 
@@ -411,9 +509,13 @@ mod tests {
 
     #[test]
     fn descends_array_before_nested_arguments_and_wildcard_bounds() {
-        use TypePathStep::{ArrayElement as A, NestedType as N, TypeArgument as T, WildcardBound as W};
-        let ty = FieldSignature::parse("[[Lpkg/Outer<Ljava/lang/String;>.Inner<+[Ljava/lang/Number;*>;")
-            .unwrap().field_type;
+        use TypePathStep::{
+            ArrayElement as A, NestedType as N, TypeArgument as T, WildcardBound as W,
+        };
+        let ty =
+            FieldSignature::parse("[[Lpkg/Outer<Ljava/lang/String;>.Inner<+[Ljava/lang/Number;*>;")
+                .unwrap()
+                .field_type;
         let annotations = [
             tag(1, &[]),
             tag(2, &[A]),
@@ -425,10 +527,21 @@ mod tests {
             tag(8, &[A, A, N, T(0), W, A]),
             tag(9, &[A, A, N, T(1)]),
             tag(10, &[A, A, N, T(1), W]), // An unbounded wildcard has no bound node.
-            tag(11, &[]), // Preserve annotation order at a shared node.
+            tag(11, &[]),                 // Preserve annotation order at a shared node.
         ];
-        let actual = render(&TypeNesting::default(), &ty, &annotations, |name| name.replace('/', "."), annotation, true).unwrap();
-        assert_eq!(actual, "pkg.@A3 Outer<java.lang.@A4 String>.@A5 Inner<@A6 ? extends java.lang.@A8 Number @A7 [], @A9 ?> @A1 @A11 [] @A2 ...");
+        let actual = render(
+            &TypeNesting::default(),
+            &ty,
+            &annotations,
+            |name| name.replace('/', "."),
+            annotation,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            actual,
+            "pkg.@A3 Outer<java.lang.@A4 String>.@A5 Inner<@A6 ? extends java.lang.@A8 Number @A7 [], @A9 ?> @A1 @A11 [] @A2 ..."
+        );
     }
 
     #[test]
@@ -438,10 +551,18 @@ mod tests {
         };
         let ty = Type::parse("Lpkg/Outer$Static$Inner;").unwrap();
         let annotations = [tag(1, &[]), tag(2, &[TypePathStep::NestedType])];
-        let actual = render(&nesting, &ty, &annotations, |name| {
-            assert_eq!(name, "pkg/Outer$Static");
-            "pkg.Outer.Static".into()
-        }, annotation, false).unwrap();
+        let actual = render(
+            &nesting,
+            &ty,
+            &annotations,
+            |name| {
+                assert_eq!(name, "pkg/Outer$Static");
+                "pkg.Outer.Static".into()
+            },
+            annotation,
+            false,
+        )
+        .unwrap();
         assert_eq!(actual, "pkg.Outer.@A1 Static.@A2 Inner");
     }
 
@@ -450,15 +571,48 @@ mod tests {
         let parameter = TypeParameter {
             name: "T".to_owned(),
             class_bound: None,
-            interface_bounds: vec![FieldSignature::parse("Ljava/io/Serializable;").unwrap().field_type],
+            interface_bounds: vec![
+                FieldSignature::parse("Ljava/io/Serializable;")
+                    .unwrap()
+                    .field_type,
+            ],
         };
         let annotations = [
-            TypeAnnotation { target: TypeTarget::MethodTypeParameter(1), ..tag(1, &[]) },
-            TypeAnnotation { target: TypeTarget::MethodTypeParameterBound { parameter: 1, bound: 0 }, ..tag(2, &[]) },
-            TypeAnnotation { target: TypeTarget::MethodTypeParameterBound { parameter: 1, bound: 1 }, ..tag(3, &[]) },
-            TypeAnnotation { target: TypeTarget::MethodTypeParameterBound { parameter: 0, bound: 1 }, ..tag(4, &[]) },
+            TypeAnnotation {
+                target: TypeTarget::MethodTypeParameter(1),
+                ..tag(1, &[])
+            },
+            TypeAnnotation {
+                target: TypeTarget::MethodTypeParameterBound {
+                    parameter: 1,
+                    bound: 0,
+                },
+                ..tag(2, &[])
+            },
+            TypeAnnotation {
+                target: TypeTarget::MethodTypeParameterBound {
+                    parameter: 1,
+                    bound: 1,
+                },
+                ..tag(3, &[])
+            },
+            TypeAnnotation {
+                target: TypeTarget::MethodTypeParameterBound {
+                    parameter: 0,
+                    bound: 1,
+                },
+                ..tag(4, &[])
+            },
         ];
-        let actual = render_parameter(&TypeNesting::default(), &parameter, TypeTarget::MethodTypeParameter(1), &annotations, |name| name.rsplit('/').next().unwrap().to_owned(), annotation).unwrap();
+        let actual = render_parameter(
+            &TypeNesting::default(),
+            &parameter,
+            TypeTarget::MethodTypeParameter(1),
+            &annotations,
+            |name| name.rsplit('/').next().unwrap().to_owned(),
+            annotation,
+        )
+        .unwrap();
         assert_eq!(actual, "@A1 T extends @A3 Serializable");
     }
 }

@@ -19,9 +19,15 @@ type NodeId = usize;
 #[derive(Debug)]
 enum Flow {
     Next(BlockId),
-    Branch { target: BlockId, next: Option<BlockId> },
+    Branch {
+        target: BlockId,
+        next: Option<BlockId>,
+    },
     Switch(Vec<BlockId>), // default, then cases in original order
-    Call { target: BlockId, next: BlockId },
+    Call {
+        target: BlockId,
+        next: BlockId,
+    },
     Ret(u16),
     Stop,
 }
@@ -47,8 +53,10 @@ impl Topology {
     fn build(ops: &[Instruction], handlers: &[ExceptionHandler]) -> Result<Self, LegacyError> {
         let mut leaders = vec![false; ops.len()];
         leaders[0] = true;
-        let index = |offset| ops.binary_search_by_key(&offset, |op| op.offset)
-            .map_err(|_| invalid(offset, "not an instruction boundary"));
+        let index = |offset| {
+            ops.binary_search_by_key(&offset, |op| op.offset)
+                .map_err(|_| invalid(offset, "not an instruction boundary"))
+        };
         let code_end = ops.last().and_then(|op| op.offset.checked_add(op.len));
         for (i, op) in ops.iter().enumerate() {
             match &op.operand {
@@ -79,25 +87,43 @@ impl Topology {
             }
             leaders[index(u32::from(handler.handler_pc))?] = true;
         }
-        let starts: Vec<_> = leaders.into_iter().enumerate()
-            .filter_map(|(i, leader)| leader.then_some(i)).collect();
-        let block_at = |offset| starts.binary_search_by_key(&offset, |&i| ops[i].offset)
-            .map_err(|_| invalid(offset, "not a basic block boundary"));
+        let starts: Vec<_> = leaders
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, leader)| leader.then_some(i))
+            .collect();
+        let block_at = |offset| {
+            starts
+                .binary_search_by_key(&offset, |&i| ops[i].offset)
+                .map_err(|_| invalid(offset, "not a basic block boundary"))
+        };
         let mut blocks = Vec::with_capacity(starts.len());
         for (i, &start) in starts.iter().enumerate() {
             let end = starts.get(i + 1).copied().unwrap_or(ops.len());
             let last = &ops[end - 1];
             let bad = |reason| invalid(last.offset, reason);
-            let next = || (i + 1 < starts.len()).then_some(i + 1)
-                .ok_or_else(|| bad("instruction falls through the end of the method"));
+            let next = || {
+                (i + 1 < starts.len())
+                    .then_some(i + 1)
+                    .ok_or_else(|| bad("instruction falls through the end of the method"))
+            };
             let branch = || match last.operand {
                 Operand::Branch(target) => block_at(target),
                 _ => Err(bad("missing branch target")),
             };
             let flow = match last.opcode {
-                0x99..=0xa6 | 0xc6 | 0xc7 => Flow::Branch { target: branch()?, next: Some(next()?) },
-                0xa7 | 0xc8 => Flow::Branch { target: branch()?, next: None },
-                0xa8 | 0xc9 => Flow::Call { target: branch()?, next: next()? },
+                0x99..=0xa6 | 0xc6 | 0xc7 => Flow::Branch {
+                    target: branch()?,
+                    next: Some(next()?),
+                },
+                0xa7 | 0xc8 => Flow::Branch {
+                    target: branch()?,
+                    next: None,
+                },
+                0xa8 | 0xc9 => Flow::Call {
+                    target: branch()?,
+                    next: next()?,
+                },
                 0xa9 => match last.operand {
                     Operand::Local(index) => Flow::Ret(index),
                     _ => return Err(bad("missing ret local index")),
@@ -106,14 +132,20 @@ impl Topology {
                     let Operand::Switch { default, cases } = &last.operand else {
                         return Err(bad("missing switch targets"));
                     };
-                    let targets = std::iter::once(*default).chain(cases.iter().map(|&(_, target)| target))
-                        .map(block_at).collect::<Result<_, _>>()?;
+                    let targets = std::iter::once(*default)
+                        .chain(cases.iter().map(|&(_, target)| target))
+                        .map(block_at)
+                        .collect::<Result<_, _>>()?;
                     Flow::Switch(targets)
                 }
                 0xac..=0xb1 | 0xbf => Flow::Stop,
                 _ => Flow::Next(next()?),
             };
-            blocks.push(Block { ops: start..end, flow, handlers: Vec::new() });
+            blocks.push(Block {
+                ops: start..end,
+                flow,
+                handlers: Vec::new(),
+            });
         }
         let mut table = Vec::with_capacity(handlers.len());
         for handler in handlers {
@@ -127,9 +159,15 @@ impl Topology {
             for block in &mut blocks[start..end] {
                 block.handlers.push(table.len());
             }
-            table.push(Handler { target, catch_type: handler.catch_type });
+            table.push(Handler {
+                target,
+                catch_type: handler.catch_type,
+            });
         }
-        Ok(Self { blocks, handlers: table })
+        Ok(Self {
+            blocks,
+            handlers: table,
+        })
     }
 
     /// Approximate one subroutine's lexical extent by following each jsr's
@@ -206,7 +244,10 @@ pub(super) fn expand(
         ops,
         topology: &topology,
         effects: vec![None; ops.len()],
-        contexts: vec![Context { entry: 0, continuation: None }],
+        contexts: vec![Context {
+            entry: 0,
+            continuation: None,
+        }],
         members: HashMap::from([(0, topology.members(0))]),
         calls: HashMap::new(),
         ids: HashMap::new(),
@@ -214,7 +255,13 @@ pub(super) fn expand(
         pending: VecDeque::new(),
         op_count: 0,
     };
-    expansion.connect(Key { context: 0, block: 0 }, &Frame::default())?;
+    expansion.connect(
+        Key {
+            context: 0,
+            block: 0,
+        },
+        &Frame::default(),
+    )?;
     while let Some(node) = expansion.pending.pop_front() {
         expansion.process(node, pool)?;
     }
@@ -237,7 +284,12 @@ impl Expansion<'_> {
             }
             let id = self.nodes.len();
             self.ids.insert(key, id);
-            self.nodes.push(Node { key, input: input.clone(), queued: true, rewrites: Vec::new() });
+            self.nodes.push(Node {
+                key,
+                input: input.clone(),
+                queued: true,
+                rewrites: Vec::new(),
+            });
             self.pending.push_back(id);
         }
         Ok(())
@@ -254,7 +306,10 @@ impl Expansion<'_> {
                 owner = context;
             }
         }
-        Key { context: owner, block }
+        Key {
+            context: owner,
+            block,
+        }
     }
 
     fn call(
@@ -265,7 +320,10 @@ impl Expansion<'_> {
         offset: u32,
     ) -> Result<Key, LegacyError> {
         if let Some(&context) = self.calls.get(&caller) {
-            return Ok(Key { context, block: entry });
+            return Ok(Key {
+                context,
+                block: entry,
+            });
         }
         let mut context = caller.context;
         while let Some(continuation) = self.contexts[context].continuation {
@@ -278,10 +336,21 @@ impl Expansion<'_> {
         // needed to detect recursion and to resolve edge ownership while this
         // invocation runs. Keep the immediate caller until ret executes.
         let context = self.contexts.len();
-        self.contexts.push(Context { entry, continuation: Some(Key { context: caller.context, block: next }) });
+        self.contexts.push(Context {
+            entry,
+            continuation: Some(Key {
+                context: caller.context,
+                block: next,
+            }),
+        });
         self.calls.insert(caller, context);
-        self.members.entry(entry).or_insert_with(|| self.topology.members(entry));
-        Ok(Key { context, block: entry })
+        self.members
+            .entry(entry)
+            .or_insert_with(|| self.topology.members(entry));
+        Ok(Key {
+            context,
+            block: entry,
+        })
     }
 
     fn process(&mut self, id: NodeId, pool: &ConstantPool<'_>) -> Result<(), LegacyError> {
@@ -312,7 +381,8 @@ impl Expansion<'_> {
             }
             // Exceptional edges see the locals before the potentially failing
             // instruction, and an operand stack containing only the exception.
-            if i != last && matches!(effect, Effect::Write { .. })
+            if i != last
+                && matches!(effect, Effect::Write { .. })
                 && let Some(exception) = &mut exception
             {
                 exception.merge_locals(&frame);
@@ -338,10 +408,14 @@ impl Expansion<'_> {
                 self.connect(destination, &frame)?;
             }
             Flow::Ret(local) => {
-                let continuation = self.contexts[key.context].continuation
+                let continuation = self.contexts[key.context]
+                    .continuation
                     .ok_or_else(|| invalid(offset, "ret outside a subroutine"))?;
                 frame.check_ret(*local, key.context, offset)?;
-                self.connect(self.target(continuation.context, continuation.block), &frame)?;
+                self.connect(
+                    self.target(continuation.context, continuation.block),
+                    &frame,
+                )?;
             }
             Flow::Stop => (),
         }
@@ -364,7 +438,9 @@ impl Expansion<'_> {
             offset: 0,
         };
         let mut starts = vec![0; order.len()];
-        let mut ranges: Vec<Vec<Protected>> = (0..self.topology.handlers.len()).map(|_| Vec::new()).collect();
+        let mut ranges: Vec<Vec<Protected>> = (0..self.topology.handlers.len())
+            .map(|_| Vec::new())
+            .collect();
         for (index, &id) in order.iter().enumerate() {
             let node = &self.nodes[id];
             let Key { context, block } = node.key;
@@ -384,13 +460,17 @@ impl Expansion<'_> {
                 if i + 1 == block.ops.end {
                     match &block.flow {
                         Flow::Call { target, .. } => {
-                            let block = Key { context: self.calls[&node.key], block: *target };
+                            let block = Key {
+                                context: self.calls[&node.key],
+                                block: *target,
+                            };
                             op.opcode = if source.opcode == 0xc9 { 0xc8 } else { 0xa7 };
                             op.operand = Operand::Branch(self.ids[&block] as u32);
                         }
                         Flow::Ret(_) => {
                             let continuation = self.contexts[context].continuation.unwrap();
-                            let dest = self.ids[&self.target(continuation.context, continuation.block)];
+                            let dest =
+                                self.ids[&self.target(continuation.context, continuation.block)];
                             op.opcode = 0xa7;
                             op.operand = Operand::Branch(dest as u32);
                             op.len = 3;
@@ -399,27 +479,37 @@ impl Expansion<'_> {
                             op.operand = Operand::Branch(target(*dest) as u32);
                         }
                         Flow::Switch(targets) => {
-                            let Operand::Switch { default, cases } = &mut op.operand else { unreachable!() };
+                            let Operand::Switch { default, cases } = &mut op.operand else {
+                                unreachable!()
+                            };
                             *default = target(targets[0]) as u32;
                             for ((_, dest), &block) in cases.iter_mut().zip(&targets[1..]) {
                                 *dest = target(block) as u32;
                             }
-                            op.len = op.len - switch_padding(source.offset) + switch_padding(emitter.offset);
+                            op.len = op.len - switch_padding(source.offset)
+                                + switch_padding(emitter.offset);
                         }
                         Flow::Next(_) | Flow::Stop => (),
                     }
                 }
                 emitter.push(op, Some(source))?;
             }
-            if let Flow::Next(next) | Flow::Branch { next: Some(next), .. } = block.flow {
+            if let Flow::Next(next)
+            | Flow::Branch {
+                next: Some(next), ..
+            } = block.flow
+            {
                 let dest = target(next);
                 if order.get(index + 1) != Some(&dest) {
-                    emitter.push(Instruction {
-                        offset: 0,
-                        opcode: 0xc8,
-                        operand: Operand::Branch(dest as u32),
-                        len: 5,
-                    }, None)?;
+                    emitter.push(
+                        Instruction {
+                            offset: 0,
+                            opcode: 0xc8,
+                            operand: Operand::Branch(dest as u32),
+                            len: 5,
+                        },
+                        None,
+                    )?;
                 }
             }
             for &index in &block.handlers {
@@ -427,7 +517,10 @@ impl Expansion<'_> {
                 let target = target(handler.target);
                 let protected = &mut ranges[index];
                 let end = emitter.offset;
-                if let Some(previous) = protected.last_mut().filter(|p| p.end == start && p.target == target) {
+                if let Some(previous) = protected
+                    .last_mut()
+                    .filter(|p| p.end == start && p.target == target)
+                {
                     previous.end = end;
                 } else {
                     protected.push(Protected { start, end, target });
@@ -435,13 +528,18 @@ impl Expansion<'_> {
             }
         }
         // Preserve first-match priority when an original table entry splits.
-        let handlers = ranges.into_iter().zip(&self.topology.handlers)
-            .flat_map(|(ranges, handler)| ranges.into_iter().map(|protected| ExceptionHandler {
-                start_pc: protected.start as u16,
-                end_pc: protected.end as u16,
-                handler_pc: starts[protected.target] as u16,
-                catch_type: handler.catch_type,
-            })).collect();
+        let handlers = ranges
+            .into_iter()
+            .zip(&self.topology.handlers)
+            .flat_map(|(ranges, handler)| {
+                ranges.into_iter().map(|protected| ExceptionHandler {
+                    start_pc: protected.start as u16,
+                    end_pc: protected.end as u16,
+                    handler_pc: starts[protected.target] as u16,
+                    catch_type: handler.catch_type,
+                })
+            })
+            .collect();
         for index in emitter.pending_targets {
             match &mut emitter.instructions[index].operand {
                 Operand::Branch(target) => *target = starts[*target as usize],
@@ -454,7 +552,11 @@ impl Expansion<'_> {
                 _ => unreachable!(),
             }
         }
-        Ok(NormalizedCode { instructions: emitter.instructions, handlers, origins: Some(emitter.origins) })
+        Ok(NormalizedCode {
+            instructions: emitter.instructions,
+            handlers,
+            origins: Some(emitter.origins),
+        })
     }
 }
 
@@ -472,9 +574,16 @@ struct Emitter {
 }
 
 impl Emitter {
-    fn push(&mut self, mut op: Instruction, source: Option<&Instruction>) -> Result<(), LegacyError> {
+    fn push(
+        &mut self,
+        mut op: Instruction,
+        source: Option<&Instruction>,
+    ) -> Result<(), LegacyError> {
         op.offset = self.offset;
-        self.offset = self.offset.checked_add(op.len).filter(|&n| n as usize <= MAX_CODE)
+        self.offset = self
+            .offset
+            .checked_add(op.len)
+            .filter(|&n| n as usize <= MAX_CODE)
             .ok_or(LegacyError::CodeTooLong)?;
         if let Some(source) = source {
             // Realigned switch operands still refer to the same source bytes;
@@ -482,14 +591,22 @@ impl Emitter {
             if matches!(op.operand, Operand::Switch { .. }) {
                 let before = 1 + switch_padding(op.offset);
                 let source_before = 1 + switch_padding(source.offset);
-                self.origins.push(Origin { start: op.offset, len: before.min(source_before), source: source.offset });
+                self.origins.push(Origin {
+                    start: op.offset,
+                    len: before.min(source_before),
+                    source: source.offset,
+                });
                 self.origins.push(Origin {
                     start: op.offset + before,
                     len: op.len - before,
                     source: source.offset + source_before,
                 });
             } else {
-                self.origins.push(Origin { start: op.offset, len: source.len.min(op.len), source: source.offset });
+                self.origins.push(Origin {
+                    start: op.offset,
+                    len: source.len.min(op.len),
+                    source: source.offset,
+                });
             }
         }
         if matches!(op.operand, Operand::Branch(_) | Operand::Switch { .. }) {

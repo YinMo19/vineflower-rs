@@ -45,6 +45,8 @@ impl Order {
 
 #[derive(Clone)]
 pub(super) enum Source {
+    Local(u16),
+    CapturedLocal,
     Plain,
     Integer(i32),
     Null,

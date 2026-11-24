@@ -8,6 +8,7 @@ use crate::cfg::ControlFlowGraph;
 use crate::lift::Machine;
 
 use super::StructureError;
+use super::assertions::Sites;
 use super::protected::ArmId;
 
 #[derive(Clone, Copy)]
@@ -51,7 +52,10 @@ impl<'r, 'a, 'c> Region<'r, 'a, 'c> {
     }
 
     pub(super) fn switch_body(&'r self, stop: Option<usize>) -> Self {
-        Self { switch_depth: self.switch_depth + 1, ..self.branch(stop) }
+        Self {
+            switch_depth: self.switch_depth + 1,
+            ..self.branch(stop)
+        }
     }
 
     pub(super) fn loop_transfer(&self, block: usize) -> Option<(&'r LoopScope<'a, 'c>, Transfer)> {
@@ -127,7 +131,7 @@ pub(super) struct Loop {
 pub(super) struct Layout {
     pub(super) loops: Vec<Option<Loop>>,
     level: Vec<Option<usize>>,
-    postdominators: PostDominators,
+    postdominators: DominanceTree,
     locals: Option<LocalLiveness>,
 }
 
@@ -135,19 +139,22 @@ impl Layout {
     pub(super) fn new(
         graph: &ControlFlowGraph,
         instructions: &[Instruction],
+        assertions: Option<&Sites>,
     ) -> Result<Self, StructureError> {
-        let mut natural_loops = graph.natural_loops();
-        natural_loops
-            .sort_unstable_by_key(|natural_loop| std::cmp::Reverse(natural_loop.blocks.len()));
+        let mut immediate_dominators = Some(graph.immediate_dominators());
+        let mut natural_loops =
+            graph.natural_loops_with_dominators(immediate_dominators.as_deref().unwrap());
+        let mut dominators = (natural_loops.len() > 1)
+            .then(|| DominanceTree::new(immediate_dominators.take().unwrap()));
+        if let Some(dominators) = &dominators {
+            // An exit-only tail can contain a loop with a larger cyclic
+            // core than its enclosing loop. Classify by dominance, not size.
+            natural_loops.sort_unstable_by_key(|shape| dominators.intervals[shape.header].0);
+        }
         let mut loops: Vec<Option<Loop>> = vec![None; graph.blocks.len()];
         let mut level: Vec<Option<usize>> = vec![None; graph.blocks.len()];
-        let postdominators = PostDominators::new(graph.immediate_postdominators());
-        let mut dominators = None;
-        let mut loop_headers = vec![false; graph.blocks.len()];
-        for shape in &natural_loops {
-            loop_headers[shape.header] = true;
-        }
-        let mut seen_tail = vec![usize::MAX; graph.blocks.len()];
+        let postdominators = DominanceTree::new(graph.immediate_postdominators());
+        let mut seen_tail = Vec::new();
         let mut pending = Vec::new();
         for natural_loop in natural_loops {
             let header = natural_loop.header;
@@ -156,7 +163,11 @@ impl Layout {
             };
             let inside = |block: usize| natural_loop.blocks.binary_search(&block).is_ok();
             let parent = level[header];
-            if natural_loop.blocks.iter().any(|&block| level[block] != parent) {
+            if natural_loop
+                .blocks
+                .iter()
+                .any(|&block| level[block] != parent)
+            {
                 return Err(unsupported());
             }
             let outer_transfer = |block| {
@@ -170,47 +181,79 @@ impl Layout {
                 }
                 false
             };
-            let exits: BTreeSet<_> = natural_loop.blocks.iter()
+            let exits: BTreeSet<_> = natural_loop
+                .blocks
+                .iter()
                 .flat_map(|&block| graph.blocks[block].successors.iter().copied())
                 .filter(|&next| !inside(next) && !outer_transfer(next))
                 .collect();
+            let is_failure = |block| assertions.is_some_and(|sites| sites.is_failure_block(block));
+            let tests_condition = matches!(instructions[graph.blocks[header].instructions.end - 1].opcode,
+                0x99..=0xa6 | 0xc6..=0xc7)
+                && !assertions.is_some_and(|sites| sites.starts(header));
             let test = match graph.blocks[header].successors.as_slice() {
-                [first, second] => match (inside(*first), inside(*second)) {
-                    (true, false) if !outer_transfer(*second) => Some(While { body: *first, exit: *second }),
-                    (false, true) if !outer_transfer(*first) => Some(While { body: *second, exit: *first }),
+                [first, second] if tests_condition => match (inside(*first), inside(*second)) {
+                    (true, false) if !outer_transfer(*second) && !is_failure(*second) => {
+                        Some(While {
+                            body: *first,
+                            exit: *second,
+                        })
+                    }
+                    (false, true) if !outer_transfer(*first) && !is_failure(*first) => {
+                        Some(While {
+                            body: *second,
+                            exit: *first,
+                        })
+                    }
                     _ => None,
                 },
                 _ => None,
             };
-            let mut exit = exits.first().copied().filter(|_| exits.len() == 1)
-                .or_else(|| test.map(|test| test.exit))
-                .or_else(|| {
-                    let mut targets = exits.iter().copied();
-                    let first = targets.next()?;
-                    let common = targets.try_fold(first, |a, b| postdominators.common(a, b))?;
-                    (!inside(common) && !outer_transfer(common) && level[common] == parent).then_some(common)
-                });
-            let simple = test.is_some() && natural_loop.blocks.iter().copied().filter(|&block| block != header)
-                .all(|block| graph.blocks[block].successors.iter().copied().all(inside));
+            let mut normal = exits.iter().copied().filter(|&target| !is_failure(target));
+            let first = normal.next();
+            let mut exit = match (first, normal.next()) {
+                (Some(target), None) => Some(target),
+                (Some(a), Some(b)) => test.map(|test| test.exit).or_else(|| {
+                    let common = normal.try_fold(postdominators.common(a, b)?, |a, b| {
+                        postdominators.common(a, b)
+                    })?;
+                    (!inside(common) && !outer_transfer(common) && level[common] == parent)
+                        .then_some(common)
+                }),
+                (None, _) => None,
+            };
 
             // A natural loop contains only blocks that can return to its
             // header. Include dominated exit-only tails in the same source
             // loop, stopping at its continuation or an enclosing transfer.
-            let tail_start = |target| Some(target) != exit;
-            pending.extend(exits.iter().copied().filter(|&target| tail_start(target)));
+            pending.extend(exits.iter().copied().filter(|&target| Some(target) != exit));
+            if !pending.is_empty() && seen_tail.is_empty() {
+                seen_tail.resize(graph.blocks.len(), usize::MAX);
+            }
+            let mut exit_is_required = false;
             let mut tails = Vec::new();
             while let Some(block) = pending.pop() {
-                if Some(block) == exit || inside(block) || outer_transfer(block)
+                if Some(block) == exit
+                    || inside(block)
+                    || outer_transfer(block)
                     || std::mem::replace(&mut seen_tail[block], header) == header
                 {
                     continue;
                 }
-                let dominates = dominators.get_or_insert_with(|| PostDominators::new(graph.immediate_dominators()));
-                if level[block] != parent || loop_headers[block] || !dominates.contains(header, block) {
-                    if level[block] != parent || exit.is_some() {
+                let dominates = dominators.get_or_insert_with(|| {
+                    DominanceTree::new(immediate_dominators.take().unwrap())
+                });
+                if level[block] != parent {
+                    return Err(unsupported());
+                }
+                if loops[block].is_some() || !dominates.contains(header, block) {
+                    if exit_is_required {
                         return Err(unsupported());
                     }
-                    exit = Some(block);
+                    if let Some(previous) = exit.replace(block) {
+                        pending.push(previous);
+                    }
+                    exit_is_required = true;
                     continue;
                 }
                 tails.push(block);
@@ -219,15 +262,37 @@ impl Layout {
             if exit.is_some_and(|block| level[block] != parent) {
                 return Err(unsupported());
             }
+            if !tails.is_empty() {
+                tails.sort_unstable();
+                let dominates = dominators.as_ref().expect("tail dominance was tested");
+                let enters_tail = |pred| {
+                    dominates.contains(0, pred)
+                        && !inside(pred)
+                        && tails.binary_search(&pred).is_err()
+                };
+                if tails.iter().any(|&block| {
+                    let node = &graph.blocks[block];
+                    node.predecessors
+                        .iter()
+                        .chain(&node.exception_predecessors)
+                        .copied()
+                        .any(enters_tail)
+                }) {
+                    return Err(unsupported());
+                }
+            }
             for block in natural_loop.blocks.into_iter().chain(tails) {
-                level[block] = Some(header);
+                // Keep the header visible as one node of the parent region,
+                // including while classifying a later sibling loop.
+                if block != header {
+                    level[block] = Some(header);
+                }
             }
-            loops[header] = Some(Loop { test: test.filter(|_| simple), exit, parent });
-        }
-        for (header, shape) in loops.iter().enumerate() {
-            if let Some(loop_shape) = shape {
-                level[header] = loop_shape.parent;
-            }
+            loops[header] = Some(Loop {
+                test: test.filter(|test| Some(test.exit) == exit),
+                exit,
+                parent,
+            });
         }
         Ok(Self {
             loops,
@@ -327,28 +392,37 @@ struct LocalLiveness {
 
 impl LocalLiveness {
     fn new(graph: &ControlFlowGraph, instructions: &[Instruction]) -> Self {
-        let accesses = graph.blocks.iter().map(|block| {
-            let mut first = BTreeMap::new();
-            for instruction in &instructions[block.instructions.clone()] {
-                let (slot, read, wide) = match (instruction.opcode, &instruction.operand) {
-                    (0x15..=0x19, Operand::Local(slot)) => (*slot, true, false),
-                    (op @ 0x1a..=0x2d, _) => (u16::from((op - 0x1a) % 4), true, false),
-                    (op @ 0x36..=0x3a, Operand::Local(slot)) => (*slot, false, matches!(op, 0x37 | 0x39)),
-                    (op @ 0x3b..=0x4e, _) => (
-                        u16::from((op - 0x3b) % 4),
-                        false,
-                        matches!((op - 0x3b) / 4, 1 | 3),
-                    ),
-                    (0x84, Operand::Increment { index, .. }) => (*index, true, false),
-                    _ => continue,
-                };
-                first.entry(slot).or_insert(read);
-                if !read && wide && let Some(high) = slot.checked_add(1) {
-                    first.entry(high).or_insert(false);
+        let accesses = graph
+            .blocks
+            .iter()
+            .map(|block| {
+                let mut first = BTreeMap::new();
+                for instruction in &instructions[block.instructions.clone()] {
+                    let (slot, read, wide) = match (instruction.opcode, &instruction.operand) {
+                        (0x15..=0x19, Operand::Local(slot)) => (*slot, true, false),
+                        (op @ 0x1a..=0x2d, _) => (u16::from((op - 0x1a) % 4), true, false),
+                        (op @ 0x36..=0x3a, Operand::Local(slot)) => {
+                            (*slot, false, matches!(op, 0x37 | 0x39))
+                        }
+                        (op @ 0x3b..=0x4e, _) => (
+                            u16::from((op - 0x3b) % 4),
+                            false,
+                            matches!((op - 0x3b) / 4, 1 | 3),
+                        ),
+                        (0x84, Operand::Increment { index, .. }) => (*index, true, false),
+                        _ => continue,
+                    };
+                    first.entry(slot).or_insert(read);
+                    if !read
+                        && wide
+                        && let Some(high) = slot.checked_add(1)
+                    {
+                        first.entry(high).or_insert(false);
+                    }
                 }
-            }
-            first.into_iter().collect()
-        }).collect();
+                first.into_iter().collect()
+            })
+            .collect();
         Self {
             accesses,
             seen: vec![0; graph.blocks.len()],
@@ -382,20 +456,20 @@ impl LocalLiveness {
     }
 }
 
-struct PostDominators {
+struct DominanceTree {
     parent: Vec<Option<usize>>,
     intervals: Vec<(usize, usize)>,
 }
 
-impl PostDominators {
+impl DominanceTree {
     fn new(parent: Vec<Option<usize>>) -> Self {
-        // Number the postdominator forest in preorder, beneath a virtual root.
-        // A postdominance query then costs one subtree-interval lookup.
+        // Number the forest in preorder beneath a virtual root so dominance
+        // is a single subtree interval lookup.
         let root = parent.len();
         let mut first_child = vec![None; root + 1];
         let mut next_sibling = vec![None; root];
-        for (block, &postdom) in parent.iter().enumerate() {
-            next_sibling[block] = first_child[postdom.unwrap_or(root)].replace(block);
+        for (block, &parent) in parent.iter().enumerate() {
+            next_sibling[block] = first_child[parent.unwrap_or(root)].replace(block);
         }
         let mut intervals = vec![(0, 0); root];
         let mut next_index = 0;
