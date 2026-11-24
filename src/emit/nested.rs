@@ -252,6 +252,7 @@ impl<'a, 'c> Writer<'a, 'c> {
             return Ok(false);
         }
         Ok(!self.hidden(method)?
+            || crate::lift::scala_trait::keep_synthetic_bridge(self.class, method)?
             || self
                 .dynamic_helpers
                 .borrow()

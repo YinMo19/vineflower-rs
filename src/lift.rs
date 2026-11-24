@@ -26,6 +26,7 @@ mod operations;
 mod overloads;
 pub(crate) mod pattern_dispatch;
 pub(crate) mod qualified_new;
+pub(crate) mod scala_trait;
 mod switch_expression;
 
 pub(crate) use anonymous::{AnonymousBindings, AnonymousSite, AnonymousSites};

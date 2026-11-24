@@ -288,6 +288,11 @@ impl Machine<'_, '_> {
                 }
             } else {
                 if op.opcode == 0xb7 && !self.own_method_is_private(name, method_type)? {
+                    if matches!(tag, Constant::InterfaceMethodref { .. })
+                        && let Some(effect) = self.scala_trait_invocation(op, index, member, expr)?
+                    {
+                        return Ok(effect);
+                    }
                     return Err(self.unsupported(
                         "nonvirtual invokespecial of a nonprivate current-class method",
                     ));
