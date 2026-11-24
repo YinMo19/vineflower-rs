@@ -16,13 +16,11 @@ use super::{
     nested::parameter_load_slot,
 };
 
-#[path = "anonymous_capture.rs"]
 mod capture;
 pub(crate) use capture::AnonymousBindings;
 use capture::{Capture, CaptureFrame, loaded_parameter, writes_local};
 use super::locals::LexicalNames;
 
-#[path = "local_classes.rs"]
 mod local;
 use local::LocalSite;
 

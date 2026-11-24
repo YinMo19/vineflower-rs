@@ -12,7 +12,6 @@ use super::initializers::FieldInitializers;
 use super::type_annotations::TypeNesting;
 use super::{DecompileError, Enumeration, INTERFACE, PUBLIC, STATIC, SYNTHETIC, SourceMap, Writer};
 
-#[path = "local.rs"]
 mod local;
 
 impl<'a, 'c> Writer<'a, 'c> {

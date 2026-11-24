@@ -26,15 +26,11 @@ use super::{
     nested::OuterAlias,
 };
 
-#[path = "instanceof_locals.rs"]
 mod instanceof_locals;
 pub(crate) use instanceof_locals::IfPatternLocal;
 
-#[path = "joins.rs"]
 mod joins;
-#[path = "lambda_locals.rs"]
 mod lambda_locals;
-#[path = "local_tokens.rs"]
 mod local_tokens;
 
 use local_tokens::LocalTokenIndices;

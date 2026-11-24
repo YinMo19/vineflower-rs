@@ -28,7 +28,6 @@ use super::{
     expr::{Expr, PRIMARY, Source, UNARY},
 };
 
-#[path = "lambda_anonymous.rs"]
 mod lambda_anonymous;
 use lambda_anonymous::AnonymousSam;
 

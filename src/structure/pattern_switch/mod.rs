@@ -16,10 +16,8 @@ use crate::{
 
 use super::{Emitter, Line, Region, StructureError, switch_expression::CaseLabel};
 
-#[path = "pattern_guard.rs"]
 mod guards;
 
-#[path = "pattern_value.rs"]
 mod values;
 
 pub(super) struct Head {

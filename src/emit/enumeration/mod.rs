@@ -11,7 +11,6 @@ use crate::{
     source_text::Document,
 };
 
-#[path = "enumeration_subclasses.rs"]
 mod subclasses;
 
 struct ConstantInit<'a> {

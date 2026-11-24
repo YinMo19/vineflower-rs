@@ -12,7 +12,6 @@ use crate::{
 };
 use super::pattern_switch::{Head, local, push_zero};
 
-#[path = "pattern_instanceof.rs"]
 mod pattern_instanceof;
 use pattern_instanceof::Instance;
 

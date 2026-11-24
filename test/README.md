@@ -43,8 +43,8 @@ repairs still produce an error.
 
 The implementation separates class-file decoding, JVM instructions, CFG
 analysis, operand-stack lifting, region recovery, and source rendering.
-Modules with submodules use `src/<module>/mod.rs`; leaf modules stay in
-single files.
+Modules with submodules use a directory `mod.rs` and ordinary relative
+module declarations; leaf modules stay in single files.
 Native passes recover stack/local joins, exception regions, declared member
 classes, typed lambdas and selected dynamic constants. Kotlin reconstruction
 and Java compiler idiom recovery are incomplete; a parseable input can still
@@ -82,6 +82,7 @@ Exact upstream comparison with all fixture bytecode and required JDKs:
 | Transparent rethrows, qualified enum patterns, and conditional case fallthrough | 154 | 85 | 458 | 0 |
 | Finally locals and saved returns, loop continuations, grouped unnamed patterns, and short-circuit assignments | 154 | 80 | 463 | 0 |
 | Labeled loops, protected switches, nested predicate state, and named Kotlin suspension | 154 | 75 | 468 | 0 |
+| Scoped catch joins, abrupt finally copies, bound preview guards, and Kotlin enum entries | 154 | 68 | 475 | 0 |
 
 All eight upstream CLI and bulk cases match. The full test remains failing
 until all 697 comparisons match.
