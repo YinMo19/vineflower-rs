@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use super::{flow::Layout, switch_expression::CaseLabel};
+use super::switch_expression::CaseLabel;
 
 pub(super) struct Arm {
     pub(super) target: usize,
@@ -24,8 +24,7 @@ pub(super) fn order(
     default: u32,
     keys: Keys,
     offset: impl Fn(usize) -> u32,
-    layout: &Layout,
-    join: Option<usize>,
+    falls_through: impl Fn(usize, usize) -> bool,
 ) -> Vec<Arm> {
     let dense = matches!(keys, Keys::DenseIntegers);
     let projected = matches!(keys, Keys::Projected);
@@ -35,7 +34,7 @@ pub(super) fn order(
         let fallthrough = groups
             .peek()
             .map(|&(next, _)| next)
-            .filter(|&next| layout.can_fall_through(target, next, join));
+            .filter(|&next| falls_through(target, next));
         arms.push(Arm {
             target,
             labels,

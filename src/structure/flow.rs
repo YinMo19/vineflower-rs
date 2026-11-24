@@ -2,6 +2,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::rc::Rc;
 
 use crate::bytecode::{Instruction, Operand};
 use crate::cfg::ControlFlowGraph;
@@ -10,6 +11,7 @@ use crate::lift::Machine;
 use super::StructureError;
 use super::assertions::Sites;
 use super::do_while::PostTest;
+use super::labeled_blocks::conditional_case::{ConditionalCase, ConditionalCaseScope};
 use super::protected::{ArmId, Exceptions};
 
 #[derive(Clone, Copy)]
@@ -26,6 +28,7 @@ pub(super) struct Region<'r, 'a, 'c> {
     pub(super) predicate: Option<&'r super::switch_expression::predicate::Scope<'r, 'a, 'c>>,
     loop_scope: Option<&'r LoopScope<'a, 'c>>,
     label_scope: Option<&'r super::labeled_blocks::Scope<'a, 'c>>,
+    conditional_case: Option<&'r ConditionalCaseScope<'r, 'a, 'c>>,
     outer: Option<&'r Region<'r, 'a, 'c>>,
 }
 
@@ -41,6 +44,7 @@ impl<'r, 'a, 'c> Region<'r, 'a, 'c> {
         switch_scope: None,
         loop_scope: None,
         label_scope: None,
+        conditional_case: None,
         outer: None,
     };
 
@@ -62,6 +66,14 @@ impl<'r, 'a, 'c> Region<'r, 'a, 'c> {
 
     pub(super) fn label_scope(&self) -> Option<&'r super::labeled_blocks::Scope<'a, 'c>> {
         self.label_scope
+    }
+
+    pub(super) fn conditional_case_body(&'r self, scope: &'r ConditionalCaseScope<'r, 'a, 'c>) -> Self {
+        Self { conditional_case: Some(scope), ..self.branch(self.stop) }
+    }
+
+    pub(super) fn conditional_case_scope(&self) -> Option<&'r ConditionalCaseScope<'r, 'a, 'c>> {
+        self.conditional_case
     }
 
     pub(super) fn loop_body(&'r self, scope: &'r LoopScope<'a, 'c>) -> Self {
@@ -211,6 +223,7 @@ pub(super) struct Layout {
     pub(super) loops: Vec<Option<Loop>>,
     level: Vec<Option<usize>>,
     postdominators: DominanceTree,
+    conditional_cases: BTreeMap<usize, Rc<ConditionalCase>>,
     locals: Option<LocalLiveness>,
 }
 
@@ -244,6 +257,7 @@ impl Layout {
         let mut loops: Vec<Option<Loop>> = vec![None; graph.blocks.len()];
         let mut level: Vec<Option<usize>> = vec![None; graph.blocks.len()];
         let postdominators = DominanceTree::new(graph.immediate_postdominators());
+        let mut conditional_cases = BTreeMap::new();
         let mut seen_tail = Vec::new();
         let mut pending = Vec::new();
         for natural_loop in natural_loops {
@@ -332,6 +346,17 @@ impl Layout {
             } else {
                 PostTest::classify(graph, instructions, &natural_loop)
             };
+            let conditional_case = if parent.is_none() && predicate.is_none() && post_test.is_none()
+                && exits.len() > 1
+            {
+                test.and_then(|test| ConditionalCase::prove(
+                    graph, instructions, exceptions, &natural_loop, test.exit, &exits,
+                    |head| postdominators.parent[head],
+                ))
+            } else {
+                None
+            };
+            let case_boundary = |block| conditional_case.as_ref().is_some_and(|case| case.loop_boundary(block));
             // A header that already executes body code can branch to an
             // early method exit. Keep such abrupt tails in the body when
             // the unique conditional latch supplies the normal continuation.
@@ -351,7 +376,8 @@ impl Layout {
                             && matches!(instructions[node.instructions.end - 1].opcode, 0xac..=0xb1 | 0xbf)
                     })
             });
-            let mut exit = post_exit.or(mirrored_exit).or_else(|| {
+            let mut exit = conditional_case.as_ref().map(|case| case.continuation)
+                .or(post_exit).or(mirrored_exit).or_else(|| {
                 // A proven repeating try owns even the noncyclic terminal
                 // tails of its body and handlers; none is a loop exit.
                 if repeating_try.is_some() {
@@ -375,7 +401,7 @@ impl Layout {
             // A natural loop contains only blocks that can return to its
             // header. Include dominated exit-only tails in the same source
             // loop, stopping at its continuation or an enclosing transfer.
-            pending.extend(exits.iter().copied().filter(|&target| Some(target) != exit));
+            pending.extend(exits.iter().copied().filter(|&target| Some(target) != exit && !case_boundary(target)));
             if !pending.is_empty() && seen_tail.is_empty() {
                 seen_tail.resize(graph.blocks.len(), usize::MAX);
             }
@@ -385,6 +411,7 @@ impl Layout {
                 if Some(block) == exit
                     || inside(block)
                     || outer_transfer(block)
+                    || case_boundary(block)
                     || std::mem::replace(&mut seen_tail[block], header) == header
                 {
                     continue;
@@ -469,6 +496,9 @@ impl Layout {
                 wrapped: wrapped.map(|(_, _, body, exit)| While { body, exit }),
                 parent,
             });
+            if let Some(case) = conditional_case {
+                conditional_cases.insert(case.head, Rc::new(case));
+            }
         }
         // An abrupt arm can put only part of an exceptional cleanup in
         // the natural loop. All its arms are lexically at the try's level.
@@ -489,12 +519,17 @@ impl Layout {
             loops,
             level,
             postdominators,
+            conditional_cases,
             locals: None,
         })
     }
 
     pub(super) fn cut_at_cycle_entry(&mut self, graph: &ControlFlowGraph, header: usize) {
         self.postdominators = DominanceTree::new(graph.immediate_postdominators_at_cut(header));
+    }
+
+    pub(super) fn conditional_case(&self, block: usize) -> Option<Rc<ConditionalCase>> {
+        self.conditional_cases.get(&block).cloned()
     }
 
     pub(super) fn install_closed_cycle(&mut self, header: usize, members: &[bool]) {

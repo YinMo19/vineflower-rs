@@ -8,6 +8,7 @@ use super::{
     flow::Loop,
 };
 
+pub(super) mod conditional_case;
 mod resource_switch;
 
 pub(super) struct Scope<'a, 'c> {
@@ -305,6 +306,11 @@ impl Emitter<'_> {
         offsets: &mut Vec<u32>,
         control: RangeInclusive<u32>,
     ) -> Result<Option<usize>, StructureError> {
+        if machine.this_is_initialized() && machine.stack_is_empty()
+            && let Some(plan) = self.layout.conditional_case(head)
+        {
+            return self.emit_conditional_case_switch(&plan, region, machine, depth, selector, offsets, control);
+        }
         let plan = if machine.this_is_initialized() && machine.stack_is_empty() {
             self.labeled_resource_switch(head, region)
         } else {

@@ -297,6 +297,9 @@ impl Emitter<'_> {
             block = next;
             let first_header = mem::take(&mut enter_loop);
             if !first_header {
+                if self.record_conditional_case_exit(block, region, machine, depth, pending)? {
+                    return Ok(false);
+                }
                 if region.stop == Some(block) {
                     return Ok(true);
                 }
@@ -413,6 +416,7 @@ impl Emitter<'_> {
                     if self.record_labeled_break(block, next, region, machine, depth, first_line, &mut offsets)? {
                         return Ok(false);
                     }
+                    self.map_conditional_case_jump(block, next, region, &mut offsets);
                     block = next;
                     *pending = offsets;
                 }
@@ -748,6 +752,7 @@ impl Emitter<'_> {
                     // A physical return or rethrow may have been trimmed
                     // from the lexical join of this region.
                     region.predicate.is_some_and(|scope| scope.outcome(arm).is_some())
+                        || region.conditional_case_scope().is_some_and(|scope| scope.guard(arm, region))
                         || (region.stop != Some(arm)
                             && (region.loop_transfer(arm).is_some()
                                 || self.is_terminal(arm)
@@ -1459,15 +1464,17 @@ impl Emitter<'_> {
             }
         }
         let labeled_tail = region.label_scope().and_then(|scope| scope.head_tail(block));
+        let projected = region.conditional_case_scope().map(|scope| scope.plan())
+            .filter(|plan| plan.head == block);
         // A default-only enum dispatch has no non-default label with which to
         // distinguish its selector from an integer selector.
         let numeric = numeric && groups.len() > 1 && labeled_tail.is_none();
-        if labeled_tail.is_none() && let Some((condition, schedule)) = self.try_predicate_switch(
+        if projected.is_none() && labeled_tail.is_none() && let Some((condition, schedule)) = self.try_predicate_switch(
             block, region, machine, depth, &selector, &groups, default, &control,
         ) {
             return self.emit_if(block, region, machine, depth, condition, None, offsets, schedule);
         }
-        if labeled_tail.is_none() && dispatch.is_none()
+        if projected.is_none() && labeled_tail.is_none() && dispatch.is_none()
             && let Some(next) = self.try_complex_predicate_switch(
                 block, region, machine, depth, &selector, &groups, default, offsets, &control,
             )?
@@ -1486,7 +1493,7 @@ impl Emitter<'_> {
             });
             self.layout.common_join(self.graph, region, arms)
         };
-        let join = labeled_tail.or_else(|| {
+        let join = projected.map(|plan| plan.switch_join()).or(labeled_tail).or_else(|| {
             let normal = self.layout.normal_join(block, region);
             // A continue can jump past the remainder of the loop body.
             // Keep that remainder outside the switch when its cases share it.
@@ -1498,7 +1505,7 @@ impl Emitter<'_> {
                 normal.or_else(shared_join)
             }
         }).or(region.stop);
-        if labeled_tail.is_none() && let Some(join) = join
+        if projected.is_none() && labeled_tail.is_none() && let Some(join) = join
             && self.try_switch_expression(
                 block, region, machine, depth, &selector, &groups, default, join, &control,
             )
@@ -1511,12 +1518,18 @@ impl Emitter<'_> {
         let scope = join.filter(|_| labeled_tail.is_none()).map(|target| switch_exit::Scope::new(target, region));
         let mut switch_region = region.switch_body(join);
         switch_region.switch_scope = scope.as_ref();
+        let falls_through = |layout: &Layout, target, next| {
+            projected.map_or_else(
+                || layout.can_fall_through(target, next, join),
+                |plan| plan.falls_through(target, next),
+            )
+        };
         let has_fallthrough = || {
             let targets = groups.keys().copied();
             targets
                 .clone()
                 .zip(targets.skip(1))
-                .any(|(target, next)| self.layout.can_fall_through(target, next, join))
+                .any(|(target, next)| falls_through(&self.layout, target, next))
         };
         if !machine.stack_is_empty() && has_fallthrough() {
             for statement in machine.bind_edge_stack(self.offset(block), Some(*control.start()))? {
@@ -1548,8 +1561,7 @@ impl Emitter<'_> {
                         _ => numeric_switch::Keys::SparseIntegers,
                     },
                     |target| self.offset(target),
-                    &self.layout,
-                    join,
+                    |target, next| falls_through(&self.layout, target, next),
                 )
             })
             .unwrap_or_default()
@@ -1566,13 +1578,14 @@ impl Emitter<'_> {
                 let fallthrough = groups
                     .peek()
                     .map(|&(next, _)| next)
-                    .filter(|&next| self.layout.can_fall_through(target, next, join));
+                    .filter(|&next| falls_through(&self.layout, target, next));
                 Some((target, keys, fallthrough))
             })
         {
             let last = ordered.len() == 0 && groups.peek().is_none();
             let prior_implicit_break = implicit_break.take();
-            let default_line = (last && !numeric && !scoped_arms && labeled_tail.is_none()
+            let default_line = (last && (!numeric || projected.is_some_and(|plan| plan.omit_default()))
+                && !scoped_arms && labeled_tail.is_none()
                 && target == default && join == Some(default) && keys.is_empty()
                 && !arms.is_empty())
                 .then_some(self.lines.len());
