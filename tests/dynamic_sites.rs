@@ -800,3 +800,58 @@ fn recovered_parameterized_receiver_keeps_the_erased_invocation_applicable() {
     assert!(text.contains("DynamicSites<String> box = null;"), "{text}");
     assert!(text.contains("((DynamicSites)box).put(var0);"), "{text}");
 }
+
+#[test]
+fn contracted_builder_maps_the_wrapped_operands_without_changing_fallback_calls() {
+    let mut class = Class::default();
+    let owner = "java/lang/StringBuilder";
+    let literal = "a deliberately long literal for the wide fixture";
+    let utf8 = class.utf8(literal);
+    let [text_hi, text_lo] = class.entry(8, &utf8.to_be_bytes()).to_be_bytes();
+    let [builder_hi, builder_lo] = class.class(owner).to_be_bytes();
+    let [init_hi, init_lo] = class.method_ref(owner, "<init>", "()V").to_be_bytes();
+    let [append_hi, append_lo] = class
+        .method_ref(owner, "append", "(Ljava/lang/String;)Ljava/lang/StringBuilder;")
+        .to_be_bytes();
+    let [end_hi, end_lo] = class.method_ref(owner, "toString", "()Ljava/lang/String;").to_be_bytes();
+    let initial = [
+        0xbb, builder_hi, builder_lo, 0x59, 0xb7, init_hi, init_lo,
+        0x13, text_hi, text_lo, 0xb6, append_hi, append_lo,
+    ];
+    let wide_append = [0xc4, 0x19, 0, 0, 0xb6, append_hi, append_lo];
+    let terminal = [0xb6, end_hi, end_lo, 0xb0];
+    class.method(
+        9,
+        "wrapped",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        &[initial.as_slice(), wide_append.as_slice(), terminal.as_slice()].concat(),
+    );
+    class.method(
+        9,
+        "constantOnly",
+        "()Ljava/lang/String;",
+        &[initial.as_slice(), terminal.as_slice()].concat(),
+    );
+
+    let mut options = Options::default();
+    options.include_line_mappings = true;
+    options.preferred_line_length = 36;
+    let source = decompile(&class.finish(), &options).unwrap();
+    let lines: Vec<_> = source.text.lines().collect();
+    let map = source.map.unwrap();
+    let wrapped = &map.methods.iter().find(|m| m.name == "wrapped").unwrap().offsets;
+    let first = wrapped[&7];
+    let second = wrapped[&13];
+    assert!(lines[first].contains(literal), "{}", source.text);
+    assert!(lines[second].trim_start().starts_with("+ "), "{}", source.text);
+    assert_eq!(second, first + 1);
+    assert!((7..10).chain(20..23).all(|byte| wrapped[&byte] == first));
+    assert!((13..17).all(|byte| wrapped[&byte] == second));
+    assert!((10..13).chain(17..20).all(|byte| !wrapped.contains_key(&byte)));
+
+    let fallback = &map.methods.iter().find(|m| m.name == "constantOnly").unwrap().offsets;
+    assert!(lines[fallback[&7]].contains("return new StringBuilder()"));
+    assert!((7..10).all(|byte| fallback[&byte] == fallback[&7]));
+    assert!((10..13).all(|byte| lines[fallback[&byte]].contains(".append(")));
+    assert!((13..16).all(|byte| lines[fallback[&byte]].contains(".toString()")));
+}

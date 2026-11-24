@@ -449,33 +449,39 @@ impl<'a, 'c> Machine<'a, 'c> {
         }
         match op.opcode {
             0x00 => {}
-            0x01 => self.push(Expr {
-                source: Source::Null,
-                ..Expr::atom(object_type(), "null".into())
-            })?,
-            0x02..=0x08 => self.push(Expr::integer(i32::from(op.opcode) - 3))?,
-            0x09..=0x0a => self.push(Expr::numeric_literal(
-                Primitive::Long, format!("{}L", op.opcode - 0x09).into(), op.opcode == 0x0a,
-            ))?,
-            0x0b..=0x0d => self.push(Expr::numeric_literal(
-                Primitive::Float, format!("{}.0F", op.opcode - 0x0b).into(), op.opcode == 0x0c,
-            ))?,
-            0x0e..=0x0f => self.push(Expr::numeric_literal(
-                Primitive::Double, format!("{}.0", op.opcode - 0x0e).into(), op.opcode == 0x0f,
-            ))?,
-            0x10..=0x11 => {
-                let Operand::Immediate(value) = op.operand else {
-                    return Err(self.invalid_operand("expected an integer immediate"));
+            0x01..=0x11 => {
+                let value = match op.opcode {
+                    0x01 => Expr {
+                        source: Source::Null,
+                        ..Expr::atom(object_type(), "null".into())
+                    },
+                    0x02..=0x08 => Expr::integer(i32::from(op.opcode) - 3),
+                    0x09..=0x0a => Expr::numeric_literal(
+                        Primitive::Long, format!("{}L", op.opcode - 0x09).into(), op.opcode == 0x0a,
+                    ),
+                    0x0b..=0x0d => Expr::numeric_literal(
+                        Primitive::Float, format!("{}.0F", op.opcode - 0x0b).into(), op.opcode == 0x0c,
+                    ),
+                    0x0e..=0x0f => Expr::numeric_literal(
+                        Primitive::Double, format!("{}.0", op.opcode - 0x0e).into(), op.opcode == 0x0f,
+                    ),
+                    0x10..=0x11 => {
+                        let Operand::Immediate(value) = op.operand else {
+                            return Err(self.invalid_operand("expected an integer immediate"));
+                        };
+                        Expr::integer(value)
+                    }
+                    _ => unreachable!(),
                 };
-                self.push(Expr::integer(value))?;
+                self.push_leaf(op, value)?;
             }
             0x12..=0x14 => self.load_constant(op)?,
             0x15..=0x19 => {
-                self.load(self.local_index(op)?, Category::for_local(op.opcode - 0x15))?
+                self.load(op, self.local_index(op)?, Category::for_local(op.opcode - 0x15))?
             }
             0x1a..=0x2d => {
                 let relative = op.opcode - 0x1a;
-                self.load(u16::from(relative % 4), Category::for_local(relative / 4))?;
+                self.load(op, u16::from(relative % 4), Category::for_local(relative / 4))?;
             }
             0x2e..=0x35 => self.array_load(op.opcode - 0x2e)?,
             0x36..=0x3a => {
@@ -643,7 +649,11 @@ impl<'a, 'c> Machine<'a, 'c> {
         } {
             value.source = Source::NumericOne;
         }
-        self.push(value)
+        if value.constant && !matches!(constant, Constant::Dynamic { .. }) {
+            self.push_leaf(op, value)
+        } else {
+            self.push(value)
+        }
     }
 
     fn return_value(&mut self, opcode: u8) -> Result<Effect, LiftError> {

@@ -708,7 +708,7 @@ impl<'c> Machine<'_, 'c> {
         ))
     }
 
-    pub(super) fn load(&mut self, index: u16, category: Category) -> Result<(), LiftError> {
+    pub(super) fn load(&mut self, op: &Instruction, index: u16, category: Category) -> Result<(), LiftError> {
         let local = self
             .locals
             .slots
@@ -733,7 +733,7 @@ impl<'c> Machine<'_, 'c> {
             expr.source = Source::Local(index);
             expr.order = Some(Order::at(self.offset));
         }
-        self.push(expr)
+        self.push_leaf(op, expr)
     }
 
     pub(super) fn store(

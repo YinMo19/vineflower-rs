@@ -1,8 +1,9 @@
 // Copyright 2000-2018 JetBrains s.r.o. Use of this source code is governed by the Apache 2.0 license that can be found in the LICENSE file.
 
-use std::borrow::Cow;
+use std::{borrow::Cow, num::NonZeroU32, ops::Range};
 
 use crate::{
+    bytecode::Instruction,
     descriptor::{Primitive, Type},
     source_text::{Document, Infix},
 };
@@ -46,6 +47,20 @@ impl Order {
     }
 }
 
+/// Bytecode of a verified operand leaf, kept separate from evaluation order
+/// until a rewrite moves its source away from the statement's default line.
+#[derive(Clone, Copy)]
+pub(super) struct OperandOrigin {
+    offset: u32,
+    len: NonZeroU32,
+}
+
+impl OperandOrigin {
+    pub(super) fn bytes(self) -> Range<u32> {
+        self.offset..self.offset + self.len.get()
+    }
+}
+
 #[derive(Clone)]
 pub(super) enum Source {
     Local(u16),
@@ -86,6 +101,7 @@ pub(super) struct Expr {
     pub(super) alias: Option<StackAlias>,
     pub(super) precedence: u8,
     pub(super) order: Option<Order>,
+    pub(super) operand_origin: Option<OperandOrigin>,
     pub(super) observable: bool,
     pub(super) statement: bool,
     pub(super) constant: bool,
@@ -104,10 +120,17 @@ impl Expr {
             source: Source::Plain,
             alias: None,
             order: None,
+            operand_origin: None,
             observable: false,
             statement: false,
             constant: false,
         }
+    }
+
+    pub(super) fn deferred_operand_origin(&self) -> Option<OperandOrigin> {
+        self.operand_origin.filter(|_| {
+            self.constant || matches!(self.source, Source::Local(_) | Source::This | Source::Null)
+        })
     }
 
     pub(super) fn literal(ty: Type, text: Document) -> Self {
@@ -315,6 +338,16 @@ impl Relation {
 }
 
 impl Machine<'_, '_> {
+    pub(super) fn push_leaf(&mut self, op: &Instruction, mut value: Expr) -> Result<(), LiftError> {
+        if self.options.include_line_mappings && self.normalized.is_none() {
+            value.operand_origin = NonZeroU32::new(op.len).map(|len| OperandOrigin {
+                offset: op.offset,
+                len,
+            });
+        }
+        self.push(value)
+    }
+
     pub(super) fn order_of<'e>(
         &self,
         values: impl IntoIterator<Item = &'e Expr>,

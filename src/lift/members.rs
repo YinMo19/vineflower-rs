@@ -288,7 +288,7 @@ impl Machine<'_, '_> {
             return Ok(effect);
         }
         if let Some(effect) =
-            self.emit_builder_concat(owner, name, method_type, receiver.as_ref())?
+            self.emit_builder_concat(op, owner, name, method_type, receiver.as_ref())?
         {
             return Ok(effect);
         }
@@ -842,7 +842,9 @@ impl Machine<'_, '_> {
                     }
                     text.push_str(&literal);
                 }
-                Part::Arg(index) => push_joined(&mut text, &args[index].text, args[index].precedence),
+                Part::Arg(index) => {
+                    push_joined(&mut text, &args[index].text, args[index].precedence, None);
+                }
             }
         }
         if single {
@@ -863,7 +865,7 @@ impl Machine<'_, '_> {
         Ok(Effect::None)
     }
 
-    fn anchor_member(&self, text: &mut Document, op: &Instruction) {
+    pub(super) fn anchor_member(&self, text: &mut Document, op: &Instruction) {
         if self.options.include_line_mappings && self.normalized.is_none() {
             text.anchor(op.offset..op.offset + op.len);
         }

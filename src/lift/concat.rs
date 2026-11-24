@@ -4,11 +4,12 @@
 use std::{ops::Range, sync::Arc};
 
 use crate::{
+    bytecode::Instruction,
     descriptor::{MethodDescriptor, Primitive, Type},
     source_text::{Document, Infix},
 };
 
-use super::expr::{ADDITIVE, Category, Expr, Source};
+use super::expr::{ADDITIVE, Category, Expr, OperandOrigin, Source};
 use super::{Effect, LiftError, Machine};
 
 pub(super) const CONCAT: Infix = Infix::new("+", ADDITIVE);
@@ -16,6 +17,7 @@ pub(super) const CONCAT: Infix = Infix::new("+", ADDITIVE);
 #[derive(Clone)]
 pub(super) struct Operand {
     text: Document,
+    origin: Option<OperandOrigin>,
     precedence: u8,
     string: bool,
     constant: bool,
@@ -27,6 +29,7 @@ impl From<Expr> for Operand {
             string: is_string(&value.ty),
             constant: value.constant,
             precedence: value.precedence,
+            origin: value.deferred_operand_origin(),
             text: value.text,
         }
     }
@@ -111,6 +114,7 @@ pub(super) fn call_source(
 impl Machine<'_, '_> {
     pub(super) fn emit_builder_concat(
         &mut self,
+        op: &Instruction,
         owner: &str,
         name: &str,
         descriptor: &str,
@@ -129,12 +133,13 @@ impl Machine<'_, '_> {
             return Ok(None);
         }
         let mut text = Document::new();
+        self.anchor_member(&mut text, op);
         text.begin_infix(CONCAT);
         if !parts.iter().take(2).any(|part| part.string) {
             text.push_str("\"\"");
         }
         for part in parts.iter() {
-            push_joined(&mut text, &part.text, part.precedence);
+            push_joined(&mut text, &part.text, part.precedence, part.origin);
         }
         if parts.len() == 1 && parts[0].string {
             // Appending an empty literal still creates a fresh String on the
@@ -198,10 +203,18 @@ pub(super) fn inline_value_of(args: &mut [Expr]) {
     }
 }
 
-pub(super) fn push_joined(text: &mut Document, operand: &Document, precedence: u8) {
+pub(super) fn push_joined(
+    text: &mut Document,
+    operand: &Document,
+    precedence: u8,
+    origin: Option<OperandOrigin>,
+) {
     let right = !text.is_empty();
     if right {
         text.infix_separator(CONCAT.symbol);
+    }
+    if let Some(origin) = origin {
+        text.anchor(origin.bytes());
     }
     // A numeric sum can be the left operand, but folding it into the right
     // would concatenate its terms individually instead of adding them first.
