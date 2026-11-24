@@ -37,7 +37,7 @@ impl Instance {
     pub(super) fn prove(
         instructions: &[Instruction],
         graph: &ControlFlowGraph,
-        accesses: &BTreeSet<usize>,
+        accesses: &BTreeMap<usize, usize>,
         machine: &Machine<'_, '_>,
         head: usize,
     ) -> Option<Projection> {
@@ -79,6 +79,7 @@ impl Instance {
             instructions, graph, pool: machine.constant_pool(), accesses, machine,
             pos: cursor + 1, alias: selector, restart: None, dispatch: head, key: 0,
             first_temporary: machine.pattern_raw_parameter_slots(), failure: Some(failure),
+            wrapper: None,
             temporaries: BTreeSet::new(), receivers: BTreeSet::new(), leaves: BTreeSet::new(),
             used_accesses: BTreeSet::new(), retries: BTreeSet::new(), may_fail: false,
         };

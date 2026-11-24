@@ -1,4 +1,5 @@
 use crate::classfile::{TypeArgumentTarget, TypeTarget};
+use crate::descriptor::Primitive;
 
 use super::{Category, Effect, Instruction, LiftError, Local, Machine, Source, Type};
 use crate::source_text::Document;
@@ -20,6 +21,28 @@ impl Machine<'_, '_> {
     pub(crate) fn supports_instanceof_patterns(&self) -> bool {
         self.class.major_version >= 60
             || self.class.major_version >= 58 && self.class.minor_version == u16::MAX
+    }
+
+    pub(crate) fn supports_unnamed_record_components(&self) -> bool {
+        self.class.major_version >= 66
+            || self.class.major_version == 65 && self.class.minor_version == u16::MAX
+    }
+
+    pub(crate) fn unnamed_record_component(&self, ty: Option<&Type>) -> Document {
+        let Some(ty) = ty else { return Document::from("_"); };
+        let mut text = self.local_type_document(ty);
+        text.push_str(" _");
+        text
+    }
+
+    pub(crate) fn record_component_covers(&self, declared: &Type, tested: &Type) -> bool {
+        self.pattern_covers(declared, tested)
+            // Bootstrap numeric wrappers have a known superclass even
+            // when no runtime class path was supplied.
+            || matches!((declared, tested), (Type::Object(a), Type::Object(b))
+                if a == "java/lang/Number" && matches!(crate::lift::boxing::unboxed(b),
+                    Some(Primitive::Byte | Primitive::Short | Primitive::Int
+                        | Primitive::Long | Primitive::Float | Primitive::Double)))
     }
 
     pub(crate) fn if_pattern_alias_unnamed(&self, store: &Instruction, slot: u16) -> bool {

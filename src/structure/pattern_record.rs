@@ -41,6 +41,7 @@ pub(super) struct RecordArm {
 enum Pattern {
     Record(Type, Vec<Pattern>),
     Binding { ty: Type, store: Instruction, cast: Option<Instruction>, slot: u16 },
+    Unnamed(Option<Type>),
 }
 
 impl Pattern {
@@ -56,6 +57,7 @@ impl Pattern {
     ) -> Result<Document, LiftError> {
         match self {
             Self::Binding { ty, store, cast, slot } => binding(machine, ty, store, cast.as_ref(), *slot),
+            Self::Unnamed(ty) => Ok(machine.unnamed_record_component(ty.as_ref())),
             Self::Record(ty, children) => {
                 let mut text = Document::from(machine.pattern_record_type(ty));
                 let children = children.iter().map(|child| child.render_with(machine, binding)).collect::<Result<Vec<_>, _>>()?;
@@ -99,7 +101,7 @@ impl Plans {
         let at = |offset| instructions.binary_search_by_key(&offset, |op| op.offset).ok();
         let pool = machine.constant_pool();
         let first_temporary = machine.pattern_raw_parameter_slots();
-        let mut accesses = BTreeSet::new();
+        let mut accesses = BTreeMap::new();
         let mut wrappers = BTreeMap::new();
         for handler in handlers {
             let start = at(u32::from(handler.start_pc))?;
@@ -107,7 +109,7 @@ impl Plans {
             let target = graph.block_at(u32::from(handler.handler_pc))?;
             if op.opcode != 0xb6 || op.offset + op.len != u32::from(handler.end_pc)
                 || pool.class_name(handler.catch_type).ok()? != "java/lang/Throwable"
-                || !accesses.insert(start)
+                || accesses.insert(start, target).is_some()
             {
                 return None;
             }
@@ -177,6 +179,7 @@ impl Plans {
                     instructions, graph, pool, accesses: &accesses, machine,
                     pos: start, alias, restart, dispatch: dispatch_block, key,
                     failure: None,
+                    wrapper: None,
                     first_temporary,
                     temporaries: BTreeSet::new(), receivers: BTreeSet::new(), leaves: BTreeSet::new(),
                     used_accesses: BTreeSet::new(), retries: BTreeSet::new(), may_fail: false,
@@ -213,7 +216,7 @@ impl Plans {
                 }
             }
         }
-        if (plans.arms.is_empty() && plans.instances.is_empty()) || accesses != consumed_accesses {
+        if (plans.arms.is_empty() && plans.instances.is_empty()) || accesses.len() != consumed_accesses.len() {
             return None;
         }
         for (header, preheader) in dispatch_headers {
@@ -292,10 +295,11 @@ fn restart_head(
 
 struct Prefix<'s, 'm, 'a, 'c> {
     instructions: &'s [Instruction], graph: &'s ControlFlowGraph, pool: &'s ConstantPool<'a>,
-    accesses: &'s BTreeSet<usize>, machine: &'m Machine<'a, 'c>,
+    accesses: &'s BTreeMap<usize, usize>, machine: &'m Machine<'a, 'c>,
     pos: usize, alias: u16, restart: Option<u16>, dispatch: usize, key: i32,
     first_temporary: u16,
     failure: Option<u32>,
+    wrapper: Option<usize>,
     temporaries: BTreeSet<u16>, receivers: BTreeSet<u16>, leaves: BTreeSet<u16>,
     used_accesses: BTreeSet<usize>, retries: BTreeSet<usize>, may_fail: bool,
 }
@@ -334,36 +338,66 @@ impl Prefix<'_, '_, '_, '_> {
         let machine = self.machine;
         let components = machine.pattern_record_components(ty)?;
         let mut labels = Vec::with_capacity(components.len());
+        let mut tested = Vec::new();
         for (name, expected) in components {
             if local(self.take()?, false, true)? != slot { return None; }
             let accessor_index = self.pos;
-            let op = self.take()?.clone();
-            let (called, method, desc) = method_ref(self.pool, &op, 0xb6)?;
+            let pool = self.pool;
+            let (called, method, desc) = method_ref(pool, self.take()?, 0xb6)?;
+            let &wrapper = self.accesses.get(&accessor_index)?;
             if called != owner || method != name || Type::parse(desc.strip_prefix("()")?).ok()? != expected
-                || !self.accesses.contains(&accessor_index)
+                || self.wrapper.replace(wrapper).is_some_and(|previous| previous != wrapper)
                 || !self.used_accesses.insert(accessor_index)
             {
                 return None;
             }
-            labels.push(self.component(expected, depth)?);
+            let (component, test) = self.component(expected)?;
+            if let Some(requires_deconstruction) = test {
+                tested.push((labels.len(), requires_deconstruction));
+            }
+            labels.push(component);
+        }
+        // Javac first reads all accessors of this receiver. It then visits
+        // the tested child receivers in component order, recursively.
+        for (index, requires_deconstruction) in tested {
+            let Pattern::Binding { ty, slot, .. } = &labels[index] else { return None; };
+            self.receivers.remove(slot);
+            if self.looks_like_record_component(*slot) {
+                labels[index] = self.record(ty, *slot, depth + 1)?;
+            } else if requires_deconstruction || !self.leaf(*slot, 1) {
+                // A same-type test rejects null. An unconditional type
+                // binding of the component's declared type would accept it.
+                return None;
+            }
         }
         self.receivers.remove(&slot);
         Some(Pattern::Record(ty.clone(), labels))
     }
 
-    fn component(&mut self, expected: Type, depth: usize) -> Option<Pattern> {
+    fn reads_scratch(&self, scratch: u16, kind: u8) -> bool {
+        self.instructions.get(self.pos).and_then(|op| typed_local(op, false, kind)) == Some(scratch)
+    }
+
+    fn component(&mut self, expected: Type) -> Option<(Pattern, Option<bool>)> {
         let (kind, width) = kind(&expected)?;
-        let stored = self.take()?.clone();
-        let scratch = typed_local(&stored, true, kind)?;
+        let stored = self.take()?;
+        let scratch = typed_local(stored, true, kind)?;
         if !self.temporary(scratch, width) { return None; }
-        if typed_local(self.take()?, false, kind)? != scratch { return None; }
+        if !self.reads_scratch(scratch, kind) {
+            return self.machine.supports_unnamed_record_components().then_some((Pattern::Unnamed(None), None));
+        }
+        self.pos += 1;
         if kind == 4 && self.instructions.get(self.pos)?.opcode == 0xc1 {
-            let test = self.take()?.clone();
-            let narrowed = cast_type(self.machine, &test, 0xc1)?;
-            if !self.machine.pattern_covers(&expected, &narrowed) { return None; }
+            let machine = self.machine;
+            let narrowed = cast_type(machine, self.take()?, 0xc1)?;
+            if !self.machine.record_component_covers(&expected, &narrowed) { return None; }
             let retry = self.take()?.clone();
             self.retry(&retry, true)?;
-            if typed_local(self.take()?, false, kind)? != scratch { return None; }
+            if !self.reads_scratch(scratch, kind) {
+                return (expected != narrowed && self.machine.supports_unnamed_record_components())
+                    .then_some((Pattern::Unnamed(Some(narrowed)), None));
+            }
+            self.pos += 1;
             let cast = if self.instructions.get(self.pos)?.opcode == 0xc0 {
                 let cast = self.take()?.clone();
                 if cast_type(self.machine, &cast, 0xc0)? != narrowed { return None; }
@@ -373,11 +407,13 @@ impl Prefix<'_, '_, '_, '_> {
             } else { return None; };
             let binding = self.take()?.clone();
             let binding_slot = typed_local(&binding, true, kind)?;
-            if self.looks_like_record_component(binding_slot) {
-                return self.record(&narrowed, binding_slot, depth + 1);
+            if self.reserved(binding_slot) || self.temporaries.contains(&binding_slot)
+                || self.leaves.contains(&binding_slot) || !self.receivers.insert(binding_slot)
+            {
+                return None;
             }
-            if expected == narrowed || !self.leaf(binding_slot, width) { return None; }
-            return Some(Pattern::Binding { ty: narrowed, store: binding, cast, slot: binding_slot });
+            let requires_deconstruction = expected == narrowed;
+            return Some((Pattern::Binding { ty: narrowed, store: binding, cast, slot: binding_slot }, Some(requires_deconstruction)));
         }
         let mut binding = self.take()?.clone();
         let mut slot = typed_local(&binding, true, kind)?;
@@ -399,12 +435,12 @@ impl Prefix<'_, '_, '_, '_> {
             slot = typed_local(&binding, true, kind)?;
         }
         if !self.leaf(slot, width) { return None; }
-        Some(Pattern::Binding { ty: expected, store: binding, cast: None, slot })
+        Some((Pattern::Binding { ty: expected, store: binding, cast: None, slot }, None))
     }
 
     fn looks_like_record_component(&self, receiver: u16) -> bool {
         self.instructions.get(self.pos).is_some_and(|op| local(op, false, true) == Some(receiver))
-            && self.accesses.contains(&(self.pos + 1))
+            && self.accesses.contains_key(&(self.pos + 1))
     }
 
     fn retry(&mut self, op: &Instruction, real: bool) -> Option<()> {
@@ -443,7 +479,7 @@ impl Prefix<'_, '_, '_, '_> {
     fn leaf(&mut self, slot: u16, width: u16) -> bool {
         let Some(end) = slot.checked_add(width) else { return false };
         let slots = slot..end;
-        if slots.clone().any(|slot| self.reserved(slot) || self.temporaries.contains(&slot) || self.leaves.contains(&slot)) {
+        if slots.clone().any(|slot| self.reserved(slot) || self.receivers.contains(&slot) || self.temporaries.contains(&slot) || self.leaves.contains(&slot)) {
             return false;
         }
         self.leaves.extend(slots);
@@ -525,6 +561,7 @@ impl Pattern {
         match self {
             Self::Binding { ty, slot: start, .. } => (*start..*start + ty.slots()).contains(&slot),
             Self::Record(_, children) => children.iter().any(|child| child.defines(slot)),
+            Self::Unnamed(_) => false,
         }
     }
 }
