@@ -166,6 +166,7 @@ impl Emitter<'_> {
                 &enhanced.helpers,
                 &enhanced.omitted_uses,
                 seed.handler_latch,
+                false,
             )
             && !(enhanced.element_slot
                 ..enhanced
@@ -207,7 +208,7 @@ impl Emitter<'_> {
         }
         let count = count?;
         if self.local_is_live(test.exit, count.slot)
-            || !self.safe_for_body(header, test, &[None; 3], &[count.update], None)
+            || !self.safe_for_body(header, test, &[None; 3], &[count.update], None, true)
         {
             return None;
         }
@@ -585,6 +586,7 @@ impl Emitter<'_> {
         helpers: &[Option<u16>; 3],
         omitted: &[usize],
         handler_latch: Option<usize>,
+        allow_finally: bool,
     ) -> bool {
         let graph = self.graph;
         let instructions = self.instructions;
@@ -608,6 +610,12 @@ impl Emitter<'_> {
                 ([], []) => {}
                 ([handler], []) if Some(*handler) == handler_latch => pending.push(*handler),
                 ([], _) if Some(block) == handler_latch => {}
+                (handlers, entries) if allow_finally
+                    && (entries.is_empty() || self.exceptions.counted_loop_finally_entry(block))
+                    && handlers.iter().all(|&handler| self.exceptions.counted_loop_finally_dispatch(block, handler)) =>
+                {
+                    pending.extend_from_slice(handlers);
+                }
                 _ => return false,
             }
             for index in node.instructions.clone() {

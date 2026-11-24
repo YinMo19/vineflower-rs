@@ -547,6 +547,91 @@ fn exceptional_finally_copy_can_be_detached_from_the_enclosing_loop_cfg() {
 }
 
 #[test]
+fn mirrored_finally_can_break_or_continue_without_consuming_the_loop_targets() {
+    let bytes = [
+        0x03, 0x3c, // 0: initialize induction slot
+        0x1b, 0x10, 10, 0xa2, 0, 62, // 2: loop test; if_icmpge 67
+        0xb8, 0, 22, // 8: protected body
+        0x1b, 0x08, 0xa0, 0, 9, // 11: normal cleanup; if i != 5, go to 22
+        0xb8, 0, 22, 0xa7, 0, 42, // 16: continue to 61 after work
+        0x1b, 0x07, 0xa0, 0, 6, // 22: if i != 4, go to 30
+        0xa7, 0, 40, // 27: break to 67
+        0xb8, 0, 22, 0xa7, 0, 28, // 30: normal exit to 61 after work
+        0x4d, // 36: save the exception
+        0x1b, 0x08, 0xa0, 0, 9, // 37: exceptional cleanup; if i != 5, go to 48
+        0xb8, 0, 22, 0xa7, 0, 16, // 42: continue to 61 after work
+        0x1b, 0x07, 0xa0, 0, 6, // 48: if i != 4, go to 56
+        0xa7, 0, 14, // 53: break to 67
+        0xb8, 0, 22, 0x2c, 0xbf, // 56: work and rethrow the original exception
+        0x84, 1, 1, 0xa7, 0xff, 0xc2, // 61: increment and jump to 2
+        0xb8, 0, 22, 0xb1, // 67: work after the loop
+    ];
+    let handlers = [handler(8, 11, 36, 0)];
+    let lines = test_method(&bytes, &handlers, &[]).unwrap();
+    let cleanup = lines.iter().position(|line| line.text == "} finally {").unwrap();
+    assert!(lines[0].text.as_flat().starts_with("for ("));
+    assert_eq!(lines[cleanup].depth, 1);
+    for text in ["break;", "continue;"] {
+        assert!(lines[cleanup + 1..].iter().any(|line| line.text == text));
+    }
+    assert!(lines.iter().any(|line| line.depth == 0 && line.text == "work();"));
+    assert!(!lines.iter().any(|line| line.text.as_flat().starts_with("throw ")));
+
+    for (offset, replacement) in [
+        (7, 37), // The loop test would enter the middle of the exceptional copy.
+        (47, 22), // The exceptional continue would instead break to 67.
+        (59, 0x2a), // A different object would be thrown.
+    ] {
+        let mut changed = bytes;
+        changed[offset] = replacement;
+        assert!(matches!(classify(&changed, &handlers).1, Err(StructureError::ExceptionHandlers)));
+    }
+}
+
+#[test]
+fn mirrored_finally_keeps_only_the_nested_catch_with_identical_dispatch() {
+    let bytes = [
+        0xb8, 0, 22, // 0: protected loop body
+        0x2a, 0xc6, 0, 30, // 3: skip normal cleanup to the latch if argument is null
+        0xb8, 0, 22, // 7: normal cleanup's protected call
+        0xa7, 0, 27, // 10: break to 37
+        0x4c, 0xa7, 0, 20, // 13: normal catch ignores exception and goes to 34
+        0x4d, 0x2a, 0xc6, 0, 13, // 17: save original exception; ifnull 32
+        0xb8, 0, 22, // 22: exceptional cleanup's protected call
+        0xa7, 0, 12, // 25: break to 37
+        0x4e, 0xa7, 0, 3, // 28: exceptional catch ignores exception and goes to 32
+        0x2c, 0xbf, // 32: rethrow the original exception
+        0xa7, 0xff, 0xde, // 34: jump to loop head
+        0xb8, 0, 22, 0xb1, // 37: work after the loop
+    ];
+    let normal = handler(7, 10, 13, 26);
+    let outer = handler(0, 3, 17, 0);
+    let normal_alternative = handler(7, 10, 13, 24);
+    let exceptional_alternative = handler(22, 25, 28, 24);
+    let exceptional = handler(22, 25, 28, 26);
+    let lines = test_method(&bytes, &[normal, outer, exceptional], &[]).unwrap();
+    assert_eq!(lines[0].text, "while (true) {");
+    assert_eq!(lines.iter().filter(|line| line.text.as_flat().starts_with("} catch (")).count(), 1);
+    assert!(lines.iter().any(|line| line.depth == 4 && line.text == "break;"));
+    assert_eq!(lines.iter().filter(|line| line.text == "work();").count(), 3);
+    assert!(classify(
+        &bytes,
+        &[normal, normal_alternative, outer, exceptional, exceptional_alternative],
+    ).1.is_ok());
+
+    for extra_or_changed in [
+        vec![normal, outer, handler(22, 25, 28, 24)],
+        vec![normal, outer, exceptional, handler(37, 40, 13, 26)],
+        vec![normal, normal_alternative, outer, exceptional_alternative, exceptional],
+    ] {
+        assert!(matches!(
+            classify(&bytes, &extra_or_changed).1,
+            Err(StructureError::ExceptionHandlers),
+        ));
+    }
+}
+
+#[test]
 fn each_branched_finally_copy_projects_to_one_proven_continuation() {
     let mut bytes = vec![
         0x2a, // 0: aload_0

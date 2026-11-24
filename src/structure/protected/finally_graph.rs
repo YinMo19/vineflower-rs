@@ -6,8 +6,11 @@ use std::ops::Range;
 use crate::bytecode::{Instruction, Operand};
 use crate::cfg::ControlFlowGraph;
 
+use super::cleanup_locals;
 use super::monitor::{MonitorCandidates, MonitorPlan};
-use super::{MonitorDeparture, Route, local_touches, normal_exits, reference_load, reference_store};
+use super::{
+    Dominance, MonitorDeparture, Route, local_touches, normal_exits, reference_load, reference_store,
+};
 
 pub(in crate::structure) struct BranchedFinally {
     pub(in crate::structure) entry: usize,
@@ -16,11 +19,15 @@ pub(in crate::structure) struct BranchedFinally {
     pub(super) blocks: BTreeSet<usize>,
     pub(super) body_join: Option<usize>,
     pub(super) projected_entries: BTreeSet<usize>,
+    pub(super) returns: Vec<ReturnResume>,
     pub(super) prefix_block: Option<usize>,
-    pub(super) tail: usize,
+    pub(in crate::structure) tail: Option<usize>,
     pub(super) tail_code: Range<usize>,
     pub(in crate::structure) monitor_exit: Option<FinallyMonitorExit>,
     pub(in crate::structure) shared_return: Option<SharedReturn>,
+    pub(in crate::structure) loop_targets: BTreeSet<usize>,
+    pub(super) nested_handlers: BTreeSet<usize>,
+    pub(super) copied_routes: BTreeSet<Route>,
 }
 
 pub(in crate::structure) struct FinallyMonitorExit {
@@ -35,10 +42,64 @@ pub(in crate::structure) struct SharedReturn {
     pub(in crate::structure) jump: usize,
 }
 
+pub(super) struct ReturnResume {
+    pub(super) entry: usize,
+    pub(super) block: usize,
+    pub(super) spill: Option<(usize, usize)>,
+}
+
+impl ReturnResume {
+    fn prove(
+        instructions: &[Instruction],
+        graph: &ControlFlowGraph,
+        routes: &[Vec<Route>],
+        entry: usize,
+        block: usize,
+        prefix: usize,
+        copy: &BTreeSet<usize>,
+        targets: &BTreeSet<usize>,
+    ) -> Option<Self> {
+        let node = &graph.blocks[block];
+        if !node.exception_predecessors.is_empty()
+            || !node.predecessors.iter().all(|pred| copy.contains(pred))
+        {
+            return None;
+        }
+        let load = node.instructions.start + prefix;
+        let spill = match &instructions[load..node.instructions.end] {
+            [Instruction { opcode: 0xb1, .. }] => None,
+            [reload, transfer] => {
+                let local = cleanup_locals::returned(reload, transfer)?;
+                let entry = &graph.blocks[entry];
+                let &[pred] = entry.predecessors.as_slice() else {
+                    return None;
+                };
+                let origin = &graph.blocks[pred];
+                let store = origin.instructions.end - 1;
+                if origin.instructions.end != entry.instructions.start
+                    || cleanup_locals::store(&instructions[store]) != Some(local)
+                    || !routes[block].is_empty()
+                    || copy.iter().any(|&block| !routes[block].is_empty())
+                    || cleanup_locals::live_at_any(instructions, graph, targets, local)
+                    || instructions[node.instructions.start..load].iter().any(|op| local.touches(op))
+                    || copy.iter().any(|&block| {
+                        instructions[graph.blocks[block].instructions.clone()].iter().any(|op| local.touches(op))
+                    })
+                {
+                    return None;
+                }
+                Some((load, store))
+            }
+            _ => return None,
+        };
+        Some(Self { entry, block, spill })
+    }
+}
+
 impl BranchedFinally {
-    /// Mirrors the exceptional cleanup against its normal copy, mapping
-    /// branch destinations rather than comparing byte offsets. The rethrow
-    /// of the original exception is the only unmatched handler operation.
+    /// Mirrors the exceptional cleanup against its normal copies. An edge
+    /// leaving both copies must agree on its exact destination; only a
+    /// rethrow of the original exception can resume the normal path instead.
     pub(super) fn prove(
         instructions: &[Instruction],
         graph: &ControlFlowGraph,
@@ -46,6 +107,7 @@ impl BranchedFinally {
         body: &BTreeSet<usize>,
         handler: usize,
         monitors: &MonitorCandidates<'_>,
+        dominance: &Dominance,
     ) -> Option<Self> {
         let start = &graph.blocks[handler];
         if handler == 0 || !start.predecessors.is_empty() || body.contains(&handler) {
@@ -75,16 +137,31 @@ impl BranchedFinally {
         let mut monitor_exit = None;
         let mut cleanup = BTreeSet::new();
         let mut rethrow = None;
+        let mut boundary = BTreeSet::new();
+        let mut nested_handlers = BTreeSet::new();
         let mut pending = vec![entry];
         while let Some(index) = pending.pop() {
+            if !dominance.contains(handler, index) {
+                boundary.insert(index);
+                continue;
+            }
             if !cleanup.insert(index) {
                 continue;
             }
             let block = &graph.blocks[index];
-            if body.contains(&index)
-                || (index != handler && !block.exception_predecessors.is_empty())
-            {
+            if body.contains(&index) {
                 return None;
+            }
+            if monitor.is_none() {
+                for &route in &routes[index] {
+                    if route.handler != handler && dominance.contains(handler, route.handler) {
+                        if route.catch_type == 0 {
+                            return None;
+                        }
+                        nested_handlers.insert(route.handler);
+                        pending.push(route.handler);
+                    }
+                }
             }
             let start = block.instructions.start + usize::from(index == handler);
             let mut end = block.instructions.end;
@@ -116,8 +193,19 @@ impl BranchedFinally {
             }
             pending.extend(block.successors.iter().copied());
         }
-        let (tail, tail_code) = rethrow?;
-        if entry == tail {
+        if cleanup.iter().any(|&index| {
+            let block = &graph.blocks[index];
+            if nested_handlers.contains(&index) {
+                !block.predecessors.is_empty()
+                    || block.exception_predecessors.iter().any(|pred| !cleanup.contains(pred))
+            } else {
+                index != handler && !block.exception_predecessors.is_empty()
+            }
+        }) {
+            return None;
+        }
+        let (tail, tail_code) = rethrow.map_or((None, 0..0), |(tail, code)| (Some(tail), code));
+        if tail == Some(entry) {
             return None;
         }
         cleanup.insert(handler);
@@ -142,27 +230,55 @@ impl BranchedFinally {
             }
         }
         let mut shared_return = None;
-        for &block in &cleanup {
-            let node = &graph.blocks[block];
-            if node.predecessors.iter().all(|pred| cleanup.contains(pred)) {
+        let mut loop_targets = BTreeSet::new();
+        for block in boundary {
+            if graph.blocks[block].exception_predecessors.is_empty()
+                && dominance.natural_loops(graph).iter().any(|shape| {
+                    let inside = |node| shape.blocks.binary_search(&node).is_ok();
+                    if !body.iter().copied().any(inside)
+                        || !body.iter().copied().all(|member| dominance.contains(shape.header, member))
+                    {
+                        return false;
+                    }
+                    if block == shape.header {
+                        return true;
+                    }
+                    if inside(block) {
+                        // A shared update belongs to the for header, not to
+                        // either cleanup. Emission must prove that for loop.
+                        let node = &graph.blocks[block];
+                        return matches!(&instructions[node.instructions.clone()],
+                            [update, jump] if matches!(update.operand, Operand::Increment { .. })
+                                && matches!(jump.opcode, 0xa7 | 0xc8))
+                            && node.successors == [shape.header];
+                    }
+                    // A break can leave through a noncyclic tail of the
+                    // normal copy rather than directly from the loop core.
+                    dominance.contains(shape.header, block)
+                })
+            {
+                loop_targets.insert(block);
                 continue;
             }
-            // A forward labeled departure can be rendered where it occurs
-            // if both copies alone reach the same terminal return block.
-            // Do not move code across a handler or monitor boundary.
+
+            // Outside a loop, keep the existing proof for a private,
+            // terminal return shared by exactly one pair of copies.
+            let node = &graph.blocks[block];
             let &[sample, source] = node.predecessors.as_slice() else {
                 return None;
             };
             if shared_return.is_some()
                 || monitor.is_some()
                 || enclosing.is_some()
-                || block <= tail
+                || tail.is_none_or(|tail| block <= tail)
                 || sample >= handler
                 || cleanup.contains(&sample)
                 || !cleanup.contains(&source)
                 || source >= block
+                || !node.exception_predecessors.is_empty()
                 || !routes[block].is_empty()
                 || !matches!(instructions[node.instructions.end - 1].opcode, 0xac..=0xb1)
+                || instructions[node.instructions.clone()].iter().any(|op| local_touches(op, slot))
             {
                 return None;
             }
@@ -172,6 +288,18 @@ impl BranchedFinally {
                 return None;
             }
             shared_return = Some(SharedReturn { block, jump });
+            cleanup.insert(block);
+        }
+        if cleanup.iter().any(|&block| {
+            Some(block) != shared_return.map(|exit| exit.block)
+                && graph.blocks[block].predecessors.iter().any(|pred| !cleanup.contains(pred))
+        }) {
+            return None;
+        }
+        if !loop_targets.is_empty() && instructions.iter().enumerate().any(|(index, op)| {
+            (tail.is_none() || index != tail_code.end) && cleanup_locals::reads(op, slot)
+        }) {
+            return None;
         }
         if body.iter().any(|&block| {
             matches!(
@@ -190,7 +318,7 @@ impl BranchedFinally {
             && (exits.len() != 1
                 || cleanup.contains(&edge.target)
                 || graph.blocks[entry].successors.len() != 2
-                || !graph.blocks[entry].successors.contains(&tail))
+                || tail.is_none_or(|tail| !graph.blocks[entry].successors.contains(&tail)))
         {
             return None;
         }
@@ -201,21 +329,28 @@ impl BranchedFinally {
             blocks: cleanup,
             body_join: None,
             projected_entries: BTreeSet::new(),
+            returns: Vec::new(),
             prefix_block: None,
             tail,
             tail_code,
             monitor_exit: None,
             shared_return,
+            loop_targets,
+            nested_handlers,
+            copied_routes: BTreeSet::new(),
         };
         let mut tails = BTreeSet::new();
+        let mut continuing = BTreeSet::new();
         for &sample in &exits {
             let pair = match (monitor, monitors.get(&sample).map(|&(plan, _)| plan)) {
                 (Some(pattern), Some(sample)) => Some(MonitorCopy { pattern, sample }),
                 (None, None) => None,
                 _ => return None,
             };
-            let (tail, removed, copied_exit) =
-                result.match_copy(instructions, graph, routes, body, handler, sample, pair, projection)?;
+            let (tail, removed, copied_exit, copied_routes) = result.match_copy(
+                instructions, graph, routes, body, handler, sample, pair, projection,
+            )?;
+            result.copied_routes.extend(copied_routes);
             if let Some((edge, owner)) = projection {
                 result.monitor_exit = Some(FinallyMonitorExit {
                     acquisition: owner.acquisition,
@@ -223,7 +358,19 @@ impl BranchedFinally {
                     copy: copied_exit?,
                 });
             }
-            tails.insert(tail);
+            if exits.len() > 1 && !result.loop_targets.is_empty()
+                && result.shared_return.is_none() && result.monitor_exit.is_none()
+                && let Some(block) = tail
+                && let Some(resume) = ReturnResume::prove(
+                    instructions, graph, routes, sample, block, result.tail_code.len(),
+                    &removed, &result.loop_targets,
+                )
+            {
+                result.returns.push(resume);
+            } else {
+                continuing.insert(sample);
+                tails.extend(tail);
+            }
             for block in removed {
                 if !result.removed.insert(block) {
                     return None;
@@ -281,10 +428,10 @@ impl BranchedFinally {
             return None;
         }
         if exits.len() > 1 {
-            result.body_join = result.continuation;
-            result.projected_entries = exits;
+            result.body_join = result.continuation.or_else(|| continuing.first().copied());
+            result.projected_entries = continuing;
         } else {
-            result.body_join = exits.first().copied();
+            result.body_join = continuing.first().copied();
         }
         Some(result)
     }
@@ -299,14 +446,18 @@ impl BranchedFinally {
         sample_start: usize,
         monitor: Option<MonitorCopy<'_>>,
         departure: Option<(MonitorDeparture, &MonitorPlan)>,
-    ) -> Option<(usize, BTreeSet<usize>, Option<usize>)> {
+    ) -> Option<(Option<usize>, BTreeSet<usize>, Option<usize>, BTreeSet<Route>)> {
         let mut paired = BTreeMap::new();
         let mut copies = BTreeSet::new();
         let mut removed = BTreeSet::new();
         let mut continuation = None;
+        let mut copied_routes = BTreeSet::new();
+        let mut renamed = BTreeSet::new();
         let mut pending = vec![(self.entry, sample_start)];
         while let Some((pattern, sample)) = pending.pop() {
-            if self.shared_return.is_some_and(|exit| exit.block == pattern) {
+            if self.loop_targets.contains(&pattern)
+                || self.shared_return.is_some_and(|exit| exit.block == pattern)
+            {
                 if pattern != sample {
                     return None;
                 }
@@ -324,21 +475,43 @@ impl BranchedFinally {
             paired.insert(pattern, sample);
             let expected = &graph.blocks[pattern];
             let actual = &graph.blocks[sample];
-            let trim = pattern == self.tail;
-            if (!trim || !self.tail_code.is_empty())
-                && (!actual.exception_predecessors.is_empty()
-                    || !same_dispatch(&routes[pattern], &routes[sample], monitor))
-            {
-                return None;
+            let trim = Some(pattern) == self.tail;
+            let nested = self.nested_handlers.contains(&pattern);
+            if !trim || !self.tail_code.is_empty() {
+                if (!nested && !actual.exception_predecessors.is_empty())
+                    || (nested && !actual.predecessors.is_empty())
+                    || routes[pattern].len() != routes[sample].len()
+                {
+                    return None;
+                }
+                for (&expected, &actual) in routes[pattern].iter().zip(&routes[sample]) {
+                    if self.nested_handlers.contains(&expected.handler) {
+                        if expected.catch_type != actual.catch_type || expected.handler == actual.handler {
+                            return None;
+                        }
+                        pending.push((expected.handler, actual.handler));
+                        copied_routes.insert(actual);
+                    } else if !same_dispatch(&[expected], &[actual], monitor) {
+                        return None;
+                    }
+                }
             }
-            let start = expected.instructions.start + usize::from(pattern == handler);
+            let start = expected.instructions.start + usize::from(pattern == handler || nested);
+            let actual_start = actual.instructions.start + usize::from(nested);
+            if nested {
+                let left = reference_store(&instructions[expected.instructions.start])?;
+                let right = reference_store(&instructions[actual.instructions.start])?;
+                if left != right {
+                    renamed.extend([left, right]);
+                }
+            }
             let end = if trim {
                 self.tail_code.end
             } else {
                 expected.instructions.end
             };
             let mut expected_code = &instructions[start..end];
-            let mut actual_code = &instructions[actual.instructions.clone()];
+            let mut actual_code = &instructions[actual_start..actual.instructions.end];
             if !trim && expected.successors.len() == 1 && actual.successors.len() == 1 {
                 // An inlined cleanup can jump over the exception handler
                 // where the handler's copy simply falls through. The
@@ -417,6 +590,19 @@ impl BranchedFinally {
                 return None;
             }
         }
+        for &pattern in &self.nested_handlers {
+            let &sample = paired.get(&pattern)?;
+            if graph.blocks[sample].exception_predecessors.iter().any(|pred| !removed.contains(pred)) {
+                return None;
+            }
+        }
+        // A different slot can hold the corresponding nested exception
+        // only when neither binding can be read, even after a CFG join.
+        if !renamed.is_empty() && instructions.iter().any(|op| {
+            renamed.iter().copied().any(|slot| cleanup_locals::reads(op, slot))
+        }) {
+            return None;
+        }
         for &sample in &removed {
             if graph.blocks[sample].predecessors.iter().any(|pred| {
                 !removed.contains(pred) && (sample != sample_start || !body.contains(pred))
@@ -425,7 +611,10 @@ impl BranchedFinally {
             }
         }
         let copied_exit = departure.and_then(|(edge, _)| paired.get(&edge.source).copied());
-        Some((continuation?, removed, copied_exit))
+        if self.tail.is_some() != continuation.is_some() {
+            return None;
+        }
+        Some((continuation, removed, copied_exit, copied_routes))
     }
 }
 

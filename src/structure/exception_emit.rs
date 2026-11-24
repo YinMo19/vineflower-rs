@@ -282,6 +282,11 @@ impl Emitter<'_> {
             let mut body = machine.clone();
             let mut offsets = Vec::new();
             if let Some(branch) = finally.branched() {
+                if let Some(&target) = branch.loop_targets.iter().find(|&&target| {
+                    region.loop_transfer(target).is_none()
+                }) {
+                    return Err(self.unstructured(target));
+                }
                 if let Some(exit) = branch.shared_return
                     && !self.exceptions.contains(region.exception_arm, exit.block)
                 {
@@ -293,15 +298,16 @@ impl Emitter<'_> {
                 {
                     return Err(self.unstructured(finally.start()));
                 }
-                if !self.region_with_offsets(
+                let reaches_tail = self.region_with_offsets(
                     branch.entry,
                     region
-                        .exception(Some(finally.block()), finally.arm, None)
+                        .exception(branch.tail, finally.arm, None)
                         .with_exception_layout(self.layout.containing_loop(branch.entry)),
                     &mut body,
                     depth + 1,
                     &mut offsets,
-                )? {
+                )?;
+                if reaches_tail != branch.tail.is_some() {
                     return Err(self.unstructured(branch.entry));
                 }
                 if let Some(exit) = branch.shared_return {
@@ -402,7 +408,7 @@ impl Emitter<'_> {
                     }
                     continuation = None;
                 }
-            } else {
+            } else if finally.branched().is_none_or(|branch| branch.tail.is_some()) {
                 if mem::replace(&mut self.emitted[terminal], true) {
                     return Err(self.unstructured(terminal));
                 }

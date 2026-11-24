@@ -6,11 +6,12 @@ mod legacy_resource;
 mod monitor;
 mod overriding_finally;
 
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
 use crate::bytecode::{Instruction, Operand};
-use crate::cfg::ControlFlowGraph;
+use crate::cfg::{ControlFlowGraph, NaturalLoop};
 use crate::classfile::ExceptionHandler;
 use crate::lift::Machine;
 
@@ -38,6 +39,7 @@ pub(super) struct Exceptions {
     cleanup_copies: BTreeSet<usize>,
     terminal_cleanup_copies: BTreeSet<usize>,
     cleanup_returns: BTreeSet<usize>,
+    cleanup_return_entries: BTreeMap<usize, usize>,
     cleanup_forward: BTreeSet<usize>,
     cleanup_bypasses: BTreeMap<usize, usize>,
     cleanup_landings: BTreeSet<usize>,
@@ -216,6 +218,7 @@ struct Table {
     by_block: Vec<Vec<Route>>,
     by_range: BTreeMap<Vec<usize>, Vec<Route>>,
     monitor_handlers: BTreeMap<usize, MonitorHandler>,
+    nested_finally_departures: BTreeSet<(usize, usize)>,
 }
 
 fn unsupported() -> StructureError {
@@ -274,6 +277,8 @@ impl Exceptions {
             monitors.insert(route.handler, (monitor, covered.as_slice()));
         }
         let mut cleanups = BTreeMap::new();
+        let mut copied_routes = BTreeSet::new();
+        let mut nested_finally_departures = BTreeSet::new();
         let by_acquisition = monitors
             .values()
             .map(|(monitor, covered)| (monitor.acquisition, (monitor, *covered)))
@@ -285,14 +290,21 @@ impl Exceptions {
                 && !monitors.contains_key(&route.handler)
             {
                 let body = covered.iter().copied().collect();
-                let plan = result.prepare_cleanup(
+                let mut plan = result.prepare_cleanup(
                     instructions,
                     graph,
                     &table,
                     &body,
                     route.handler,
                     &by_acquisition,
+                    &dominators,
                 )?;
+                if let Some(branch) = &mut plan.branched {
+                    copied_routes.append(&mut branch.copied_routes);
+                    for handler in std::mem::take(&mut branch.nested_handlers) {
+                        nested_finally_departures.extend(branch.loop_targets.iter().map(|&target| (handler, target)));
+                    }
+                }
                 if cleanups.insert(route.handler, CleanupPlan::Finally(plan)).is_some() {
                     return Err(unsupported());
                 }
@@ -303,6 +315,18 @@ impl Exceptions {
                 .into_iter()
                 .map(|(handler, (plan, _))| (handler, CleanupPlan::Monitor(plan))),
         );
+        table.nested_finally_departures = nested_finally_departures;
+        if !copied_routes.is_empty() {
+            // The exceptional copy retains the real nested catch clauses.
+            // Nothing can dispatch into a removed copy from outside it.
+            for routes in &mut table.by_block {
+                routes.retain(|route| !copied_routes.contains(route));
+            }
+            table.by_range.retain(|_, routes| {
+                routes.retain(|route| !copied_routes.contains(route));
+                !routes.is_empty()
+            });
+        }
         // Give inner catches the already-proven boundary of their enclosing
         // monitor, including catches that are the only normal way out.
         let is_monitor = |routes: &[Route]| {
@@ -465,6 +489,50 @@ impl Exceptions {
             })
     }
 
+    pub(super) fn allows_finally_loop_transfer(
+        &self,
+        arm: Option<ArmId>,
+        enclosing: Option<ArmId>,
+        target: usize,
+    ) -> bool {
+        let mut current = arm;
+        while let Some(arm) = current {
+            let region = self.region(self.arms[arm.0].region);
+            if let Some(finally) = &region.finally {
+                return finally.arm == arm
+                    && region.enclosing == enclosing
+                    && finally.branched().is_some_and(|branch| branch.loop_targets.contains(&target));
+            }
+            if region.monitor.is_some() || region.legacy_resource.is_some() {
+                return false;
+            }
+            current = region.enclosing;
+        }
+        false
+    }
+
+    pub(super) fn loop_finally_regions(&self) -> impl Iterator<Item = (&ProtectedRegion, &Finally)> {
+        self.regions.iter().filter_map(|region| {
+            let finally = region.finally.as_ref()?;
+            (!finally.branched()?.loop_targets.is_empty()).then_some((region, finally))
+        })
+    }
+
+    pub(super) fn counted_loop_finally_entry(&self, block: usize) -> bool {
+        self.loop_finally_regions().any(|(_, finally)| {
+            self.contains(Some(finally.arm), block) || finally.branched().unwrap().removed.contains(&block)
+        })
+    }
+
+    pub(super) fn counted_loop_finally_dispatch(&self, block: usize, handler: usize) -> bool {
+        self.loop_finally_regions().any(|(region, finally)| {
+            let removed = &finally.branched().unwrap().removed;
+            (finally.start() == handler && self.contains(Some(region.body), block))
+                || (self.contains(Some(finally.arm), block) && self.contains(Some(finally.arm), handler))
+                || (removed.contains(&block) && removed.contains(&handler))
+        })
+    }
+
     pub(super) fn catches_of_finally<'s>(
         &'s self,
         outer: &ProtectedRegion,
@@ -535,7 +603,9 @@ impl Exceptions {
     pub(super) fn finally_range(&self, arm: Option<ArmId>, block: usize) -> Option<Range<usize>> {
         let arm = arm?;
         let finally = self.region(self.arms[arm.0].region).finally.as_ref()?;
-        (finally.arm == arm && finally.plan.block == block)
+        (finally.arm == arm
+            && finally.plan.block == block
+            && finally.branched().is_none_or(|branch| branch.tail.is_some()))
             .then(|| finally.plan.instructions.clone())
     }
 
@@ -612,7 +682,7 @@ impl Exceptions {
                 exits.insert(exit);
             }
         }
-        let start = single_entry(graph, &body)?;
+        let start = single_entry(graph, &body, self)?;
         let only_body_exit = exits.first().copied().filter(|_| exits.len() == 1);
         let mut catches: Vec<Catch> = Vec::new();
         let mut handlers = BTreeSet::new();
@@ -642,6 +712,11 @@ impl Exceptions {
                 arm,
                 start: route.handler,
                 alternatives: vec![route.catch_type],
+            });
+        }
+        if finally.is_none() && monitor.is_none() && !catches.is_empty() {
+            exits.retain(|&target| {
+                !catches.iter().all(|catch| table.nested_finally_departures.contains(&(catch.start, target)))
             });
         }
         if let Some(target) = monitor
@@ -745,10 +820,9 @@ impl Exceptions {
                 && !monitor_acquisition
                     .is_some_and(|owner| self.monitor_finally_copies.get(&exit) == Some(&owner)))
             || !block.exception_predecessors.is_empty()
-            || block.predecessors.iter().any(|pred| !body.contains(pred))
+            || self.projected_predecessors(graph, exit).iter().any(|pred| !body.contains(pred))
             || table.by_block[exit].iter().any(|route| {
-                !block
-                    .predecessors
+                !self.projected_predecessors(graph, exit)
                     .iter()
                     .any(|&pred| table.by_block[pred].contains(route))
             })
@@ -791,6 +865,11 @@ impl Exceptions {
         }
     }
 
+    fn projected_predecessors<'g>(&self, graph: &'g ControlFlowGraph, block: usize) -> &'g [usize] {
+        let entry = self.cleanup_return_entries.get(&block).copied().unwrap_or(block);
+        &graph.blocks[entry].predecessors
+    }
+
     fn prepare_cleanup(
         &mut self,
         instructions: &[Instruction],
@@ -799,6 +878,7 @@ impl Exceptions {
         body: &BTreeSet<usize>,
         handler: usize,
         monitors: &MonitorCandidates<'_>,
+        dominance: &Dominance,
     ) -> Result<Cleanup, StructureError> {
         let node = &graph.blocks[handler];
         let head = if node.instructions.len() == 1 {
@@ -814,9 +894,9 @@ impl Exceptions {
         {
             return Ok(plan);
         }
-        let mut branch =
-            BranchedFinally::prove(instructions, graph, &table.by_block, body, handler, monitors)
-                .ok_or_else(unsupported)?;
+        let mut branch = BranchedFinally::prove(
+            instructions, graph, &table.by_block, body, handler, monitors, dominance,
+        ).ok_or_else(unsupported)?;
         if let Some(exit) = &branch.monitor_exit {
             if self
                 .monitor_finally_targets
@@ -837,18 +917,41 @@ impl Exceptions {
             }
         }
         if !branch.projected_entries.is_empty() {
-            let next = branch.continuation.ok_or_else(unsupported)?;
-            if self.is_cleanup_copy(next) {
-                return Err(unsupported());
+            let next = branch.body_join.ok_or_else(unsupported)?;
+            if branch.continuation.is_some() {
+                if self.is_cleanup_copy(next) {
+                    return Err(unsupported());
+                }
+                self.cleanup_landings.insert(next);
             }
-            self.cleanup_landings.insert(next);
             for entry in std::mem::take(&mut branch.projected_entries) {
-                if self.cleanup_bypasses.insert(entry, next).is_some() {
+                if entry != next && self.cleanup_bypasses.insert(entry, next).is_some() {
                     return Err(unsupported());
                 }
             }
         }
         let instructions = std::mem::take(&mut branch.tail_code);
+        let mut spill_offsets = Vec::new();
+        for resume in std::mem::take(&mut branch.returns) {
+            let block = resume.block;
+            if self.is_cleanup_copy(block)
+                || !self.cleanup_returns.insert(block)
+                || self.cleanup_return_entries.insert(block, resume.entry).is_some()
+                || self.cleanup_bypasses.insert(resume.entry, block).is_some()
+                || (!instructions.is_empty()
+                    && self.cleanup_prefixes.insert(block, instructions.len()).is_some())
+            {
+                return Err(unsupported());
+            }
+            if let Some((load, store)) = resume.spill {
+                if !self.omitted_instructions.insert(load)
+                    || !self.omitted_instructions.insert(store)
+                {
+                    return Err(unsupported());
+                }
+                spill_offsets.push((load + 1, store));
+            }
+        }
         if let Some(next) = branch.prefix_block
             && !instructions.is_empty()
             && (self.is_cleanup_copy(next)
@@ -861,12 +964,12 @@ impl Exceptions {
         }
         Ok(Cleanup {
             start: handler,
-            block: branch.tail,
+            block: branch.tail.unwrap_or(handler),
             instructions,
             branched: Some(branch),
             terminal_copies: None,
             overriding_return: None,
-            spill_offsets: Vec::new(),
+            spill_offsets,
         })
     }
 
@@ -1294,17 +1397,20 @@ impl Table {
             by_block,
             by_range,
             monitor_handlers,
+            nested_finally_departures: BTreeSet::new(),
         })
     }
 }
 
-fn single_entry(graph: &ControlFlowGraph, body: &BTreeSet<usize>) -> Result<usize, StructureError> {
+fn single_entry(
+    graph: &ControlFlowGraph,
+    body: &BTreeSet<usize>,
+    exceptions: &Exceptions,
+) -> Result<usize, StructureError> {
     let mut entries = body.iter().copied().filter(|&block| {
         let node = &graph.blocks[block];
         block == 0
-            || node
-                .predecessors
-                .iter()
+            || exceptions.projected_predecessors(graph, block).iter()
                 .chain(&node.exception_predecessors)
                 .any(|pred| !body.contains(pred))
     });
@@ -1375,6 +1481,7 @@ fn catch_blocks(
 
 struct Dominance {
     spans: Vec<Range<usize>>,
+    loops: OnceCell<Vec<NaturalLoop>>,
 }
 
 impl Dominance {
@@ -1398,11 +1505,15 @@ impl Dominance {
                 stack.pop();
             }
         }
-        Self { spans }
+        Self { spans, loops: OnceCell::new() }
     }
 
     fn contains(&self, dominator: usize, node: usize) -> bool {
         self.spans[dominator].contains(&self.spans[node].start)
+    }
+
+    fn natural_loops(&self, graph: &ControlFlowGraph) -> &[NaturalLoop] {
+        self.loops.get_or_init(|| graph.natural_loops())
     }
 }
 

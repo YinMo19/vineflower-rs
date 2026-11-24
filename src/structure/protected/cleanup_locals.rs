@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::bytecode::{Instruction, Operand};
+use crate::cfg::ControlFlowGraph;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(in crate::structure) struct Local {
@@ -36,6 +37,42 @@ pub(in crate::structure) fn store(instruction: &Instruction) -> Option<Local> {
 pub(in crate::structure) fn returned(load: &Instruction, transfer: &Instruction) -> Option<Local> {
     let local = local(load, 0x15, 0x1a)?;
     (transfer.opcode == 0xac + local.category).then_some(local)
+}
+
+/// Locals (including either half of a wide value) read by an instruction.
+pub(super) fn reads(instruction: &Instruction, slot: u16) -> bool {
+    match instruction.operand {
+        Operand::Increment { index, .. } => index == slot,
+        _ => local(instruction, 0x15, 0x1a).is_some_and(|read| read.slots().any(|index| index == slot)),
+    }
+}
+
+pub(super) fn live_at_any(
+    instructions: &[Instruction],
+    graph: &ControlFlowGraph,
+    starts: &BTreeSet<usize>,
+    value: Local,
+) -> bool {
+    let mut pending: Vec<_> = starts.iter().copied().collect();
+    let mut seen = BTreeSet::new();
+    'walk: while let Some(block) = pending.pop() {
+        if !seen.insert(block) {
+            continue;
+        }
+        let node = &graph.blocks[block];
+        // Conservatively keep the incoming value on exceptional edges.
+        pending.extend_from_slice(&node.exception_successors);
+        for op in &instructions[node.instructions.clone()] {
+            if value.slots().any(|slot| reads(op, slot)) {
+                return true;
+            }
+            if store(op).is_some_and(|written| value.slots().all(|slot| written.slots().any(|index| index == slot))) {
+                continue 'walk;
+            }
+        }
+        pending.extend_from_slice(&node.successors);
+    }
+    false
 }
 
 fn local(instruction: &Instruction, indexed: u8, implicit: u8) -> Option<Local> {

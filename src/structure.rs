@@ -302,7 +302,15 @@ impl Emitter<'_> {
             {
                 return Err(self.unstructured(block));
             }
-            if !first_header && let Some(id) = self.exceptions.at_start(region.exception_arm, block)
+            let exception_body = self.layout.loops[block].and_then(|shape| shape.exception_body);
+            if let Some(id) = self.exceptions.at_start(region.exception_arm, block)
+                && (if first_header {
+                    exception_body.is_some_and(|body| {
+                        body == self.exceptions.region(id).body || Some(body) == region.exception_arm
+                    })
+                } else {
+                    exception_body != Some(self.exceptions.region(id).body)
+                })
             {
                 let Some(next) = self.emit_exception(id, region, machine, depth, pending)? else {
                     return Ok(false);
@@ -697,11 +705,14 @@ impl Emitter<'_> {
         }
             .or_else(|| {
                 let abrupt = |arm| {
-                    region.loop_transfer(arm).is_some()
-                        || region.predicate.is_some_and(|scope| scope.outcome(arm).is_some())
-                        || self.is_terminal(arm)
-                            && (machine.this_is_initialized()
-                                || self.is_prologue_throw(arm, machine))
+                    // A physical return or rethrow may have been trimmed
+                    // from the lexical join of this region.
+                    region.predicate.is_some_and(|scope| scope.outcome(arm).is_some())
+                        || (region.stop != Some(arm)
+                            && (region.loop_transfer(arm).is_some()
+                                || self.is_terminal(arm)
+                                    && (machine.this_is_initialized()
+                                        || self.is_prologue_throw(arm, machine))))
                 };
                 let next = match (abrupt(taken), abrupt(fallthrough)) {
                     (true, false) => fallthrough,
@@ -1277,14 +1288,18 @@ impl Emitter<'_> {
         offsets: &mut Vec<u32>,
     ) -> Result<(), StructureError> {
         if region.exception_arm != scope.exception_arm
-            && !(transfer == Transfer::Break
-                && machine.stack_is_empty()
-                && self.exceptions.allows_loop_break(
+            && !(machine.stack_is_empty()
+                && (self.exceptions.allows_finally_loop_transfer(
                     region.exception_arm,
                     scope.exception_arm,
-                    scope.header,
                     target,
-                )
+                ) || (transfer == Transfer::Break
+                    && self.exceptions.allows_loop_break(
+                        region.exception_arm,
+                        scope.exception_arm,
+                        scope.header,
+                        target,
+                    )))
                 && machine.same_live_loop_bindings(&scope.entry, |slot| {
                     self.local_is_live(target, slot)
                 }))
@@ -1689,7 +1704,10 @@ impl Emitter<'_> {
             return Ok(true);
         }
         let mut arm = baseline.clone();
-        let reaches = self.region(start, region, &mut arm, depth)?;
+        let at_loop_entry = region.loop_header == Some(start)
+            && self.layout.loops[start].and_then(|shape| shape.exception_body) == region.exception_arm
+            && region.exception_arm.is_some();
+        let reaches = self.run_region(start, region, &mut arm, depth, &mut Vec::new(), at_loop_entry, None)?;
         if reaches {
             Self::check_scope(
                 arm,

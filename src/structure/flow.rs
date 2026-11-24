@@ -188,6 +188,7 @@ pub(super) struct Loop {
     pub(super) test: Option<While>,
     pub(super) post_test: Option<PostTest>,
     pub(super) exit: Option<usize>,
+    pub(super) exception_body: Option<ArmId>,
     parent: Option<usize>,
 }
 
@@ -278,10 +279,24 @@ impl Layout {
                 .flat_map(|&block| graph.blocks[block].successors.iter().copied())
                 .filter(|&next| !inside(next) && !outer_transfer(next))
                 .collect();
+            let exception_body = exceptions.loop_finally_regions().find_map(|(region, _)| {
+                (region.start == header && natural_loop.latches.iter().any(|&latch| {
+                    !exceptions.contains(Some(region.body), latch)
+                })).then_some(region.body)
+            });
+            let mirrored_exit = {
+                let mut targets = exceptions
+                    .loop_finally_regions()
+                    .filter(|(region, _)| inside(region.start))
+                    .flat_map(|(_, finally)| finally.branched().unwrap().loop_targets.iter().copied())
+                    .filter(|&target| !inside(target) && !outer_transfer(target));
+                targets.next().filter(|&exit| targets.all(|target| target == exit))
+            };
             let is_failure = |block| assertions.is_some_and(|sites| sites.is_failure_block(block));
             let tests_condition = matches!(instructions[graph.blocks[header].instructions.end - 1].opcode,
                 0x99..=0xa6 | 0xc6..=0xc7)
-                && !assertions.is_some_and(|sites| sites.starts(header));
+                && !assertions.is_some_and(|sites| sites.starts(header))
+                && exception_body.is_none();
             let test = match graph.blocks[header].successors.as_slice() {
                 [first, second] if tests_condition => match (inside(*first), inside(*second)) {
                     (true, false) if !outer_transfer(*second) && !is_failure(*second) => {
@@ -320,7 +335,7 @@ impl Layout {
                             && matches!(instructions[node.instructions.end - 1].opcode, 0xac..=0xb1 | 0xbf)
                     })
             });
-            let mut exit = post_exit.or_else(|| {
+            let mut exit = post_exit.or(mirrored_exit).or_else(|| {
                 let mut normal = exits.iter().copied().filter(|&target| !is_failure(target));
                 let first = normal.next();
                 match (first, normal.next()) {
@@ -429,8 +444,24 @@ impl Layout {
                 test: test.filter(|test| Some(test.exit) == exit),
                 post_test: post_test.filter(|test| Some(test.exit()) == exit),
                 exit,
+                exception_body,
                 parent,
             });
+        }
+        // An abrupt arm can put only part of an exceptional cleanup in
+        // the natural loop. All its arms are lexically at the try's level.
+        for (region, finally) in exceptions.loop_finally_regions() {
+            let at_header = loops[region.start].is_some_and(|shape| shape.exception_body == Some(region.body));
+            let owner = if at_header { Some(region.start) } else { level[region.start] };
+            for block in exceptions.arm_blocks(finally.arm) {
+                if level[block].is_some_and(|head| exceptions.contains(Some(finally.arm), head)) {
+                    continue;
+                }
+                level[block] = owner;
+                if let Some(shape) = &mut loops[block] {
+                    shape.parent = owner;
+                }
+            }
         }
         Ok(Self {
             loops,
