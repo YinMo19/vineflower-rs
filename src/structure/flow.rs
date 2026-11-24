@@ -284,7 +284,7 @@ impl Layout {
                 (region.start == header && natural_loop.latches.iter().any(|&latch| {
                     !exceptions.contains(Some(region.body), latch)
                 })).then_some(region.body)
-            });
+            }).or_else(|| exceptions.retry_loop_body(header));
             let mirrored_exit = {
                 let mut targets = exceptions
                     .loop_finally_regions()

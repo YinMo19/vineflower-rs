@@ -672,6 +672,50 @@ fn pending_labeled_break_exports_locals_written_before_and_during_finally() {
 }
 
 #[test]
+fn empty_finally_forwards_to_the_same_ordered_dispatch_around_a_catch_only_retry() {
+    let bytes = [
+        0x03, 0x3b, 0x04, 0x3c, 0x05, 0x3d, // 0: initialize locals before entering the loop
+        0xb8, 0, 22, // 6: work inside the inner try
+        0xb8, 0, 22, 0xb1, // 9: outer finally's normal copy and return
+        0x4e, // 13: catch the retryable exception
+        0xa7, 0, 8, // 14: go to 22
+        0x3a, 4, // 17: inner finally saves the incoming exception
+        0x19, 4, 0xbf, // 19: immediately rethrow the same object
+        0xa7, 0xff, 0xf0, // 22: retry the inner try at 6
+        0x3a, 5, // 25: outer finally saves the incoming exception
+        0xb8, 0, 22, // 27: run the outer finally cleanup
+        0x19, 5, 0xbf, // 30: rethrow the original object
+    ];
+    let handlers = [
+        handler(6, 9, 13, 26),
+        handler(6, 9, 17, 0),
+        handler(13, 14, 17, 0),
+        handler(17, 19, 17, 0),
+        handler(6, 9, 25, 0),
+        handler(13, 27, 25, 0),
+    ];
+    let (graph, regions) = classify(&bytes, &handlers);
+    let regions = regions.unwrap();
+    assert_eq!(
+        regions.transparent_handlers().collect::<Vec<_>>(),
+        [graph.block_at(17).unwrap(), graph.block_at(19).unwrap()],
+    );
+    let lines = test_method_with_descriptor(&bytes, &handlers, &[], "()V").unwrap();
+    assert!(lines.iter().any(|line| line.depth == 1 && line.text == "while (true) {"));
+    assert!(lines.iter().any(|line| line.depth == 2 && line.text.as_flat().starts_with("} catch (")));
+    assert_eq!(lines.iter().filter(|line| line.text == "} finally {").count(), 1);
+    assert_eq!(lines.iter().filter(|line| line.text == "work();").count(), 2);
+    assert!(!lines.iter().any(|line| line.text.as_flat().starts_with("throw ")));
+
+    let mut reversed = handlers;
+    reversed.swap(1, 4);
+    assert!(matches!(classify(&bytes, &reversed).1, Err(StructureError::ExceptionHandlers)));
+    let mut other_slot = bytes;
+    other_slot[20] = 3;
+    assert!(matches!(classify(&other_slot, &handlers).1, Err(StructureError::ExceptionHandlers)));
+}
+
+#[test]
 fn each_branched_finally_copy_projects_to_one_proven_continuation() {
     let mut bytes = vec![
         0x2a, // 0: aload_0

@@ -46,6 +46,7 @@ pub(super) struct Exceptions {
     monitor_acquisitions: BTreeMap<usize, usize>,
     monitor_finally_targets: BTreeMap<usize, usize>,
     monitor_finally_copies: BTreeMap<usize, usize>,
+    transparent_handlers: BTreeSet<usize>,
     omitted_instructions: BTreeSet<usize>,
 }
 
@@ -241,6 +242,7 @@ impl Exceptions {
         if let Some(machine) = machine {
             result.classify_legacy_resources(instructions, graph, &mut table, machine)?;
         }
+        result.transparent_handlers = table.elide_transparent_finally(instructions, graph);
         let mut monitors = BTreeMap::new();
         // Prove lock ownership before comparing duplicated finally bodies:
         // the compiler can allocate different synthetic slots in each copy.
@@ -471,6 +473,17 @@ impl Exceptions {
             let departure = region.loop_departure.as_ref()?;
             (departure.header == header && departure.target == target).then_some(departure.latch)
         })
+    }
+
+    pub(super) fn retry_loop_body(&self, header: usize) -> Option<ArmId> {
+        self.regions.iter().find_map(|region| {
+            (region.start == header && region.loop_departure.as_ref()?.header == header)
+                .then_some(region.body)
+        })
+    }
+
+    pub(super) fn transparent_handlers(&self) -> impl Iterator<Item = usize> + '_ {
+        self.transparent_handlers.iter().copied()
     }
 
     pub(super) fn allows_loop_break(
@@ -749,11 +762,14 @@ impl Exceptions {
         let loop_departure = if exits.len() == 2
             && finally_route.is_none()
             && let (Some(target), [catch]) = (only_body_exit, catches.as_slice())
-            && self.arms[catch.arm.0].blocks.len() == 1
         {
-            LoopDeparture::prove(
-                instructions, graph, dominators, &body, start, catch.start, target,
-            )
+            let catch_blocks = &self.arms[catch.arm.0].blocks;
+            let classic = (catch_blocks.len() == 1).then(|| {
+                LoopDeparture::prove(instructions, graph, dominators, &body, start, catch.start, target)
+            }).flatten();
+            classic.or_else(|| LoopDeparture::prove_retry(
+                instructions, graph, &body, catch_blocks, start, catch.start, target,
+            ))
             .filter(|departure| exits.contains(&departure.header))
         } else {
             None
@@ -1319,9 +1335,142 @@ impl LoopDeparture {
         }
         Some(Self { header, latch, target })
     }
+
+    fn prove_retry(
+        instructions: &[Instruction],
+        graph: &ControlFlowGraph,
+        body: &BTreeSet<usize>,
+        catch: &BTreeSet<usize>,
+        header: usize,
+        handler: usize,
+        target: usize,
+    ) -> Option<Self> {
+        // The protected code is itself the loop head. Success leaves the
+        // loop; only the catch can retry, through one exclusive goto chain.
+        let entry = &graph.blocks[handler];
+        if !entry.predecessors.is_empty()
+            || entry.exception_predecessors.is_empty()
+            || entry.exception_predecessors.iter().any(|pred| !body.contains(pred))
+            || !graph.blocks[header].exception_predecessors.is_empty()
+            || graph.blocks[header].predecessors.iter().any(|pred| body.contains(pred))
+        {
+            return None;
+        }
+        let mut current = handler;
+        let mut previous = None;
+        for index in 1..=catch.len() {
+            if !catch.contains(&current) {
+                return None;
+            }
+            let node = &graph.blocks[current];
+            let &[next] = node.successors.as_slice() else { return None; };
+            let code = &instructions[node.instructions.clone()];
+            let code = if let Some(pred) = previous {
+                if node.predecessors != [pred] || !node.exception_predecessors.is_empty() {
+                    return None;
+                }
+                code
+            } else {
+                reference_store(code.first()?)?;
+                &code[1..]
+            };
+            if !matches!(code, [] | [Instruction { opcode: 0xa7 | 0xc8, .. }]) {
+                return None;
+            }
+            if next == header {
+                return (index == catch.len()).then_some(Self { header, latch: current, target });
+            }
+            previous = Some(current);
+            current = next;
+        }
+        None
+    }
 }
 
 impl Table {
+    fn elide_transparent_finally(
+        &mut self,
+        instructions: &[Instruction],
+        graph: &ControlFlowGraph,
+    ) -> BTreeSet<usize> {
+        let mut removed = BTreeSet::new();
+        loop {
+            let candidate = self.by_range.iter().find_map(|(covered, routes)| {
+                routes.iter().find_map(|&route| {
+                    self.transparent_rethrow(instructions, graph, covered, route)
+                        .map(|tail| (route, tail))
+                })
+            });
+            let Some((route, tail)) = candidate else { return removed; };
+            removed.extend([route.handler, tail]);
+            for routes in &mut self.by_block {
+                routes.retain(|&active| active != route);
+            }
+            self.by_range.retain(|_, routes| {
+                routes.retain(|&active| active != route);
+                !routes.is_empty()
+            });
+        }
+    }
+
+    fn transparent_rethrow(
+        &self,
+        instructions: &[Instruction],
+        graph: &ControlFlowGraph,
+        covered: &[usize],
+        route: Route,
+    ) -> Option<usize> {
+        if route.catch_type != 0 || route.handler == 0 {
+            return None;
+        }
+        let handler = &graph.blocks[route.handler];
+        let split = handler.instructions.len() == 1;
+        let slot = reference_store(&instructions[handler.instructions.start])?;
+        if !handler.predecessors.is_empty()
+            || covered.binary_search(&route.handler).is_ok()
+            || handler.exception_predecessors.iter().any(|&pred| {
+                !(split && pred == route.handler) && covered.binary_search(&pred).is_err()
+            })
+            || self.by_block.iter().flatten().any(|active| {
+                active.handler == route.handler && active.catch_type != 0
+            })
+        {
+            return None;
+        }
+        let tail = if split {
+            let &[next] = handler.successors.as_slice() else { return None; };
+            let node = &graph.blocks[next];
+            if node.predecessors != [route.handler] || !node.exception_predecessors.is_empty() {
+                return None;
+            }
+            next
+        } else {
+            route.handler
+        };
+        let node = &graph.blocks[tail];
+        let load_index = node.instructions.start + usize::from(!split);
+        let [load, throw] = &instructions[load_index..node.instructions.end] else { return None; };
+        let outgoing = self.by_block[tail].as_slice();
+        if reference_load(load) != Some(slot)
+            || throw.opcode != 0xbf
+            || !node.successors.is_empty()
+            || outgoing.is_empty()
+            || outgoing.contains(&route)
+            || instructions.iter().enumerate().any(|(index, op)| {
+                index != load_index && cleanup_locals::reads(op, slot)
+            })
+        {
+            return None;
+        }
+        // Dispatch resumes with the *same object*, at the identical ordered
+        // suffix. Earlier typed rows retain their original priority.
+        covered.iter().all(|&block| {
+            let active = &self.by_block[block];
+            active.iter().position(|&entry| entry == route)
+                .is_some_and(|index| active[index + 1..] == *outgoing)
+        }).then_some(tail)
+    }
+
     fn new(
         instructions: &[Instruction],
         graph: &ControlFlowGraph,

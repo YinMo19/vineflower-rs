@@ -180,6 +180,9 @@ fn structure_regions(
         emitted: vec![false; graph.blocks.len()],
         lines: Vec::new(),
     };
+    for block in exceptions.transparent_handlers() {
+        emitter.emitted[block] = true;
+    }
     emitter.region(0, Region::METHOD, &mut machine, 0)?;
     if !machine.this_is_initialized() {
         return Err(emitter.unstructured(0));
@@ -1708,13 +1711,13 @@ impl Emitter<'_> {
         baseline: &Machine<'a, 'c>,
         depth: usize,
     ) -> Result<bool, StructureError> {
-        if region.stop == Some(start) {
-            return Ok(true);
-        }
-        let mut arm = baseline.clone();
         let at_loop_entry = region.loop_header == Some(start)
             && self.layout.loops[start].and_then(|shape| shape.exception_body) == region.exception_arm
             && region.exception_arm.is_some();
+        if region.stop == Some(start) && !at_loop_entry {
+            return Ok(true);
+        }
+        let mut arm = baseline.clone();
         let reaches = self.run_region(start, region, &mut arm, depth, &mut Vec::new(), at_loop_entry, None)?;
         if reaches {
             Self::check_scope(
