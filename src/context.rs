@@ -306,6 +306,14 @@ impl<'a> ClassGroup<'a> {
         name: &str,
         options: &Options,
     ) -> Result<&'static str, DecompileError> {
+        self.output_file_parts(name, options).map(|(extension, _)| extension)
+    }
+
+    pub(crate) fn output_file_parts(
+        &self,
+        name: &str,
+        options: &Options,
+    ) -> Result<(&'static str, Option<&str>), DecompileError> {
         let name = if options.decompile_inner {
             self.compilation_root(name)
         } else {
@@ -316,13 +324,22 @@ impl<'a> ClassGroup<'a> {
             .get(name)
             .filter(|entry| entry.source)
             .ok_or_else(|| DecompileError::MissingClass(name.into()))?;
-        Ok(
-            if options.decompile_kotlin && crate::kotlin::has_metadata(&class.class)? {
-                "kt"
-            } else {
-                "java"
-            },
-        )
+        let kind = if options.decompile_kotlin {
+            crate::kotlin::metadata_kind(&class.class)?
+        } else {
+            None
+        };
+        let Some(kind) = kind else { return Ok(("java", None)); };
+        // K2 derives a file facade or multifile part's JVM name from the
+        // source basename. Writing FacadeKt.kt would change it to FacadeKtKt.
+        let basename = if matches!(kind, 2 | 5) {
+            class.class.source_file()?
+                .and_then(|name| name.strip_suffix(".kt"))
+                .filter(|name| !matches!(*name, "" | "." | "..") && !name.contains(['/', '\\', ':', '\0']))
+        } else {
+            None
+        };
+        Ok(("kt", basename))
     }
 
     /// Render one compilation unit in the context of all registered classes.

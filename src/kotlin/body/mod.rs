@@ -27,6 +27,7 @@ mod logic;
 mod loops;
 mod nullable;
 mod statements;
+mod suspend;
 mod switches;
 mod tailrec;
 mod templates;
@@ -142,6 +143,7 @@ enum ExprKind<'a> {
     StringLength(Box<Expr<'a>>),
     ValueBlock(Box<statements::ValueBlock<'a>>),
     Nullable(Box<nullable::Expression<'a>>),
+    SuspendClosure(Vec<statements::Statement<'a>>),
 }
 
 #[derive(Debug)]
@@ -1296,7 +1298,8 @@ impl<'a> Expr<'a> {
             ExprKind::Local(local) => Some(load_opcode(&local.value.jvm)),
             ExprKind::Invocation(call) => Some(load_opcode(&call.result().jvm)),
             ExprKind::BoxedInt(_) => Some(0x19),
-            ExprKind::Template(_) | ExprKind::ClassLiteral(_) | ExprKind::SmartString(_) => Some(0x19),
+            ExprKind::Template(_) | ExprKind::ClassLiteral(_) | ExprKind::SmartString(_)
+            | ExprKind::SuspendClosure(_) => Some(0x19),
             ExprKind::ThisProperty { primitive, .. } => Some(load_opcode(&JvmType::Primitive(*primitive))),
             ExprKind::Binary(_, primitive, _) => Some(load_opcode(&JvmType::Primitive(*primitive))),
             ExprKind::Nullable(expression) if expression.result().jvm != JvmType::Void => {
@@ -1341,7 +1344,7 @@ impl<'a> Expr<'a> {
             ExprKind::ValueBlock(block) => block.value.primitive_hint(parameters),
             ExprKind::SmartString(_) => None,
             ExprKind::BoxedInt(_) => None,
-            ExprKind::Template(_) | ExprKind::ClassLiteral(_) => None,
+            ExprKind::Template(_) | ExprKind::ClassLiteral(_) | ExprKind::SuspendClosure(_) => None,
             ExprKind::ThisProperty { primitive, .. } => Some(*primitive),
             ExprKind::Nullable(expression) => expression.result().primitive(),
             ExprKind::Conditional(conditional) => conditional.primitive_hint(parameters),
@@ -1424,6 +1427,22 @@ impl<'a> Expr<'a> {
             }
             ExprKind::ValueBlock(block) => {
                 block.write(out, expected, parameters, declaration)?;
+            }
+            ExprKind::SuspendClosure(statements) => {
+                if !matches!(expected, Expected::Type(ty, JvmType::Object(owner))
+                    if owner == suspend::FUNCTION1 && suspend::unit_return(ty).is_some())
+                {
+                    return Err(mismatch());
+                }
+                out.push('{');
+                for (index, statement) in statements.iter().enumerate() {
+                    out.push_str(if index == 0 { " " } else { "; " });
+                    statement.write_exact_print(out, parameters, declaration)?;
+                }
+                if !statements.is_empty() {
+                    out.push(' ');
+                }
+                out.push('}');
             }
             ExprKind::ExtensionReceiver(receiver) => {
                 if !receiver.accepts(expected) {

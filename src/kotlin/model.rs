@@ -162,6 +162,47 @@ impl Type {
             _ => None,
         }
     }
+
+    pub(super) fn function_arity(&self) -> Option<usize> {
+        self.class_id()?.strip_prefix("kotlin/Function")?.parse().ok()
+    }
+
+    /// Kotlin/JVM metadata encodes suspend functions as FunctionN with an
+    /// extra Continuation<R> parameter and an erased Any? result.
+    pub(super) fn suspend_signature(&self) -> Option<(&[TypeArgument], &Type)> {
+        if !self.suspend || self.arguments.len().checked_sub(1)? != self.function_arity()? {
+            return None;
+        }
+        let [parameters @ .., TypeArgument::Type(Variance::Invariant, continuation),
+            TypeArgument::Type(Variance::Invariant, erased)] = self.arguments.as_slice()
+        else {
+            return None;
+        };
+        if !continuation.simple_class("kotlin/coroutines/Continuation")
+            || continuation.nullable
+            || !erased.simple_class("kotlin/Any")
+            || !erased.nullable
+            || !erased.arguments.is_empty()
+        {
+            return None;
+        }
+        let [TypeArgument::Type(Variance::Invariant, returns)] = continuation.arguments.as_slice()
+        else {
+            return None;
+        };
+        Some((parameters, returns))
+    }
+
+    pub(super) fn simple_class(&self, id: &str) -> bool {
+        matches!(&self.classifier, Classifier::Class(name) if !name.local && name.id == id)
+            && !self.suspend
+            && !self.raw
+            && !self.definitely_not_null
+            && self.outer.is_none()
+            && self.abbreviated.is_none()
+            && self.flexible.is_none()
+            && self.annotations.is_empty()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

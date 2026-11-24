@@ -130,8 +130,8 @@ impl Types<'_> {
     }
 
     pub fn write(&self, out: &mut String, ty: &Type) -> Result<(), KotlinError> {
-        if ty.raw || ty.flexible.is_some() || ty.suspend {
-            return Err(self.unsupported("raw, flexible or suspend type"));
+        if ty.raw || ty.flexible.is_some() {
+            return Err(self.unsupported("raw or flexible type"));
         }
         if let Some(abbreviated) = &ty.abbreviated {
             if abbreviated.nullable != ty.nullable || !ty.annotations.is_empty() {
@@ -139,12 +139,11 @@ impl Types<'_> {
             }
             return self.write(out, abbreviated);
         }
-        if let Some(arity) = ty
-            .class_id()
-            .and_then(|id| id.strip_prefix("kotlin/Function"))
-            .and_then(|arity| arity.parse::<usize>().ok())
-        {
+        if let Some(arity) = ty.function_arity() {
             return self.function(out, ty, arity);
+        }
+        if ty.suspend {
+            return Err(self.unsupported("unrecognized suspend function type"));
         }
         if !ty.annotations.is_empty() {
             return Err(self.unsupported("type-use annotations"));
@@ -257,15 +256,24 @@ impl Types<'_> {
         {
             return Err(self.unsupported("annotated or malformed function type"));
         }
-        let Some((returns, parameters)) = ty.arguments.split_last() else {
-            return Err(self.unsupported("function type arguments"));
+        let (parameters, returns) = if ty.suspend {
+            ty.suspend_signature()
+                .ok_or_else(|| self.unsupported("unrecognized suspend function type"))?
+        } else {
+            let Some((returns, parameters)) = ty.arguments.split_last() else {
+                return Err(self.unsupported("function type arguments"));
+            };
+            if parameters.len() != arity {
+                return Err(self.unsupported("function type arity"));
+            }
+            (parameters, function_argument(returns, self.declaration)?)
         };
-        if parameters.len() != arity {
-            return Err(self.unsupported("function type arity"));
-        }
         let mut parameters = parameters.iter();
         if ty.nullable {
             out.push('(');
+        }
+        if ty.suspend {
+            out.push_str("suspend ");
         }
         if extension {
             let receiver = parameters
@@ -282,7 +290,7 @@ impl Types<'_> {
             self.write(out, function_argument(param, self.declaration)?)?;
         }
         out.push_str(") -> ");
-        self.write(out, function_argument(returns, self.declaration)?)?;
+        self.write(out, returns)?;
         if ty.nullable {
             out.push_str(")?");
         }

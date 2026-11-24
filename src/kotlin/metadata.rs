@@ -48,6 +48,17 @@ pub fn has_metadata(class: &ClassFile<'_>) -> Result<bool, KotlinError> {
     Ok(metadata_annotation(class)?.is_some())
 }
 
+pub(crate) fn metadata_kind(class: &ClassFile<'_>) -> Result<Option<i32>, KotlinError> {
+    let Some(annotation) = metadata_annotation(class)? else { return Ok(None); };
+    let mut kind = None;
+    for (index, value) in annotation.elements {
+        if class.pool.utf8(index)? == "k" && kind.replace(integer(&class.pool, &value)?).is_some() {
+            return Err(KotlinError::Metadata("duplicate Kotlin annotation element"));
+        }
+    }
+    Ok(Some(kind.unwrap_or(1)))
+}
+
 fn metadata_annotation(class: &ClassFile<'_>) -> Result<Option<Annotation>, KotlinError> {
     let mut metadata = None;
     for visible in [true, false] {

@@ -12,6 +12,7 @@ mod names;
 mod proto;
 mod syntax;
 pub use metadata::{Metadata, MetadataHeader, has_metadata, read_metadata};
+pub(crate) use metadata::metadata_kind;
 pub use model::{
     ClassDeclaration, ClassKind, ClassName, Classifier, Constructor, Declaration, Flags, Function,
     JvmFieldSignature, JvmMethodSignature, JvmPropertySignature, MemberKind, Modality,

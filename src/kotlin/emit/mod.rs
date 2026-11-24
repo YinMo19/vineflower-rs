@@ -123,7 +123,7 @@ pub(super) fn render<'a, 'data>(
                 owner_parameters: &[],
                 local_parameters: &[],
             };
-            let plan = Plan::new(&bytecode, members, None, Layout::File)?;
+            let plan = Plan::new(&bytecode, members, None, Layout::File(nested))?;
             let style = Style {
                 indent: "",
                 unit,
@@ -603,13 +603,13 @@ type Field<'a, 'data> = &'a Member<'data>;
 enum Layout<'scope, 'a, 'data> {
     Class,
     CompanionHost,
-    File,
+    File(Option<&'a ClassGroup<'data>>),
     Singleton(&'scope objects::Singleton<'a, 'data>),
 }
 
 impl<'scope, 'a, 'data> Layout<'scope, 'a, 'data> {
     fn file(self) -> bool {
-        matches!(self, Self::File)
+        matches!(self, Self::File(_))
     }
 
     fn singleton(self) -> Option<&'scope objects::Singleton<'a, 'data>> {
@@ -689,7 +689,7 @@ impl<'a, 'data, 'metadata> Plan<'a, 'data, 'metadata> {
         let parameters = constructor.map_or(&[][..], |(con, _)| con.parameters.as_slice());
         let mut promoted = vec![None; parameters.len()];
         let mut ordered = Vec::new();
-        let clinit = if matches!(layout, Layout::Class | Layout::File) {
+        let clinit = if matches!(layout, Layout::Class | Layout::File(_)) {
             let signature = JvmMethodSignature {
                 name: "<clinit>".to_owned(),
                 descriptor: MethodDescriptor {
@@ -698,9 +698,14 @@ impl<'a, 'data, 'metadata> Plan<'a, 'data, 'metadata> {
                 },
             };
             let initialization = bytecode.find_method(&signature)?.map(|method| {
-                let assignments = bytecode.initialization(
-                    method, &signature.descriptor, &[], None, bytecode.owner,
-                )?;
+                let assignments = match layout {
+                    Layout::File(Some(group)) => bytecode.package_initialization(
+                        method, &signature.descriptor, group, &members.properties,
+                    )?,
+                    _ => bytecode.initialization(
+                        method, &signature.descriptor, &[], None, bytecode.owner,
+                    )?,
+                };
                 Ok::<_, KotlinError>((assignments, method))
             }).transpose()?;
             if !layout.file() && initialization.as_ref().is_some_and(|(assignments, _)| !assignments.is_empty()) {

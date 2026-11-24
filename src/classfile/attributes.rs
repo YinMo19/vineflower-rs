@@ -107,6 +107,12 @@ impl<'a> ClassFile<'a> {
         signature(&self.attributes, &self.pool)
     }
 
+    pub(crate) fn source_file(&self) -> Result<Option<&str>, ClassError> {
+        decode_attribute(&self.attributes, &self.pool, "SourceFile", |reader| {
+            self.pool.utf8(reader.u16()?)
+        })
+    }
+
     pub fn inner_classes(&self) -> Result<Vec<InnerClass>, ClassError> {
         let pool = &self.pool;
         Ok(

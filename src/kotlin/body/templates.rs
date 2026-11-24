@@ -440,7 +440,7 @@ fn actual<'a>(expr: &'a Expr<'_>, locals: &'a Locals<'_>) -> Shape<'a> {
         ExprKind::ValueBlock(block) => actual(&block.value, locals),
         ExprKind::BoxedInt(_) => Shape::Object("java/lang/Integer"),
         ExprKind::ClassLiteral(_) => Shape::Object(CLASS),
-        ExprKind::Conditional(_) | ExprKind::Nullable(_) => Shape::Unknown,
+        ExprKind::Conditional(_) | ExprKind::Nullable(_) | ExprKind::SuspendClosure(_) => Shape::Unknown,
     }
 }
 

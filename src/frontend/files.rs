@@ -443,13 +443,13 @@ impl Inputs {
             if options.decompile_inner && !group.is_root(&name) {
                 continue;
             }
-            let extension = group
-                .file_extension(&name, options)
+            let (extension, source_basename) = group
+                .output_file_parts(&name, options)
                 .map_err(|error| self.class_error(&input, error))?;
             let actual = self.renames.class_name(&name);
-            let basename = actual.rsplit('/').next().expect("class name");
+            let basename = source_basename.unwrap_or_else(|| actual.rsplit('/').next().expect("class name"));
             let output_name = if let Some(mut entry_name) = entry_name {
-                if actual == name {
+                if actual == name && source_basename.is_none() {
                     entry_name.truncate(entry_name.len() - "class".len());
                 } else {
                     let prefix_len = entry_name.rfind('/').map_or(0, |slash| slash + 1);
@@ -460,9 +460,8 @@ impl Inputs {
                 entry_name.push_str(extension);
                 entry_name
             } else {
-                // Like Vineflower, standalone inputs are written at the output root,
-                // using the declared binary name instead of the input file name.
-                // `basename` is derived from the class declaration, not the input path.
+                // Standalone inputs are written at the output root. Kotlin
+                // file facades retain their original basename for recompilation.
                 let Input::File { path, .. } = &input else {
                     unreachable!()
                 };

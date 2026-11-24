@@ -29,7 +29,7 @@ pub(in crate::kotlin) struct Statement<'a> {
 enum Kind<'a> {
     Print {
         argument: Option<(Expr<'a>, PrintOperand)>,
-        argument_first: bool,
+        order: PrintOrder,
     },
     Declare(Rc<Binding<'a>>, Expr<'a>),
     Increment(Rc<Binding<'a>>, i16),
@@ -76,6 +76,19 @@ enum PrintOperand {
     String,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum PrintOrder {
+    ReceiverFirst,
+    ArgumentFirst,
+    ArgumentFirstRequired,
+}
+
+impl PrintOrder {
+    fn argument_first(argument: &Expr<'_>) -> Self {
+        if argument.infallible() { Self::ArgumentFirst } else { Self::ArgumentFirstRequired }
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct ValueBlock<'a> {
     pub(super) statements: Vec<Statement<'a>>,
@@ -104,8 +117,31 @@ impl Statement<'_> {
         parameters: &[ValueParameter],
         declaration: &str,
     ) -> Result<(), KotlinError> {
-        let (argument, argument_first) = match &self.kind {
-            Kind::Print { argument, argument_first } => (argument, *argument_first),
+        self.write_with_print_overload(out, parameters, declaration, false)
+    }
+
+    pub(super) fn write_exact_print(
+        &self,
+        out: &mut String,
+        parameters: &[ValueParameter],
+        declaration: &str,
+    ) -> Result<(), KotlinError> {
+        self.write_with_print_overload(out, parameters, declaration, true)
+    }
+
+    fn write_with_print_overload(
+        &self,
+        out: &mut String,
+        parameters: &[ValueParameter],
+        declaration: &str,
+        exact_print_overload: bool,
+    ) -> Result<(), KotlinError> {
+        // Java PrintStream chooses a different overload for String, CharArray,
+        // and other arguments that Kotlin's inline println sends as Object.
+        // Keep the proven overload when embedding a recovered closure.
+        // Other statement emission keeps its existing source formatting.
+        let (argument, order) = match &self.kind {
+            Kind::Print { argument, order } => (argument, *order),
             Kind::Declare(local, value) => {
                 out.push_str(if local.mutable { "var " } else { "val " });
                 identifier(out, &local.name, declaration)?;
@@ -141,10 +177,18 @@ impl Statement<'_> {
                 return value.write(out, &result.ty, &result.jvm, parameters, declaration);
             }
         };
+        let argument_first = matches!(order, PrintOrder::ArgumentFirstRequired)
+            || exact_print_overload && matches!(order, PrintOrder::ArgumentFirst);
+        if argument_first && matches!(argument, Some((_, PrintOperand::String))) {
+            return Err(KotlinError::unsupported(declaration, "argument-first String println"));
+        }
         out.push_str(if argument_first { "kotlin.io.println(" } else { "System.out.println(" });
         if let Some((expr, expected)) = argument {
             let (expected, cast) = match expected {
                 PrintOperand::Primitive(primitive) => (Expected::Primitive(*primitive), ""),
+                PrintOperand::Object if exact_print_overload && !argument_first => {
+                    (Expected::Reference, " as kotlin.Any?")
+                }
                 PrintOperand::Object => {
                     // Kotlin println is compiled to the Object overload. Keep
                     // nontrivial reference overloads (e.g. CharArray) distinct.
@@ -195,7 +239,13 @@ impl Statement<'_> {
                     (Expected::Reference, cast)
                 }
             };
-            expr.write_at(out, expected, parameters, declaration, 0)?;
+            if exact_print_overload && !cast.is_empty() {
+                out.push('(');
+                expr.write_at(out, expected, parameters, declaration, 0)?;
+                out.push(')');
+            } else {
+                expr.write_at(out, expected, parameters, declaration, 0)?;
+            }
             out.push_str(cast);
         }
         out.push(')');
@@ -236,7 +286,17 @@ pub(super) fn lower<'a, 'data>(
     locals: &Locals<'_>,
     declaration: &str,
 ) -> Result<Vec<Statement<'a>>, KotlinError> {
-    let range = start..instructions.len() - 1;
+    lower_debug_range(bytecode, instructions, start..instructions.len() - 1, code, locals, declaration)
+}
+
+pub(super) fn lower_debug_range<'a, 'data>(
+    bytecode: &Bytecode<'a, 'data>,
+    instructions: &[Instruction],
+    range: Range<usize>,
+    code: &Code<'data>,
+    locals: &Locals<'_>,
+    declaration: &str,
+) -> Result<Vec<Statement<'a>>, KotlinError> {
     let debug = if instructions[range.clone()].iter().any(|instruction| local_store(instruction).is_some()) {
         DebugLocals { entries: code.local_variables(&bytecode.class.pool)?, max: code.max_locals }
     } else {
@@ -484,7 +544,7 @@ fn lower_operands<'a>(
 ) -> Result<Prefix<'a>, KotlinError> {
     let mut statements = Vec::new();
     let mut stack = Vec::new();
-    let mut argument_first = false;
+    let mut print_order = PrintOrder::ReceiverFirst;
     let mut index = range.start;
     let mut first = range.start;
     let mut inherited = &[][..];
@@ -550,7 +610,7 @@ fn lower_operands<'a>(
             {
                 // For a fallible value, use Kotlin's inline println, whose
                 // PrintStream read must stay after the argument evaluation.
-                argument_first = !argument.infallible();
+                print_order = PrintOrder::argument_first(argument);
                 stack.insert(0, StackValue::PrintStream);
                 index += 3;
                 continue;
@@ -631,7 +691,7 @@ fn lower_operands<'a>(
             if let [StackValue::Value(argument), StackValue::PrintStream] = stack.as_slice()
                 && matches!(argument.stack_load(), Some(0x15 | 0x17 | 0x19))
             {
-                argument_first = !argument.infallible();
+                print_order = PrintOrder::argument_first(argument);
                 stack.swap(0, 1);
             } else {
                 return Err(invalid());
@@ -640,7 +700,7 @@ fn lower_operands<'a>(
             bytecode.reference(instruction, 0xb6)?
         {
             let expected = println_operand(descriptor).ok_or_else(invalid)?;
-            if argument_first
+            if matches!(print_order, PrintOrder::ArgumentFirstRequired)
                 && (matches!(expected, None | Some(PrintOperand::String))
                     || locals.templates.properties.iter().any(|property| property.name == "kotlin")
                     || locals.extension.as_ref().is_some_and(|context| {
@@ -664,9 +724,9 @@ fn lower_operands<'a>(
             stack.clear();
             statements.push(Statement {
                 instructions: first..index + 1,
-                kind: Kind::Print { argument, argument_first },
+                kind: Kind::Print { argument, order: print_order },
             });
-            argument_first = false;
+            print_order = PrintOrder::ReceiverFirst;
             first = index + 1;
         } else if matches!(instruction.opcode, 0x57 | 0x58) {
             let ExprKind::Invocation(call) = pop_value(&mut stack, declaration)?.kind else {
