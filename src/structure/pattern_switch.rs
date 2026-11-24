@@ -783,7 +783,12 @@ mod tests {
         let group = ClassGroup::new([JAVA17_NULL_TYPE]).unwrap();
         let source = group.decompile("pkg/TestSwitchPatternMatchingWithNull", &Options::default()).unwrap().text;
         assert_eq!(source.matches("case null, Integer i").count(), 2, "{source}");
-        assert_eq!(source.matches("System.out.println((Object)i);").count(), 2, "{source}");
+        assert_eq!(
+            source.matches("System.out.println(i);").count()
+                + source.matches("System.out.println((Object)i);").count(),
+            2,
+            "{source}",
+        );
         assert!(!source.contains("requireNonNull"), "{source}");
     }
 

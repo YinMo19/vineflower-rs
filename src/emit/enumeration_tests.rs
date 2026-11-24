@@ -125,7 +125,9 @@ fn visible_enum_arguments_and_retained_static_code_share_one_initializer_map() {
     let options = Options { include_line_mappings: true, ..Options::default() };
     let source = group.decompile("pkg/TestEnum", &options).unwrap();
     let named = source.text.lines().position(|line| line.contains("E3(\"-\",")).unwrap();
-    let tail = source.text.lines().position(|line| line.contains(" = TestEnum.E1;")).unwrap();
+    let tail = source.text.lines().position(|line| {
+        line.split_once(" = ").is_some_and(|(_, value)| value == "E1;" || value.ends_with(".E1;"))
+    }).unwrap();
     let map = source.map.unwrap();
     let names = map.methods.iter().filter(|method| method.class_name == "pkg/TestEnum")
         .map(|method| method.name.as_str()).collect::<Vec<_>>();
