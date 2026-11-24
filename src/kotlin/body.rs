@@ -104,6 +104,9 @@ enum ExprKind<'a> {
     ClassLiteral(&'a str),
     Conditional(Box<Conditional<'a>>),
     SafeCastComparison(Box<casts::Comparison<'a>>),
+    SmartString(usize),
+    StringLength(Box<Expr<'a>>),
+    ValueBlock(Box<statements::ValueBlock<'a>>),
     Nullable(Box<nullable::Expression<'a>>),
 }
 
@@ -1248,7 +1251,8 @@ impl<'a> Expr<'a> {
             | ExprKind::Compare(_)
             | ExprKind::Not(_)
             | ExprKind::SafeCastComparison(_)
-            | ExprKind::TypeTest { .. } => Some(0x15),
+            | ExprKind::TypeTest { .. }
+            | ExprKind::StringLength(_) => Some(0x15),
             ExprKind::Literal(Literal::Long(_)) => Some(0x16),
             ExprKind::Literal(Literal::Float(_)) => Some(0x17),
             ExprKind::Literal(Literal::Double(_)) => Some(0x18),
@@ -1259,12 +1263,13 @@ impl<'a> Expr<'a> {
             ExprKind::Local(local) => Some(load_opcode(&local.value.jvm)),
             ExprKind::Invocation(call) => Some(load_opcode(&call.result().jvm)),
             ExprKind::BoxedInt(_) => Some(0x19),
-            ExprKind::Template(_) | ExprKind::ClassLiteral(_) => Some(0x19),
+            ExprKind::Template(_) | ExprKind::ClassLiteral(_) | ExprKind::SmartString(_) => Some(0x19),
             ExprKind::ThisProperty { primitive, .. } => Some(load_opcode(&JvmType::Primitive(*primitive))),
             ExprKind::Binary(_, primitive, _) => Some(load_opcode(&JvmType::Primitive(*primitive))),
             ExprKind::Nullable(expression) if expression.result().jvm != JvmType::Void => {
                 Some(load_opcode(&expression.result().jvm))
             }
+            ExprKind::ValueBlock(block) => block.value.stack_load(),
             ExprKind::Conditional(_) | ExprKind::Nullable(_) => None,
         }
     }
@@ -1299,6 +1304,9 @@ impl<'a> Expr<'a> {
             ExprKind::Compare(_) | ExprKind::Not(_) | ExprKind::TypeTest { .. } | ExprKind::SafeCastComparison(_) => {
                 Some(Primitive::Boolean)
             }
+            ExprKind::StringLength(_) => Some(Primitive::Int),
+            ExprKind::ValueBlock(block) => block.value.primitive_hint(parameters),
+            ExprKind::SmartString(_) => None,
             ExprKind::BoxedInt(_) => None,
             ExprKind::Template(_) | ExprKind::ClassLiteral(_) => None,
             ExprKind::ThisProperty { primitive, .. } => Some(*primitive),
@@ -1364,6 +1372,25 @@ impl<'a> Expr<'a> {
                     return Err(mismatch());
                 }
                 identifier(out, &parameter.name, declaration)?;
+            }
+            ExprKind::SmartString(index) => {
+                if !matches!(expected, Expected::Reference)
+                    && !matches!(expected, Expected::Type(ty, JvmType::Object(owner))
+                        if owner == "java/lang/String" && ty.class_id() == Some("kotlin/String"))
+                {
+                    return Err(mismatch());
+                }
+                identifier(out, &parameters[*index].name, declaration)?;
+            }
+            ExprKind::StringLength(value) => {
+                if expected.primitive() != Some(Primitive::Int) {
+                    return Err(mismatch());
+                }
+                value.write_at(out, Expected::Reference, parameters, declaration, u8::MAX)?;
+                out.push_str(".length");
+            }
+            ExprKind::ValueBlock(block) => {
+                block.write(out, expected, parameters, declaration)?;
             }
             ExprKind::ExtensionReceiver(receiver) => {
                 if !receiver.accepts(expected) {

@@ -19,11 +19,13 @@ pub(in crate::kotlin) struct StatementBlock<'a> {
     pub implicit_return: bool,
 }
 
+#[derive(Debug)]
 pub(in crate::kotlin) struct Statement<'a> {
     pub instructions: Range<usize>,
     kind: Kind<'a>,
 }
 
+#[derive(Debug)]
 enum Kind<'a> {
     Print {
         argument: Option<(Expr<'a>, PrintOperand)>,
@@ -67,11 +69,32 @@ struct DebugLocals<'a> {
     max: u16,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum PrintOperand {
     Primitive(Primitive),
     Object,
     String,
+}
+
+#[derive(Debug)]
+pub(super) struct ValueBlock<'a> {
+    pub(super) statements: Vec<Statement<'a>>,
+    pub(super) value: Expr<'a>,
+}
+
+impl ValueBlock<'_> {
+    pub(super) fn write(
+        &self, out: &mut String, expected: Expected<'_>, parameters: &[ValueParameter], declaration: &str,
+    ) -> Result<(), KotlinError> {
+        out.push_str("kotlin.run { ");
+        for statement in &self.statements {
+            statement.write(out, parameters, declaration)?;
+            out.push_str("; ");
+        }
+        self.value.write_at(out, expected, parameters, declaration, 0)?;
+        out.push_str(" }");
+        Ok(())
+    }
 }
 
 impl Statement<'_> {

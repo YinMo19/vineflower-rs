@@ -3,10 +3,9 @@
 use crate::cfg::ControlFlowGraph;
 
 use super::{
-    Bytecode, Expr, Instruction, JvmType, KotlinError, Locals, Operand, StackValue, ValueParameter,
-    logic::{self, Conditional},
-    pop_value, return_opcode,
-    tailrec,
+    Bytecode, Expr, ExprKind, Instruction, JvmType, KotlinError, Literal, Locals, Operand,
+    StackValue, ValueParameter, logic::{self, Conditional}, pop_value, return_opcode,
+    statements::{self, ValueBlock}, tailrec,
 };
 
 /// Lower a forward-only expression graph. A structured region either returns
@@ -59,7 +58,7 @@ pub(super) fn lower<'class>(
         tail,
         steps,
     };
-    match lower.region(0, None, &mut Vec::new(), 0)? {
+    match lower.region(0, None, &mut Vec::new(), None, 0)? {
         Exit::Return(expr) => Ok((expr, materialized)),
         Exit::Join(_) => Err(lower.unsupported("expression path without a return")),
     }
@@ -115,12 +114,32 @@ enum Exit<'a> {
     Return(Expr<'a>),
 }
 
+/// Lexical facts are available inside a single emitted arm, not at its
+/// postdominator. The expression lifter never writes to a parameter slot.
+struct StringFact<'a> {
+    parameter: usize,
+    parent: Option<&'a Self>,
+}
+
+impl StringFact<'_> {
+    fn contains(mut fact: Option<&Self>, index: usize) -> bool {
+        while let Some(current) = fact {
+            if current.parameter == index {
+                return true;
+            }
+            fact = current.parent;
+        }
+        false
+    }
+}
+
 impl<'class> Lowering<'_, 'class, '_> {
     fn region(
         &mut self,
         mut index: usize,
         stop: Option<usize>,
         stack: &mut Vec<StackValue<'class>>,
+        facts: Option<&StringFact<'_>>,
         depth: usize,
     ) -> Result<Exit<'class>, KotlinError> {
         if depth >= 64 {
@@ -151,9 +170,13 @@ impl<'class> Lowering<'_, 'class, '_> {
                 }
                 return tail.call(self.bytecode, before, self.locals, stack, self.declaration).map(Exit::Return);
             }
+            if stop.is_none() && stack.is_empty() && last.opcode == self.return_opcode
+                && let Some(value) = self.statement_value(block.instructions.start..block.instructions.end - 1)?
+            {
+                return Ok(Exit::Return(value));
+            }
             for instruction in before {
-                self.bytecode
-                    .expression(instruction, self.locals, stack, self.declaration)?;
+                self.expression(instruction, stack, facts)?;
             }
             match (last.opcode, &last.operand, block.successors.as_slice()) {
                 (0xac..=0xb1, _, []) => {
@@ -176,8 +199,19 @@ impl<'class> Lowering<'_, 'class, '_> {
                     if stop.is_some_and(|stop| join.is_none_or(|join| join > stop)) {
                         return Err(self.unsupported("crossing Kotlin conditional regions"));
                     }
-                    let yes = self.region(fallthrough, join, stack, depth + 1)?;
-                    let no = self.region(target, join, stack, depth + 1)?;
+                    let guarded = match &guard.kind {
+                        ExprKind::TypeTest { operand, target: "java/lang/String", negative } => {
+                            match operand.kind {
+                                ExprKind::Parameter { index, load: 0x19 } => Some((*negative, StringFact { parameter: index, parent: facts })),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
+                    let yes_facts = guarded.as_ref().filter(|(negative, _)| !negative).map(|(_, fact)| fact).or(facts);
+                    let no_facts = guarded.as_ref().filter(|(negative, _)| *negative).map(|(_, fact)| fact).or(facts);
+                    let yes = self.region(fallthrough, join, stack, yes_facts, depth + 1)?;
+                    let no = self.region(target, join, stack, no_facts, depth + 1)?;
                     match (yes, no, join) {
                         (Exit::Return(yes), Exit::Return(no), None) => {
                             return Ok(Exit::Return(Conditional::new(
@@ -203,13 +237,73 @@ impl<'class> Lowering<'_, 'class, '_> {
                     return Err(self.unsupported("unsupported Kotlin control transfer"));
                 }
                 (_, _, [next]) => {
-                    self.bytecode
-                        .expression(last, self.locals, stack, self.declaration)?;
+                    self.expression(last, stack, facts)?;
                     index = *next;
                 }
                 _ => return Err(self.unsupported("unterminated Kotlin expression path")),
             }
         }
+    }
+
+    fn expression(
+        &self,
+        instruction: &Instruction,
+        stack: &mut Vec<StackValue<'class>>,
+        facts: Option<&StringFact<'_>>,
+    ) -> Result<(), KotlinError> {
+        if let (0xc0, Operand::Constant(index)) = (instruction.opcode, &instruction.operand)
+            && let Some(StackValue::Value(value)) = stack.last_mut()
+            && let ExprKind::Parameter { index: parameter, load: 0x19 } = value.kind
+            && StringFact::contains(facts, parameter)
+            && self.bytecode.class.pool.class_name(*index)? == "java/lang/String"
+        {
+            value.kind = ExprKind::SmartString(parameter);
+            return Ok(());
+        }
+        if let Some(StackValue::Value(value)) = stack.last()
+            && self.bytecode.reference(instruction, 0xb6)? == Some(("java/lang/String", "length", "()I"))
+            && (matches!(value.kind, ExprKind::SmartString(_) | ExprKind::Literal(Literal::String(_)))
+                || value.source_type(self.locals).is_some_and(|(ty, jvm)| {
+                    !ty.nullable && ty.class_id() == Some("kotlin/String")
+                        && matches!(jvm, JvmType::Object(owner) if owner == "java/lang/String")
+                }))
+        {
+            let value = pop_value(stack, self.declaration)?;
+            let depth = value.depth + 1;
+            let length = Expr::new(ExprKind::StringLength(Box::new(value)), depth, self.declaration)?;
+            stack.push(StackValue::Value(length));
+            return Ok(());
+        }
+        self.bytecode.expression(instruction, self.locals, stack, self.declaration)
+    }
+
+    fn statement_value(&self, range: std::ops::Range<usize>) -> Result<Option<Expr<'class>>, KotlinError> {
+        if !self.instructions[range.clone()].iter().any(|instruction| instruction.opcode == 0xb2)
+            || self.parameters.iter().any(|parameter| parameter.name == "kotlin")
+            || self.locals.templates.properties.iter().any(|property| property.name == "kotlin")
+            || self.bytecode.owner.split(['/', '$']).next() == Some("kotlin")
+        {
+            return Ok(None);
+        }
+        // The terminal block owns the effects and the final operand. The
+        // caller executes this block only on its original conditional arm.
+        let (statements, tail) = match statements::lower_open(
+            self.bytecode, self.instructions, range, self.locals, self.declaration, &[],
+        ) {
+            Ok(result) => result,
+            Err(KotlinError::Unsupported { .. }) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let Some(tail) = tail.filter(|tail| tail.expr.stack_load() == Some(self.return_opcode - 0x97)) else {
+            return Ok(None);
+        };
+        if statements.is_empty() {
+            return Ok(None);
+        }
+        let depth = tail.expr.depth + 1;
+        Expr::new(ExprKind::ValueBlock(Box::new(ValueBlock {
+            statements, value: tail.expr,
+        })), depth, self.declaration).map(Some)
     }
 
     fn one_value(&self, stack: &mut Vec<StackValue<'class>>) -> Result<Expr<'class>, KotlinError> {
