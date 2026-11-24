@@ -138,13 +138,15 @@ enum ExprKind<'a> {
         target: &'a str,
         negative: bool,
     },
-    BoxedInt(Box<Expr<'a>>),
+    Boxed(Primitive, Box<Expr<'a>>),
     Template(templates::Template<'a>),
     ThisProperty { name: &'a str, primitive: Primitive },
     ClassLiteral(&'a str),
     Conditional(Box<Conditional<'a>>),
     SafeCastComparison(Box<casts::Comparison<'a>>),
     SmartString(usize),
+    SmartInt(usize),
+    ThrowIllegalState(Cow<'a, [u16]>),
     StringLength(Box<Expr<'a>>),
     ValueBlock(Box<statements::ValueBlock<'a>>),
     Nullable(Box<nullable::Expression<'a>>),
@@ -1124,12 +1126,16 @@ impl<'a> Bytecode<'a, '_> {
                 Expr::new(ExprKind::CatchMessage(binding), 2, declaration)?
             }
             (0xb8, _)
-                if self.reference(instruction, 0xb8)?
-                    == Some(("java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;")) =>
+                if let Some((owner, "valueOf", signature)) = self.reference(instruction, 0xb8)?
+                    && let Some(primitive) = match (owner, signature) {
+                        ("java/lang/Integer", "(I)Ljava/lang/Integer;") => Some(Primitive::Int),
+                        ("java/lang/Boolean", "(Z)Ljava/lang/Boolean;") => Some(Primitive::Boolean),
+                        _ => None,
+                    } =>
             {
                 let operand = pop_value(stack, declaration)?;
                 let depth = operand.depth + 1;
-                Expr::new(ExprKind::BoxedInt(Box::new(operand)), depth, declaration)?
+                Expr::new(ExprKind::Boxed(primitive, Box::new(operand)), depth, declaration)?
             }
             (0xb8, _) if self.reference_are_equal(instruction)? => {
                 let rhs = pop_value(stack, declaration)?;
@@ -1315,6 +1321,7 @@ impl<'a> Expr<'a> {
             | ExprKind::Not(_)
             | ExprKind::SafeCastComparison(_)
             | ExprKind::TypeTest { .. }
+            | ExprKind::SmartInt(_)
             | ExprKind::StringLength(_) => Some(0x15),
             ExprKind::Literal(Literal::Long(_)) => Some(0x16),
             ExprKind::Literal(Literal::Float(_)) => Some(0x17),
@@ -1325,7 +1332,7 @@ impl<'a> Expr<'a> {
             ExprKind::LoopLocal(local) => Some(local.element.load()),
             ExprKind::Local(local) => Some(load_opcode(&local.value.jvm)),
             ExprKind::Invocation(call) => Some(load_opcode(&call.result().jvm)),
-            ExprKind::BoxedInt(_) => Some(0x19),
+            ExprKind::Boxed(..) => Some(0x19),
             ExprKind::Template(_) | ExprKind::ClassLiteral(_) | ExprKind::SmartString(_)
             | ExprKind::SuspendClosure(_) | ExprKind::Closure(_) | ExprKind::Cast(_) => Some(0x19),
             ExprKind::Capture(capture) => Some(load_opcode(&capture.value.jvm)),
@@ -1336,7 +1343,7 @@ impl<'a> Expr<'a> {
                 Some(load_opcode(&expression.result().jvm))
             }
             ExprKind::ValueBlock(block) => block.value.stack_load(),
-            ExprKind::Conditional(_) | ExprKind::Nullable(_) => None,
+            ExprKind::Conditional(_) | ExprKind::Nullable(_) | ExprKind::ThrowIllegalState(_) => None,
         }
     }
 
@@ -1374,10 +1381,10 @@ impl<'a> Expr<'a> {
             ExprKind::Compare(_) | ExprKind::Not(_) | ExprKind::TypeTest { .. } | ExprKind::SafeCastComparison(_) => {
                 Some(Primitive::Boolean)
             }
-            ExprKind::StringLength(_) => Some(Primitive::Int),
+            ExprKind::SmartInt(_) | ExprKind::StringLength(_) => Some(Primitive::Int),
             ExprKind::ValueBlock(block) => block.value.primitive_hint(parameters),
             ExprKind::SmartString(_) => None,
-            ExprKind::BoxedInt(_) => None,
+            ExprKind::Boxed(..) | ExprKind::ThrowIllegalState(_) => None,
             ExprKind::Template(_) | ExprKind::ClassLiteral(_) | ExprKind::SuspendClosure(_)
             | ExprKind::Closure(_) | ExprKind::Cast(_) => None,
             ExprKind::Capture(capture) => capture.value.primitive(),
@@ -1454,6 +1461,24 @@ impl<'a> Expr<'a> {
                     return Err(mismatch());
                 }
                 identifier(out, &parameters[*index].name, declaration)?;
+            }
+            ExprKind::SmartInt(index) => {
+                if expected.primitive() != Some(Primitive::Int) {
+                    return Err(mismatch());
+                }
+                identifier(out, &parameters[*index].name, declaration)?;
+            }
+            ExprKind::ThrowIllegalState(message) => {
+                let parens = binding > 0;
+                if parens {
+                    out.push('(');
+                }
+                out.push_str("throw kotlin.IllegalStateException(");
+                write_string(out, message.iter().copied());
+                out.push(')');
+                if parens {
+                    out.push(')');
+                }
             }
             ExprKind::StringLength(value) => {
                 if expected.primitive() != Some(Primitive::Int) {
@@ -1623,13 +1648,17 @@ impl<'a> Expr<'a> {
                     out.push(')');
                 }
             }
-            ExprKind::BoxedInt(operand) => {
-                if !matches!(expected, Expected::Reference) {
+            ExprKind::Boxed(primitive, operand) => {
+                if !matches!(expected, Expected::Reference)
+                    && !matches!((primitive, expected),
+                        (Primitive::Boolean, Expected::Type(ty, JvmType::Object(owner)))
+                            if owner == "java/lang/Boolean" && ty.class_id() == Some("kotlin/Boolean") && ty.nullable)
+                {
                     return Err(mismatch());
                 }
                 operand.write_at(
                     out,
-                    Expected::Primitive(Primitive::Int),
+                    Expected::Primitive(*primitive),
                     parameters,
                     declaration,
                     binding,

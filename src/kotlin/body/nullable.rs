@@ -352,7 +352,7 @@ fn write_value(
     declaration: &str,
 ) -> Result<(), KotlinError> {
     let expected = if any_type(&result.ty, &result.jvm)
-        && matches!(value.kind, ExprKind::Literal(Literal::String(_)) | ExprKind::Template(_) | ExprKind::BoxedInt(_))
+        && matches!(value.kind, ExprKind::Literal(Literal::String(_)) | ExprKind::Template(_) | ExprKind::Boxed(..))
     {
         Expected::Reference
     } else {

@@ -78,6 +78,19 @@ impl<'a> Comparison<'a> {
         Self::new(relation, left, right, Expected::Reference, declaration)
     }
 
+    pub(super) fn nonnull_parameter(&self) -> Option<(usize, bool)> {
+        let truth = match self.relation {
+            Relation::Eq | Relation::Same => false,
+            Relation::Ne | Relation::Different => true,
+            _ => return None,
+        };
+        match (&self.left.kind, &self.right.kind) {
+            (ExprKind::Parameter { index, load: 0x19 }, ExprKind::Literal(Literal::Null))
+            | (ExprKind::Literal(Literal::Null), ExprKind::Parameter { index, load: 0x19 }) => Some((*index, truth)),
+            _ => None,
+        }
+    }
+
     fn new(
         relation: Relation,
         left: Expr<'a>,
@@ -180,8 +193,8 @@ fn reference_cast(left: &Expr<'_>, right: &Expr<'_>, parameters: &[ValueParamete
         | (ExprKind::Parameter { index, .. }, ExprKind::Literal(Literal::String(_))) => {
             !any_or_string(ty(*index))
         }
-        (ExprKind::BoxedInt(_), ExprKind::Parameter { index, .. })
-        | (ExprKind::Parameter { index, .. }, ExprKind::BoxedInt(_)) => {
+        (ExprKind::Boxed(..), ExprKind::Parameter { index, .. })
+        | (ExprKind::Parameter { index, .. }, ExprKind::Boxed(..)) => {
             ty(*index).class_id() != Some("kotlin/Any")
         }
         (ExprKind::Literal(Literal::String(_)), ExprKind::Literal(Literal::String(_))) => false,

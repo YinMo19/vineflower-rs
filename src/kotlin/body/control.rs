@@ -4,7 +4,7 @@ use crate::cfg::ControlFlowGraph;
 
 use super::{
     Bytecode, Expr, ExprKind, Instruction, JvmType, KotlinError, Literal, Locals, Operand,
-    StackValue, ValueParameter, logic::{self, Conditional}, pop_value, return_opcode,
+    StackValue, ValueParameter, lambdas, logic::{self, Conditional}, pop_value, return_opcode,
     statements::{self, ValueBlock}, tailrec,
 };
 
@@ -114,17 +114,24 @@ enum Exit<'a> {
     Return(Expr<'a>),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RefinedType {
+    String,
+    Int,
+}
+
 /// Lexical facts are available inside a single emitted arm, not at its
 /// postdominator. The expression lifter never writes to a parameter slot.
-struct StringFact<'a> {
+struct ParameterFact<'a> {
     parameter: usize,
+    ty: RefinedType,
     parent: Option<&'a Self>,
 }
 
-impl StringFact<'_> {
-    fn contains(mut fact: Option<&Self>, index: usize) -> bool {
+impl ParameterFact<'_> {
+    fn contains(mut fact: Option<&Self>, index: usize, ty: RefinedType) -> bool {
         while let Some(current) = fact {
-            if current.parameter == index {
+            if current.parameter == index && current.ty == ty {
                 return true;
             }
             fact = current.parent;
@@ -139,7 +146,7 @@ impl<'class> Lowering<'_, 'class, '_> {
         mut index: usize,
         stop: Option<usize>,
         stack: &mut Vec<StackValue<'class>>,
-        facts: Option<&StringFact<'_>>,
+        facts: Option<&ParameterFact<'_>>,
         depth: usize,
     ) -> Result<Exit<'class>, KotlinError> {
         if depth >= 64 {
@@ -175,6 +182,11 @@ impl<'class> Lowering<'_, 'class, '_> {
             {
                 return Ok(Exit::Return(value));
             }
+            if last.opcode == 0xbf && stop.is_none() && stack.is_empty()
+                && let Some(throw) = self.throw_value(before)?
+            {
+                return Ok(Exit::Return(throw));
+            }
             for instruction in before {
                 self.expression(instruction, stack, facts)?;
             }
@@ -199,15 +211,7 @@ impl<'class> Lowering<'_, 'class, '_> {
                     if stop.is_some_and(|stop| join.is_none_or(|join| join > stop)) {
                         return Err(self.unsupported("crossing Kotlin conditional regions"));
                     }
-                    let guarded = match &guard.kind {
-                        ExprKind::TypeTest { operand, target: "java/lang/String", negative } => {
-                            match operand.kind {
-                                ExprKind::Parameter { index, load: 0x19 } => Some((*negative, StringFact { parameter: index, parent: facts })),
-                                _ => None,
-                            }
-                        }
-                        _ => None,
-                    };
+                    let guarded = self.parameter_fact(&guard, facts);
                     let yes_facts = guarded.as_ref().filter(|(negative, _)| !negative).map(|(_, fact)| fact).or(facts);
                     let no_facts = guarded.as_ref().filter(|(negative, _)| *negative).map(|(_, fact)| fact).or(facts);
                     let yes = self.region(fallthrough, join, stack, yes_facts, depth + 1)?;
@@ -245,20 +249,64 @@ impl<'class> Lowering<'_, 'class, '_> {
         }
     }
 
+    fn parameter_fact<'a>(
+        &self,
+        guard: &Expr<'_>,
+        parent: Option<&'a ParameterFact<'a>>,
+    ) -> Option<(bool, ParameterFact<'a>)> {
+        let (parameter, ty, negative) = match &guard.kind {
+            ExprKind::TypeTest { operand, target, negative }
+                if let ExprKind::Parameter { index, load: 0x19 } = operand.kind =>
+            {
+                let ty = match *target {
+                    "java/lang/String" => RefinedType::String,
+                    "java/lang/Integer" => RefinedType::Int,
+                    _ => return None,
+                };
+                (index, ty, *negative)
+            }
+            ExprKind::Compare(compare) => {
+                let (parameter, positive) = compare.nonnull_parameter()?;
+                let ty = &self.parameters[parameter].ty;
+                if ty.class_id() != Some("kotlin/Int")
+                    || !matches!(self.locals.slots[parameter].1, JvmType::Object(owner) if owner == "java/lang/Integer")
+                {
+                    return None;
+                }
+                (parameter, RefinedType::Int, !positive)
+            }
+            _ => return None,
+        };
+        Some((negative, ParameterFact { parameter, ty, parent }))
+    }
+
     fn expression(
         &self,
         instruction: &Instruction,
         stack: &mut Vec<StackValue<'class>>,
-        facts: Option<&StringFact<'_>>,
+        facts: Option<&ParameterFact<'_>>,
     ) -> Result<(), KotlinError> {
-        if let (0xc0, Operand::Constant(index)) = (instruction.opcode, &instruction.operand)
-            && let Some(StackValue::Value(value)) = stack.last_mut()
+        if let Some(StackValue::Value(value)) = stack.last_mut()
             && let ExprKind::Parameter { index: parameter, load: 0x19 } = value.kind
-            && StringFact::contains(facts, parameter)
-            && self.bytecode.class.pool.class_name(*index)? == "java/lang/String"
         {
-            value.kind = ExprKind::SmartString(parameter);
-            return Ok(());
+            if let (0xc0, Operand::Constant(index)) = (instruction.opcode, &instruction.operand) {
+                match self.bytecode.class.pool.class_name(*index)? {
+                    "java/lang/String" if ParameterFact::contains(facts, parameter, RefinedType::String) => {
+                        value.kind = ExprKind::SmartString(parameter);
+                        return Ok(());
+                    }
+                    "java/lang/Integer" | "java/lang/Number"
+                        if ParameterFact::contains(facts, parameter, RefinedType::Int) => return Ok(()),
+                    _ => {}
+                }
+            }
+            if ParameterFact::contains(facts, parameter, RefinedType::Int)
+                && matches!(self.bytecode.reference(instruction, 0xb6)?,
+                    Some(("java/lang/Integer" | "java/lang/Number", "intValue", "()I")))
+            {
+                value.kind = ExprKind::SmartInt(parameter);
+                return Ok(());
+            }
         }
         if let Some(StackValue::Value(value)) = stack.last()
             && self.bytecode.reference(instruction, 0xb6)? == Some(("java/lang/String", "length", "()I"))
@@ -275,6 +323,30 @@ impl<'class> Lowering<'_, 'class, '_> {
             return Ok(());
         }
         self.bytecode.expression(instruction, self.locals, stack, self.declaration)
+    }
+
+    fn throw_value(&self, before: &[Instruction]) -> Result<Option<Expr<'class>>, KotlinError> {
+        let [new, dup, label, tail @ ..] = before else { return Ok(None); };
+        let owner = "java/lang/IllegalStateException";
+        let (0xbb, Operand::Constant(ty)) = (new.opcode, &new.operand) else { return Ok(None); };
+        let (0x12 | 0x13, Operand::Constant(label)) = (label.opcode, &label.operand) else { return Ok(None); };
+        if self.bytecode.class.pool.class_name(*ty)? != owner || dup.opcode != 0x59
+            || lambdas::namespace_shadowed(self.locals)
+        {
+            return Ok(None);
+        }
+        let init = match tail {
+            [init] => init,
+            [stringify, init] if self.bytecode.reference(stringify, 0xb6)?
+                == Some(("java/lang/Object", "toString", "()Ljava/lang/String;")) => init,
+            _ => return Ok(None),
+        };
+        if self.bytecode.reference(init, 0xb7)? != Some((owner, "<init>", "(Ljava/lang/String;)V")) {
+            return Ok(None);
+        }
+        let Literal::String(message) = self.bytecode.literal(self.bytecode.class.pool.get(*label)?, self.declaration)?
+            else { return Ok(None); };
+        Expr::new(ExprKind::ThrowIllegalState(message), 1, self.declaration).map(Some)
     }
 
     fn statement_value(&self, range: std::ops::Range<usize>) -> Result<Option<Expr<'class>>, KotlinError> {

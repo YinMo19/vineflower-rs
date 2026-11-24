@@ -446,14 +446,16 @@ fn actual<'a>(expr: &'a Expr<'_>, locals: &'a Locals<'_>) -> Shape<'a> {
         ExprKind::Compare(_) | ExprKind::Not(_) | ExprKind::TypeTest { .. }
         | ExprKind::SafeCastComparison(_) => Shape::Primitive(Primitive::Boolean),
         ExprKind::SmartString(_) => Shape::Object(STRING),
-        ExprKind::StringLength(_) => Shape::Primitive(Primitive::Int),
+        ExprKind::SmartInt(_) | ExprKind::StringLength(_) => Shape::Primitive(Primitive::Int),
         ExprKind::ValueBlock(block) => actual(&block.value, locals),
-        ExprKind::BoxedInt(_) => Shape::Object("java/lang/Integer"),
+        ExprKind::Boxed(Primitive::Int, _) => Shape::Object("java/lang/Integer"),
+        ExprKind::Boxed(Primitive::Boolean, _) => Shape::Object("java/lang/Boolean"),
         ExprKind::ClassLiteral(_) => Shape::Object(CLASS),
         ExprKind::Capture(capture) => shape(&capture.value.jvm),
         ExprKind::Field(field) => shape(&field.value.jvm),
         ExprKind::Cast(cast) => shape(&cast.value.jvm),
-        ExprKind::Conditional(_) | ExprKind::Nullable(_) | ExprKind::SuspendClosure(_) | ExprKind::Closure(_) => Shape::Unknown,
+        ExprKind::Conditional(_) | ExprKind::Nullable(_) | ExprKind::SuspendClosure(_) | ExprKind::Closure(_)
+        | ExprKind::Boxed(..) | ExprKind::ThrowIllegalState(_) => Shape::Unknown,
     }
 }
 
