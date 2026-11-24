@@ -4,6 +4,9 @@ use crate::descriptor::{MethodDescriptor, Type as JvmType};
 
 use super::KotlinError;
 
+pub(super) const CONTINUATION: &str = "kotlin/coroutines/Continuation";
+pub(super) const CONTINUATION_DESCRIPTOR: &str = "Lkotlin/coroutines/Continuation;";
+
 /// A Kotlin metadata class ID: package components use `/` and nested classes use `.`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClassName {
@@ -229,6 +232,17 @@ pub struct JvmMethodSignature {
     pub descriptor: MethodDescriptor,
 }
 
+impl JvmMethodSignature {
+    pub(super) fn suspend_parameters(&self) -> Option<&[JvmType]> {
+        let (JvmType::Object(last), parameters) = self.descriptor.parameters.split_last()? else {
+            return None;
+        };
+        (last == CONTINUATION
+            && matches!(&self.descriptor.return_type, JvmType::Object(name) if name == "java/lang/Object"))
+            .then_some(parameters)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct JvmFieldSignature {
     pub name: String,
@@ -287,6 +301,12 @@ pub struct Function {
     pub flags: Flags,
     pub signature: Option<JvmMethodSignature>,
     pub has_contract: bool,
+}
+
+impl Function {
+    pub(super) fn is_suspend(&self) -> bool {
+        self.flags.has(13)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

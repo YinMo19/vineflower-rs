@@ -4,6 +4,7 @@ use std::ops::Range;
 
 use super::{Binding, Block, End, Finally, Instruction, JvmType, KotlinError, Region, TryBody, ValueParameter};
 use crate::kotlin::{Type, syntax::qualified};
+use super::super::{Expected, Primitive};
 
 impl TryBody<'_> {
     pub fn write(
@@ -103,6 +104,27 @@ impl<M: FnMut(&Instruction, usize)> Writer<'_, M> {
                 self.newline();
             }
             End::Try(region) => self.region(region, level)?,
+            End::Loop { start, body, next } => {
+                self.indent(level);
+                self.out.push_str("while (true) {");
+                (self.map)(&self.instructions[*start], self.line);
+                self.newline();
+                self.block(body, level + 1)?;
+                self.indent(level);
+                self.out.push('}');
+                self.newline();
+                self.block(next, level)?;
+            }
+            End::BreakIf { condition, instructions } => {
+                self.indent(level);
+                self.out.push_str("if (");
+                condition.write_at(
+                    self.out, Expected::Primitive(Primitive::Boolean), self.parameters, self.declaration, 0,
+                )?;
+                self.out.push_str(") break");
+                self.map(instructions.clone());
+                self.newline();
+            }
         }
         Ok(())
     }

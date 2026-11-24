@@ -58,6 +58,14 @@ pub(super) enum Vararg<'a> {
 }
 
 impl Call<'_> {
+    pub(super) fn named_suspend(name: &str, ty: &Type, jvm: &JvmType) -> Self {
+        Self {
+            target: Target::Function { name: name.to_owned() },
+            arguments: Vec::new(),
+            result: Value { ty: ty.clone(), jvm: jvm.clone() },
+        }
+    }
+
     pub(super) fn result(&self) -> &Value {
         &self.result
     }

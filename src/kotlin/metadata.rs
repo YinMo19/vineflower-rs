@@ -478,6 +478,7 @@ impl<'strings> Reader<'_, 'strings> {
         name: &str,
         parameters: impl Iterator<Item = &'a Type>,
         returns: Option<&Type>,
+        suspending: bool,
     ) -> Result<Option<JvmMethodSignature>, KotlinError> {
         let name = match signature.and_then(|s| s.name) {
             Some(index) => self.name(Some(index))?,
@@ -496,8 +497,13 @@ impl<'strings> Reader<'_, 'strings> {
                 }
                 descriptor.push_str(&param);
             }
+            if suspending {
+                descriptor.push_str(super::model::CONTINUATION_DESCRIPTOR);
+            }
             descriptor.push(')');
-            if let Some(returns) = returns {
+            if suspending {
+                descriptor.push_str("Ljava/lang/Object;");
+            } else if let Some(returns) = returns {
                 let Some(returns) = default_descriptor(returns) else {
                     return Ok(None);
                 };
@@ -595,11 +601,13 @@ impl<'strings> Reader<'_, 'strings> {
         let parameters = reader.parameters(&function.parameters)?;
         let returns = reader.required_type(function.returns.as_ref(), function.returns_id, 0)?;
         let receiver = reader.ty(function.receiver.as_ref(), function.receiver_id, 0)?;
+        let flags = flags(function.flags, function.old_flags, 6);
         let signature = reader.method_signature(
             function.signature.as_ref(),
             &name,
             receiver.iter().chain(parameters.iter().map(|p| &p.ty)),
             Some(&returns),
+            flags.has(13),
         )?;
         Ok(Function {
             name,
@@ -611,7 +619,7 @@ impl<'strings> Reader<'_, 'strings> {
                 .types(&function.context_receivers, &function.context_receiver_ids)?,
             context_parameters: reader.parameters(&function.context_parameters)?,
             type_parameters: reader.type_parameters(&function.type_parameters)?,
-            flags: flags(function.flags, function.old_flags, 6),
+            flags,
             has_contract: function.contract.is_some(),
         })
     }
@@ -623,6 +631,7 @@ impl<'strings> Reader<'_, 'strings> {
             "<init>",
             parameters.iter().map(|p| &p.ty),
             None,
+            false,
         )?;
         Ok(Constructor {
             signature,

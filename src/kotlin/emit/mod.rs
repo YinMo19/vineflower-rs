@@ -1040,7 +1040,7 @@ fn render_members<'a, 'data>(
     plan: &Plan<'a, 'data, '_>,
     members: &PackageDeclaration,
     style: Style<'_>,
-    group: Option<&ClassGroup<'_>>,
+    group: Option<&ClassGroup<'data>>,
     mut location: Location<'_>,
     data_class: bool,
 ) -> Result<(), KotlinError> {
@@ -1209,7 +1209,7 @@ fn render_function<'a, 'data>(
     members: &PackageDeclaration,
     style: Style<'_>,
     plan: &Plan<'a, 'data, '_>,
-    group: Option<&ClassGroup<'_>>,
+    group: Option<&ClassGroup<'data>>,
     mut location: Location<'_>,
 ) -> Result<(), KotlinError> {
     let name = &function.name;
@@ -1223,10 +1223,13 @@ fn render_function<'a, 'data>(
     let external = flags.has(12);
     let abstract_function = flags.modality() == Modality::Abstract;
     let inline = flags.has(10);
+    let suspending = function.is_suspend();
     let facade = plan.layout.file();
     let singleton = plan.layout.singleton();
     if flags.has_annotations() && singleton.is_none()
-        || flags.has(13)
+        || suspending && (!facade || function.receiver.is_some() || inline || flags.has(11)
+            || external || !function.type_parameters.is_empty()
+            || function.parameters.iter().any(|parameter| parameter.flags.has(1)))
         || flags.has(14)
         || flags.has(16)
         || flags.member_kind() != MemberKind::Declaration
@@ -1259,19 +1262,27 @@ fn render_function<'a, 'data>(
         name,
     )?;
     let descriptor = &signature.descriptor;
-    if descriptor.parameters.len()
+    let (source_parameters, source_return) = if suspending {
+        (
+            signature.suspend_parameters().ok_or_else(|| types.unsupported("invalid JVM suspend signature"))?,
+            body::suspend_source_return(&function.returns).ok_or_else(|| types.unsupported("named suspend return type"))?,
+        )
+    } else {
+        (descriptor.parameters.as_slice(), &descriptor.return_type)
+    };
+    if source_parameters.len()
         != function.parameters.len() + usize::from(function.receiver.is_some())
     {
         return Err(types.unsupported("JVM parameters do not match Kotlin function"));
     }
-    let defaults = if function.receiver.is_none() {
+    let defaults = if function.receiver.is_none() && !suspending {
         body::parameter_defaults(bytecode, signature, &function.parameters, !static_member, name)?
     } else {
         Vec::new()
     };
     let mut defaults = defaults.iter().peekable();
     let unit = function.returns.class_id() == Some("kotlin/Unit") && !function.returns.nullable;
-    if (descriptor.return_type == JvmType::Void) != unit {
+    if (*source_return == JvmType::Void) != unit {
         return Err(types.unsupported("JVM return does not match Kotlin Unit"));
     }
     let overrides_any =
@@ -1307,6 +1318,7 @@ fn render_function<'a, 'data>(
         (flags.has(11), "tailrec "),
         (flags.has(8), "operator "),
         (flags.has(9), "infix "),
+        (suspending, "suspend "),
     ] {
         if enabled {
             out.push_str(keyword);
@@ -1337,7 +1349,7 @@ fn render_function<'a, 'data>(
             .map(|(_, value)| {
                 (
                     value,
-                    &descriptor.parameters[index],
+                    &source_parameters[index],
                     function.parameters.as_slice(),
                 )
             });
@@ -1383,20 +1395,25 @@ fn render_function<'a, 'data>(
             }
             return Ok(());
         }
-        let local_functions = body::local_extensions(
-            bytecode, function, signature, method, members, group, location.is_some(),
-        )?;
-        let body = bytecode.function(
-            method,
-            descriptor,
-            &function.parameters,
-            &function.returns,
-            plan.metadata_properties,
-            Some(body::Extension::new(function, signature, method, members, group)?
-                .with_local_functions(&local_functions)),
-            name,
-            location.is_some(),
-        )?;
+        let (body, local_functions) = if suspending {
+            (bytecode.named_suspend(method, function, members, group, location.is_some())?, Vec::new())
+        } else {
+            let local_functions = body::local_extensions(
+                bytecode, function, signature, method, members, group, location.is_some(),
+            )?;
+            let body = bytecode.function(
+                method,
+                descriptor,
+                &function.parameters,
+                &function.returns,
+                plan.metadata_properties,
+                Some(body::Extension::new(function, signature, method, members, group)?
+                    .with_local_functions(&local_functions)),
+                name,
+                location.is_some(),
+            )?;
+            (body, local_functions)
+        };
         if !local_functions.is_empty() && !matches!(body, Body::Expression(..) | Body::Statements(_)) {
             return Err(types.unsupported("unproven scope for Kotlin local extensions"));
         }
@@ -1412,7 +1429,7 @@ fn render_function<'a, 'data>(
                     expr.write(
                         out,
                         &function.returns,
-                        &descriptor.return_type,
+                        source_return,
                         &function.parameters,
                         name,
                     )?;
@@ -1429,7 +1446,7 @@ fn render_function<'a, 'data>(
                     expr.write(
                         out,
                         &function.returns,
-                        &descriptor.return_type,
+                        source_return,
                         &function.parameters,
                         name,
                     )?;
@@ -1540,7 +1557,7 @@ fn render_function<'a, 'data>(
                     .transpose()?;
                 body.write(
                     out,
-                    (&function.returns, &descriptor.return_type),
+                    (&function.returns, source_return),
                     &function.parameters,
                     name,
                     indent,

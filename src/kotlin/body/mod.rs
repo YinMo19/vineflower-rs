@@ -26,6 +26,7 @@ mod invocations;
 mod local_functions;
 mod logic;
 mod loops;
+mod named_suspend;
 mod nullable;
 mod statements;
 mod suspend;
@@ -38,6 +39,7 @@ pub(super) use defaults::{recover as parameter_defaults, verify_copy, verify_cop
 pub(super) use extensions::Context as Extension;
 pub(super) use invocations::uses_stdlib_repeat;
 pub(super) use local_functions::{Definition as LocalFunction, recover as local_extensions};
+pub(super) use named_suspend::source_return as suspend_source_return;
 use logic::{Comparison, Conditional, Relation};
 
 pub(super) const STATIC: u16 = 0x0008;
@@ -235,16 +237,25 @@ impl<'a> Locals<'a> {
         extension: Option<Extension<'a>>,
         declaration: &str,
     ) -> Result<Self, KotlinError> {
+        Self::with_parameters(&descriptor.parameters, instance, parameters, extension, declaration)
+    }
+
+    fn with_parameters(
+        jvm_parameters: &'a [JvmType],
+        instance: bool,
+        parameters: &[ValueParameter],
+        extension: Option<Extension<'a>>,
+        declaration: &str,
+    ) -> Result<Self, KotlinError> {
         let receiver = usize::from(extension.as_ref().is_some_and(Extension::has_receiver));
-        if descriptor.parameters.len() != parameters.len() + receiver {
+        if jvm_parameters.len() != parameters.len() + receiver {
             return Err(KotlinError::unsupported(
                 declaration,
                 "JVM parameters do not match Kotlin parameters",
             ));
         }
         let mut next = u16::from(instance) + extension.as_ref().map_or(0, Extension::slots);
-        let slots = descriptor
-            .parameters
+        let slots = jvm_parameters
             .iter()
             .skip(receiver)
             .map(|ty| {

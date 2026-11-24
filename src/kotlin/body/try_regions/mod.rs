@@ -7,7 +7,7 @@ use std::{fmt::Write, ops::Range};
 use crate::classfile::LocalVariable;
 
 use super::{
-    Bytecode, Code, Instruction, JvmType, KotlinError, Locals, Operand, ScopedLocal, ValueParameter,
+    Bytecode, Code, Expr, Instruction, JvmType, KotlinError, Locals, Operand, ScopedLocal, ValueParameter,
     identifier, load_opcode, local_load, local_store, return_opcode,
     statements::{self, Statement, TailValue},
 };
@@ -61,6 +61,8 @@ enum End<'a> {
     Result(TailValue<'a>),
     Throw(Binding<'a>, Range<usize>),
     Try(Box<Region<'a>>),
+    Loop { start: usize, body: Box<Block<'a>>, next: Box<Block<'a>> },
+    BreakIf { condition: Expr<'a>, instructions: Range<usize> },
 }
 
 struct Region<'a> {
@@ -116,6 +118,52 @@ struct Lower<'b, 'a, 'data> {
     declaration: &'b str,
     entries: Vec<Entry<'a>>,
     debug_locals: Vec<LocalVariable<'a>>,
+}
+
+/// Source regions after the coroutine pass proves the protected fragments,
+/// equivalent cleanup calls, and all three continuations of the finally.
+pub(super) struct SuspendingLoop<'a> {
+    pub start: usize,
+    pub protected: usize,
+    pub binding: Statement<'a>,
+    pub condition: Expr<'a>,
+    pub branch: Range<usize>,
+    pub cleanup: Statement<'a>,
+    pub copies: [usize; 2],
+    pub result: TailValue<'a>,
+}
+
+impl<'a> SuspendingLoop<'a> {
+    pub(super) fn into_body(self, instructions: Vec<Instruction>, lines: Vec<(u16, u16)>) -> TryBody<'a> {
+        let region = Region {
+            start: self.protected,
+            body: Block {
+                statements: vec![self.binding],
+                end: End::BreakIf { condition: self.condition, instructions: self.branch },
+            },
+            catches: Vec::new(),
+            finally: Some(Finally {
+                start: self.cleanup.instructions.start,
+                statements: vec![self.cleanup],
+                returning: None,
+                copies: self.copies.to_vec(),
+            }),
+            result: None,
+            next: None,
+        };
+        TryBody {
+            instructions,
+            lines,
+            block: Block {
+                statements: Vec::new(),
+                end: End::Loop {
+                    start: self.start,
+                    body: Box::new(Block { statements: Vec::new(), end: End::Try(Box::new(region)) }),
+                    next: Box::new(Block { statements: Vec::new(), end: End::Return(self.result) }),
+                },
+            },
+        }
+    }
 }
 
 pub(super) fn lower<'a, 'data>(

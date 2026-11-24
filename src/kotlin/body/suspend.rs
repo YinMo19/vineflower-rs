@@ -6,7 +6,7 @@
 
 use crate::{
     context::{ClassGroup, NestedKind},
-    kotlin::{Declaration, read_metadata},
+    kotlin::{Declaration, model::CONTINUATION, read_metadata},
 };
 
 use super::{
@@ -17,7 +17,6 @@ use super::{
 
 pub(super) const FUNCTION1: &str = "kotlin/jvm/functions/Function1";
 const FUNCTION1_FIELD: &str = "Lkotlin/jvm/functions/Function1;";
-const CONTINUATION: &str = "kotlin/coroutines/Continuation";
 const SUSPEND_LAMBDA: &str = "kotlin/coroutines/jvm/internal/SuspendLambda";
 const CONSTRUCTOR: &str = "(Lkotlin/coroutines/Continuation;)V";
 const CREATE: &str = "(Lkotlin/coroutines/Continuation;)Lkotlin/coroutines/Continuation;";
@@ -27,6 +26,13 @@ const PUBLIC: u16 = 0x0001;
 const SUPER: u16 = 0x0020;
 const BRIDGE: u16 = 0x0040;
 const SYNTHETIC: u16 = 0x1000;
+
+pub(super) const COROUTINE_MARKER: (&str, &str, &str) = (
+    "kotlin/coroutines/intrinsics/IntrinsicsKt", "getCOROUTINE_SUSPENDED", "()Ljava/lang/Object;",
+);
+pub(super) const THROW_ON_FAILURE: (&str, &str, &str) = (
+    "kotlin/ResultKt", "throwOnFailure", "(Ljava/lang/Object;)V",
+);
 
 pub(super) fn unit_return(ty: &Type) -> Option<&Type> {
     let (parameters, returns) = ty.suspend_signature()?;
@@ -195,11 +201,10 @@ impl<'a, 'data> Bytecode<'a, 'data> {
         else { return Err(invalid()); };
         let Operand::Switch { default, cases } = &dispatch.operand else { return Err(invalid()); };
         if !matches!(cases.as_slice(), [(0, start)] if *start == result.offset && *default > check.offset)
-            || self.reference(marker, 0xb8)? != Some(("kotlin/coroutines/intrinsics/IntrinsicsKt",
-                "getCOROUTINE_SUSPENDED", "()Ljava/lang/Object;"))
+            || self.reference(marker, 0xb8)? != Some(COROUTINE_MARKER)
             || pop.opcode != 0x57 || !aload(this, 0) || self.reference(load, 0xb4)? != Some((self.owner, state, "I"))
             || !aload(result, 1)
-            || self.reference(check, 0xb8)? != Some(("kotlin/ResultKt", "throwOnFailure", "(Ljava/lang/Object;)V"))
+            || self.reference(check, 0xb8)? != Some(THROW_ON_FAILURE)
         {
             return Err(invalid());
         }
@@ -227,7 +232,7 @@ impl<'a, 'data> Bytecode<'a, 'data> {
         statements::lower_debug_range(self, &instructions, first..default - 2, &code, &locals, declaration)
     }
 
-    fn bad_resume(&self, instructions: &[Instruction]) -> Result<bool, KotlinError> {
+    pub(super) fn bad_resume(&self, instructions: &[Instruction]) -> Result<bool, KotlinError> {
         const ILLEGAL_STATE: &str = "java/lang/IllegalStateException";
         let [new, dup, message, call, throw] = instructions else { return Ok(false); };
         let Operand::Constant(message_index) = message.operand else { return Ok(false); };
@@ -240,11 +245,11 @@ impl<'a, 'data> Bytecode<'a, 'data> {
             && throw.opcode == 0xbf)
     }
 
-    fn unit(&self, instruction: &Instruction) -> Result<bool, KotlinError> {
+    pub(super) fn unit(&self, instruction: &Instruction) -> Result<bool, KotlinError> {
         Ok(self.reference(instruction, 0xb2)? == Some(("kotlin/Unit", "INSTANCE", "Lkotlin/Unit;")))
     }
 
-    fn suspend_method(
+    pub(super) fn suspend_method(
         &self,
         name: &str,
         descriptor: &str,
@@ -259,7 +264,7 @@ impl<'a, 'data> Bytecode<'a, 'data> {
                 return Ok(method);
             }
         }
-        Err(KotlinError::unsupported(declaration, "unproven suspend lambda entry point"))
+        Err(KotlinError::unsupported(declaration, "unproven coroutine entry point"))
     }
 }
 
@@ -271,7 +276,7 @@ fn suspend_property(property: &Property) -> Option<(&str, &Type)> {
     Some((&field.name, unit_return(&property.ty)?))
 }
 
-fn class_operand<'a>(bytecode: &Bytecode<'a, '_>, instruction: &Instruction, opcode: u8) -> Result<Option<&'a str>, KotlinError> {
+pub(super) fn class_operand<'a>(bytecode: &Bytecode<'a, '_>, instruction: &Instruction, opcode: u8) -> Result<Option<&'a str>, KotlinError> {
     if instruction.opcode == opcode && let Operand::Constant(index) = instruction.operand {
         Ok(Some(bytecode.class.pool.class_name(index)?))
     } else {
@@ -279,6 +284,6 @@ fn class_operand<'a>(bytecode: &Bytecode<'a, '_>, instruction: &Instruction, opc
     }
 }
 
-fn aload(instruction: &Instruction, slot: u16) -> bool {
+pub(super) fn aload(instruction: &Instruction, slot: u16) -> bool {
     local_load(instruction) == Some((0x19, slot))
 }

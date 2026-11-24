@@ -110,6 +110,34 @@ impl ValueBlock<'_> {
     }
 }
 
+impl<'a> Statement<'a> {
+    pub(super) fn bind_suspending_call(
+        name: &'a str, slot: u16, range: Range<u32>, instructions: Range<usize>, call: Call<'a>,
+    ) -> (Self, Expr<'a>) {
+        let result = call.result();
+        let value = Value { ty: result.ty.clone(), jvm: result.jvm.clone() };
+        let local = Rc::new(Binding { name: Cow::Borrowed(name), slot, range, value, mutable: false });
+        let binding = Self {
+            instructions,
+            kind: Kind::Declare(
+                Rc::clone(&local), Expr { kind: ExprKind::Invocation(Box::new(call)), depth: 1 },
+            ),
+        };
+        (binding, Expr { kind: ExprKind::Local(local), depth: 1 })
+    }
+
+    pub(super) fn evaluate(call: Call<'a>, instructions: Range<usize>) -> Self {
+        Self { instructions, kind: Kind::Evaluate(Box::new(call)) }
+    }
+
+    pub(super) fn returning(value: TailValue<'a>, ty: &Type, jvm: &JvmType) -> Self {
+        Self {
+            instructions: value.instructions,
+            kind: Kind::Return(value.expr, Value { ty: ty.clone(), jvm: jvm.clone() }),
+        }
+    }
+}
+
 impl Statement<'_> {
     pub fn write(
         &self,
