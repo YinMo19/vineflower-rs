@@ -423,12 +423,22 @@ impl Emitter<'_> {
             }
         }
         let body_start = self.lines.len();
-        let reaches = self.scoped_arm(
-            shape.start,
-            region.exception(shape.join, shape.body, Some(machine)),
+        let reaches = if let Some(reaches) = self.emit_monitor_with_finally_departure(
+            shape,
+            monitor.plan.acquisition,
+            region,
             machine,
             depth + 1,
-        )?;
+        )? {
+            reaches
+        } else {
+            self.scoped_arm(
+                shape.start,
+                region.exception(shape.join, shape.body, Some(machine)),
+                machine,
+                depth + 1,
+            )?
+        };
         if self.lines.len() == body_start {
             self.syntax(depth + 1, ";");
             self.syntax(depth, "}");
@@ -570,6 +580,18 @@ impl Emitter<'_> {
         Some(left.len() + " = ".len())
     }
 
+    fn enclosing_resource_continuation(
+        &self,
+        region: Region<'_, '_, '_>,
+        landing: usize,
+    ) -> Option<ExceptionRedirect> {
+        match self.exception_redirects.get(&landing).copied()? {
+            redirect @ ExceptionRedirect::Continue { arm, .. }
+                if region.exception_arm == Some(arm) && self.emitted[landing] => Some(redirect),
+            _ => None,
+        }
+    }
+
     fn emit_resource<'a, 'c>(
         &mut self,
         shape: &ProtectedRegion,
@@ -598,10 +620,22 @@ impl Emitter<'_> {
         }
         let next = match resource.exit {
             ResourceExit::Continue(next) => {
-                if resource.body_stop.is_some_and(|stop| self.exception_redirects.contains_key(&stop))
-                    || resource.redirects.iter().any(|(entry, _)| self.exception_redirects.contains_key(entry))
+                let enclosing = resource.body_stop
+                    .filter(|&stop| next == Some(stop))
+                    .and_then(|stop| {
+                        self.enclosing_resource_continuation(region, stop)
+                            .map(|redirect| (stop, redirect))
+                    });
+                if resource.body_stop.is_some_and(|stop| {
+                    enclosing.is_none() && self.exception_redirects.contains_key(&stop)
+                }) || resource.redirects.iter().any(|(entry, _)| self.exception_redirects.contains_key(entry))
                 {
                     return Err(StructureError::ExceptionHandlers);
+                }
+                // The child stops at the exact enclosing close entrance.
+                // Only the enclosing arm may follow its redirect beyond that entrance.
+                if let Some((stop, _)) = enclosing {
+                    self.exception_redirects.remove(&stop);
                 }
                 for &(entry, transfer) in &resource.redirects {
                     self.exception_redirects.insert(entry, transfer);
@@ -617,6 +651,9 @@ impl Emitter<'_> {
                     let remaining = self.exception_redirects.remove(&entry);
                     unfulfilled |= matches!(redirect, ExceptionRedirect::Return { .. })
                         && remaining.is_some();
+                }
+                if let Some((stop, redirect)) = enclosing {
+                    self.exception_redirects.insert(stop, redirect);
                 }
                 if reaches_stop? != next.is_some() || unfulfilled {
                     return Err(self.unstructured(shape.start));

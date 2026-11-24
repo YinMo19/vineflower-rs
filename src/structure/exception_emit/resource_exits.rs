@@ -8,9 +8,9 @@ use super::{
 };
 
 impl Emitter<'_> {
-    // Every normal edge must implement this exact close. Continuations may
-    // share one target; a typed return instead belongs to its own spill and
-    // reload. Never redirect a copied close into a differently protected arm.
+    // Every normal edge must implement this exact close. Continuations must
+    // share one lexical target; a typed return instead belongs to its own
+    // spill and reload.
     pub(super) fn prove_split_resource_exits(
         &mut self,
         id: ExceptionId,
@@ -116,7 +116,8 @@ impl Emitter<'_> {
             && (skipped.contains(&next)
                 || self.exceptions.contains(Some(shape.body), next)
                 || (!self.exceptions.contains(region.exception_arm, next)
-                    && enclosing_terminal.flatten() != Some(next))
+                    && enclosing_terminal.flatten() != Some(next)
+                    && self.enclosing_resource_continuation(region, next).is_none())
                 || self.exceptions.at_start(region.exception_arm, next).is_some()
                 || self.exceptions.bypass_cleanup(next) != next
                 || self.layout.loops[next].is_some()

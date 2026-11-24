@@ -16,7 +16,7 @@ use crate::lift::Machine;
 
 use self::finally_graph::BranchedFinally;
 use self::legacy_resource::LegacyResource;
-use self::monitor::{MonitorHandler, MonitorPlan};
+use self::monitor::{MonitorCandidates, MonitorHandler, MonitorPlan};
 use self::overriding_finally::OverridingReturn;
 use super::StructureError;
 
@@ -42,6 +42,8 @@ pub(super) struct Exceptions {
     cleanup_bypasses: BTreeMap<usize, usize>,
     cleanup_landings: BTreeSet<usize>,
     monitor_acquisitions: BTreeMap<usize, usize>,
+    monitor_finally_targets: BTreeMap<usize, usize>,
+    monitor_finally_copies: BTreeMap<usize, usize>,
     omitted_instructions: BTreeSet<usize>,
 }
 
@@ -262,12 +264,12 @@ impl Exceptions {
                     }
                 }
             }
-            monitors.insert(route.handler, monitor);
+            monitors.insert(route.handler, (monitor, covered.as_slice()));
         }
         let mut cleanups = BTreeMap::new();
         let by_acquisition = monitors
             .values()
-            .map(|monitor| (monitor.acquisition, monitor))
+            .map(|(monitor, covered)| (monitor.acquisition, (monitor, *covered)))
             .collect();
         // Register verified normal copies before classifying bodies. A copy
         // can be an exit of both a finally and its nested typed catch.
@@ -292,7 +294,7 @@ impl Exceptions {
         cleanups.extend(
             monitors
                 .into_iter()
-                .map(|(handler, plan)| (handler, CleanupPlan::Monitor(plan))),
+                .map(|(handler, (plan, _))| (handler, CleanupPlan::Monitor(plan))),
         );
         // Give inner catches the already-proven boundary of their enclosing
         // monitor, including catches that are the only normal way out.
@@ -479,6 +481,22 @@ impl Exceptions {
         self.monitor_acquisitions.get(&block).copied()
     }
 
+    pub(super) fn monitor_finally_boundary(&self, header: usize) -> Option<usize> {
+        if self.monitor_finally_targets.is_empty() {
+            return None;
+        }
+        self.regions
+            .iter()
+            .filter_map(|region| {
+                let monitor = region.monitor.as_ref()?;
+                let &target = self.monitor_finally_targets.get(&monitor.plan.acquisition)?;
+                let body = &self.arms[region.body.0].blocks;
+                body.contains(&header).then_some((body.len(), target))
+            })
+            .min()
+            .map(|(_, target)| target)
+    }
+
     pub(super) fn cleanup_prefix(&self, block: usize) -> usize {
         self.cleanup_prefixes.get(&block).copied().unwrap_or(0)
     }
@@ -554,7 +572,8 @@ impl Exceptions {
             if body.contains(&exit) {
                 continue;
             }
-            if self.can_include_exit(instructions, graph, table, &body, exit) {
+            let acquisition = monitor.as_ref().map(|monitor| monitor.plan.acquisition);
+            if self.can_include_exit(instructions, graph, table, &body, exit, acquisition) {
                 exits.remove(&exit);
                 body.insert(exit);
                 pending.extend(graph.blocks[exit].successors.iter().copied());
@@ -592,6 +611,13 @@ impl Exceptions {
                 start: route.handler,
                 alternatives: vec![route.catch_type],
             });
+        }
+        if let Some(target) = monitor
+            .as_ref()
+            .and_then(|monitor| self.monitor_finally_targets.get(&monitor.plan.acquisition))
+            && (exits.len() != 1 || !exits.contains(target))
+        {
+            return Err(unsupported());
         }
         if let Some(monitor) = &mut monitor
             && exits.len() > 1
@@ -661,10 +687,13 @@ impl Exceptions {
         table: &Table,
         body: &BTreeSet<usize>,
         exit: usize,
+        monitor_acquisition: Option<usize>,
     ) -> bool {
         let block = &graph.blocks[exit];
         if exit == 0
-            || self.is_cleanup_copy(exit)
+            || (self.is_cleanup_copy(exit)
+                && !monitor_acquisition
+                    .is_some_and(|owner| self.monitor_finally_copies.get(&exit) == Some(&owner)))
             || !block.exception_predecessors.is_empty()
             || block.predecessors.iter().any(|pred| !body.contains(pred))
             || table.by_block[exit].iter().any(|route| {
@@ -719,7 +748,7 @@ impl Exceptions {
         table: &Table,
         body: &BTreeSet<usize>,
         handler: usize,
-        monitors: &BTreeMap<usize, &MonitorPlan>,
+        monitors: &MonitorCandidates<'_>,
     ) -> Result<Cleanup, StructureError> {
         let node = &graph.blocks[handler];
         let head = if node.instructions.len() == 1 {
@@ -738,6 +767,16 @@ impl Exceptions {
         let mut branch =
             BranchedFinally::prove(instructions, graph, &table.by_block, body, handler, monitors)
                 .ok_or_else(unsupported)?;
+        if let Some(exit) = &branch.monitor_exit {
+            if self
+                .monitor_finally_targets
+                .insert(exit.acquisition, exit.edge.target)
+                .is_some()
+                || self.monitor_finally_copies.insert(exit.copy, exit.acquisition).is_some()
+            {
+                return Err(unsupported());
+            }
+        }
         for &copy in &branch.removed {
             if self.cleanup_prefixes.contains_key(&copy)
                 || self.cleanup_landings.contains(&copy)

@@ -190,10 +190,20 @@ pub(super) struct Layout {
 }
 
 impl Layout {
+    #[cfg(test)]
     pub(super) fn new(
         graph: &ControlFlowGraph,
         instructions: &[Instruction],
         assertions: Option<&Sites>,
+    ) -> Result<Self, StructureError> {
+        Self::with_monitor_boundaries(graph, instructions, assertions, |_| None)
+    }
+
+    pub(super) fn with_monitor_boundaries(
+        graph: &ControlFlowGraph,
+        instructions: &[Instruction],
+        assertions: Option<&Sites>,
+        monitor_boundary: impl Fn(usize) -> Option<usize>,
     ) -> Result<Self, StructureError> {
         let mut immediate_dominators = Some(graph.immediate_dominators());
         let mut natural_loops =
@@ -224,7 +234,11 @@ impl Layout {
             {
                 return Err(unsupported());
             }
+            let monitor_boundary = monitor_boundary(header);
             let outer_transfer = |block| {
+                if monitor_boundary == Some(block) {
+                    return true;
+                }
                 let mut enclosing = parent;
                 while let Some(head) = enclosing {
                     let shape: Loop = loops[head].expect("outer loops are classified first");

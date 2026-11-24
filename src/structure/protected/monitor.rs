@@ -12,17 +12,19 @@ use super::{local_touches, reference_load, reference_store};
 pub(super) struct MonitorHandler {
     pub(super) start: usize,
     release: usize,
-    pub(super) rethrow: usize,
+    rethrow: usize,
     throwable: Option<u16>,
     slot: u16,
 }
 
 pub(in crate::structure) struct MonitorPlan {
-    pub(super) acquisition: usize,
+    pub(in crate::structure) acquisition: usize,
     pub(super) scaffold: Range<usize>,
     pub(super) releases: BTreeMap<usize, Range<usize>>,
     pub(super) handler: MonitorHandler,
 }
+
+pub(super) type MonitorCandidates<'a> = BTreeMap<usize, (&'a MonitorPlan, &'a [usize])>;
 
 impl MonitorHandler {
     pub(super) fn detect(
@@ -197,25 +199,12 @@ impl MonitorPlan {
         if unlocked.iter().any(|block| releases.contains_key(block)) {
             return None;
         }
-        unlocked.extend(
-            graph.blocks[handler.rethrow]
-                .exception_successors
-                .iter()
-                .copied(),
-        );
+        let rethrow_edges = &graph.blocks[handler.rethrow].exception_successors;
+        unlocked.extend(rethrow_edges.iter().copied());
         unlocked.extend(graph.blocks[acquisition].exception_successors.iter().copied());
         if escapes(instructions, graph, slot, unlocked)
             || handler.throwable.is_some_and(|throwable| {
-                escapes(
-                    instructions,
-                    graph,
-                    throwable,
-                    graph.blocks[handler.rethrow]
-                        .exception_successors
-                        .iter()
-                        .copied()
-                        .collect(),
-                )
+                escapes(instructions, graph, throwable, rethrow_edges.iter().copied())
             })
         {
             return None;
@@ -234,6 +223,31 @@ impl MonitorPlan {
 
     pub(in crate::structure) fn release_index(&self, block: usize) -> Option<usize> {
         self.releases.get(&block).map(|release| release.end - 1)
+    }
+
+    pub(super) fn unlock_target(
+        &self,
+        instructions: &[Instruction],
+        graph: &ControlFlowGraph,
+        source: usize,
+    ) -> Option<usize> {
+        let edge = &graph.blocks[source];
+        let &[target] = edge.successors.as_slice() else {
+            return None;
+        };
+        if !matches!(instructions[edge.instructions.end - 1].opcode, 0xa7 | 0xc8) {
+            return None;
+        }
+        if self.release_index(source).is_some() {
+            return Some(target);
+        }
+        let &[release] = edge.predecessors.as_slice() else {
+            return None;
+        };
+        (edge.instructions.len() == 1
+            && edge.exception_predecessors.is_empty()
+            && self.release_index(release).is_some())
+        .then_some(target)
     }
 
     pub(in crate::structure) fn handler_blocks(&self) -> impl Iterator<Item = usize> {
@@ -272,9 +286,12 @@ fn escapes(
     instructions: &[Instruction],
     graph: &ControlFlowGraph,
     slot: u16,
-    starts: BTreeSet<usize>,
+    starts: impl IntoIterator<Item = usize>,
 ) -> bool {
     let mut pending: Vec<_> = starts.into_iter().collect();
+    if pending.is_empty() {
+        return false;
+    }
     let mut seen = vec![false; graph.blocks.len()];
     while let Some(block) = pending.pop() {
         if std::mem::replace(&mut seen[block], true) {

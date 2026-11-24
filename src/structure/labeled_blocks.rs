@@ -31,14 +31,16 @@ pub(super) enum EdgeLine {
 
 impl Scope<'_, '_> {
     pub(super) fn head_tail(&self, block: usize) -> Option<usize> {
-        (self.head == block && !matches!(&self.edges, Edges::Monitor { .. })).then_some(self.tail)
+        (self.head == block
+            && !matches!(&self.edges, Edges::Monitor { branch_tail: false, .. }))
+        .then_some(self.tail)
     }
 
     pub(super) fn owns_monitor_departure(&self, arm: ArmId, departure: MonitorDeparture) -> bool {
         matches!(
             &self.edges,
-            Edges::Monitor { arm: owner, source, target }
-                if *owner == arm && *source == departure.source && *target == departure.target
+            Edges::Monitor { arm: owner, edge, .. }
+                if *owner == arm && edge.source == departure.source && edge.target == departure.target
         )
     }
 }
@@ -53,7 +55,7 @@ struct Plan {
 enum Edges {
     Explicit,
     Resource { arm: ArmId, abrupt_entries: BTreeSet<usize> },
-    Monitor { arm: ArmId, source: usize, target: usize },
+    Monitor { arm: ArmId, edge: MonitorDeparture, branch_tail: bool },
 }
 
 enum Head {
@@ -315,12 +317,54 @@ impl Emitter<'_> {
             }
             target = next;
         }
+        self.emit_monitor_departure_scope(shape, region, machine, depth, arm, departure, None)
+    }
+
+    pub(super) fn emit_monitor_with_finally_departure<'a, 'c>(
+        &mut self,
+        shape: &ProtectedRegion,
+        acquisition: usize,
+        region: Region<'_, 'a, 'c>,
+        machine: &Machine<'a, 'c>,
+        depth: usize,
+    ) -> Result<Option<bool>, StructureError> {
+        let mut departures = self.exceptions.children_of(shape.body).filter_map(|child| {
+            let finally = self.exceptions.region(child).finally.as_ref()?;
+            let branch = finally.branched()?;
+            let exit = branch.monitor_exit.as_ref()?;
+            (exit.acquisition == acquisition)
+                .then_some((finally.arm, exit.edge, (branch.entry, finally.block())))
+        });
+        let Some((arm, edge, branch)) = departures.next() else {
+            return Ok(None);
+        };
+        if region.label_scope().is_some()
+            || departures.next().is_some()
+            || shape.join != Some(edge.target)
+        {
+            return Err(self.unstructured(edge.source));
+        }
+        self.emit_monitor_departure_scope(shape, region, machine, depth, arm, edge, Some(branch))
+    }
+
+    fn emit_monitor_departure_scope<'a, 'c>(
+        &mut self,
+        shape: &ProtectedRegion,
+        region: Region<'_, 'a, 'c>,
+        machine: &Machine<'a, 'c>,
+        depth: usize,
+        arm: ArmId,
+        departure: MonitorDeparture,
+        branch: Option<(usize, usize)>,
+    ) -> Result<Option<bool>, StructureError> {
+        let join = shape.join.ok_or(StructureError::ExceptionHandlers)?;
+        let (head, tail) = branch.unwrap_or((shape.start, join));
         let scope = Scope {
-            head: shape.start,
-            tail: join,
+            head,
+            tail,
             join,
             name: format!("label{}", self.offset(join)),
-            edges: Edges::Monitor { arm, source: departure.source, target: departure.target },
+            edges: Edges::Monitor { arm, edge: departure, branch_tail: branch.is_some() },
             exits: RefCell::new(Vec::with_capacity(1)),
         };
         self.syntax(depth, &format!("{}: {{", scope.name));
@@ -362,8 +406,8 @@ impl Emitter<'_> {
             {
                 self.explicit_jump(block, to)
             }
-            Edges::Monitor { arm, source, target }
-                if region.exception_arm == Some(*arm) && (*source, *target) == (block, to) =>
+            Edges::Monitor { arm, edge, .. }
+                if region.exception_arm == Some(*arm) && (edge.source, edge.target) == (block, to) =>
             {
                 let jump = self.explicit_jump(block, to).ok_or_else(|| self.unstructured(block))?;
                 scope.exits.borrow_mut().push(Exit { block, state: machine.clone() });

@@ -155,7 +155,9 @@ fn structure_regions(
     let mut emitter = Emitter {
         instructions,
         graph,
-        layout: Layout::new(graph, instructions, assertions)?,
+        layout: Layout::with_monitor_boundaries(graph, instructions, assertions, |header| {
+            exceptions.monitor_finally_boundary(header)
+        })?,
         exceptions,
         exception_redirects: BTreeMap::new(),
         resource_epilogue: None,

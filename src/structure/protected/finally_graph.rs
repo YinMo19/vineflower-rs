@@ -6,8 +6,8 @@ use std::ops::Range;
 use crate::bytecode::{Instruction, Operand};
 use crate::cfg::ControlFlowGraph;
 
-use super::monitor::MonitorPlan;
-use super::{Route, local_touches, normal_exits, reference_load, reference_store};
+use super::monitor::{MonitorCandidates, MonitorPlan};
+use super::{MonitorDeparture, Route, local_touches, normal_exits, reference_load, reference_store};
 
 pub(in crate::structure) struct BranchedFinally {
     pub(in crate::structure) entry: usize,
@@ -19,6 +19,13 @@ pub(in crate::structure) struct BranchedFinally {
     pub(super) prefix_block: Option<usize>,
     pub(super) tail: usize,
     pub(super) tail_code: Range<usize>,
+    pub(in crate::structure) monitor_exit: Option<FinallyMonitorExit>,
+}
+
+pub(in crate::structure) struct FinallyMonitorExit {
+    pub(in crate::structure) acquisition: usize,
+    pub(in crate::structure) edge: MonitorDeparture,
+    pub(super) copy: usize,
 }
 
 impl BranchedFinally {
@@ -31,7 +38,7 @@ impl BranchedFinally {
         routes: &[Vec<Route>],
         body: &BTreeSet<usize>,
         handler: usize,
-        monitors: &BTreeMap<usize, &MonitorPlan>,
+        monitors: &MonitorCandidates<'_>,
     ) -> Option<Self> {
         let start = &graph.blocks[handler];
         if handler == 0 || !start.predecessors.is_empty() || body.contains(&handler) {
@@ -49,7 +56,16 @@ impl BranchedFinally {
         } else {
             handler
         };
-        let monitor = monitors.get(&entry).copied();
+        let monitor = monitors.get(&entry).map(|&(plan, _)| plan);
+        let enclosing = monitors
+            .values()
+            .copied()
+            .filter(|(_, covered)| {
+                covered.binary_search(&handler).is_ok()
+                    && body.iter().all(|block| covered.binary_search(block).is_ok())
+            })
+            .min_by_key(|(_, covered)| covered.len());
+        let mut monitor_exit = None;
         let mut cleanup = BTreeSet::new();
         let mut rethrow = None;
         let mut pending = vec![entry];
@@ -79,6 +95,17 @@ impl BranchedFinally {
                 .any(|op| local_touches(op, slot))
             {
                 return None;
+            }
+            if let Some((owner, covered)) = enclosing
+                && let Some(target) = owner.unlock_target(instructions, graph, index)
+            {
+                if target <= index
+                    || covered.binary_search(&target).is_ok()
+                    || monitor_exit.replace(MonitorDeparture { source: index, target }).is_some()
+                {
+                    return None;
+                }
+                continue;
             }
             pending.extend(block.successors.iter().copied());
         }
@@ -121,6 +148,15 @@ impl BranchedFinally {
             return None;
         }
         let exits: BTreeSet<_> = normal_exits(graph, body).collect();
+        let projection = monitor_exit.zip(enclosing.map(|(owner, _)| owner));
+        if let Some((edge, _)) = projection
+            && (exits.len() != 1
+                || cleanup.contains(&edge.target)
+                || graph.blocks[entry].successors.len() != 2
+                || !graph.blocks[entry].successors.contains(&tail))
+        {
+            return None;
+        }
         let mut result = Self {
             entry,
             continuation: None,
@@ -131,16 +167,24 @@ impl BranchedFinally {
             prefix_block: None,
             tail,
             tail_code,
+            monitor_exit: None,
         };
         let mut tails = BTreeSet::new();
         for &sample in &exits {
-            let pair = match (monitor, monitors.get(&sample).copied()) {
+            let pair = match (monitor, monitors.get(&sample).map(|&(plan, _)| plan)) {
                 (Some(pattern), Some(sample)) => Some(MonitorCopy { pattern, sample }),
                 (None, None) => None,
                 _ => return None,
             };
-            let (tail, removed) =
-                result.match_copy(instructions, graph, routes, body, handler, sample, pair)?;
+            let (tail, removed, copied_exit) =
+                result.match_copy(instructions, graph, routes, body, handler, sample, pair, projection)?;
+            if let Some((edge, owner)) = projection {
+                result.monitor_exit = Some(FinallyMonitorExit {
+                    acquisition: owner.acquisition,
+                    edge,
+                    copy: copied_exit?,
+                });
+            }
             tails.insert(tail);
             for block in removed {
                 if !result.removed.insert(block) {
@@ -216,7 +260,8 @@ impl BranchedFinally {
         handler: usize,
         sample_start: usize,
         monitor: Option<MonitorCopy<'_>>,
-    ) -> Option<(usize, BTreeSet<usize>)> {
+        departure: Option<(MonitorDeparture, &MonitorPlan)>,
+    ) -> Option<(usize, BTreeSet<usize>, Option<usize>)> {
         let mut paired = BTreeMap::new();
         let mut copies = BTreeSet::new();
         let mut removed = BTreeSet::new();
@@ -278,6 +323,16 @@ impl BranchedFinally {
                     return None;
                 }
                 removed.insert(sample);
+                if let Some((edge, owner)) = departure
+                    && edge.source == pattern
+                {
+                    // Both cleanup copies must unlock the very same dynamic
+                    // monitor and transfer to the same external destination.
+                    if owner.unlock_target(instructions, graph, sample) != Some(edge.target) {
+                        return None;
+                    }
+                    continue;
+                }
                 pending.extend(
                     expected
                         .successors
@@ -325,7 +380,8 @@ impl BranchedFinally {
                 return None;
             }
         }
-        Some((continuation?, removed))
+        let copied_exit = departure.and_then(|(edge, _)| paired.get(&edge.source).copied());
+        Some((continuation?, removed, copied_exit))
     }
 }
 

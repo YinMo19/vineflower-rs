@@ -874,6 +874,81 @@ fn nested_split_resources_delegate_each_return_to_its_own_spill() {
 }
 
 #[test]
+fn nested_split_resource_stops_at_the_enclosing_close_before_falling_through() {
+    let bytes = [
+        0x2a, 0x4d, // 0: acquire outer resource
+        0x2a, 0x4e, // 2: acquire inner resource
+        0x1b, 0x99, 0, 29, // 4: select fallthrough path at 34
+        0x2d, 0x3a, 4, // 8: spill the early return value
+        0x2d, 0xc6, 0, 9, // 11: first inner close guard -> 21
+        0x2d, 0xb9, 0, 13, 1, 0, // 15: first inner close
+        0x2c, 0xc6, 0, 9, // 21: first outer close guard -> 31
+        0x2c, 0xb9, 0, 13, 1, 0, // 25: first outer close
+        0x19, 4, 0xb0, // 31: reload the return value
+        0xb8, 0, 22, // 34: work on the fallthrough path
+        0x2d, 0xc6, 0, 39, // 37: second inner close guard -> 77
+        0x2d, 0xb9, 0, 13, 1, 0, // 41: second inner close
+        0xa7, 0, 30, // 47: goto 77
+        0x3a, 4, 0x2d, 0xc6, 0, 21, // 50: inner primary exception
+        0x2d, 0xb9, 0, 13, 1, 0, // 56: inner exceptional close
+        0xa7, 0, 12, // 62: goto 74
+        0x3a, 5, 0x19, 4, 0x19, 5, 0xb6, 0, 19, // 65: inner addSuppressed
+        0x19, 4, 0xbf, // 74: inner rethrow
+        0x2c, 0xc6, 0, 39, // 77: second outer close guard -> 117
+        0x2c, 0xb9, 0, 13, 1, 0, // 81: second outer close
+        0xa7, 0, 30, // 87: goto 117
+        0x3a, 4, 0x2c, 0xc6, 0, 21, // 90: outer primary exception
+        0x2c, 0xb9, 0, 13, 1, 0, // 96: outer exceptional close
+        0xa7, 0, 12, // 102: goto 114
+        0x3a, 5, 0x19, 4, 0x19, 5, 0xb6, 0, 19, // 105: outer addSuppressed
+        0x19, 4, 0xbf, // 114: outer rethrow
+        0x01, 0xb0, // 117: ordinary return after both resource scopes
+    ];
+    let handlers = [
+        handler(4, 11, 50, 15),
+        handler(34, 37, 50, 15),
+        handler(56, 62, 65, 15),
+        handler(2, 21, 90, 15),
+        handler(34, 77, 90, 15),
+        handler(96, 102, 105, 15),
+    ];
+    let decompile = |bytes| {
+        test_method_with_descriptor(
+            bytes,
+            &handlers,
+            &[],
+            "(Ljava/lang/AutoCloseable;Z)Ljava/lang/AutoCloseable;",
+        )
+    };
+    let lines = decompile(&bytes).unwrap();
+    assert_eq!(lines[0].text, "try (");
+    assert_eq!(lines[1].text, "java.lang.AutoCloseable var2 = var0;");
+    assert_eq!(lines[2].text, "java.lang.AutoCloseable var3 = var0;");
+    let early = lines.iter().find(|line| line.text == "return var3;").unwrap();
+    assert!(early.depth > 0);
+    assert_eq!(early.offsets, [8, 33]);
+    let work = lines.iter().find(|line| line.text == "work();").unwrap();
+    assert!(work.depth > 0 && work.offsets.contains(&34));
+    let ordinary = lines.last().unwrap();
+    assert_eq!(ordinary.text, "return null;");
+    assert_eq!(ordinary.depth, 0);
+    assert_eq!(ordinary.offsets, [117, 118]);
+    assert!(!lines.iter().any(|line| line.text.contains("close()")));
+
+    let mut wrong_landing = bytes;
+    wrong_landing[40] = 79; // The null path bypasses the outer close.
+    assert!(decompile(&wrong_landing).is_err());
+
+    let mut wrong_resource = bytes;
+    wrong_resource[81] = 0x2d; // The enclosing exit closes the inner slot again.
+    assert!(decompile(&wrong_resource).is_err());
+
+    let mut reversed_suppression = bytes;
+    reversed_suppression.swap(68, 70);
+    assert!(decompile(&reversed_suppression).is_err());
+}
+
+#[test]
 fn legacy_resource_proves_the_primary_exception_and_both_closes() {
     let mut bytes = [
         0x2a, 0x4c, 0x01, 0x4d, // 0: resource store; primary = null
@@ -1021,6 +1096,11 @@ fn synchronized_finally_copies_can_use_distinct_synthetic_slots() {
     assert!(matches!(classify(&bytes, &handlers).1, Err(StructureError::ExceptionHandlers)));
     bytes[51] = 5;
 
+    // A handler cannot release a monitor whose acquisition just failed.
+    handlers[2].start_pc = 18;
+    assert!(matches!(classify(&bytes, &handlers).1, Err(StructureError::ExceptionHandlers)));
+    handlers[2].start_pc = 22;
+
     // An enclosing catch-all must not intercept the inner monitor retry.
     handlers.swap(1, 4);
     assert!(matches!(classify(&bytes, &handlers).1, Err(StructureError::ExceptionHandlers)));
@@ -1141,6 +1221,56 @@ fn synchronized_inner_catch_stops_at_the_normal_unlock() {
     }));
     let work = lines.iter().find(|line| line.text == "work();").unwrap();
     assert_eq!(work.depth, 0);
+}
+
+#[test]
+fn synchronized_finally_can_leave_the_monitor_from_within_a_loop() {
+    let mut bytes = [
+        0x2a, 0x59, 0x4d, 0xc2, // 0: acquire monitor
+        0xb8, 0, 22, // 4: work inside the monitor
+        0x1b, 0x9e, 0, 44, // 7: loop header; leave the loop at 52
+        0x84, 1, 0xff, // 11: decrement var1
+        0xb8, 0, 22, // 14: work before the try
+        0xb8, 0, 22, // 17: work in the try
+        0xb8, 0, 22, // 20: work in the normal cleanup copy
+        0x1b, 0x08, 0xa4, 0, 24, // 23: if var1 <= 5, loop again at 49
+        0x2c, 0xc3, // 28: otherwise unlock
+        0xa7, 0, 37, // 30: goto 67
+        0x4e, // 33: finally handler
+        0xb8, 0, 22, // 34: work in the exceptional cleanup copy
+        0x1b, 0x08, 0xa4, 0, 8, // 37: if var1 <= 5, rethrow at 47
+        0x2c, 0xc3, // 42: otherwise unlock and override the exception
+        0xa7, 0, 23, // 44: goto 67
+        0x2d, 0xbf, // 47: rethrow original failure
+        0xa7, 0xff, 0xd6, // 49: goto 7
+        0xb8, 0, 22, // 52: work after the loop, still holding the lock
+        0x2c, 0xc3, // 55: ordinarily unlock
+        0xa7, 0, 10, // 57: goto 67
+        0x3a, 4, 0x2c, 0xc3, // 60: unlock on uncaught exception
+        0x19, 4, 0xbf, // 64: rethrow
+        0xb8, 0, 22, // 67: work outside synchronized
+        0xb1, // 70: return
+    ];
+    let handlers = [
+        handler(17, 20, 33, 0),
+        handler(4, 30, 60, 0),
+        handler(33, 44, 60, 0),
+        handler(47, 57, 60, 0),
+        handler(60, 64, 60, 0),
+    ];
+    let descriptor = "(Ljava/lang/Object;I)V";
+    let lines = test_method_with_descriptor(&bytes, &handlers, &[], descriptor).unwrap();
+    assert_eq!(lines[0].text, "synchronized (var0) {");
+    assert_eq!(lines[1].text, "label67: {");
+    assert!(lines.iter().any(|line| line.depth == 2 && line.text.as_flat().starts_with("while (")));
+    assert!(lines.iter().any(|line| line.depth == 3 && line.text == "} finally {"));
+    assert!(lines.iter().any(|line| line.depth == 5 && line.text == "break label67;"));
+    let work = lines.iter().rev().find(|line| line.text == "work();").unwrap();
+    assert_eq!(work.depth, 0);
+
+    // The exceptional copy cannot bypass a statement done on normal exit.
+    bytes[46] = 26; // goto 70, not 67
+    assert!(matches!(classify(&bytes, &handlers).1, Err(StructureError::ExceptionHandlers)));
 }
 
 #[test]
