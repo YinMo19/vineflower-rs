@@ -401,10 +401,7 @@ impl Emitter<'_> {
                 });
             }
             let prelude = machine.take_prelude();
-            // Discarding a stack value may emit the value's expression, but
-            // the pop itself has no source token. The pending value offsets
-            // still map to that statement.
-            if !matches!(instruction.opcode, 0 | 0x57 | 0x58)
+            if machine.instruction_has_source()
                 && (!prelude.is_empty() || !matches!(effect, Effect::Jump(_)))
             {
                 offsets.extend(instruction.offset..instruction.offset + instruction.len);

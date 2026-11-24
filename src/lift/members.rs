@@ -483,6 +483,9 @@ impl Machine<'_, '_> {
                 if !matches!(&receiver.ty, Type::Object(name) if name == owner) {
                     return Err(self.invalid_operand("constructor owner does not match new"));
                 }
+                // Unlike explicit this()/super() delegation, this call is
+                // part of a new expression. Its arguments own the mappings.
+                self.instruction_has_source = false;
                 let order = self
                     .order_of(&args, true)?
                     .expect("constructor has effects");

@@ -129,6 +129,7 @@ pub(crate) struct Machine<'a, 'c> {
     lambda_depth: u8,
     array_probe_depth: u8,
     initialized_this: bool,
+    instruction_has_source: bool,
     opcode: u8,
     offset: u32,
 }
@@ -175,6 +176,7 @@ impl<'a, 'c> Machine<'a, 'c> {
             lambda_depth: 0,
             array_probe_depth: 0,
             initialized_this: method_name != "<init>" || super_class.is_none(),
+            instruction_has_source: false,
             opcode: 0,
             offset: 0,
         })
@@ -362,9 +364,16 @@ impl<'a, 'c> Machine<'a, 'c> {
         Ok(detail)
     }
 
+    pub(crate) fn instruction_has_source(&self) -> bool {
+        self.instruction_has_source
+    }
+
     pub(crate) fn step(&mut self, op: &Instruction) -> Result<Effect, LiftError> {
         self.offset = op.offset;
         self.opcode = op.opcode;
+        // Stack management and the allocation half of `new` do not
+        // correspond to standalone source tokens.
+        self.instruction_has_source = !matches!(op.opcode, 0 | 0x57..=0x5f | 0xbb);
         if !matches!(op.opcode, 0x00 | 0x99..=0x9e) {
             self.lower_pending_comparison()?;
         }
