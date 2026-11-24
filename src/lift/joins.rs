@@ -11,7 +11,7 @@ use crate::{
     bytecode::{Instruction, Operand},
     classfile::LocalVariable,
     descriptor::{GenericType, MethodSignature, Type, TypeArgument},
-    source_text::{Document, tokens::Token},
+    source_text::{Document, Infix, tokens::Token},
 };
 
 pub(crate) struct JoinCode {
@@ -389,14 +389,8 @@ impl Machine<'_, '_> {
         } else {
             let yes = self.conditional_operand(yes, &ty, &no.ty)?;
             let no = self.conditional_operand(no, &ty, &yes.ty)?;
-            let mut text = condition.clone();
-            if text.contains('?') {
-                text.surround("(", ")");
-            }
-            text.push_str(" ? ");
-            text.append(yes.text);
-            text.push_str(" : ");
-            text.append(no.text);
+            let parens = condition.infix() == Some(Infix::TERNARY);
+            let text = Document::ternary_expression([condition, &yes.text, &no.text], parens);
             (text, TERNARY)
         };
         let mut original = held.filter(|held| {

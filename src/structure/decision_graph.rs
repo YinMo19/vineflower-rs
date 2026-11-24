@@ -5,7 +5,7 @@ use std::ops::RangeInclusive;
 
 use crate::bytecode::Operand;
 use crate::lift::{Effect, Machine};
-use crate::source_text::Document;
+use crate::source_text::{Document, Infix};
 
 use super::{Condition, Emitter, Region, logical};
 
@@ -369,21 +369,10 @@ fn combine(yes: Document, no: Document, when_yes: Value, when_no: Value) -> Opti
         (Value::Test([a, b]), Value::Exit(true)) => [logical(no, "||", a), logical(yes, "&&", b)],
         (Value::Test([a, b]), Value::Exit(false)) => [logical(yes, "&&", a), logical(no, "||", b)],
         (Value::Test([a, b]), Value::Test([c, d])) => {
-            [ternary(yes.clone(), a, c), ternary(yes, b, d)]
+            let parens = yes.infix() == Some(Infix::TERNARY);
+            let select = |when_yes, when_no| Document::ternary_expression([&yes, when_yes, when_no], parens);
+            [select(&a, &c), select(&b, &d)]
         }
         (Value::Exit(_), Value::Exit(_)) => return None,
     })
-}
-
-fn ternary(mut selector: Document, mut yes: Document, mut no: Document) -> Document {
-    for value in [&mut selector, &mut yes, &mut no] {
-        if value.contains('?') {
-            value.surround("(", ")");
-        }
-    }
-    selector.push_str(" ? ");
-    selector.append(yes);
-    selector.push_str(" : ");
-    selector.append(no);
-    selector
 }

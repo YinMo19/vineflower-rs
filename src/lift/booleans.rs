@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 
-use crate::source_text::Document;
+use crate::source_text::{Document, Infix};
 
 use super::{Machine, expr::{BOOLEAN, Expr, PRIMARY, Source, TERNARY, UNARY}};
 
@@ -51,10 +51,8 @@ impl BooleanFact {
         }
     }
 
-    fn parenthesize(self, text: &mut Cow<'_, Document>, minimum: u8) {
-        if self.precedence < minimum {
-            text.to_mut().surround("(", ")");
-        }
+    fn with_layout(self, text: &Document) -> Self {
+        text.infix().map_or(self, |infix| Self::expression(infix.precedence))
     }
 }
 
@@ -131,37 +129,30 @@ impl BooleanSelection {
     ) -> (BooleanFact, Document) {
         let (BooleanCondition([direct, negated]), [expression, inverse]) = condition;
         match self {
-            Self::Condition { inverse: false } => (direct, expression.into_owned()),
-            Self::Condition { inverse: true } => (negated, inverse.into_owned()),
+            Self::Condition { inverse: false } => {
+                (direct.with_layout(&expression), expression.into_owned())
+            }
+            Self::Condition { inverse: true } => {
+                (negated.with_layout(&inverse), inverse.into_owned())
+            }
             Self::ShortCircuit { inverse: negate, and, uses_true } => {
-                let (left, mut left_text) = if negate { (negated, inverse) } else { (direct, expression) };
-                let (right, mut right_text) = if uses_true { yes } else { no };
-                let precedence = if and { 3 } else { 2 };
-                left.parenthesize(&mut left_text, precedence);
-                right.parenthesize(&mut right_text, precedence);
-                let mut text = left_text.into_owned();
-                text.push_str(if and { " && " } else { " || " });
-                append(&mut text, right_text);
-                (BooleanFact::expression(precedence), text)
+                let (left, left_text) = if negate { (negated, inverse) } else { (direct, expression) };
+                let (right, right_text) = if uses_true { yes } else { no };
+                let infix = if and { Infix::AND } else { Infix::OR };
+                let text = Document::infix_expression(
+                    infix,
+                    [(left, &*left_text), (right, &*right_text)].map(|(fact, text)| {
+                        (text, fact.with_layout(text).precedence < infix.precedence)
+                    }),
+                );
+                (BooleanFact::expression(infix.precedence), text)
             }
             Self::Ternary => {
-                let mut text = expression;
-                direct.parenthesize(&mut text, TERNARY + 1);
-                let mut text = text.into_owned();
-                text.push_str(" ? ");
-                append(&mut text, yes.1);
-                text.push_str(" : ");
-                append(&mut text, no.1);
+                let parens = direct.with_layout(&expression).precedence <= TERNARY;
+                let text = Document::ternary_expression([&expression, &yes.1, &no.1], parens);
                 (BooleanFact::expression(TERNARY), text)
             }
         }
-    }
-}
-
-fn append(target: &mut Document, value: Cow<'_, Document>) {
-    match value {
-        Cow::Borrowed(value) => target.append_ref(value),
-        Cow::Owned(value) => target.append(value),
     }
 }
 

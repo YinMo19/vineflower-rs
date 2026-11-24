@@ -14,7 +14,7 @@ use crate::{
 use super::{
     Effect, LiftError, Machine,
     assignment_expr::{Access, AddressPart},
-    concat::{builder_constructor, inline_value_of, is_string, push_joined},
+    concat::{CONCAT, builder_constructor, inline_value_of, is_string, push_joined},
     dynamic::LambdaSite,
     expr::{ADDITIVE, Category, Expr, Order, PRIMARY, Source},
     string_literal,
@@ -804,6 +804,7 @@ impl Machine<'_, '_> {
             Part::Arg(index) => is_string(&args[*index].ty),
         };
         let mut text = Document::new();
+        text.begin_infix(CONCAT);
         if parts.len() != 1 && !parts.iter().take(2).any(is_text) {
             text.push_str("\"\"");
         }
@@ -812,16 +813,18 @@ impl Machine<'_, '_> {
             match part {
                 Part::Text(literal) => {
                     if !text.is_empty() {
-                        text.push_str(" + ");
+                        text.infix_separator(CONCAT.symbol);
                     }
                     text.push_str(&literal);
                 }
-                Part::Arg(index) => push_joined(&mut text, &args[index]),
+                Part::Arg(index) => push_joined(&mut text, &args[index].text, args[index].precedence),
             }
         }
         if single {
-            text.push_str(" + \"\"");
+            text.infix_separator(CONCAT.symbol);
+            text.push_str("\"\"");
         }
+        text.end_group();
         // An invokedynamic concat is not a Java constant expression. Preserve
         // the distinction when every operand can be folded into a literal.
         let precedence = if args.iter().all(|arg| arg.constant) {

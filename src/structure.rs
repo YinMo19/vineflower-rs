@@ -33,7 +33,7 @@ use crate::bytecode::{Instruction, Operand};
 use crate::cfg::ControlFlowGraph;
 use crate::classfile::ExceptionHandler;
 use crate::lift::{BooleanCondition, Effect, LiftError, Machine};
-use crate::source_text::Document;
+use crate::source_text::{Document, Infix};
 
 use self::boolean_returns::BooleanReturn;
 use self::exception_emit::ExceptionRedirect;
@@ -1641,15 +1641,16 @@ fn surrounded(mut text: Document, prefix: &str, suffix: &str) -> Document {
     text
 }
 
-fn logical(mut left: Document, op: &str, mut right: Document) -> Document {
-    for text in [&mut left, &mut right] {
-        if text.contains('?') || (op == "&&" && text.contains(" || ")) {
-            text.surround("(", ")");
-        }
-    }
-    left.push(' ');
-    left.push_str(op);
-    left.push(' ');
-    left.append(right);
-    left
+fn logical(left: Document, op: &str, right: Document) -> Document {
+    let infix = match op {
+        "&&" => Infix::AND,
+        "||" => Infix::OR,
+        _ => unreachable!("non-short-circuit operator"),
+    };
+    Document::infix_expression(
+        infix,
+        [&left, &right].map(|operand| {
+            (operand, operand.infix().is_some_and(|child| child.precedence < infix.precedence))
+        }),
+    )
 }

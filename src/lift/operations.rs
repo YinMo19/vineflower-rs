@@ -6,7 +6,7 @@ use crate::{
     bytecode::{Instruction, Operand},
     classfile::{OffsetTarget, TypeArgumentTarget, TypeTarget},
     descriptor::{Primitive, Type},
-    source_text::Document,
+    source_text::{Document, Infix},
 };
 
 use super::{
@@ -55,12 +55,13 @@ impl Machine<'_, '_> {
         };
         let left = self.implicit_unboxing(left);
         let right = self.implicit_unboxing(right);
-        let mut text = Document::new();
-        left.append_at(precedence, &mut text);
-        text.push(' ');
-        text.push_str(operator);
-        text.push(' ');
-        right.append_at(precedence + 1, &mut text);
+        // Integral arithmetic at the same width is associative modulo that
+        // width; do not regroup a narrower computation or a floating one.
+        let reassociate = boolean
+            || (matches!(category, Category::Int | Category::Long)
+                && right.ty == ty
+                && matches!(operator, "+" | "*" | "&" | "|" | "^"));
+        let text = left.binary(Infix::new(operator, precedence), &right, reassociate);
         self.push(self.expression(ty, text, precedence, [&left, &right], can_throw)?)
     }
 

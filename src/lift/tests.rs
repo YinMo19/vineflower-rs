@@ -214,6 +214,33 @@ fn recovers_postincrement_of_the_loaded_local_without_a_spill() {
 }
 
 #[test]
+fn binary_layout_preserves_numeric_association() {
+    let cases = [
+        (Primitive::Int, 0x60, 0x60, "a + b + c"),
+        (Primitive::Int, 0x60, 0x64, "a - (b + c)"),
+        (Primitive::Long, 0x6d, 0x69, "a * (b / c)"),
+        (Primitive::Float, 0x62, 0x62, "a + (b + c)"),
+        (Primitive::Double, 0x6b, 0x6b, "a * (b * c)"),
+    ];
+    for (ty, inner, outer, expected) in cases {
+        with_machine(|mut machine| {
+            for name in ["a", "b", "c"] {
+                machine.push(Expr::atom(Type::Primitive(ty), name.into())).unwrap();
+            }
+            machine.arithmetic(inner).unwrap();
+            machine.arithmetic(outer).unwrap();
+            let result = machine.pop_raw().unwrap().text;
+            assert_eq!(result, expected);
+            if expected == "a + b + c" {
+                let mut out = String::new();
+                result.render(&mut out, 6, "  ");
+                assert_eq!(out, "a\n  + b\n  + c");
+            }
+        });
+    }
+}
+
+#[test]
 fn floating_comparison_keeps_nan_on_the_correct_branch() {
     with_machine(|mut machine| {
         let instructions = decode(&[0x0b, 0x0c, 0x95, 0x9b, 0, 3, 0x00]).unwrap();

@@ -4,12 +4,12 @@ use std::borrow::Cow;
 
 use crate::{
     descriptor::{Primitive, Type},
-    source_text::Document,
+    source_text::{Document, Infix},
 };
 
 use super::{LiftError, Machine, assignment_expr::{Access, StackAlias}};
 
-pub(super) const TERNARY: u8 = 1;
+pub(super) const TERNARY: u8 = Infix::TERNARY.precedence;
 pub(super) const BIT_OR: u8 = 4;
 pub(super) const BIT_XOR: u8 = 5;
 pub(super) const BIT_AND: u8 = 6;
@@ -170,6 +170,18 @@ impl Expr {
         }
     }
 
+    pub(super) fn binary(&self, infix: Infix, right: &Self, reassociate: bool) -> Document {
+        let precedence = infix.precedence;
+        let same_right = reassociate && right.text.infix() == Some(infix);
+        Document::infix_expression(
+            infix,
+            [
+                (&self.text, self.needs_parens(precedence)),
+                (&right.text, right.needs_parens(precedence + u8::from(!same_right))),
+            ],
+        )
+    }
+
     pub(super) fn into_at(mut self, min: u8) -> Document {
         self.parenthesize(min);
         self.text
@@ -278,13 +290,7 @@ impl Relation {
         } else {
             RELATIONAL
         };
-        let mut text = Document::new();
-        left.append_at(precedence, &mut text);
-        text.push(' ');
-        text.push_str(self.operator());
-        text.push(' ');
-        right.append_at(precedence + 1, &mut text);
-        text
+        left.binary(Infix::new(self.operator(), precedence), right, false)
     }
 
     pub(super) fn against_cmp(self, cmp: &Comparison) -> Document {

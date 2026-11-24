@@ -5,15 +5,18 @@ use std::{ops::Range, sync::Arc};
 
 use crate::{
     descriptor::{MethodDescriptor, Primitive, Type},
-    source_text::Document,
+    source_text::{Document, Infix},
 };
 
 use super::expr::{ADDITIVE, Category, Expr, Source};
 use super::{Effect, LiftError, Machine};
 
+pub(super) const CONCAT: Infix = Infix::new("+", ADDITIVE);
+
 #[derive(Clone)]
 pub(super) struct Operand {
     text: Document,
+    precedence: u8,
     string: bool,
     constant: bool,
 }
@@ -23,7 +26,8 @@ impl From<Expr> for Operand {
         Self {
             string: is_string(&value.ty),
             constant: value.constant,
-            text: value.into_at(ADDITIVE + 1),
+            precedence: value.precedence,
+            text: value.text,
         }
     }
 }
@@ -125,20 +129,20 @@ impl Machine<'_, '_> {
             return Ok(None);
         }
         let mut text = Document::new();
+        text.begin_infix(CONCAT);
         if !parts.iter().take(2).any(|part| part.string) {
             text.push_str("\"\"");
         }
         for part in parts.iter() {
-            if !text.is_empty() {
-                text.push_str(" + ");
-            }
-            text.append_ref(&part.text);
+            push_joined(&mut text, &part.text, part.precedence);
         }
         if parts.len() == 1 && parts[0].string {
             // Appending an empty literal still creates a fresh String on the
             // evaluated path, unlike simply returning the String operand.
-            text.push_str(" + \"\"");
+            text.infix_separator(CONCAT.symbol);
+            text.push_str("\"\"");
         }
+        text.end_group();
         self.push(self.expression(
             Type::Object("java/lang/String".into()),
             text,
@@ -194,9 +198,12 @@ pub(super) fn inline_value_of(args: &mut [Expr]) {
     }
 }
 
-pub(super) fn push_joined(text: &mut Document, operand: &Expr) {
-    if !text.is_empty() {
-        text.push_str(" + ");
+pub(super) fn push_joined(text: &mut Document, operand: &Document, precedence: u8) {
+    let right = !text.is_empty();
+    if right {
+        text.infix_separator(CONCAT.symbol);
     }
-    operand.append_at(ADDITIVE + 1, text);
+    // A numeric sum can be the left operand, but folding it into the right
+    // would concatenate its terms individually instead of adding them first.
+    text.append_infix_operand(operand, precedence < ADDITIVE + u8::from(right));
 }

@@ -34,7 +34,7 @@ enum Kind {
         base: BaseDepth,
         extra: usize,
         has_breaks: bool,
-        qualifier: bool,
+        role: GroupRole,
     },
     Break {
         len: usize,
@@ -58,6 +58,31 @@ enum Kind {
 enum Link {
     Open { parent: Option<NonZeroUsize> },
     Closed { end: usize },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GroupRole {
+    Plain,
+    Qualifier,
+    Infix(Infix),
+}
+
+/// An operator's Java precedence (higher binds more tightly). The producer
+/// decides when an operand of equal precedence can omit its parentheses.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Infix {
+    pub(crate) symbol: &'static str,
+    pub(crate) precedence: u8,
+}
+
+impl Infix {
+    pub(crate) const OR: Self = Self::new("||", 2);
+    pub(crate) const AND: Self = Self::new("&&", 3);
+    pub(crate) const TERNARY: Self = Self::new("?", 1);
+
+    pub(crate) const fn new(symbol: &'static str, precedence: u8) -> Self {
+        Self { symbol, precedence }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -309,9 +334,114 @@ impl Document {
                 base,
                 extra,
                 has_breaks: false,
-                qualifier: false,
+                role: GroupRole::Plain,
             },
         });
+    }
+
+    pub(crate) fn begin_infix(&mut self, infix: Infix) {
+        self.begin_relative_group(0, 1);
+        let Some(Event { kind: Kind::Begin { role, .. }, .. }) = self.events.last_mut() else {
+            unreachable!("a new group ends with its begin event");
+        };
+        *role = GroupRole::Infix(infix);
+    }
+
+    pub(crate) fn infix(&self) -> Option<Infix> {
+        self.infix_span().map(|(_, _, infix, _)| infix)
+    }
+
+    fn infix_span(&self) -> Option<(usize, usize, Infix, bool)> {
+        let metadata = |event: &Event| {
+            matches!(event.kind, Kind::Anchor { .. } | Kind::OmittedBytes { .. })
+        };
+        let start = self.events.iter().position(|event| !metadata(event))?;
+        let Event {
+            at: 0,
+            kind: Kind::Begin {
+                link: Link::Closed { end },
+                role: GroupRole::Infix(infix),
+                has_breaks,
+                ..
+            },
+        } = self.events[start]
+        else {
+            return None;
+        };
+        (self.events[end].at == self.flat.len() && self.events[end + 1..].iter().all(metadata))
+            .then_some((start, end, infix, has_breaks))
+    }
+
+    /// Equal-precedence unparenthesized operands share their parent's breaks.
+    /// Keep the operand's complete flat text, nested groups, and metadata.
+    pub(crate) fn append_infix_operand(&mut self, fragment: &Self, parens: bool) {
+        if parens {
+            self.push('(');
+            self.begin_relative_group(0, 1);
+            self.soft_break("", false);
+            self.append_ref(fragment);
+            self.soft_break("", true);
+            self.end_group();
+            self.push(')');
+            return;
+        }
+        let open = self.open.expect("infix operand outside a group").get() - 1;
+        let Kind::Begin { role: GroupRole::Infix(parent), has_breaks, .. } =
+            &mut self.events[open].kind
+        else {
+            unreachable!("infix operands belong to an infix group");
+        };
+        if let Some((start, end, child, child_breaks)) = fragment.infix_span()
+            && child.precedence == parent.precedence
+        {
+            *has_breaks |= child_breaks;
+            self.append_tokens(fragment.tokens.clone());
+            self.extend(
+                &fragment.flat,
+                fragment.events.iter().cloned().enumerate().filter_map(|(index, mut event)| {
+                    if index == start || index == end {
+                        return None;
+                    }
+                    if let Kind::Begin { link: Link::Closed { end: nested }, .. } = &mut event.kind
+                    {
+                        *nested -= 1;
+                    }
+                    Some(event)
+                }),
+            );
+        } else {
+            self.append_ref(fragment);
+        }
+    }
+
+    pub(crate) fn infix_separator(&mut self, symbol: &str) {
+        self.soft_break(" ", false);
+        self.push_str(symbol);
+        self.push(' ');
+    }
+
+    pub(crate) fn infix_expression(infix: Infix, operands: [(&Self, bool); 2]) -> Self {
+        let [(left, left_parens), (right, right_parens)] = operands;
+        let mut text = Self::new();
+        text.begin_infix(infix);
+        text.append_infix_operand(left, left_parens);
+        text.infix_separator(infix.symbol);
+        text.append_infix_operand(right, right_parens);
+        text.end_group();
+        text
+    }
+
+    pub(crate) fn ternary_expression(operands: [&Self; 3], selector_parens: bool) -> Self {
+        let [selector, yes, no] = operands;
+        let mut text = Self::new();
+        text.begin_infix(Infix::TERNARY);
+        text.append_infix_operand(selector, selector_parens);
+        text.infix_separator("?");
+        text.append_infix_operand(yes, yes.infix() == Some(Infix::TERNARY));
+        text.infix_separator(":");
+        text.append_infix_operand(no, no.infix() == Some(Infix::TERNARY));
+        text.end_group();
+        text
     }
 
     /// Preserve the formatting of an embedded member chain without letting a
@@ -319,10 +449,12 @@ impl Document {
     pub(crate) fn seal_qualifier(&mut self) {
         if let Some(Event {
             at: 0,
-            kind: Kind::Begin { qualifier, .. },
+            kind: Kind::Begin { role, .. },
         }) = self.events.first_mut()
         {
-            *qualifier = false;
+            if *role == GroupRole::Qualifier {
+                *role = GroupRole::Plain;
+            }
         }
     }
 
@@ -340,7 +472,7 @@ impl Document {
                 at: 0,
                 kind:
                     Kind::Begin {
-                        qualifier: true,
+                        role: GroupRole::Qualifier,
                         link,
                         ..
                     },
@@ -378,7 +510,7 @@ impl Document {
                         base: BaseDepth::Relative(0),
                         extra: 1,
                         has_breaks: true,
-                        qualifier: true,
+                        role: GroupRole::Qualifier,
                     },
                 },
             );
@@ -1366,6 +1498,60 @@ mod tests {
         out.clear();
         assert_eq!(direct.render(&mut out, 14, "  "), 2);
         assert_eq!(out, "int[] a = {\n    1234\n}");
+    }
+
+    #[test]
+    fn infix_wraps_equal_precedence_together_and_keeps_operand_metadata() {
+        use super::{Infix, Token, TokenRange, tokens::TokenKind};
+
+        let mut third = Document::new();
+        third.anchor(11..13);
+        third.token(
+            "𝔘",
+            Token {
+                declaration: false,
+                kind: TokenKind::Variable {
+                    owner: "Example".into(),
+                    method: "test".into(),
+                    descriptor: "(Z)V".into(),
+                    index: 1,
+                    name: "𝔘".into(),
+                    parameter: true,
+                },
+            },
+        );
+        let and = Document::infix_expression(
+            Infix::AND,
+            [(&Document::from("second"), false), (&third, false)],
+        );
+        let mut right = Document::infix_expression(
+            Infix::OR,
+            [(&and, false), (&Document::from("fourth"), false)],
+        );
+        right.anchor(20..21);
+        right.omit_bytes(24..27);
+        let mut condition = Document::infix_expression(
+            Infix::OR,
+            [(&Document::from("first"), false), (&right, false)],
+        );
+        condition.surround("  if (", ") {");
+
+        let mut out = String::new();
+        let mut anchors = Vec::new();
+        let mut tokens = Vec::new();
+        condition.render_with_tokens_at(
+            &mut out,
+            24,
+            "  ",
+            false,
+            1,
+            |offsets, line| anchors.push((offsets, line)),
+            |_, range| tokens.push(range),
+        );
+        assert_eq!(out, "  if (first\n    || second && 𝔘\n    || fourth) {");
+        assert_eq!(anchors, [(11..13, 1), (20..21, 2)]);
+        assert_eq!(tokens, [TokenRange::on_line(1, 17, 2)]);
+        assert_eq!(condition.omitted_bytecode().collect::<Vec<_>>(), [24..27]);
     }
 
     #[test]
