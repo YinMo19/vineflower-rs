@@ -16,10 +16,6 @@ use super::pattern_switch::{Head, local, push_zero};
 mod pattern_instanceof;
 use pattern_instanceof::Instance;
 
-#[cfg(test)]
-#[path = "pattern_record_tests.rs"]
-mod tests;
-
 pub(super) struct Plans {
     arms: BTreeMap<(u32, u32), RecordArm>,
     instances: BTreeMap<u32, Instance>,

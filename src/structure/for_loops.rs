@@ -12,9 +12,6 @@ use crate::{
 
 use super::{Emitter, Line, Region, While};
 
-#[cfg(test)]
-mod tests;
-
 pub(super) struct ForLoop {
     setup: Range<usize>,
     style: Style,

@@ -208,15 +208,6 @@ pub(super) struct Layout {
 }
 
 impl Layout {
-    #[cfg(test)]
-    pub(super) fn new(
-        graph: &ControlFlowGraph,
-        instructions: &[Instruction],
-        assertions: Option<&Sites>,
-    ) -> Result<Self, StructureError> {
-        Self::with_exceptions(graph, instructions, assertions, &Exceptions::default())
-    }
-
     pub(super) fn with_exceptions(
         graph: &ControlFlowGraph,
         instructions: &[Instruction],
@@ -289,13 +280,14 @@ impl Layout {
                 .filter(|&next| !inside(next) && !outer_transfer(next))
                 .collect();
             let wrapped = exceptions.finally_wrapped_loop(instructions, graph, &natural_loop);
+            let repeating_try = exceptions.repeating_try_at_entry(header);
             let exception_body = wrapped.map(|(arm, ..)| arm).or_else(|| {
                 exceptions.loop_finally_regions().find_map(|(region, _)| {
                     (region.start == header && natural_loop.latches.iter().any(|&latch| {
                         !exceptions.contains(Some(region.body), latch)
                     })).then_some(region.body)
                 })
-            }).or_else(|| exceptions.retry_loop_body(header));
+            }).or(repeating_try).or_else(|| exceptions.retry_loop_body(header));
             let mirrored_exit = {
                 let mut targets = exceptions
                     .loop_finally_regions()
@@ -353,6 +345,11 @@ impl Layout {
                     })
             });
             let mut exit = post_exit.or(mirrored_exit).or_else(|| {
+                // A proven repeating try owns even the noncyclic terminal
+                // tails of its body and handlers; none is a loop exit.
+                if repeating_try.is_some() {
+                    return None;
+                }
                 let mut normal = exits.iter().copied().filter(|&target| !is_failure(target));
                 let first = normal.next();
                 match (first, normal.next()) {

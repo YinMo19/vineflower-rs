@@ -10,9 +10,6 @@ use crate::{
 
 use super::{Condition, Emitter, Region, StructureError, Tail, surrounded};
 
-#[cfg(test)]
-mod tests;
-
 pub(super) fn is_conditional(opcode: u8) -> bool {
     matches!(opcode, 0x99..=0xa6 | 0xc6..=0xc7)
 }

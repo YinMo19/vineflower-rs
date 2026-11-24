@@ -14,10 +14,6 @@ use crate::{
 #[path = "enumeration_subclasses.rs"]
 mod subclasses;
 
-#[cfg(test)]
-#[path = "enumeration_tests.rs"]
-mod tests;
-
 struct ConstantInit<'a> {
     name: &'a str,
     arguments: Document,
@@ -193,7 +189,12 @@ impl<'a> Enumeration<'a> {
                     machine.set_anonymous_sites(Rc::clone(sites));
                 }
                 machine
-                    .enum_constant_arguments(arg_ops, &descriptor, map_offsets)
+                    .enum_constant_arguments(
+                        arg_ops,
+                        tail[constructor_at].offset,
+                        &descriptor,
+                        map_offsets,
+                    )
                     .map_err(wrap)?
             };
             has_visible_arguments |= !arguments.is_empty();

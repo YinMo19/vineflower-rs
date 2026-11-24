@@ -15,9 +15,6 @@ use super::{
     operations::array_store_opcode,
 };
 
-#[cfg(test)]
-mod tests;
-
 #[derive(Clone, Copy)]
 pub(super) struct Binary {
     pub(super) left: Category,

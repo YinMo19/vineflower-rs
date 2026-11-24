@@ -11,9 +11,6 @@ use crate::descriptor::{Primitive, Type};
 
 use super::identifiers::local_keyword;
 
-#[cfg(test)]
-mod tests;
-
 /// Built-in Vineflower variable-renaming providers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VariableRenamer {

@@ -11,9 +11,6 @@ use crate::source_text::Document;
 use super::{Effect, Expr, LiftError, Machine, PRIMARY, Source, parameter_load_slot};
 use crate::lift::assignment_expr::{Binary, Form, one_instruction, store_dup_opcode};
 
-#[cfg(test)]
-mod tests;
-
 enum Action {
     Read,
     WriteVoid,

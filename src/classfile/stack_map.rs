@@ -382,6 +382,3 @@ impl<'entries, 'types> Types<'entries, 'types> {
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

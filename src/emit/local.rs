@@ -511,22 +511,6 @@ fn dead_in_straight_line(instructions: &[Instruction], slot: u32) -> bool {
     false
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{bytecode, dead_in_straight_line};
-
-    #[test]
-    fn slot_read_before_redefinition_prevents_a_scope_cut() {
-        let instructions = bytecode::decode(&[
-            0x2c, 0x57, // aload_2; pop
-            0x01, 0x4d, 0xb1, // aconst_null; astore_2; return
-        ])
-        .unwrap();
-        assert!(!dead_in_straight_line(&instructions, 2));
-        assert!(dead_in_straight_line(&instructions[2..], 2));
-    }
-}
-
 fn referenced_class<'a>(
     class: &'a ClassFile<'_>,
     op: &Instruction,

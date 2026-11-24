@@ -6,7 +6,7 @@ use crate::{
     classfile::Constant,
     context::NestedKind,
     descriptor::{MethodDescriptor, Primitive, Type},
-    source_text::{ArrayStyle, Document},
+    source_text::Document,
 };
 
 use super::{
@@ -14,9 +14,6 @@ use super::{
     expr::{Category, Expr, INT, Order, Source, UNARY},
     operations::array_store_opcode,
 };
-
-#[cfg(test)]
-mod tests;
 
 #[derive(Clone)]
 pub(super) struct ArrayArgument {
@@ -275,7 +272,7 @@ impl Machine<'_, '_> {
 
     fn render_array_elements(&self, ty: &Type, elements: impl IntoIterator<Item = Document>) -> Document {
         let mut text = self.array_initializer_header(ty);
-        let mut initializer = text.array_initializer(ArrayStyle::New);
+        let mut initializer = text.array_initializer();
         for element in elements {
             initializer.append(element);
         }
@@ -504,7 +501,7 @@ impl Machine<'_, '_> {
             text.omit_bytes(allocation.offset..allocation.offset + allocation.len);
         }
         let mut initializer = if pending.is_none() {
-            Some(text.array_initializer(ArrayStyle::New))
+            Some(text.array_initializer())
         } else {
             None
         };

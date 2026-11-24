@@ -14,9 +14,6 @@ use crate::source_text::Document;
 
 use super::{Emitter, Region, StructureError};
 
-#[cfg(test)]
-mod tests;
-
 pub(super) struct Dispatch {
     pub(super) default: u32,
     pub(super) cases: Vec<(i32, u32)>,

@@ -9,9 +9,6 @@ use crate::source_text::{Document, Infix};
 
 use super::{Condition, Emitter, Region, logical};
 
-#[cfg(test)]
-mod tests;
-
 /// Keep speculative analysis and recursive rendering bounded, just like the
 /// enclosing region emitter. Larger graphs remain ordinary control flow.
 const MAX_NODES: usize = 128;

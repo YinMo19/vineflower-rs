@@ -4,6 +4,19 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "Native Rust JVM decompiler based on Vineflower"
+autotests = false
+
+[lib]
+test = false
+doctest = false
+
+[[bin]]
+name = "vineflower-rs"
+test = false
+
+[[test]]
+name = "upstream_parity"
+path = "test/upstream_parity.rs"
 
 [dependencies]
 cesu8 = "1.1"

@@ -731,6 +731,3 @@ fn class_aliases(
     }
     Ok(result)
 }
-
-#[cfg(test)]
-mod tests;

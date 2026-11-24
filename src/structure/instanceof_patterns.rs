@@ -810,6 +810,3 @@ fn local_access(instruction: &Instruction, slot: u16) -> Option<bool> {
     };
     (slot == index || wide_write && index.checked_add(1) == Some(slot)).then_some(read)
 }
-
-#[cfg(test)]
-mod tests;

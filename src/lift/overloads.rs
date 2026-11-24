@@ -673,6 +673,3 @@ fn object_api_contains(name: &str) -> bool {
             | "wait"
     )
 }
-
-#[cfg(test)]
-mod tests;

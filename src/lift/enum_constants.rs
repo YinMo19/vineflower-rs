@@ -2,7 +2,10 @@
 
 use std::ops::Range;
 
-use crate::{bytecode::Instruction, descriptor::MethodDescriptor, source_text::Document};
+use crate::{
+    bytecode::Instruction, descriptor::MethodDescriptor, source_text::Document,
+    structure::enum_argument_switch,
+};
 
 use super::{Effect, LiftError, Machine};
 
@@ -21,21 +24,33 @@ impl Machine<'_, '_> {
     pub(crate) fn enum_constant_arguments(
         &mut self,
         instructions: &[Instruction],
+        constructor_offset: u32,
         user_arguments: &MethodDescriptor,
         map_offsets: bool,
     ) -> Result<Document, LiftError> {
         let mut spans = map_offsets.then(Vec::new);
-        for op in instructions {
+        let mut remaining = instructions;
+        while let Some((op, rest)) = remaining.split_first() {
             let shuffled = if map_offsets {
                 self.enum_shuffle_floor(op)?
             } else {
                 None
             };
-            if !matches!(self.step(op)?, Effect::None) || !self.prelude.is_empty() {
-                return Err(
-                    self.unsupported("enum constant arguments require expression-only evaluation")
-                );
-            }
+            remaining = if matches!(op.opcode, 0xaa | 0xab) {
+                let consumed =
+                    enum_argument_switch(self, remaining, constructor_offset, map_offsets)?
+                        .ok_or_else(|| {
+                            self.unsupported("enum constant switch has no independent value join")
+                        })?;
+                &remaining[consumed..]
+            } else {
+                if !matches!(self.step(op)?, Effect::None) || !self.prelude.is_empty() {
+                    return Err(self.unsupported(
+                        "enum constant arguments require expression-only evaluation",
+                    ));
+                }
+                rest
+            };
             if let Some(spans) = &mut spans {
                 let depth = self.stack.len();
                 let visible = self.instruction_has_source();

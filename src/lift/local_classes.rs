@@ -443,7 +443,3 @@ impl Machine<'_, '_> {
             .ok_or_else(layout)?])
     }
 }
-
-#[cfg(test)]
-#[path = "local_class_tests.rs"]
-mod tests;

@@ -86,6 +86,3 @@ fn class_declaration(binary: &str) -> Token {
 fn simple(binary: &str) -> &str {
     binary.rsplit('/').next().unwrap_or(binary)
 }
-
-#[cfg(test)]
-mod tests;

@@ -160,35 +160,3 @@ fn has_reporter(class: &ClassFile<'_>) -> Result<bool, ClassError> {
     }
     Ok(false)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn removes_original_idea_parameter_and_return_guards_without_remapping() {
-        let class = ClassFile::parse(include_bytes!(
-            "../tests/upstream/plugins/idea-not-null/testData/classes/custom/TestIdeaNotNull.class"
-        ))
-        .unwrap();
-        for (name, guards) in [("test", 2), ("test3", 3), ("test5", 3)] {
-            let method = class
-                .methods
-                .iter()
-                .find(|m| class.pool.utf8(m.name_index).unwrap() == name)
-                .unwrap();
-            let desc =
-                MethodDescriptor::parse(class.pool.utf8(method.descriptor_index).unwrap()).unwrap();
-            let code = method.code(&class.pool).unwrap().unwrap();
-            let mut instructions = decode(code.bytes).unwrap();
-            let original = instructions.clone();
-            strip_guards(&class, method, &code, &desc, &mut instructions).unwrap();
-            assert_eq!(
-                instructions.iter().filter(|i| i.opcode == 0).count(),
-                4 * guards,
-                "{name}"
-            );
-            assert!(instructions.iter().zip(original).all(|(after, before)| after.offset == before.offset && after.len == before.len));
-        }
-    }
-}

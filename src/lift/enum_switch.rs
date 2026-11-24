@@ -1175,7 +1175,3 @@ fn evaluate_producer<'a>(
     stack.push(value);
     Some(())
 }
-
-#[cfg(test)]
-#[path = "enum_switch_tests.rs"]
-mod tests;

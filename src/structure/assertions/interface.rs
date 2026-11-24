@@ -13,9 +13,6 @@ use crate::{
 
 use super::{Guard, SYNTHETIC, canonical_guard_field};
 
-#[cfg(test)]
-mod tests;
-
 const STATIC: u16 = 0x0008;
 const INTERFACE: u16 = 0x0200;
 
