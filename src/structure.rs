@@ -563,6 +563,11 @@ impl Emitter<'_> {
             for statement in prelude {
                 self.push(depth, statement, mem::take(&mut offsets));
             }
+            if instruction.len == 0 && matches!(effect, Effect::Return(None)) {
+                // No explicit bytecode return exists. A pure value discarded
+                // at the end cannot acquire a source location on the brace.
+                offsets.clear();
+            }
             match effect {
                 Effect::None => {}
                 Effect::Statement(statement) => {

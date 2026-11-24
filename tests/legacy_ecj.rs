@@ -33,9 +33,10 @@ fn opt_in_recovers_void_fallthrough_without_mapping_a_synthetic_return() {
     options.set("ignore-invalid-bytecode", "1").unwrap();
     options.include_line_mappings = true;
     let leaky = decompile(LEAKY, &options).unwrap();
-    let methods = leaky.map.unwrap().methods;
-    assert!(methods.iter().filter(|method| method.name == "testIllegal")
-        .all(|method| method.offsets.keys().all(|offset| *offset < 2)));
+    let map = leaky.map.unwrap();
+    assert_eq!(map.unmapped_lines.into_iter().collect::<Vec<_>>(), [23, 24]);
+    let methods = map.methods;
+    assert!(!methods.iter().any(|method| method.name == "testIllegal"));
     assert_eq!(methods.iter().find(|m| m.name == "test").unwrap().offsets.keys()
         .copied().collect::<Vec<_>>(), [0]);
 

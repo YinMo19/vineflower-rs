@@ -1378,13 +1378,14 @@ impl<'a, 'c> Writer<'a, 'c> {
             }
         }
         self.write_local_declarations(line_count, 0, false, &mut declarations)?;
+        let source_free = line_count == 0 && closing.as_ref().is_some_and(Vec::is_empty);
         if mapping && let Some(closing) = closing {
             for offset in closing {
                 offsets.entry(offset).or_insert(self.lines);
             }
         }
         self.line(1, "}");
-        if let Some(mapping) = &mut self.mapping {
+        if !source_free && let Some(mapping) = &mut self.mapping {
             let original = code.line_numbers(&self.class.pool)?;
             mapping.add(
                 MethodMap {
