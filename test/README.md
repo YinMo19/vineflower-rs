@@ -77,6 +77,7 @@ Exact upstream comparison with all fixture bytecode and required JDKs:
 | Labeled `finally`, array mappings, local classes, string switches, Scala bridges and Kotlin spread | 154 | 100 | 443 | 0 |
 | Shared loop headers and compound `finally`, Kotlin sealed class groups, short-circuit local joins | 154 | 98 | 445 | 0 |
 | Typed catch loop retries and enum switch arguments | 154 | 95 | 448 | 0 |
+| Nested switch exits, multi-entry loops, Groovy checked dispatch and Kotlin suspend closures | 154 | 93 | 450 | 0 |
 
 All eight upstream CLI and bulk cases match. The full test remains failing
 until all 697 comparisons match.

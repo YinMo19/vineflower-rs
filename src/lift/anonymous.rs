@@ -4,7 +4,7 @@ use std::{cell::RefCell, fmt::Write, rc::Rc};
 
 use crate::{
     bytecode::{self, Instruction, Operand},
-    classfile::ClassFile,
+    classfile::{ClassFile, Constant},
     context::NestedKind,
     descriptor::{ClassSignature, GenericType, MethodDescriptor, Type, TypeArgument},
     source_text::Document,
@@ -201,7 +201,8 @@ impl Machine<'_, '_> {
             fields: Vec::new(),
             enclosing_assigned: false,
         };
-        let prefix = captures.skip_stores(self, &instructions)?;
+        let checked = captures.checked_enclosing_prefix(&instructions)?;
+        let prefix = checked + captures.skip_stores(self, &instructions[checked..])?;
         let remaining = instructions.get(prefix..).ok_or_else(fail)?;
         let Some((receiver, remaining)) = remaining.split_first() else {
             return Err(fail());
@@ -397,6 +398,36 @@ struct ConstructorCaptures<'a, 'c> {
 }
 
 impl ConstructorCaptures<'_, '_> {
+    /// javac can omit the enclosing field but still check its mandated
+    /// constructor argument. The caller proved this argument is lexical `this`.
+    fn checked_enclosing_prefix(&self, instructions: &[Instruction]) -> Result<usize, LiftError> {
+        let Some(owner) = self.enclosing.filter(|_| self.class.major_version >= 69) else {
+            return Ok(0);
+        };
+        let Some(([load, duplicate, call, pop_result, pop_outer], _)) =
+            instructions.split_first_chunk::<5>()
+        else {
+            return Ok(0);
+        };
+        if !matches!(self.parameters.first(), Some(Type::Object(name)) if name == owner)
+            || loaded_parameter(load, self.parameters) != Some((0, 1))
+            || [duplicate.opcode, call.opcode, pop_result.opcode, pop_outer.opcode]
+                != [0x59, 0xb8, 0x57, 0x57]
+        {
+            return Ok(0);
+        }
+        let Operand::Constant(index) = call.operand else { return Ok(0); };
+        let pool = &self.class.pool;
+        Ok(if matches!(pool.get(index)?, Constant::Methodref { .. })
+            && pool.member_ref(index)?
+                == ("java/util/Objects", "requireNonNull", "(Ljava/lang/Object;)Ljava/lang/Object;")
+        {
+            5
+        } else {
+            0
+        })
+    }
+
     fn skip_stores(
         &mut self,
         machine: &Machine<'_, '_>,
