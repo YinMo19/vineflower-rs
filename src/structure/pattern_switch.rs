@@ -856,37 +856,14 @@ impl Emitter<'_> {
         {
             return Err(self.unstructured(block));
         }
-        self.emitted[block] = true;
         let start_line = self.lines.len();
-        let end = self.graph.blocks[block].instructions.end;
-        let super::Tail {
-            effect,
-            mut offsets,
-            ..
-        } = self.lift_range(block, start..end, &mut entry, region, depth, Vec::new())?;
-        let reaches = match effect {
-            Effect::None | Effect::Jump(_) => {
-                let next = self.single_successor(block)?;
-                self.region_with_offsets(next, region, &mut entry, depth, &mut offsets)?
-            }
-            Effect::Return(value) => {
-                let text = value.map_or_else(
-                    || Document::from("return;"),
-                    |value| super::surrounded(value, "return ", ";"),
-                );
-                self.push(depth, text, mem::take(&mut offsets));
-                false
-            }
-            Effect::Throw(value) => {
-                self.push(
-                    depth,
-                    super::surrounded(value, "throw ", ";"),
-                    mem::take(&mut offsets),
-                );
-                false
-            }
-            _ => return Err(self.unstructured(block)),
-        };
+        let mut offsets = Vec::new();
+        // The pattern has already bound the local. Run the rest of this
+        // block through the ordinary region emitter: the first statement
+        // of a case can be a branch, nested switch or abrupt transfer.
+        let reaches = self.run_region(
+            block, region, &mut entry, depth, &mut offsets, false, Some(start),
+        )?;
         Ok(super::Arm {
             exit: reaches.then_some(entry),
             offsets,
