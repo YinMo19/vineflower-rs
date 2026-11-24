@@ -167,6 +167,25 @@ impl Emitter<'_> {
     }
 }
 
+pub(super) fn exclusive_return_edge(
+    graph: &ControlFlowGraph,
+    instructions: &[Instruction],
+    source: usize,
+) -> Option<(u32, Range<u32>)> {
+    let block = &graph.blocks[source];
+    let [target] = block.successors.as_slice() else { return None };
+    let target = &graph.blocks[*target];
+    if target.predecessors != [source] || !target.exception_predecessors.is_empty()
+        || target.exception_successors != block.exception_successors
+    {
+        return None;
+    }
+    let jump = &instructions[block.instructions.end - 1];
+    let ret = &instructions[target.instructions.end - 1];
+    (is_jump(jump) && matches!(ret.opcode, 0xac..=0xb0))
+        .then_some((jump.offset, ret.offset..ret.offset + ret.len))
+}
+
 struct Matcher<'m, 'c> {
     instructions: &'m [Instruction],
     graph: &'m ControlFlowGraph,

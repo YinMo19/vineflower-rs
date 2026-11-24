@@ -11,15 +11,24 @@ pub(super) struct Arm {
     first_key: Option<i32>,
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum Keys {
+    DenseIntegers,
+    SparseIntegers,
+    Projected,
+}
+
 pub(super) fn order(
     groups: BTreeMap<usize, Vec<CaseLabel>>,
     cases: &[(i32, u32)],
     default: u32,
-    dense: bool,
+    keys: Keys,
     offset: impl Fn(usize) -> u32,
     layout: &Layout,
     join: Option<usize>,
 ) -> Vec<Arm> {
+    let dense = matches!(keys, Keys::DenseIntegers);
+    let projected = matches!(keys, Keys::Projected);
     let mut groups = groups.into_iter().peekable();
     let mut arms = Vec::with_capacity(groups.len());
     while let Some((target, labels)) = groups.next() {
@@ -46,7 +55,7 @@ pub(super) fn order(
     }).flatten();
     for &(key, target) in cases {
         let alias = target == default;
-        if alias
+        if alias && !projected
             && (!dense
                 || !((0..=127).contains(&key)
                     || span.as_ref().is_some_and(|span| span.contains(&key))))
@@ -58,7 +67,7 @@ pub(super) fn order(
             .expect("every dispatch target has a case group");
         let arm = &mut arms[index];
         arm.first_key.get_or_insert(key);
-        if alias {
+        if alias && !projected {
             arm.labels.push(CaseLabel {
                 text: key.to_string().into(),
                 offsets: Vec::new(),

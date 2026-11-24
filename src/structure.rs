@@ -1473,13 +1473,17 @@ impl Emitter<'_> {
         );
         let mut arms = Vec::new();
         let scoped_arms = machine.switch_requires_case_scopes();
-        let mut ordered = numeric
+        let mut ordered = (numeric || dispatch.is_some())
             .then(|| {
                 numeric_switch::order(
                     mem::take(&mut groups),
                     cases,
                     default_offset,
-                    instruction.opcode == 0xaa,
+                    match (dispatch.is_some(), instruction.opcode) {
+                        (true, _) => numeric_switch::Keys::Projected,
+                        (false, 0xaa) => numeric_switch::Keys::DenseIntegers,
+                        _ => numeric_switch::Keys::SparseIntegers,
+                    },
                     |target| self.offset(target),
                     &self.layout,
                     join,
@@ -1528,6 +1532,17 @@ impl Emitter<'_> {
                 self.syntax(depth + 1, if scoped_arms { "default: {" } else { "default:" });
             }
             let arm = self.branch_arm(target, arm_region, machine, depth + 2)?;
+            if dispatch.is_some() && last && join.is_none() && target == default && arm.exit.is_none()
+                && let Some((jump, ret)) = string_switch::exclusive_return_edge(self.graph, instructions, target)
+                && let Some(line) = self.lines.get_mut(arm.start..arm.end).and_then(|lines| lines.last_mut())
+                && line.text.starts_with("return ") && line.offsets.contains(&ret.start)
+            {
+                // The exclusive post-switch return is now inside this arm.
+                // Its value retains its origin; the source break owns the
+                // old jump site on that same return line.
+                line.offsets.push(jump);
+                line.text.omit_bytes(ret);
+            }
             if let Some(end) = &arm.exit {
                 if let Some(next) = fallthrough {
                     let mut offsets = arm.offsets;
