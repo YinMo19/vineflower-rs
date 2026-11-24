@@ -67,6 +67,14 @@ fn ordinary_typed_compound_stores_use_one_lvalue_access() {
 }
 
 #[test]
+fn a_duplicate_store_is_redundant_only_for_the_loaded_binding() {
+    let same = lift(&[0x1a, 0x59, 0x3b, 0x1a, 0x60, 0xac], "(II)I", true);
+    assert_eq!(texts(&same), ["return var0 + var0;"]);
+    let other = lift(&[0x1a, 0x59, 0x3c, 0x1b, 0x60, 0xac], "(II)I", true);
+    assert_eq!(texts(&other), ["return (var1 = var0) + var1;"]);
+}
+
+#[test]
 fn terminal_update_is_the_return_value_only_for_the_exact_reloaded_slot() {
     let lines = lift(&[0x1a, 0x1b, 0x60, 0x3b, 0x1a, 0xac], "(II)I", true);
     assert_eq!(texts(&lines), ["return var0 + var1;"]);

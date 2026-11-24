@@ -342,6 +342,19 @@ impl Machine<'_, '_> {
                 declaration: None,
             }));
         }
+        if let Candidate { target: Target::Local(target), form: Form::Assign, leaves_value: true, declaration: false, store, .. } = candidate
+            && let Some(value) = self.stack.last_mut()
+            && target.matches(value)
+            && matches!(self.opcode, 0x15..=0x2d)
+            && value.order.is_some_and(|order| order.first == self.offset && order.last == self.offset)
+        {
+            // An immediate load/dup/store to the same active binding
+            // leaves the input value and does not change any local state.
+            value.text.omit_bytes(first.offset..store.offset + store.len);
+            self.offset = store.offset;
+            self.opcode = store.opcode;
+            return Ok(Some(AssignmentStep { consumed, effect: Effect::None, declaration: None }));
+        }
         let Candidate { store, target, form, order, operands, leaves_value, declaration } = candidate;
         let mut right = self.pop_raw()?;
         let left = if operands >= 2 { Some(self.pop_raw()?) } else { None };
