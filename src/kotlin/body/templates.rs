@@ -216,7 +216,7 @@ pub(super) fn class_literal<'a>(
     let pool = &bytecode.class.pool;
     // Only use an unqualified class literal when a local/property or generic
     // parameter cannot shadow it.
-    if owner != bytecode.owner || name.contains('$') || !scoped.is_empty() || locals.extension.is_some()
+    if owner != bytecode.owner || name.contains('$') || !scoped.is_empty() || locals.has_extension_receiver()
         || locals.templates.properties.iter().any(|property| property.name == name)
         || find_attribute(&bytecode.class.attributes, pool, "Signature")?.is_some()
         || find_attribute(&method.attributes, pool, "Signature")?.is_some()
@@ -237,7 +237,7 @@ fn this_property<'a>(
     let Some((owner, name, descriptor)) = bytecode.reference(instruction, 0xb4)? else {
         return Err(invalid());
     };
-    if owner != bytecode.owner || !matches!(stack.last(), Some(StackValue::This)) || locals.extension.is_some() {
+    if owner != bytecode.owner || !matches!(stack.last(), Some(StackValue::This)) || locals.has_extension_receiver() {
         return Err(invalid());
     }
     let ty = JvmType::parse(descriptor)?;
@@ -415,6 +415,8 @@ fn actual<'a>(expr: &'a Expr<'_>, locals: &'a Locals<'_>) -> Shape<'a> {
         ExprKind::ExtensionReceiver(super::extensions::Receiver::Primitive(primitive)) => Shape::Primitive(*primitive),
         ExprKind::ExtensionReceiver(super::extensions::Receiver::Reference(receiver)) => shape(&receiver.jvm),
         ExprKind::BoundGetter(read) => shape(&read.value().jvm),
+        ExprKind::Local(local) => shape(&local.value.jvm),
+        ExprKind::Invocation(call) => shape(&call.result().jvm),
         ExprKind::Literal(Literal::Int(value)) => Shape::IntConstant(*value),
         ExprKind::Literal(Literal::Long(_)) => Shape::Primitive(Primitive::Long),
         ExprKind::Literal(Literal::Float(_)) => Shape::Primitive(Primitive::Float),
@@ -477,7 +479,10 @@ pub(super) fn elided_trace(
     instruction: &Instruction,
     next: Option<&Instruction>,
 ) -> Result<bool, KotlinError> {
-    if matches!(instruction.opcode, 0xbb | 0x59)
+    let builder_allocation = instruction.opcode == 0xbb
+        && matches!(instruction.operand, Operand::Constant(index)
+            if bytecode.class.pool.class_name(index)? == BUILDER);
+    if builder_allocation || instruction.opcode == 0x59
         || builder_call(bytecode, instruction, 0xb7)? == Some(("<init>", "()V"))
         || matches!(builder_call(bytecode, instruction, 0xb6)?, Some(("append", _)))
     {

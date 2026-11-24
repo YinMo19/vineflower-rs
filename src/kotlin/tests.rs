@@ -58,6 +58,14 @@ const EXTENSIONS: [&str; 3] = [
     include_str!("fixtures/Extensions$Point.class.hex"),
     include_str!("fixtures/ExtensionsKt.class.hex"),
 ];
+const CLASS_DECLARATIONS: [&str; 5] = [
+    include_str!("fixtures/TestClassDec.class.hex"),
+    include_str!("fixtures/TestClassDec$EmptyDec.class.hex"),
+    include_str!("fixtures/TestClassDec$Vec2iVal.class.hex"),
+    include_str!("fixtures/TestClassDec$Vec2iVar.class.hex"),
+    include_str!("fixtures/TestClassDec$Vec2i.class.hex"),
+];
+const PARAMETERS: &str = include_str!("fixtures/TestParams.class.hex");
 
 pub(super) fn bytes(hex: &str) -> Vec<u8> {
     assert!(hex.lines().all(|line| line.len() % 2 == 0));
@@ -68,6 +76,122 @@ pub(super) fn bytes(hex: &str) -> Vec<u8> {
             })
         })
         .collect()
+}
+
+#[test]
+fn recovers_original_kotlin_allocations_locals_and_member_extension_calls() {
+    let classes = CLASS_DECLARATIONS.map(bytes);
+    let group = crate::ClassGroup::new(classes.iter().map(Vec::as_slice)).unwrap();
+    let options = crate::Options {
+        decompile_kotlin: true,
+        include_line_mappings: true,
+        ..crate::Options::default()
+    };
+    let source = group.decompile("pkg/TestClassDec", &options).unwrap();
+    let test_lines = [
+        "      val a = pkg.TestClassDec.EmptyDec()",
+        "      val vec = pkg.TestClassDec.Vec2iVal(1, 2)",
+        "      val vec1 = pkg.TestClassDec.Vec2iVal(2, 4)",
+        "      kotlin.io.println(vec.x)",
+        "      kotlin.io.println(vec.dot(vec1))",
+    ];
+    for fragment in [
+        "fun pkg.TestClassDec.Vec2iVal.dot(v: pkg.TestClassDec.Vec2iVal): Int",
+        "return this.x * v.x + this.y * v.y",
+        "class EmptyDec",
+        "class Vec2iVal(public val x: Int, public val y: Int)",
+        "class Vec2iVar(public var x: Int, public var y: Int)",
+        "class Vec2i(x: Int, y: Int)",
+    ] {
+        assert!(source.text.contains(fragment), "missing {fragment:?} in {}", source.text);
+    }
+    let map = source.map.unwrap();
+    let method = map.methods.iter().find(|method| method.name == "test").unwrap();
+    for ((offset, original_line), expected) in [(0, 15), (8, 16), (18, 17), (28, 19), (42, 20)]
+        .into_iter()
+        .zip(test_lines)
+    {
+        let index = method.offsets[&offset];
+        assert_eq!(map.original_lines[&original_line], index + 1);
+        assert_eq!(source.text.lines().nth(index), Some(expected));
+    }
+    assert!(!method.offsets.contains_key(&3), "allocation dup should not be mapped");
+}
+
+#[test]
+fn checks_kotlin_constructor_sequences_local_lifetimes_and_call_types() {
+    let classes = CLASS_DECLARATIONS.map(bytes);
+    let options = crate::Options { decompile_kotlin: true, ..crate::Options::default() };
+    for (offset, from, to, feature) in [
+        (3, 0x59, 0x00, "unproven Kotlin invocation"),
+        (17, 0x4d, 0x4c, "unsupported Kotlin statement bytecode"),
+        (28, 0x2c, 0x2b, "bytecode outside the supported expression subset"),
+        (44, 0x2d, 0x2b, "unproven Kotlin invocation"),
+    ] {
+        let mut host = classes[0].clone();
+        replace_function_opcode(&mut host, "test", offset, from, to);
+        let group = crate::ClassGroup::new(std::iter::once(host.as_slice())
+            .chain(classes[1..].iter().map(Vec::as_slice))).unwrap();
+        assert!(matches!(
+            group.decompile("pkg/TestClassDec", &options),
+            Err(crate::DecompileError::Kotlin(KotlinError::Unsupported { declaration, feature: actual }))
+                if declaration == "test" && actual == feature
+        ));
+    }
+
+    let mut host = classes[0].clone();
+    let length = {
+        let class = ClassFile::parse(&host).unwrap();
+        let function = class.methods.iter().find(|method| class.pool.utf8(method.name_index).unwrap() == "test").unwrap();
+        let code = function.code(&class.pool).unwrap().unwrap();
+        let entries = code.local_variables(&class.pool).unwrap();
+        let row = entries.iter().position(|local| local.name == "vec").unwrap();
+        let table = crate::classfile::find_attribute(&code.attributes, &class.pool, "LocalVariableTable")
+            .unwrap().unwrap();
+        let length = 2 + row * 10 + 2;
+        assert_eq!(&table[length..length + 2], &entries[row].length.to_be_bytes());
+        table.as_ptr() as usize - host.as_ptr() as usize + length
+    };
+    // End vec's lifetime at the first aload_2 instead of after its uses.
+    host[length..length + 2].copy_from_slice(&10u16.to_be_bytes());
+    let group = crate::ClassGroup::new(std::iter::once(host.as_slice())
+        .chain(classes[1..].iter().map(Vec::as_slice))).unwrap();
+    assert!(matches!(
+        group.decompile("pkg/TestClassDec", &options),
+        Err(crate::DecompileError::Kotlin(KotlinError::Unsupported {
+            declaration, feature: "load of non-parameter local",
+        })) if declaration == "test"
+    ));
+}
+
+#[test]
+fn recovers_original_kotlin_member_calls_with_default_arguments() {
+    let source = render(PARAMETERS);
+    for fragment in [
+        "fun printMessageWithPrefix(message: String, prefix: String = \"Info\")",
+        "this.printMessageWithPrefix(\"Test\")",
+        "this.printMessageWithPrefix(\"Test\", \"Debug\")",
+    ] {
+        assert!(source.contains(fragment), "missing {fragment:?} in {source}");
+    }
+    let mut input = bytes(PARAMETERS);
+    replace_function_opcode(&mut input, "callPrintMessage", 4, 0x05, 0x04);
+    assert!(matches!(
+        decompile_class(&ClassFile::parse(&input).unwrap()),
+        Err(KotlinError::Unsupported { declaration, feature: "unproven Kotlin invocation" })
+            if declaration == "callPrintMessage"
+    ));
+}
+
+fn replace_function_opcode(data: &mut [u8], name: &str, offset: usize, from: u8, to: u8) {
+    let index = {
+        let class = ClassFile::parse(data).unwrap();
+        let function = class.methods.iter().find(|method| class.pool.utf8(method.name_index).unwrap() == name).unwrap();
+        let code = function.code(&class.pool).unwrap().unwrap();
+        assert_eq!(code.bytes[offset], from);
+        code.bytes.as_ptr() as usize - data.as_ptr() as usize + offset
+    };
+    data[index] = to;
 }
 
 #[test]

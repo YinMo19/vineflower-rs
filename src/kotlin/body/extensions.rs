@@ -4,17 +4,17 @@
 //! emit a property read when Kotlin metadata and the invoked JVM member agree.
 
 use std::{
-    cell::{OnceCell, RefCell},
+    cell::{OnceCell, Ref, RefCell},
     collections::HashMap,
     rc::Rc,
 };
 
 use crate::{
-    classfile::ExceptionHandler,
+    classfile::{ClassFile, ExceptionHandler},
     context::ClassGroup,
     kotlin::{
-        ClassKind, Classifier, Declaration, Function, MemberKind, TypeArgument, Variance,
-        Visibility, names::default_descriptor, read_metadata,
+        ClassDeclaration, ClassKind, Classifier, Declaration, Function, MemberKind, PackageDeclaration,
+        TypeArgument, Variance, Visibility, names::default_descriptor, read_metadata,
     },
 };
 
@@ -26,7 +26,7 @@ use super::{
 
 #[derive(Debug)]
 pub(super) struct Value {
-    ty: Type,
+    pub(super) ty: Type,
     pub(super) jvm: JvmType,
 }
 
@@ -74,21 +74,21 @@ impl Receiver {
     }
 }
 
-#[derive(Default)]
-struct Links {
-    owners: HashMap<String, Vec<Property>>,
-    sites: HashMap<u16, Rc<Getter>>,
-}
-
-pub(in crate::kotlin) struct Context<'a> {
+struct Parameter<'a> {
     slot: u16,
     ty: &'a Type,
     jvm: &'a JvmType,
-    parameters: &'a [ValueParameter],
     assertions: bool,
-    receiver: OnceCell<Rc<Value>>,
-    group: Option<&'a ClassGroup<'a>>,
-    links: RefCell<Links>,
+    value: OnceCell<Rc<Value>>,
+}
+
+pub(in crate::kotlin) struct Context<'a> {
+    receiver: Option<Parameter<'a>>,
+    pub(super) parameters: &'a [ValueParameter],
+    pub(super) members: &'a PackageDeclaration,
+    pub(super) group: Option<&'a ClassGroup<'a>>,
+    owners: RefCell<HashMap<String, ClassDeclaration>>,
+    getters: RefCell<HashMap<u16, Rc<Getter>>>,
 }
 
 impl<'a> Context<'a> {
@@ -96,8 +96,24 @@ impl<'a> Context<'a> {
         function: &'a Function,
         signature: &'a JvmMethodSignature,
         member: &Member<'_>,
+        members: &'a PackageDeclaration,
         group: Option<&'a ClassGroup<'a>>,
-    ) -> Result<Option<Self>, KotlinError> {
+    ) -> Result<Self, KotlinError> {
+        Ok(Self {
+            receiver: Self::parameter(function, signature, member)?,
+            parameters: &function.parameters,
+            members,
+            group,
+            owners: RefCell::default(),
+            getters: RefCell::default(),
+        })
+    }
+
+    fn parameter(
+        function: &'a Function,
+        signature: &'a JvmMethodSignature,
+        member: &Member<'_>,
+    ) -> Result<Option<Parameter<'a>>, KotlinError> {
         let Some(ty) = &function.receiver else { return Ok(None); };
         let descriptor = &signature.descriptor;
         let Some((jvm, parameters)) = descriptor.parameters.split_first() else {
@@ -120,28 +136,46 @@ impl<'a> Context<'a> {
         {
             return Err(invalid(&function.name));
         }
-        Ok(Some(Self {
+        Ok(Some(Parameter {
             slot: u16::from(member.access_flags & STATIC == 0),
             ty,
             jvm,
-            parameters: &function.parameters,
             assertions: access != 0x0002,
-            receiver: OnceCell::new(),
-            group,
-            links: RefCell::new(Links::default()),
+            value: OnceCell::new(),
         }))
     }
 
+    pub(super) fn has_receiver(&self) -> bool {
+        self.receiver.is_some()
+    }
+
+    pub(super) fn owner(
+        &self,
+        class: &ClassFile<'_>,
+        owner: &str,
+    ) -> Result<Option<Ref<'_, ClassDeclaration>>, KotlinError> {
+        if !self.owners.borrow().contains_key(owner) {
+            let Some(metadata) = read_metadata(class)? else { return Ok(None); };
+            let Declaration::Class(declaration) = metadata.declaration else { return Ok(None); };
+            if declaration.name.local || !same_class(&declaration.name.id, owner) {
+                return Ok(None);
+            }
+            self.owners.borrow_mut().insert(owner.to_owned(), declaration);
+        }
+        Ok(Some(Ref::map(self.owners.borrow(), |owners| &owners[owner])))
+    }
+
     pub(super) fn slots(&self) -> u16 {
-        self.jvm.slots()
+        self.receiver.as_ref().map_or(0, |receiver| receiver.jvm.slots())
     }
 
     pub(super) fn load<'b>(&self, opcode: u8, slot: u16) -> Option<ExprKind<'b>> {
-        (slot == self.slot && opcode == load_opcode(self.jvm)).then(|| {
-            ExprKind::ExtensionReceiver(match self.jvm {
+        let receiver = self.receiver.as_ref()?;
+        (slot == receiver.slot && opcode == load_opcode(receiver.jvm)).then(|| {
+            ExprKind::ExtensionReceiver(match receiver.jvm {
                 JvmType::Primitive(primitive) => Receiver::Primitive(*primitive),
-                _ => Receiver::Reference(Rc::clone(self.receiver.get_or_init(|| {
-                    Rc::new(Value { ty: self.ty.clone(), jvm: self.jvm.clone() })
+                _ => Receiver::Reference(Rc::clone(receiver.value.get_or_init(|| {
+                    Rc::new(Value { ty: receiver.ty.clone(), jvm: receiver.jvm.clone() })
                 }))),
             })
         })
@@ -159,9 +193,9 @@ impl<'a> Context<'a> {
         // Require their exact labels and order; do not drop equivalent-looking
         // assertions that throw differently, or invent guards on unchecked input.
         let original = instructions;
-        if self.assertions {
-            if !self.ty.nullable && load_opcode(self.jvm) == 0x19 {
-                instructions = assertion(bytecode, instructions, self.slot, "<this>", declaration)?;
+        if let Some(receiver) = &self.receiver && receiver.assertions {
+            if !receiver.ty.nullable && load_opcode(receiver.jvm) == 0x19 {
+                instructions = assertion(bytecode, instructions, receiver.slot, "<this>", declaration)?;
             }
             for ((slot, jvm), parameter) in locals.slots.iter().zip(self.parameters) {
                 if !parameter.ty.nullable && load_opcode(jvm) == 0x19 {
@@ -201,15 +235,13 @@ impl<'a> Context<'a> {
             (0xb9, Operand::InvokeInterface { index, count: 1 }) => (*index, true),
             _ => return Ok(None),
         };
-        let (subject, subject_jvm) = match stack.last() {
-            Some(StackValue::Value(Expr { kind: ExprKind::ExtensionReceiver(Receiver::Reference(receiver)), .. }))
-                if !receiver.ty.nullable => (Subject::Receiver, &receiver.jvm),
-            Some(StackValue::Value(Expr { kind: ExprKind::Parameter { index, .. }, .. }))
-                if !self.parameters[*index].ty.nullable =>
-                    (Subject::Parameter(*index), locals.slots[*index].1),
-            _ => return Ok(None),
+        let Some(StackValue::Value(subject)) = stack.last() else { return Ok(None); };
+        let Some((ty, jvm @ JvmType::Object(subject_jvm))) = subject.source_type(locals) else {
+            return Ok(None);
         };
-        let JvmType::Object(subject_jvm) = subject_jvm else { return Ok(None); };
+        if ty.nullable || !exact_type(ty, jvm, false) {
+            return Ok(None);
+        }
         let pool = &bytecode.class.pool;
         if !matches!((pool.get(index)?, interface),
             (Constant::Methodref { .. }, false) | (Constant::InterfaceMethodref { .. }, true))
@@ -220,40 +252,42 @@ impl<'a> Context<'a> {
         if owner != subject_jvm || !raw.starts_with("()") {
             return Ok(None);
         }
-        let mut links = self.links.borrow_mut();
-        let linked = if let Some(getter) = links.sites.get(&index) {
+        let mut getters = self.getters.borrow_mut();
+        let linked = if let Some(getter) = getters.get(&index) {
             Rc::clone(getter)
         } else {
             let descriptor = MethodDescriptor::parse(raw)?;
+            let sibling_metadata;
             let getter = if owner == bytecode.owner {
                 prove_getter(bytecode, interface, locals.templates.properties, name, &descriptor, raw)?
             } else {
                 let Some(class) = self.group.and_then(|group| group.get(owner)) else {
                     return Ok(None);
                 };
-                if !links.owners.contains_key(owner) {
-                    let Some(metadata) = read_metadata(class)? else { return Ok(None); };
-                    let Declaration::Class(declaration) = metadata.declaration else { return Ok(None); };
-                    if declaration.name.local || !same_class(&declaration.name.id, owner)
-                        || (declaration.kind == ClassKind::Interface) != interface
-                    {
-                        return Ok(None);
-                    }
-                    links.owners.insert(owner.to_owned(), declaration.members.properties);
+                let Some(metadata) = self.owner(class, owner)? else { return Ok(None); };
+                sibling_metadata = metadata;
+                if (sibling_metadata.kind == ClassKind::Interface) != interface {
+                    return Ok(None);
                 }
                 let target = Bytecode { class, owner };
-                prove_getter(&target, interface, &links.owners[owner], name, &descriptor, raw)?
+                prove_getter(&target, interface, &sibling_metadata.members.properties, name, &descriptor, raw)?
             };
             let Some(property) = getter else { return Ok(None); };
             let getter = Rc::new(Getter {
                 name: property.name.clone(),
                 value: Value { ty: property.ty.clone(), jvm: descriptor.return_type },
             });
-            links.sites.insert(index, Rc::clone(&getter));
+            getters.insert(index, Rc::clone(&getter));
             getter
         };
-        stack.pop();
-        Ok(Some(Expr::new(ExprKind::BoundGetter(Read { subject, getter: linked }), 2, declaration)?))
+        let expr = super::pop_value(stack, declaration)?;
+        let depth = expr.depth + 1;
+        let subject = match expr.kind {
+            ExprKind::ExtensionReceiver(_) => Subject::Receiver,
+            ExprKind::Parameter { index, .. } => Subject::Parameter(index),
+            _ => Subject::Expression(Box::new(expr)),
+        };
+        Ok(Some(Expr::new(ExprKind::BoundGetter(Read { subject, getter: linked }), depth, declaration)?))
     }
 }
 
@@ -325,9 +359,10 @@ fn prove_getter<'a>(
 }
 
 #[derive(Debug)]
-enum Subject {
+enum Subject<'a> {
     Receiver,
     Parameter(usize),
+    Expression(Box<Expr<'a>>),
 }
 
 #[derive(Debug)]
@@ -337,12 +372,12 @@ struct Getter {
 }
 
 #[derive(Debug)]
-pub(super) struct Read {
-    subject: Subject,
+pub(super) struct Read<'a> {
+    subject: Subject<'a>,
     getter: Rc<Getter>,
 }
 
-impl Read {
+impl Read<'_> {
     pub(super) fn value(&self) -> &Value {
         &self.getter.value
     }
@@ -353,9 +388,10 @@ impl Read {
         parameters: &[ValueParameter],
         declaration: &str,
     ) -> Result<(), KotlinError> {
-        match self.subject {
+        match &self.subject {
             Subject::Receiver => out.push_str("this"),
-            Subject::Parameter(index) => identifier(out, &parameters[index].name, declaration)?,
+            Subject::Parameter(index) => identifier(out, &parameters[*index].name, declaration)?,
+            Subject::Expression(expr) => expr.write_at(out, Expected::Reference, parameters, declaration, u8::MAX)?,
         }
         out.push('.');
         identifier(out, &self.getter.name, declaration)
@@ -371,7 +407,7 @@ fn same_class(id: &str, owner: &str) -> bool {
         && id.bytes().map(|byte| if byte == b'.' { b'$' } else { byte }).eq(owner.bytes())
 }
 
-fn exact_type(ty: &Type, jvm: &JvmType, boxed: bool) -> bool {
+pub(super) fn exact_type(ty: &Type, jvm: &JvmType, boxed: bool) -> bool {
     let Classifier::Class(name) = &ty.classifier else { return false; };
     if name.local || ty.raw || ty.flexible.is_some() || ty.suspend {
         return false;

@@ -20,6 +20,7 @@ mod control;
 mod decisions;
 mod defaults;
 mod extensions;
+mod invocations;
 mod logic;
 mod loops;
 mod statements;
@@ -77,7 +78,9 @@ enum ExprKind<'a> {
         load: u8,
     },
     ExtensionReceiver(extensions::Receiver),
-    BoundGetter(extensions::Read),
+    Local(std::rc::Rc<statements::Binding<'a>>),
+    Invocation(Box<invocations::Call<'a>>),
+    BoundGetter(extensions::Read<'a>),
     LoopLocal(loops::Binding<'a>),
     CatchLocal(try_regions::Binding<'a>),
     CatchMessage(try_regions::Binding<'a>),
@@ -183,7 +186,7 @@ impl<'a> Locals<'a> {
         extension: Option<Extension<'a>>,
         declaration: &str,
     ) -> Result<Self, KotlinError> {
-        let receiver = usize::from(extension.is_some());
+        let receiver = usize::from(extension.as_ref().is_some_and(Extension::has_receiver));
         if descriptor.parameters.len() != parameters.len() + receiver {
             return Err(KotlinError::unsupported(
                 declaration,
@@ -223,6 +226,10 @@ impl<'a> Locals<'a> {
         })
     }
 
+    fn has_extension_receiver(&self) -> bool {
+        self.extension.as_ref().is_some_and(Extension::has_receiver)
+    }
+
     fn parameter(&self, slot: u16, expected: u8) -> Option<usize> {
         if let Some((alias, load, parameter)) = self.alias
             && slot == alias
@@ -253,6 +260,8 @@ fn subject_alias(instructions: &[Instruction], locals: &Locals<'_>) -> Option<(u
 enum StackValue<'a> {
     This,
     Value(Expr<'a>),
+    Allocation(invocations::Allocation<'a>),
+    UnitCall(Box<invocations::Call<'a>>),
     PrintStream,
     StringBuilder(templates::Builder<'a>),
     /// The two Long operands remain immediately below this stack marker.
@@ -360,7 +369,9 @@ impl<'a, 'data> Bytecode<'a, 'data> {
         locals.templates.properties = properties;
         let code = self.function_code(member, declaration)?;
         let decoded = bytecode::decode(code.bytes)?;
-        let instructions = if let Some(extension) = &locals.extension {
+        let instructions = if let Some(extension) = &locals.extension
+            && extension.has_receiver()
+        {
             extension.parameter_checks(self, &decoded, &locals, &code.exceptions, declaration)?
         } else {
             self.parameter_checks(&decoded, &locals, parameters)?
@@ -446,8 +457,7 @@ impl<'a, 'data> Bytecode<'a, 'data> {
             ));
         }
         if ret.opcode == 0xb1 {
-            let start = decoded.len() - instructions.len();
-            let statements = statements::lower(self, &decoded, start, &locals, declaration)?;
+            let statements = statements::lower(self, &decoded, start, &code, &locals, declaration)?;
             if statements.is_empty() {
                 return Ok(Body::Empty);
             }
@@ -830,6 +840,11 @@ impl<'a> Bytecode<'a, '_> {
             stack.push(StackValue::Value(expr));
             return Ok(());
         }
+        if let Some(context) = &locals.extension
+            && invocations::lower(self, instruction, context, locals, stack, declaration)?
+        {
+            return Ok(());
+        }
         if instruction.opcode == 0x00 {
             return Ok(());
         }
@@ -1133,6 +1148,7 @@ impl<'a> Expr<'a> {
             ExprKind::Literal(_) | ExprKind::Parameter { .. } | ExprKind::ExtensionReceiver(_)
             | ExprKind::LoopLocal(_) | ExprKind::CatchLocal(_) | ExprKind::ThisProperty { .. }
             | ExprKind::ClassLiteral(_) => true,
+            ExprKind::Local(_) => true,
             ExprKind::Template(template) => template.infallible(),
             ExprKind::Binary(operator, _, pair) => {
                 !matches!(operator, Operator::Divide | Operator::Remainder)
@@ -1158,6 +1174,8 @@ impl<'a> Expr<'a> {
             ExprKind::ExtensionReceiver(receiver) => Some(receiver.load_opcode()),
             ExprKind::BoundGetter(read) => Some(load_opcode(&read.value().jvm)),
             ExprKind::LoopLocal(local) => Some(local.element.load()),
+            ExprKind::Local(local) => Some(load_opcode(&local.value.jvm)),
+            ExprKind::Invocation(call) => Some(load_opcode(&call.result().jvm)),
             ExprKind::BoxedInt(_) => Some(0x19),
             ExprKind::Template(_) | ExprKind::ClassLiteral(_) => Some(0x19),
             ExprKind::ThisProperty { primitive, .. } => Some(load_opcode(&JvmType::Primitive(*primitive))),
@@ -1166,11 +1184,27 @@ impl<'a> Expr<'a> {
         }
     }
 
+    fn source_type<'b>(&'b self, locals: &'b Locals<'_>) -> Option<(&'b Type, &'b JvmType)> {
+        let value: &extensions::Value = match &self.kind {
+            ExprKind::Parameter { index, .. } => {
+                return Some((&locals.extension.as_ref()?.parameters[*index].ty, locals.slots[*index].1));
+            }
+            ExprKind::ExtensionReceiver(extensions::Receiver::Reference(value)) => value,
+            ExprKind::BoundGetter(read) => read.value(),
+            ExprKind::Local(local) => &local.value,
+            ExprKind::Invocation(call) => call.result(),
+            _ => return None,
+        };
+        Some((&value.ty, &value.jvm))
+    }
+
     fn primitive_hint(&self, parameters: &[ValueParameter]) -> Option<Primitive> {
         match &self.kind {
             ExprKind::Parameter { index, .. } => logic::primitive_type(&parameters[*index].ty),
             ExprKind::ExtensionReceiver(receiver) => receiver.primitive(),
             ExprKind::BoundGetter(read) => read.value().primitive(),
+            ExprKind::Local(local) => local.value.primitive(),
+            ExprKind::Invocation(call) => call.result().primitive(),
             ExprKind::LoopLocal(local) => local.element.primitive(),
             ExprKind::Literal(Literal::Long(_)) => Some(Primitive::Long),
             ExprKind::Literal(Literal::Float(_)) => Some(Primitive::Float),
@@ -1249,6 +1283,18 @@ impl<'a> Expr<'a> {
                     return Err(mismatch());
                 }
                 out.push_str("this");
+            }
+            ExprKind::Local(local) => {
+                if !local.value.accepts(expected) {
+                    return Err(mismatch());
+                }
+                identifier(out, local.name, declaration)?;
+            }
+            ExprKind::Invocation(call) => {
+                if !call.result().accepts(expected) {
+                    return Err(mismatch());
+                }
+                call.write(out, parameters, declaration)?;
             }
             ExprKind::BoundGetter(read) => {
                 if !read.value().accepts(expected) {
