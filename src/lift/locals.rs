@@ -888,6 +888,19 @@ impl<'c> Machine<'_, 'c> {
         (ty == value.ty).then_some(!same)
     }
 
+    pub(super) fn pattern_store_type(
+        &self, store: &Instruction, index: u16,
+    ) -> Result<Option<Type>, LiftError> {
+        let end = self.debug_offset(store.offset + store.len - 1) + 1;
+        let Some(debug) = self.store_debug(store, index) else {
+            return Ok(None);
+        };
+        if u32::from(debug.start_pc) != end {
+            return Err(self.unsupported("pattern store does not start a fresh debug binding"));
+        }
+        Ok(Some(Type::parse(debug.descriptor)?))
+    }
+
     pub(super) fn define_pattern_local(
         &mut self,
         store: &Instruction,

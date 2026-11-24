@@ -15,10 +15,19 @@ use super::{
 };
 
 const BOOTSTRAP_DESCRIPTOR: &str = "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;[Ljava/lang/Object;)Ljava/lang/invoke/CallSite;";
+const ENUM_FLAG: u16 = 0x4000;
+const ENUM_CONSTANT_FLAGS: u16 = ENUM_FLAG | 0x0008 | 0x0010;
 
 pub(crate) struct PatternDispatch {
     call_selector: Type,
+    enum_descriptor: Option<String>,
     pub(crate) labels: Vec<PatternLabel>,
+}
+
+impl PatternDispatch {
+    pub(crate) fn is_enum(&self) -> bool {
+        self.enum_descriptor.is_some()
+    }
 }
 
 #[derive(Eq, Hash, PartialEq)]
@@ -102,14 +111,12 @@ impl Machine<'_, '_> {
         {
             return Ok(None);
         }
-        if enum_switch {
-            let Type::Object(owner) = selector else {
-                return Ok(None);
-            };
-            if !self.pattern_is_enum(owner) {
-                return Ok(None);
-            }
-        }
+        let enum_owner = if enum_switch {
+            let Type::Object(owner) = selector else { return Ok(None) };
+            Some(owner.as_str())
+        } else {
+            None
+        };
         let mut labels = Vec::with_capacity(method.arguments.len());
         for &index in &method.arguments {
             let label = match *pool.get(index)? {
@@ -120,13 +127,7 @@ impl Machine<'_, '_> {
                     }
                     PatternLabel::Type(ty)
                 }
-                Constant::String(name) if enum_switch => {
-                    let name = pool.utf8(name)?;
-                    if !crate::naming::is_valid_local_identifier(name, self.class.major_version) {
-                        return Ok(None);
-                    }
-                    PatternLabel::Enum(name.into())
-                }
+                Constant::String(name) if enum_switch => PatternLabel::Enum(pool.utf8(name)?.into()),
                 Constant::String(text) => PatternLabel::String(super::string_literal(
                     &pool.utf16(text)?,
                     self.options.ascii_strings,
@@ -136,19 +137,40 @@ impl Machine<'_, '_> {
             };
             labels.push(label);
         }
+        let enum_descriptor = enum_owner.map(|owner| format!("L{owner};"));
+        if let Some((owner, descriptor)) = enum_owner.zip(enum_descriptor.as_deref())
+            && !self.proves_enum_dispatch(owner, descriptor, &labels)
+        {
+            return Ok(None);
+        }
         Ok(Some(PatternDispatch {
             call_selector: selector.clone(),
+            enum_descriptor,
             labels,
         }))
     }
 
-    fn pattern_is_enum(&self, owner: &str) -> bool {
-        if let Some(class) = self
-            .group
-            .and_then(|group| group.get(owner))
+    fn proves_enum_dispatch(&self, owner: &str, descriptor: &str, labels: &[PatternLabel]) -> bool {
+        let proves_names = |exists: &dyn Fn(&str) -> bool| {
+            labels.iter().all(|label| match label {
+                PatternLabel::Enum(name) => exists(name)
+                    && crate::naming::is_valid_local_identifier(
+                        self.source_field_name(owner, name, descriptor),
+                        self.class.major_version,
+                    ),
+                _ => true,
+            })
+        };
+        if let Some(class) = self.group.and_then(|group| group.get(owner))
             .or_else(|| (owner == self.owner).then_some(self.class))
         {
-            return class.access_flags & 0x4000 != 0;
+            return class.access_flags & ENUM_FLAG != 0
+                && class.pool.class_name(class.super_class).ok() == Some("java/lang/Enum")
+                && proves_names(&|name| class.fields.iter().any(|field| {
+                    field.access_flags & ENUM_CONSTANT_FLAGS == ENUM_CONSTANT_FLAGS
+                        && class.pool.utf8(field.name_index).ok() == Some(name)
+                        && class.pool.utf8(field.descriptor_index).ok() == Some(descriptor)
+                }));
         }
         [
             self.options.library_classpath.as_deref(),
@@ -157,7 +179,31 @@ impl Machine<'_, '_> {
         .into_iter()
         .flatten()
         .find_map(|path| path.metadata(owner).ok().flatten())
-        .is_some_and(|class| class.access_flags & 0x4000 != 0)
+        .is_some_and(|class| {
+            class.access_flags & ENUM_FLAG != 0 && class.super_name.as_deref() == Some("java/lang/Enum")
+                && proves_names(&|name| class.fields.iter().any(|field| {
+                    field.access_flags & ENUM_CONSTANT_FLAGS == ENUM_CONSTANT_FLAGS
+                        && field.name == name && field.descriptor == descriptor
+                }))
+        })
+    }
+
+    pub(crate) fn preview_enum_pattern_type(
+        &self,
+        selector: &Type,
+        cast: Option<Type>,
+        store: &Instruction,
+        slot: u16,
+    ) -> Result<Option<Type>, LiftError> {
+        // Javac 17 puts the enum itself in the bootstrap for every type arm.
+        // The backing cast or fresh debug binding identifies the source type.
+        // It must be a supertype: a narrowing cast could throw and a narrowing
+        // pattern would skip enum values that the bootstrap would match.
+        let debug = self.pattern_store_type(store, slot)?;
+        if cast.as_ref().zip(debug.as_ref()).is_some_and(|(cast, debug)| cast != debug) {
+            return Ok(None);
+        }
+        Ok(cast.or(debug).filter(|ty| self.known_assignable(selector, ty)))
     }
 
     fn pattern_type_compatible(&self, selector: &Type, pattern: &Type) -> bool {
@@ -304,9 +350,16 @@ impl Machine<'_, '_> {
         Ok((text, ty, control))
     }
 
-    pub(crate) fn pattern_constant(&self, label: &PatternLabel, selector: &Type) -> Document {
+    pub(crate) fn pattern_constant(
+        &self, dispatch: &PatternDispatch, label: &PatternLabel, selector: &Type,
+    ) -> Document {
         match label {
-            PatternLabel::String(text) | PatternLabel::Enum(text) => text.as_str().into(),
+            PatternLabel::String(text) => text.as_str().into(),
+            PatternLabel::Enum(name) => {
+                let Type::Object(owner) = &dispatch.call_selector else { unreachable!("checked enum") };
+                let descriptor = dispatch.enum_descriptor.as_deref().expect("checked enum");
+                self.source_field_name(owner, name, descriptor).into()
+            }
             PatternLabel::Integer(value) => super::literal::integer_literal(
                 *value,
                 Some(&Type::Primitive(pattern_integer_type(selector, *value).expect("checked selector"))),

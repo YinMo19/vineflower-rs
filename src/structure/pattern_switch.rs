@@ -9,6 +9,7 @@ use std::{
 use crate::{
     bytecode::{Instruction, Operand},
     classfile::{Constant, ConstantPool},
+    descriptor::Type,
     lift::{Effect, Machine, pattern_dispatch::PatternLabel},
     source_text::Document,
 };
@@ -160,6 +161,8 @@ struct Arm {
     keys: Vec<i32>,
     /// The recognized `aload alias; [checkcast T;] astore local` prologue.
     binding: Option<(Range<usize>, u16)>,
+    /// Javac 17 enumSwitch erases the source pattern type to the enum class.
+    enum_pattern_type: Option<Type>,
     guard: Option<guards::Guard>,
     nullable_type: bool,
 }
@@ -200,6 +203,7 @@ impl Emitter<'_> {
         let Some(dispatch) = machine.read_pattern_dispatch(&self.instructions[indy])? else {
             return Ok(None);
         };
+        let preview_enum = dispatch.is_enum() && machine.is_first_pattern_preview();
         let mut constants = HashSet::new();
         if dispatch.labels.iter().any(|label| !matches!(label, PatternLabel::Type(_)) && !constants.insert(label)) {
             return Ok(None);
@@ -278,7 +282,6 @@ impl Emitter<'_> {
 
         let mut alias_uses = BTreeSet::from([indy - 2, head.alias_store]);
         let targets: BTreeSet<_> = groups.keys().copied().collect();
-        let mut pattern_types = Vec::new();
         for (&target, arm) in &mut groups {
             let cfg = &self.graph.blocks[target];
             if !cfg.exception_predecessors.is_empty()
@@ -311,33 +314,44 @@ impl Emitter<'_> {
                 .first()
                 .is_some_and(|op| local(op, false, true) == Some(head.alias))
             {
-                let (width, slot) = match body {
+                let (width, slot, cast_type) = match body {
                     [_, cast, store, ..] if cast.opcode == 0xc0 => {
                         let Operand::Constant(index) = cast.operand else {
                             return Ok(None);
                         };
-                        if machine.pattern_class(index)? != *ty {
+                        let cast_type = machine.pattern_class(index)?;
+                        if !preview_enum && cast_type != *ty {
                             return Ok(None);
                         }
                         let Some(slot) = local(store, true, true) else {
                             return Ok(None);
                         };
-                        (3, slot)
+                        (3, slot, Some(cast_type))
                     }
                     [_, store, ..] => {
                         let Some(slot) = local(store, true, true) else {
                             return Ok(None);
                         };
-                        (2, slot)
+                        (2, slot, None)
                     }
                     _ => return Ok(None),
                 };
                 if slot == head.alias || head.restart_store.is_some() && slot == head.restart {
                     return Ok(None);
                 }
+                if preview_enum {
+                    let store = &body[width - 1];
+                    arm.enum_pattern_type = machine.preview_enum_pattern_type(ty, cast_type, store, slot)?;
+                    if arm.enum_pattern_type.is_none() {
+                        return Ok(None);
+                    }
+                }
                 alias_uses.insert(cfg.instructions.start);
                 arm.binding = Some((cfg.instructions.start..cfg.instructions.start + width, slot));
                 body_start += width;
+            }
+            if preview_enum && arm.binding.is_none() {
+                return Ok(None);
             }
             if let Some(proof) = &restart {
                 let Some(guard) = proof.arm(self, target, body_start, key, &targets) else {
@@ -356,18 +370,23 @@ impl Emitter<'_> {
                 // checkcast permits null, and no retry may rematch that null.
                 return Ok(None);
             }
-            // Only a genuinely unconditional pattern can dominate later
-            // labels or conflict with default.
-            let record = self.record_patterns.and_then(|plans| plans.get(switch.offset, self.offset(target)));
-            if arm.guard.is_none() && !record.is_some_and(|record| record.may_fail) {
-                pattern_types.push((key, ty));
-            }
         }
+        // Only a genuinely unconditional pattern can dominate later labels
+        // or conflict with default. For enumSwitch use the proved source type.
+        let pattern_types: Vec<_> = groups.iter().filter_map(|(&target, arm)| {
+            let &key = arm.keys.first().filter(|&&key| key != NULL_KEY)?;
+            let PatternLabel::Type(ty) = &dispatch.labels[key as usize] else { return None };
+            let record = self.record_patterns.and_then(|plans| plans.get(switch.offset, self.offset(target)));
+            (arm.guard.is_none() && !record.is_some_and(|record| record.may_fail))
+                .then_some((key, arm.enum_pattern_type.as_ref().unwrap_or(ty)))
+        }).collect();
         for arm in groups.values() {
             for &key in &arm.keys {
                 if key != NULL_KEY
                     && let PatternLabel::Type(ty) = &dispatch.labels[key as usize]
-                    && pattern_types.iter().any(|&(earlier, prior)| earlier < key && machine.pattern_covers(prior, ty))
+                    && pattern_types.iter().any(|&(earlier, prior)| {
+                        earlier < key && machine.pattern_covers(prior, arm.enum_pattern_type.as_ref().unwrap_or(ty))
+                    })
                 {
                     return Ok(None);
                 }
@@ -411,19 +430,6 @@ impl Emitter<'_> {
         {
             return Ok(None);
         }
-        let switch_region = within.switch_body(join);
-        let mut ordered: Vec<_> = groups.into_iter().collect();
-        // Preserve the bootstrap matching order even if the bytecode lays
-        // the switch blocks out differently. Null never competes with a type.
-        ordered.sort_by_key(|(target, arm)| {
-            if Some(*target) == source_default {
-                (2, 0)
-            } else if arm.keys == [NULL_KEY] {
-                (0, 0)
-            } else {
-                (1, arm.keys.first().copied().unwrap_or_default())
-            }
-        });
 
         self.emitted[block] = true;
         let tail = self.lift_range(
@@ -439,7 +445,7 @@ impl Emitter<'_> {
         }
         let mut offsets = tail.offsets;
         let total = total_key.map(|key| match &dispatch.labels[key as usize] {
-            PatternLabel::Type(ty) => ty,
+            PatternLabel::Type(ty) => groups[&default].enum_pattern_type.as_ref().unwrap_or(ty),
             _ => unreachable!("checked total label"),
         });
         let (selector, selector_type, control) = machine.take_pattern_selector(
@@ -453,6 +459,19 @@ impl Emitter<'_> {
             // pattern before the final one would dominate it.
             return Err(self.unstructured(dispatch_block));
         }
+        let switch_region = within.switch_body(join);
+        let mut ordered: Vec<_> = groups.into_iter().collect();
+        // Preserve the bootstrap matching order even if the bytecode lays
+        // the switch blocks out differently. Null never competes with a type.
+        ordered.sort_by_key(|(target, arm)| {
+            if Some(*target) == source_default {
+                (2, 0)
+            } else if arm.keys == [NULL_KEY] {
+                (0, 0)
+            } else {
+                (1, arm.keys.first().copied().unwrap_or_default())
+            }
+        });
         let guard_keyword = machine.pattern_guard_keyword().ok_or_else(|| self.unstructured(block))?;
         let mut staged = Vec::with_capacity(ordered.len());
         let names = machine.local_name_checkpoint();
@@ -488,7 +507,7 @@ impl Emitter<'_> {
                     } else {
                         match &dispatch.labels[key as usize] {
                             PatternLabel::Type(ty) => entry.pattern_binding(
-                                ty,
+                                arm.enum_pattern_type.as_ref().unwrap_or(ty),
                                 Some(&selector_type),
                                 arm.binding.as_ref().map(|(indices, slot)| {
                                     (
@@ -499,7 +518,7 @@ impl Emitter<'_> {
                                 }),
                                 self.offset(*target),
                             )?,
-                            constant => entry.pattern_constant(constant, &selector_type),
+                            constant => entry.pattern_constant(&dispatch, constant, &selector_type),
                         }
                     };
                     if arm.nullable_type {
@@ -780,6 +799,94 @@ mod tests {
         include_bytes!("../../tests/smoke/java17preview/TestSwitchPatternMatching18.class");
     const JAVA17_STRING_SWITCH: &[u8] =
         include_bytes!("../../tests/smoke/java17preview/TestSwitchPatternMatching21.class");
+    const ENUM_SWITCH_CLASS: &str = "pkg/TestSwitchPatternMatching19";
+    const JAVA17_ENUM_SWITCH: [&[u8]; 8] = [
+        include_bytes!("../../tests/smoke/java17preview/TestSwitchPatternMatching19.class"),
+        include_bytes!("../../tests/smoke/java17preview/TestSwitchPatternMatching19$XXX.class"),
+        include_bytes!("../../tests/smoke/java17preview/TestSwitchPatternMatching19$A.class"),
+        include_bytes!("../../tests/smoke/java17preview/TestSwitchPatternMatching19$B.class"),
+        include_bytes!("../../tests/smoke/java17preview/TestSwitchPatternMatching19$C.class"),
+        include_bytes!("../../tests/smoke/java17preview/TestSwitchPatternMatching19$D.class"),
+        include_bytes!("../../tests/smoke/java17preview/TestSwitchPatternMatching19$E.class"),
+        include_bytes!("../../tests/smoke/java17preview/TestSwitchPatternMatching19$F.class"),
+    ];
+
+    #[test]
+    fn preview_enum_switch_preserves_constants_guards_and_null_routing() {
+        let group = ClassGroup::new(JAVA17_ENUM_SWITCH).unwrap();
+        let source = group.decompile(ENUM_SWITCH_CLASS, &Options::default()).unwrap().text;
+        let (first, rest) = source.split_once("void test2(").unwrap();
+        let second = rest.split_once("enum XXX").unwrap().0;
+        let ordered = |method: &str, labels: &[&str]| {
+            let mut remaining = method;
+            for label in labels {
+                remaining = remaining.split_once(label).unwrap_or_else(|| panic!("{label}: {method}")).1;
+            }
+        };
+        ordered(first, &[
+            "switch (s)", "case X1:", "A a && (a !=", "B b && (", "instanceof ",
+            "D d && (d == d)", "E e && (false)", "F f:", "println(\"f\")",
+        ]);
+        assert!(!first.contains("default:") && !first.contains("case null"), "{first}");
+        ordered(second, &[
+            "switch (s)", "case X1:", "case X2, null:", "println(\"maybe x2?\")",
+            "F f && (Math.random() > 0.0)", "println(\"just making sure!\")",
+            "default:", "println(\"default\")",
+        ]);
+        assert!(!source.contains("enumSwitch") && !source.contains("while ("), "{source}");
+    }
+
+    #[test]
+    fn preview_enum_switch_requires_its_own_enum_class_and_names() {
+        let bytes = JAVA17_ENUM_SWITCH[0];
+        let class = ClassFile::parse(bytes).unwrap();
+        let bootstraps = class.bootstrap_methods().unwrap();
+        let blob = crate::classfile::find_attribute(&class.attributes, &class.pool, "BootstrapMethods")
+            .unwrap().unwrap();
+        let enum_class = bootstraps[0].arguments[1];
+        assert_eq!(class.pool.class_name(enum_class).unwrap(), "pkg/TestSwitchPatternMatching19$XXX");
+        let arg = blob.as_ptr() as usize - bytes.as_ptr() as usize + 8;
+        let mut wrong_class = bytes.to_vec();
+        assert_eq!(&wrong_class[arg..arg + 2], &enum_class.to_be_bytes());
+        wrong_class[arg..arg + 2].copy_from_slice(&class.this_class.to_be_bytes());
+        reject_enum_switch(&wrong_class, "test");
+
+        let Constant::String(name) = *class.pool.get(bootstraps[1].arguments[1]).unwrap() else { panic!() };
+        let name = class.pool.utf8(name).unwrap();
+        assert_eq!(name, "X2");
+        let mut wrong_name = bytes.to_vec();
+        wrong_name[name.as_ptr() as usize - bytes.as_ptr() as usize] = b'Y';
+        reject_enum_switch(&wrong_name, "test2");
+    }
+
+    #[test]
+    fn preview_enum_switch_requires_a_compatible_binding_and_exact_guard_restart() {
+        let bytes = JAVA17_ENUM_SWITCH[0];
+        let descriptor = b"Lpkg/TestSwitchPatternMatching19$A;";
+        let at = bytes.windows(descriptor.len()).position(|part| part == descriptor).unwrap();
+        let mut wrong_binding = bytes.to_vec();
+        wrong_binding[at + descriptor.len() - 2] = b'Z';
+        reject_enum_switch(&wrong_binding, "test");
+
+        let class = ClassFile::parse(bytes).unwrap();
+        let method = class.methods.iter()
+            .find(|method| class.pool.utf8(method.name_index).unwrap() == "test2").unwrap();
+        let code = method.code(&class.pool).unwrap().unwrap();
+        let at = code.bytes.as_ptr() as usize - bytes.as_ptr() as usize + 72;
+        let mut wrong_retry = bytes.to_vec();
+        assert_eq!(wrong_retry[at], 0x06); // iconst_3: retry after bootstrap label 2
+        wrong_retry[at] = 0x05; // iconst_2: retries the same label
+        reject_enum_switch(&wrong_retry, "test2");
+    }
+
+    fn reject_enum_switch(bytes: &[u8], expected_method: &str) {
+        let mut tree = JAVA17_ENUM_SWITCH;
+        tree[0] = bytes;
+        let group = ClassGroup::new(tree).unwrap();
+        let result = group.decompile(ENUM_SWITCH_CLASS, &Options::default());
+        assert!(matches!(&result, Err(crate::DecompileError::Method { name, .. }) if name == expected_method),
+            "{result:?}");
+    }
 
     fn instructions(prefix: &[u8]) -> Vec<Instruction> {
         let mut instructions = decode(prefix).unwrap();
