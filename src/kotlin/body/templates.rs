@@ -537,6 +537,7 @@ mod tests {
             slots: descriptor.parameters.iter().enumerate().map(|(index, ty)| (index as u16, ty)).collect(),
             instance: false,
             alias: None,
+            dispatch_alias: None,
             templates: Context::default(),
             extension: None,
         };

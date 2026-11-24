@@ -12,7 +12,7 @@ use crate::{
 };
 
 use super::{
-    JvmFieldSignature, JvmMethodSignature, KotlinError, Property, Type, ValueParameter,
+    Function, JvmFieldSignature, JvmMethodSignature, KotlinError, Property, Type, ValueParameter,
     syntax::{identifier, qualified},
 };
 
@@ -26,6 +26,7 @@ mod loops;
 mod nullable;
 mod statements;
 mod switches;
+mod tailrec;
 mod templates;
 mod try_regions;
 
@@ -167,6 +168,7 @@ struct Locals<'a> {
     slots: Vec<(u16, &'a JvmType)>,
     instance: bool,
     alias: Option<(u16, u8, usize)>,
+    dispatch_alias: Option<u16>,
     templates: templates::Context<'a>,
     extension: Option<Extension<'a>>,
 }
@@ -210,6 +212,7 @@ impl<'a> Locals<'a> {
             slots,
             instance,
             alias: None,
+            dispatch_alias: None,
             templates: templates::Context::default(),
             extension,
         })
@@ -371,7 +374,7 @@ impl<'a, 'data> Bytecode<'a, 'data> {
         locals.templates.member = Some(member);
         locals.templates.properties = properties;
         let code = self.function_code(member, declaration)?;
-        let decoded = bytecode::decode(code.bytes)?;
+        let mut decoded = bytecode::decode(code.bytes)?;
         let instructions = if let Some(extension) = &locals.extension
             && extension.has_receiver()
         {
@@ -393,6 +396,14 @@ impl<'a, 'data> Bytecode<'a, 'data> {
                 trace,
             )
             .map(Body::Try);
+        }
+        if descriptor.return_type != JvmType::Void
+            && locals.extension.as_ref().is_some_and(|context| context.function.flags.has(11))
+            && tailrec::has_back_edge(instructions)
+        {
+            return tailrec::lower(
+                self, &mut decoded[start..], descriptor, &code, &mut locals, parameters, declaration, trace,
+            );
         }
         if instructions
             .iter()
@@ -479,6 +490,7 @@ impl<'a, 'data> Bytecode<'a, 'data> {
                 &descriptor.return_type,
                 parameters,
                 declaration,
+                None,
             )?;
             return self.return_expression(expr, instructions, &code, trace, materialized);
         }
@@ -619,6 +631,7 @@ impl<'a, 'data> Bytecode<'a, 'data> {
             slots: Vec::new(),
             instance: false,
             alias: None,
+            dispatch_alias: None,
             templates: templates::Context::default(),
             extension: None,
         };
@@ -892,7 +905,7 @@ impl<'a> Bytecode<'a, '_> {
                 .and_then(|local| local.load(opcode))
             {
                 stack.push(StackValue::Value(Expr { kind, depth: 1 }));
-            } else if locals.instance && opcode == 0x19 && slot == 0 {
+            } else if locals.instance && opcode == 0x19 && (slot == 0 || locals.dispatch_alias == Some(slot)) {
                 stack.push(StackValue::This);
             } else if let Some(kind) = locals.extension.as_ref().and_then(|extension| extension.load(opcode, slot)) {
                 stack.push(StackValue::Value(Expr { kind, depth: 1 }));
@@ -968,6 +981,13 @@ impl<'a> Bytecode<'a, '_> {
                     Operator::Xor,
                 ][usize::from((op - 0x78) / 2)];
                 Expr::binary(operator, primitive, stack, declaration)?
+            }
+            (0x85, _) => {
+                let operand = pop_value(stack, declaration)?;
+                let ExprKind::Literal(Literal::Int(value)) = operand.kind else {
+                    return Err(unsupported_expression(declaration));
+                };
+                Expr::literal(Literal::Long(i64::from(value)))
             }
             (0x94, _) => {
                 if !matches!(

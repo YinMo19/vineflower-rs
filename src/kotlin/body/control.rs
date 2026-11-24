@@ -6,6 +6,7 @@ use super::{
     Bytecode, Expr, Instruction, JvmType, KotlinError, Locals, Operand, StackValue, ValueParameter,
     logic::{self, Conditional},
     pop_value, return_opcode,
+    tailrec,
 };
 
 /// Lower a forward-only expression graph. A structured region either returns
@@ -19,6 +20,7 @@ pub(super) fn lower<'class>(
     return_type: &JvmType,
     parameters: &[ValueParameter],
     declaration: &str,
+    tail: Option<tailrec::Shape>,
 ) -> Result<(Expr<'class>, Option<(u32, u32)>), KotlinError> {
     let cfg = ControlFlowGraph::build(instructions, &[]).map_err(|_| {
         KotlinError::unsupported(declaration, "invalid Kotlin expression control flow")
@@ -54,6 +56,7 @@ pub(super) fn lower<'class>(
         declaration,
         postdominators,
         return_opcode: return_opcode(return_type),
+        tail,
         steps,
     };
     match lower.region(0, None, &mut Vec::new(), 0)? {
@@ -103,6 +106,7 @@ struct Lowering<'a, 'class, 'data> {
     declaration: &'a str,
     postdominators: Vec<Option<usize>>,
     return_opcode: u8,
+    tail: Option<tailrec::Shape>,
     steps: usize,
 }
 
@@ -139,6 +143,14 @@ impl<'class> Lowering<'_, 'class, '_> {
             let (last, before) = self.instructions[block.instructions.clone()]
                 .split_last()
                 .unwrap();
+            if let Some(tail) = self.tail
+                && matches!(last.operand, Operand::Branch(_)) && last.opcode == self.return_opcode
+            {
+                if stop.is_some() || !stack.is_empty() {
+                    return Err(self.unsupported("live operands entering Kotlin tail-recursive updates"));
+                }
+                return tail.call(self.bytecode, before, self.locals, stack, self.declaration).map(Exit::Return);
+            }
             for instruction in before {
                 self.bytecode
                     .expression(instruction, self.locals, stack, self.declaration)?;

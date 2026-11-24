@@ -10,7 +10,7 @@ use crate::{
 };
 
 use super::{
-    Bytecode, Constant, Expected, Expr, ExprKind, Instruction, JvmType, KotlinError, Literal,
+    Bytecode, Constant, Expected, Expr, ExprKind, Function, Instruction, JvmType, KotlinError, Literal,
     Locals, MethodDescriptor, Operand, Primitive, STATIC, StackValue, Type, ValueParameter,
     defaults, extensions::{Context, Value, exact_type}, identifier, load_opcode, qualified,
 };
@@ -33,6 +33,7 @@ pub(super) struct Call<'a> {
 enum Target<'a> {
     Constructor,
     Member { name: String, receiver: Option<Argument<'a>> },
+    Function { name: String },
 }
 
 #[derive(Debug)]
@@ -65,6 +66,7 @@ impl Call<'_> {
                 out.push('.');
                 identifier(out, name, declaration)?;
             }
+            Target::Function { name } => identifier(out, name, declaration)?,
         }
         out.push('(');
         for (index, argument) in self.arguments.iter().enumerate() {
@@ -128,16 +130,54 @@ pub(super) fn lower<'a>(
             if call.result.jvm == JvmType::Void {
                 stack.push(StackValue::UnitCall(Box::new(call)));
             } else {
-                let mut depth = call.arguments.iter().map(|arg| arg.value.depth).max().unwrap_or(0);
-                if let Target::Member { receiver: Some(receiver), .. } = &call.target {
-                    depth = depth.max(receiver.value.depth);
-                }
-                stack.push(StackValue::Value(Expr::new(ExprKind::Invocation(Box::new(call)), depth + 1, declaration)?));
+                stack.push(StackValue::Value(call_expression(Box::new(call), declaration)?));
             }
         }
         _ => return Ok(false),
     }
     Ok(true)
+}
+
+fn call_expression<'a>(call: Box<Call<'a>>, declaration: &str) -> Result<Expr<'a>, KotlinError> {
+    let mut depth = call.arguments.iter().map(|arg| arg.value.depth).max().unwrap_or(0);
+    if let Target::Member { receiver: Some(receiver), .. } = &call.target {
+        depth = depth.max(receiver.value.depth);
+    }
+    Expr::new(ExprKind::Invocation(call), depth + 1, declaration)
+}
+
+pub(super) fn tail_call<'a>(
+    bytecode: &Bytecode<'a, '_>,
+    locals: &Locals<'_>,
+    stack: &mut Vec<StackValue<'a>>,
+    declaration: &str,
+) -> Result<Expr<'a>, KotlinError> {
+    let invalid = || invalid(declaration);
+    let context = locals.extension.as_ref().ok_or_else(invalid)?;
+    let function = context.function;
+    let signature = function.signature.as_ref().ok_or_else(invalid)?;
+    let descriptor = &signature.descriptor;
+    if function.name != signature.name || function.receiver.is_some()
+        || !function.type_parameters.is_empty()
+        || stack.len() != function.parameters.len()
+        || !parameters_match(&function.parameters, &descriptor.parameters)
+        || !exact_type(&function.returns, &descriptor.return_type, false)
+        || !bare_superclass(bytecode.class)?
+        || !unambiguous(context, function, false)
+        || (!locals.instance && context.parameters.iter().any(|parameter| parameter.name == function.name))
+    {
+        return Err(invalid());
+    }
+    let arguments = take_arguments(
+        stack, 0, locals, &function.parameters, descriptor.parameters.iter().cloned(), &[], declaration,
+    )?;
+    let name = function.name.clone();
+    let target = if locals.instance { Target::Member { name, receiver: None } } else { Target::Function { name } };
+    call_expression(Box::new(Call {
+        target,
+        arguments,
+        result: Value { ty: function.returns.clone(), jvm: descriptor.return_type.clone() },
+    }), declaration)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -270,14 +310,14 @@ fn member<'a>(
     declaration: &str,
 ) -> Result<Option<Call<'a>>, KotlinError> {
     let name = if default { name.strip_suffix("$default").unwrap() } else { name };
-    let mut candidates = context.members.functions.iter().filter(|function| function.name == name);
-    let Some(function) = candidates.next() else { return Ok(None); };
+    let Some(function) = context.members.functions.iter().find(|function| {
+        function.name == name && function.signature.as_ref().is_some_and(|signature| {
+            signature.name == name && (default || signature.descriptor == invoked)
+        })
+    }) else { return Ok(None); };
     let Some(signature) = &function.signature else { return Ok(None); };
     let invalid = || invalid(declaration);
-    if signature.name != name || (!default && signature.descriptor != invoked) {
-        return Ok(None);
-    }
-    if candidates.next().is_some() || context.members.properties.iter().any(|property| property.name == name)
+    if !unambiguous(context, function, default)
         || function.flags.member_kind() != MemberKind::Declaration
         || function.flags.visibility()? != Visibility::Public || function.flags.has(10)
         || function.flags.has(13) || !function.type_parameters.is_empty()
@@ -337,6 +377,33 @@ fn member<'a>(
         arguments,
         result: Value { ty: function.returns.clone(), jvm: invoked.return_type },
     }))
+}
+
+fn unambiguous(context: &Context<'_>, function: &Function, default: bool) -> bool {
+    if context.members.properties.iter().any(|property| property.name == function.name) {
+        return false;
+    }
+    let arity = function.parameters.len();
+    context.members.functions.iter().all(|other| {
+        if std::ptr::eq(function, other) || function.name != other.name {
+            return true;
+        }
+        if default || function.receiver.is_some() || other.receiver.is_some()
+            || other.parameters.iter().any(|parameter| parameter.vararg_element.is_some())
+        {
+            return false;
+        }
+        if other.parameters.len() < arity {
+            return true;
+        }
+        let (prefix, rest) = other.parameters.split_at(arity);
+        // A longer overload with the same supplied types can only compete
+        // through defaults. Kotlin prefers the candidate omitting none.
+        !rest.is_empty() && (rest.iter().any(|parameter| !parameter.flags.has(1))
+            || (other.type_parameters.is_empty()
+                && other.context_receivers.is_empty() && other.context_parameters.is_empty()
+                && prefix.iter().zip(&function.parameters).all(|(a, b)| a.ty == b.ty)))
+    })
 }
 
 fn omissions(

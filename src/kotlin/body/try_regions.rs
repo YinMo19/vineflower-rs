@@ -82,6 +82,7 @@ struct Catch<'a> {
 struct Finally<'a> {
     start: usize,
     statements: Vec<Statement<'a>>,
+    returning: Option<TailValue<'a>>,
     copies: Vec<usize>,
 }
 
@@ -264,6 +265,11 @@ impl<'a> Lower<'_, 'a, '_> {
         let mut result_slot = None;
         let mut normal_body = range.start..protected_end;
         let mut normal_cleanup = None;
+        let returning_finally = cleanup.is_some() && handlers.is_empty()
+            && *self.returns != JvmType::Void
+            && normal_edge >= protected_end
+            && self.instructions[normal_edge].opcode == return_opcode(self.returns)
+            && self.instructions[range.end - 1].opcode == return_opcode(self.returns);
         let continuation = if normal_edge >= protected_end && let Some(join) = normal_jump {
             if join <= previous.ok_or_else(invalid)? || join >= range.end {
                 return Err(invalid());
@@ -284,6 +290,9 @@ impl<'a> Lower<'_, 'a, '_> {
                 result_slot = Some(slot);
             }
             Some(join)
+        } else if returning_finally {
+            normal_cleanup = Some(protected_end..first_handler);
+            None
         } else {
             if cleanup.is_some() {
                 // The result load occurs AFTER cleanup, but its value is
@@ -318,7 +327,7 @@ impl<'a> Lower<'_, 'a, '_> {
         let handler_limit = continuation.unwrap_or(range.end);
         let mut finally = if let Some(entry) = cleanup {
             let normal = normal_cleanup.as_ref().ok_or_else(invalid)?;
-            Some(self.finally(entry, handler_limit, normal.clone(), result_slot, scope)?)
+            Some(self.finally(entry, handler_limit, normal.clone(), result_slot, returning_finally, scope)?)
         } else {
             None
         };
@@ -388,7 +397,7 @@ impl<'a> Lower<'_, 'a, '_> {
         }
         let next = match (continuation, &result_span) {
             (Some(join), None) => Some(self.block(join..range.end, flow, scope, depth)?),
-            (None, None) if finally.is_some() => Some(Block {
+            (None, None) if finally.is_some() && !returning_finally => Some(Block {
                 statements: Vec::new(),
                 end: End::ReturnUnit(normal_edge, flow == Flow::Exit),
             }),
@@ -426,7 +435,7 @@ impl<'a> Lower<'_, 'a, '_> {
     }
 
     fn finally(&mut self, entry: Entry<'a>, limit: usize, normal: Range<usize>, result: Option<u16>,
-        scope: &[ScopedLocal<'a>],
+        returning: bool, scope: &[ScopedLocal<'a>],
     ) -> Result<Finally<'a>, KotlinError> {
         let declaration = self.declaration;
         let invalid = || invalid(declaration);
@@ -435,10 +444,10 @@ impl<'a> Lower<'_, 'a, '_> {
             return Err(invalid());
         }
         let Some((0x3a, slot)) = local_store(&self.instructions[handler]) else { return Err(invalid()); };
-        let copy = handler + 1..limit - 2;
+        let copy = handler + 1..if returning { limit } else { limit - 2 };
         if !self.fresh(slot, scope) || Some(slot) == result
-            || local_load(&self.instructions[limit - 2]) != Some((0x19, slot))
-            || self.instructions[limit - 1].opcode != 0xbf
+            || (!returning && (local_load(&self.instructions[limit - 2]) != Some((0x19, slot))
+                || self.instructions[limit - 1].opcode != 0xbf))
             || !self.same_code(normal.clone(), copy.clone())
             || result.is_some_and(|result| self.writes_slot(normal.clone(), result, self.returns.slots()))
             || self.writes_slot(copy.clone(), slot, 1)
@@ -450,8 +459,17 @@ impl<'a> Lower<'_, 'a, '_> {
         if self.cleanup_interval(handler, handler, limit)?.is_some_and(|end| end != copy.start) {
             return Err(invalid());
         }
-        let statements = self.statements(normal.clone(), scope)?;
-        Ok(Finally { start: normal.start, statements, copies: vec![copy.start] })
+        let (statements, returning) = if returning {
+            // Both copies return outright: there is no continuation and no
+            // saved result to reload after cleanup.
+            let Block { statements, end: End::Return(value) } = self.leaf(normal.clone(), Flow::Exit, scope)? else {
+                return Err(invalid());
+            };
+            (statements, Some(value))
+        } else {
+            (self.statements(normal.clone(), scope)?, None)
+        };
+        Ok(Finally { start: normal.start, statements, returning, copies: vec![copy.start] })
     }
 
     fn cleanup_interval(&mut self, start: usize, target: usize, limit: usize) -> Result<Option<usize>, KotlinError> {

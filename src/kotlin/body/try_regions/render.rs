@@ -2,7 +2,7 @@
 
 use std::ops::Range;
 
-use super::{Binding, Block, End, Instruction, JvmType, KotlinError, Region, TryBody, ValueParameter};
+use super::{Binding, Block, End, Finally, Instruction, JvmType, KotlinError, Region, TryBody, ValueParameter};
 use crate::kotlin::{Type, syntax::qualified};
 
 impl TryBody<'_> {
@@ -58,6 +58,14 @@ impl<M: FnMut(&Instruction, usize)> Writer<'_, M> {
             if !matches!(instruction.opcode, 0x00 | 0x5f) {
                 (self.map)(instruction, self.line);
             }
+        }
+    }
+
+    fn map_finally(&mut self, cleanup: &Finally<'_>, span: Range<usize>) {
+        self.map(span.clone());
+        for copy in &cleanup.copies {
+            let start = *copy + span.start - cleanup.start;
+            self.map(start..start + span.len());
         }
     }
 
@@ -129,12 +137,14 @@ impl<M: FnMut(&Instruction, usize)> Writer<'_, M> {
             for statement in &cleanup.statements {
                 self.indent(level + 1);
                 statement.write(self.out, self.parameters, self.declaration)?;
-                let span = &statement.instructions;
-                self.map(span.clone());
-                for copy in &cleanup.copies {
-                    let start = *copy + span.start - cleanup.start;
-                    self.map(start..start + span.len());
-                }
+                self.map_finally(cleanup, statement.instructions.clone());
+                self.newline();
+            }
+            if let Some(value) = &cleanup.returning {
+                self.indent(level + 1);
+                self.out.push_str("return ");
+                value.expr.write(self.out, self.returns.0, self.returns.1, self.parameters, self.declaration)?;
+                self.map_finally(cleanup, value.instructions.clone());
                 self.newline();
             }
             self.indent(level);

@@ -83,6 +83,7 @@ struct Parameter<'a> {
 }
 
 pub(in crate::kotlin) struct Context<'a> {
+    pub(super) function: &'a Function,
     receiver: Option<Parameter<'a>>,
     pub(super) parameters: &'a [ValueParameter],
     pub(super) members: &'a PackageDeclaration,
@@ -100,6 +101,7 @@ impl<'a> Context<'a> {
         group: Option<&'a ClassGroup<'a>>,
     ) -> Result<Self, KotlinError> {
         Ok(Self {
+            function,
             receiver: Self::parameter(function, signature, member)?,
             parameters: &function.parameters,
             members,
