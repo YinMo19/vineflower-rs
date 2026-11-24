@@ -268,7 +268,6 @@ impl<'a, 'c> Writer<'a, 'c> {
         &mut self,
         index: usize,
         depth: usize,
-        has_following_line: bool,
         declarations: &mut Peekable<impl Iterator<Item = LocalDeclaration<'c>>>,
     ) -> Result<(), DecompileError> {
         let mut any = false;
@@ -306,7 +305,9 @@ impl<'a, 'c> Writer<'a, 'c> {
             result?;
             any = true;
         }
-        if any && has_following_line {
+        // Like Java's ExprProcessor.listToJava, add an expression separator
+        // after the class's own newline, even at the end of a method.
+        if any {
             self.line(0, "");
         }
         Ok(())

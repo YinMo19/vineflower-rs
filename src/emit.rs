@@ -1347,7 +1347,7 @@ impl<'a, 'c> Writer<'a, 'c> {
                 scope_end = Some(end);
             }
             let depth = line.depth + usize::from(scope_end.is_some());
-            self.write_local_declarations(index, depth, true, &mut declarations)?;
+            self.write_local_declarations(index, depth, &mut declarations)?;
             closed_block =
                 (line.text == "}" || line.text.starts_with("} while ")).then_some(line.depth);
             previous_depth = Some(line.depth);
@@ -1378,7 +1378,7 @@ impl<'a, 'c> Writer<'a, 'c> {
                 scope_end = None;
             }
         }
-        self.write_local_declarations(line_count, 0, false, &mut declarations)?;
+        self.write_local_declarations(line_count, 0, &mut declarations)?;
         let source_free = line_count == 0 && closing.as_ref().is_some_and(Vec::is_empty);
         if mapping && let Some(closing) = closing {
             for offset in closing {
