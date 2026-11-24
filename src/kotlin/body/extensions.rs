@@ -20,7 +20,7 @@ use crate::{
 
 use super::{
     Bytecode, Constant, Expected, Expr, ExprKind, Instruction, JvmMethodSignature, JvmType,
-    KotlinError, Locals, Member, MethodDescriptor, Operand, Primitive, Property, STATIC,
+    KotlinError, LocalFunction, Locals, Member, MethodDescriptor, Operand, Primitive, Property, STATIC,
     StackValue, Type, ValueParameter, identifier, load_opcode, logic,
 };
 
@@ -88,6 +88,7 @@ pub(in crate::kotlin) struct Context<'a> {
     pub(super) parameters: &'a [ValueParameter],
     pub(super) members: &'a PackageDeclaration,
     pub(super) group: Option<&'a ClassGroup<'a>>,
+    pub(super) local_functions: &'a [LocalFunction<'a, 'a>],
     owners: RefCell<HashMap<String, ClassDeclaration>>,
     getters: RefCell<HashMap<u16, Rc<Getter>>>,
 }
@@ -106,9 +107,15 @@ impl<'a> Context<'a> {
             parameters: &function.parameters,
             members,
             group,
+            local_functions: &[],
             owners: RefCell::default(),
             getters: RefCell::default(),
         })
+    }
+
+    pub(in crate::kotlin) fn with_local_functions(mut self, functions: &'a [LocalFunction<'a, 'a>]) -> Self {
+        self.local_functions = functions;
+        self
     }
 
     fn parameter(
@@ -121,14 +128,20 @@ impl<'a> Context<'a> {
         let Some((jvm, parameters)) = descriptor.parameters.split_first() else {
             return Err(invalid(&function.name));
         };
-        let access = match function.flags.visibility()? {
+        let visibility = function.flags.visibility()?;
+        let access = match visibility {
             Visibility::Public | Visibility::Internal => 0x0001,
-            Visibility::Private | Visibility::PrivateToThis => 0x0002,
+            Visibility::Private | Visibility::PrivateToThis | Visibility::Local => 0x0002,
             Visibility::Protected => 0x0004,
-            Visibility::Local => return Err(invalid(&function.name)),
+        };
+        let named = if visibility == Visibility::Local {
+            member.access_flags & STATIC != 0
+                && signature.name.rsplit_once('$').is_some_and(|(_, name)| name == function.name)
+        } else {
+            signature.name == function.name
         };
         if member.access_flags & 0x0007 != access
-            || signature.name != function.name
+            || !named
             || !exact_type(ty, jvm, false)
             || parameters.len() != function.parameters.len()
             || function.parameters.iter().zip(parameters).any(|(param, jvm)| {

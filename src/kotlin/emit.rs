@@ -24,6 +24,8 @@ mod nesting;
 mod objects;
 mod trace;
 
+const MAX_NESTING_DEPTH: u8 = 32;
+
 #[derive(Clone, Copy)]
 struct Style<'a> {
     indent: &'a str,
@@ -84,6 +86,11 @@ pub(super) fn render<'a, 'data>(
         out.push_str("package ");
         qualified(&mut out, package, owner)?;
         out.push_str("\n\n");
+    }
+    let nested = if options.is_none_or(|options| options.decompile_inner) { group } else { None };
+    if imports_repeat(class, owner, nested, 0)? {
+        // An explicit import beats a same-package `repeat` extension.
+        out.push_str("import kotlin.text.repeat\n\n");
     }
     let unit = options.map_or(INDENT, |options| options.indent.as_str());
     let mut mapping = options
@@ -213,7 +220,7 @@ fn render_class<'a, 'data>(
     let invalid = |feature| error(bytecode.owner, feature);
     let ClassScope { group, decompile_inner, parent, indent, unit, depth } = scope;
     let nested = parent.is_some();
-    if depth >= 32 || declaration.name.local
+    if depth >= MAX_NESTING_DEPTH || declaration.name.local
         || declaration.name.relative_name().contains('.') != nested
         || declaration.name.jvm_internal_name() != bytecode.owner
     {
@@ -1192,21 +1199,29 @@ fn render_function<'a, 'data>(
             }
             return Ok(());
         }
-        match bytecode.function(
+        let local_functions = body::local_extensions(
+            bytecode, function, signature, method, members, group, location.is_some(),
+        )?;
+        let body = bytecode.function(
             method,
             descriptor,
             &function.parameters,
             &function.returns,
             plan.metadata_properties,
-            Some(body::Extension::new(function, signature, method, members, group)?),
+            Some(body::Extension::new(function, signature, method, members, group)?
+                .with_local_functions(&local_functions)),
             name,
             location.is_some(),
-        )? {
+        )?;
+        if !local_functions.is_empty() && !matches!(body, Body::Expression(..) | Body::Statements(_)) {
+            return Err(types.unsupported("unproven scope for Kotlin local extensions"));
+        }
+        match body {
             Body::Empty => out.push_str(" {}"),
             Body::Expression(expr, expression_trace) => {
-                if let (Some(expression_trace), Some((map, header))) = (expression_trace, location)
-                {
+                if expression_trace.is_some() || !local_functions.is_empty() {
                     out.push_str(" {\n");
+                    let line = render_local_extensions(out, bytecode, &types, style, local_functions, &mut location)?;
                     out.push_str(indent);
                     out.push_str(indent_unit);
                     out.push_str("return ");
@@ -1220,9 +1235,11 @@ fn render_function<'a, 'data>(
                     out.push('\n');
                     out.push_str(indent);
                     out.push('}');
-                    let mut trace = trace::Trace::new(bytecode, method)?;
-                    trace.offsets(expression_trace.offsets, header + 1);
-                    trace.finish(map, expression_trace.lines);
+                    if let (Some(expression_trace), Some((map, _))) = (expression_trace, location) {
+                        let mut trace = trace::Trace::new(bytecode, method)?;
+                        trace.offsets(expression_trace.offsets, line);
+                        trace.finish(map, expression_trace.lines);
+                    }
                 } else {
                     out.push_str(" = ");
                     expr.write(
@@ -1240,7 +1257,7 @@ fn render_function<'a, 'data>(
                     .as_ref()
                     .map(|_| trace::Trace::new(bytecode, method))
                     .transpose()?;
-                let mut line = location.as_ref().map_or(0, |(_, header)| *header + 1);
+                let mut line = render_local_extensions(out, bytecode, &types, style, local_functions, &mut location)?;
                 for statement in block.statements {
                     out.push_str(indent);
                     out.push_str(indent_unit);
@@ -1358,6 +1375,69 @@ fn render_function<'a, 'data>(
     }
     out.push('\n');
     Ok(())
+}
+
+fn render_local_extensions(
+    out: &mut String,
+    bytecode: &Bytecode<'_, '_>,
+    types: &Types<'_>,
+    style: Style<'_>,
+    functions: Vec<body::LocalFunction<'_, '_>>,
+    location: &mut Location<'_>,
+) -> Result<usize, KotlinError> {
+    let mut line = location.as_ref().map_or(0, |(_, header)| *header + 1);
+    for local in functions {
+        let function = local.function;
+        let descriptor = &function.signature.as_ref().unwrap().descriptor;
+        let name = &function.name;
+        let types = types.local(name, &[]);
+        out.push_str(style.indent);
+        out.push_str(style.unit);
+        out.push_str("infix fun ");
+        types.receiver(out, function.receiver.as_ref().unwrap())?;
+        out.push('.');
+        identifier(out, name, name)?;
+        out.push('(');
+        value_parameter(out, &types, &function.parameters[0], false, None)?;
+        out.push_str("): ");
+        types.write(out, &function.returns)?;
+        out.push_str(" = ");
+        local.expr.write(out, &function.returns, &descriptor.return_type, &function.parameters, name)?;
+        out.push('\n');
+        if let (Some(mapping), Some((map, _))) = (local.trace, &mut *location) {
+            let mut trace = trace::Trace::new(bytecode, local.member)?;
+            trace.offsets(mapping.offsets, line);
+            trace.finish(map, mapping.lines);
+        }
+        line += 1;
+    }
+    Ok(line)
+}
+
+fn imports_repeat(
+    class: &ClassFile<'_>,
+    owner: &str,
+    group: Option<&ClassGroup<'_>>,
+    depth: u8,
+) -> Result<bool, KotlinError> {
+    if depth >= MAX_NESTING_DEPTH {
+        return Ok(false);
+    }
+    if body::uses_stdlib_repeat(class)? {
+        return Ok(true);
+    }
+    if let Some(group) = group {
+        for (name, nesting) in group.children(owner) {
+            if matches!(nesting.kind, crate::context::NestedKind::Member(_))
+                && name.strip_prefix(owner).is_some_and(|suffix| suffix.starts_with('$'))
+                && let Some(child) = group.get(name)
+                && imports_repeat(child, name, Some(group), depth + 1)?
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn overrides_any(name: &str, descriptor: &MethodDescriptor) -> bool {

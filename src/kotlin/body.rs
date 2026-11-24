@@ -21,6 +21,7 @@ mod decisions;
 mod defaults;
 mod extensions;
 mod invocations;
+mod local_functions;
 mod logic;
 mod loops;
 mod nullable;
@@ -32,6 +33,8 @@ mod try_regions;
 
 pub(super) use defaults::{recover as parameter_defaults, verify_copy, verify_copy_defaults};
 pub(super) use extensions::Context as Extension;
+pub(super) use invocations::uses_stdlib_repeat;
+pub(super) use local_functions::{Definition as LocalFunction, recover as local_extensions};
 use logic::{Comparison, Conditional, Relation};
 
 pub(super) const STATIC: u16 = 0x0008;
@@ -1357,7 +1360,7 @@ impl<'a> Expr<'a> {
                 if !call.result().accepts(expected) {
                     return Err(mismatch());
                 }
-                call.write(out, parameters, declaration)?;
+                call.write_at(out, parameters, declaration, binding)?;
             }
             ExprKind::BoundGetter(read) => {
                 if !read.value().accepts(expected) {
