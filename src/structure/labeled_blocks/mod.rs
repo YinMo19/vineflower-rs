@@ -537,7 +537,7 @@ impl Emitter<'_> {
     ) -> Result<bool, StructureError> {
         let Some(scope) = region.label_scope() else { return Ok(false); };
         let jump = match &scope.edges {
-            Edges::Explicit if scope.join == to && block != scope.tail
+            Edges::Explicit if scope.join == to && block < scope.tail
                 && self.labeled_plain_block(block, region) =>
             {
                 Some(self.explicit_jump(block, to).ok_or_else(|| self.unstructured(block))?)
