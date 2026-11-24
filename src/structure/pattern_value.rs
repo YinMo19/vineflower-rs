@@ -23,7 +23,9 @@ impl Emitter<'_> {
         constructor_setup: Option<usize>,
     ) -> bool {
         if !machine.supports_switch_expressions()
-            || constructor_setup.is_none() && arms.iter().any(|(_, arm)| arm.guard.is_some())
+            || arms.iter().any(|(_, arm)| arm.guard.as_ref().is_some_and(|guard| {
+                constructor_setup.is_none() || guard.success().is_none()
+            }))
         {
             return false;
         }
@@ -40,10 +42,12 @@ impl Emitter<'_> {
         }) {
             return false;
         }
-        let entries = || arms.iter().map(|(target, arm)| arm.guard.as_ref().map_or(*target, |guard| guard.success));
+        let entries = || arms.iter().map(|(target, arm)| {
+            arm.guard.as_ref().and_then(super::guards::Guard::success).unwrap_or(*target)
+        });
         let Some(proof) = self.switch_region_entries(header, region, entries(), join, |entry, pred| {
             arms.iter().any(|(target, arm)| match &arm.guard {
-                Some(guard) => guard.success == entry && guard.blocks().any(|owned| owned == pred),
+                Some(guard) => guard.success() == Some(entry) && guard.blocks().any(|owned| owned == pred),
                 None => *target == entry && pred == header,
             })
         }) else {
@@ -61,7 +65,7 @@ impl Emitter<'_> {
                 let entry = local.switch_arm_entry(control).ok()?;
                 helpers.push(entry.clone());
                 let path = if let Some(guard) = &arm.guard {
-                    self.branch_arm(guard.success, arm_region, &entry, depth + 2).ok()?
+                    self.branch_arm(guard.success()?, arm_region, &entry, depth + 2).ok()?
                 } else if let Some((indices, _)) = &arm.binding {
                     self.pattern_arm(*target, arm_region, entry, depth + 2, indices.end).ok()?
                 } else {

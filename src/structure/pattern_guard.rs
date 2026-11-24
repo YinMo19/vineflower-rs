@@ -9,12 +9,22 @@ use super::super::switch_expression::{CaseLabel, DefaultLabel, Rule, RuleResult,
 
 pub(super) struct RestartLoop {
     pub(super) dispatch: usize,
-    retries: BTreeMap<usize, i32>,
+    retries: BTreeMap<usize, Retry>,
 }
 
-pub(super) struct Guard {
-    pub(super) entry: usize,
-    pub(super) success: usize,
+struct Retry {
+    next_index: i32,
+    start: usize,
+}
+
+pub(super) enum Guard {
+    Never { block: usize, bytes: Range<u32> },
+    Conditional(ConditionalGuard),
+}
+
+pub(super) struct ConditionalGuard {
+    entry: usize,
+    success: usize,
     blocks: BTreeSet<usize>,
     retries: BTreeSet<usize>,
 }
@@ -56,7 +66,7 @@ impl RestartLoop {
         let mut retries = BTreeMap::new();
         for &retry in header.predecessors.iter().filter(|&&pred| pred != preheader) {
             let node = &blocks[retry];
-            let [index, store, jump] = &emitter.instructions[node.instructions.clone()] else { return None };
+            let [.., index, store, jump] = &emitter.instructions[node.instructions.clone()] else { return None };
             if !private(emitter, retry) || node.successors.as_slice() != [dispatch]
                 || !emitter.layout.direct_loop_member(retry, dispatch)
                 || local(store, true, false) != Some(restart) || !matches!(jump.opcode, 0xa7 | 0xc8)
@@ -64,17 +74,16 @@ impl RestartLoop {
             {
                 return None;
             }
-            let index = integer(pool, index)?;
-            if index <= 0 { return None; }
-            retries.insert(retry, index);
+            let next_index = integer(pool, index)?;
+            if next_index <= 0 { return None; }
+            retries.insert(retry, Retry { next_index, start: node.instructions.end - 3 });
         }
         let head = Head { setup, restart, restart_store: Some(alias_store + 2), alias, alias_store, null_check };
         Some((head, Self { dispatch, retries }))
     }
 
-    pub(super) fn restart_store(&self, emitter: &Emitter<'_>, index: usize) -> bool {
-        let Some(store) = index.checked_sub(1) else { return false; };
-        self.retries.keys().any(|&block| emitter.graph.blocks[block].instructions.start == store)
+    pub(super) fn restart_store(&self, index: usize) -> bool {
+        self.retries.values().any(|retry| retry.start + 1 == index)
     }
 
     /// A guard owns an acyclic prefix with one successful continuation. Every
@@ -84,11 +93,25 @@ impl RestartLoop {
         &self, emitter: &Emitter<'_>, entry: usize, first: usize, key: i32, targets: &BTreeSet<usize>,
     ) -> Option<Option<Guard>> {
         let blocks = &emitter.graph.blocks;
+        let next_index = key.checked_add(1)?;
+        if let Some(retry) = self.retries.get(&entry) {
+            // Javac 17's constant-false guard shares a block with an optional
+            // verified binding. No instruction between the binding and retry
+            // may be skipped, and the dispatch is the only entry.
+            return (retry.next_index == next_index
+                && retry.start == first
+                && blocks[entry].predecessors == [self.dispatch])
+                .then(|| Some(Guard::Never {
+                    block: entry,
+                    bytes: emitter.instructions[first].offset
+                        ..emitter.instructions[blocks[entry].instructions.end - 1].offset,
+                }));
+        }
         let mut ancestors = BTreeSet::new();
         let mut retries = BTreeSet::new();
         let mut pending = Vec::new();
-        for (&retry, &index) in &self.retries {
-            if index == key.checked_add(1)? {
+        for (&retry, shape) in &self.retries {
+            if shape.next_index == next_index && shape.start == blocks[retry].instructions.start {
                 retries.insert(retry);
                 pending.extend_from_slice(&blocks[retry].predecessors);
             }
@@ -147,22 +170,57 @@ impl RestartLoop {
         }) {
             return None;
         }
-        Some(Some(Guard { entry, success: success?, blocks: owned, retries: reached_retries }))
+        Some(Some(Guard::Conditional(ConditionalGuard {
+            entry, success: success?, blocks: owned, retries: reached_retries,
+        })))
     }
 
     pub(super) fn owns_all_retries<'g>(&self, guards: impl Iterator<Item = &'g Guard>) -> bool {
         let mut covered = BTreeSet::new();
-        guards.flat_map(|guard| guard.retries.iter().copied()).all(|retry| covered.insert(retry))
+        guards.flat_map(Guard::retry_blocks).all(|retry| covered.insert(retry))
             && covered.len() == self.retries.len()
     }
 }
 
 impl Guard {
-    pub(super) fn blocks(&self) -> impl Iterator<Item = usize> + '_ {
-        self.blocks.iter().chain(&self.retries).copied()
+    pub(super) fn success(&self) -> Option<usize> {
+        match self {
+            Self::Never { .. } => None,
+            Self::Conditional(guard) => Some(guard.success),
+        }
     }
 
-    pub(super) fn document<'a, 'c>(&self, emitter: &Emitter<'_>, first: usize, machine: &Machine<'a, 'c>) -> Option<Document> {
+    fn retry_blocks(&self) -> impl Iterator<Item = usize> + '_ {
+        let (direct, conditional) = match self {
+            Self::Never { block, .. } => (Some(*block), None),
+            Self::Conditional(guard) => (None, Some(&guard.retries)),
+        };
+        direct.into_iter().chain(conditional.into_iter().flatten().copied())
+    }
+
+    pub(super) fn blocks(&self) -> impl Iterator<Item = usize> + '_ {
+        let decisions = match self {
+            Self::Never { .. } => None,
+            Self::Conditional(guard) => Some(&guard.blocks),
+        };
+        decisions.into_iter().flatten().copied().chain(self.retry_blocks())
+    }
+
+    pub(super) fn document(&self, emitter: &Emitter<'_>, first: usize, machine: &Machine<'_, '_>) -> Option<Document> {
+        match self {
+            Self::Never { bytes, .. } => {
+                let mut doc = Document::new();
+                doc.anchor(bytes.clone());
+                doc.push_str("false");
+                Some(doc)
+            }
+            Self::Conditional(guard) => guard.document(emitter, first, machine),
+        }
+    }
+}
+
+impl ConditionalGuard {
+    fn document(&self, emitter: &Emitter<'_>, first: usize, machine: &Machine<'_, '_>) -> Option<Document> {
         let mut counts = BTreeMap::<usize, usize>::new();
         for &block in &self.blocks {
             for &next in &emitter.graph.blocks[block].successors {

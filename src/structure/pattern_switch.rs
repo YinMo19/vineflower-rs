@@ -302,6 +302,12 @@ impl Emitter<'_> {
                 let Some(guard) = proof.arm(self, target, body_start, key, &targets) else {
                     return Ok(None);
                 };
+                if guard.as_ref().is_some_and(|guard| guard.success().is_none())
+                    && machine.pattern_guard_keyword() != Some(" && ")
+                {
+                    // Final Java rejects guards that are constant false.
+                    return Ok(None);
+                }
                 arm.guard = guard;
             }
             if arm.nullable_type && (arm.binding.is_none() || arm.guard.is_some()) {
@@ -336,7 +342,7 @@ impl Emitter<'_> {
             touches_slot(op, head.alias) && !alias_uses.contains(&index)
                 || head.restart_store.is_some_and(|store| {
                     touches_slot(op, head.restart) && index != store && index != indy - 1
-                        && !restart.as_ref().is_some_and(|proof| proof.restart_store(self, index))
+                        && !restart.as_ref().is_some_and(|proof| proof.restart_store(index))
                 })
         }) {
             return Ok(None);
@@ -353,7 +359,13 @@ impl Emitter<'_> {
             .or_else(|| self.layout.normal_join(dispatch_block, within))
             .or_else(|| self.layout.common_join(
                 self.graph, within,
-                groups.iter().map(|(&target, arm)| (arm.guard.as_ref().map_or(target, |guard| guard.success), None)),
+                groups.iter().filter_map(|(&target, arm)| {
+                    let entry = match &arm.guard {
+                        Some(guard) => guard.success()?,
+                        None => target,
+                    };
+                    Some((entry, None))
+                }),
             ))
             .or(region.stop);
         if groups.keys().any(|&target| Some(target) == join && target != default)
@@ -528,7 +540,11 @@ impl Emitter<'_> {
                 continue;
             }
             let path = if let Some(guard) = &arm.guard {
-                self.branch_arm(guard.success, switch_region, &entry, depth + 2)?
+                let Some(success) = guard.success() else {
+                    self.syntax(depth + 2, "break;");
+                    continue;
+                };
+                self.branch_arm(success, switch_region, &entry, depth + 2)?
             } else if let Some((indices, _)) = &arm.binding {
                 self.pattern_arm(*target, switch_region, entry, depth + 2, indices.end)?
             } else {

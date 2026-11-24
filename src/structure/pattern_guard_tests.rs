@@ -4,6 +4,7 @@ const PREVIEW_BASIC: &[u8] = include_bytes!("../../tests/smoke/java17preview/Tes
 const PREVIEW_DEFAULT: &[u8] = include_bytes!("../../tests/smoke/java17preview/TestSwitchPatternMatching4.class");
 const PREVIEW_REPEATED: &[u8] = include_bytes!("../../tests/smoke/java17preview/TestSwitchPatternMatching15.class");
 const PREVIEW_NESTED: &[u8] = include_bytes!("../../tests/smoke/java17preview/TestSwitchPatternMatching17.class");
+const PREVIEW_FALSE: &[u8] = include_bytes!("../../tests/smoke/java17preview/TestSwitchPatternMatching20.class");
 const J21: &[u8] = include_bytes!("../../tests/smoke/java21/TestSwitchPatternMatchingJ21.class");
 const J25: &[u8] = include_bytes!("../../tests/smoke/java25/TestSwitchPatternMatchingJ25.class");
 
@@ -24,6 +25,26 @@ fn failed_guards_resume_at_the_next_bootstrap_label() {
     assert_eq!(source.matches(" && ").count(), 2, "{source}");
     assert_eq!(source.matches("hashCode()").count(), 1, "{source}");
     assert!(!source.contains("typeSwitch") && !source.contains("while ("), "{source}");
+}
+
+#[test]
+fn preview_false_guard_retries_after_its_binding() {
+    let source = decompile(PREVIEW_FALSE, &Options::default()).unwrap().text;
+    assert!(source.lines().any(|line| line.contains("case Integer ") && line.contains(" && (false):")), "{source}");
+    assert!(source.contains("case String s:") && source.contains("default:"), "{source}");
+    assert!(!source.contains("typeSwitch"), "{source}");
+
+    let class = ClassFile::parse(PREVIEW_FALSE).unwrap();
+    let method = class.methods.iter().find(|method| class.pool.utf8(method.name_index).unwrap() == "test").unwrap();
+    let code = method.code(&class.pool).unwrap().unwrap();
+    let base = code.bytes.as_ptr() as usize - PREVIEW_FALSE.as_ptr() as usize;
+    let instructions = decode(code.bytes).unwrap();
+    let retry = instructions.windows(3)
+        .find(|ops| ops[0].opcode == 0x04 && ops[1].opcode == 0x3e && ops[2].opcode == 0xa7)
+        .unwrap();
+    let mut altered = PREVIEW_FALSE.to_vec();
+    altered[base + retry[0].offset as usize] = 0x05;
+    assert!(decompile(&altered, &Options::default()).is_err());
 }
 
 #[test]
