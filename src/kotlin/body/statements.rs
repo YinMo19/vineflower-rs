@@ -7,7 +7,7 @@ use crate::classfile::LocalVariable;
 use super::{
     Bytecode, Code, Expected, Expr, ExprKind, Instruction, JvmType, KotlinError, Literal, Locals,
     Operand, Primitive, ScopedLocal, StackValue, Type, ValueParameter, extensions::{Value, exact_type},
-    identifier, invocations::{Call, kotlin_type}, load_opcode, local_load, local_store, logic, nullable, pop_value,
+    identifier, invocations::{self, Call, kotlin_type}, load_opcode, local_load, local_store, logic, nullable, pop_value,
 };
 
 /// Statements and their original bytecode spans. Stack shuffles do not have
@@ -575,6 +575,51 @@ fn lower_operands<'a>(
         if let Some(expr) = read_local(scope(), instruction).map_err(|_| invalid())? {
             stack.push(StackValue::Value(expr));
             index += 1;
+            continue;
+        }
+        if instruction.opcode == 0xbd {
+            let Some(StackValue::Value(Expr { kind: ExprKind::Literal(Literal::Int(length)), .. })) = stack.last()
+                else { return Err(invalid()); };
+            let (pack, consumed, scratch) = invocations::packed(
+                bytecode, &instructions[index..range.end], *length,
+                |instruction, stack| {
+                    if let Some(value) = read_local(scope(), instruction).map_err(|_| invalid())? {
+                        stack.push(StackValue::Value(value));
+                        Ok(())
+                    } else {
+                        bytecode.expression_with_locals(instruction, locals, stack, declaration, scoped)
+                    }
+                },
+                declaration,
+            )?;
+            if let Some(slot) = scratch {
+                let begin = instruction.offset;
+                let last = &instructions[index + consumed - 1];
+                let end = last.offset + last.len;
+                let overlaps = |local_slot: u16, width: u16, from: u32, to: u32| {
+                    local_slot <= slot && u32::from(slot) < u32::from(local_slot) + u32::from(width)
+                        && begin < to && from < end
+                };
+                if slot < first_free || (debug.max != 0 && slot >= debug.max)
+                    || scope().filter_map(Statement::binding).any(|local|
+                        overlaps(local.slot, local.value.jvm.slots(), local.range.start, local.range.end))
+                    || debug.entries.iter().any(|local| {
+                        let from = u32::from(local.start_pc);
+                        let width = if matches!(local.descriptor, "J" | "D") { 2 } else { 1 };
+                        overlaps(local.index, width, from, from + u32::from(local.length))
+                    })
+                {
+                    return Err(invalid());
+                }
+            }
+            stack.truncate(stack.len() - 1);
+            stack.push(StackValue::Vararg(pack));
+            index += consumed;
+            continue;
+        }
+        if let Some(spread) = invocations::spread(bytecode, &instructions[index..range.end], locals)? {
+            stack.push(StackValue::Vararg(spread));
+            index += 5;
             continue;
         }
         if bytecode.reference(instruction, 0xb2)?

@@ -283,6 +283,7 @@ enum StackValue<'a> {
     This,
     Value(Expr<'a>),
     Allocation(invocations::Allocation<'a>),
+    Vararg(invocations::Vararg<'a>),
     UnitCall(Box<invocations::Call<'a>>),
     PrintStream,
     StringBuilder(templates::Builder<'a>),

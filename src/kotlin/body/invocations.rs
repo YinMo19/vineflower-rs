@@ -6,13 +6,13 @@
 
 use crate::{
     classfile::ClassFile,
-    kotlin::{ClassKind, ClassName, Classifier, MemberKind, Visibility},
+    kotlin::{ClassKind, ClassName, Classifier, MemberKind, TypeArgument, Variance, Visibility},
 };
 
 use super::{
     Bytecode, Constant, Expected, Expr, ExprKind, Function, Instruction, JvmType, KotlinError, Literal,
     Locals, MethodDescriptor, Operand, Primitive, STATIC, StackValue, Type, ValueParameter,
-    defaults, extensions::{Context, Value, exact_type}, identifier, load_opcode, logic, qualified,
+    defaults, extensions::{Context, Value, exact_type}, identifier, load_opcode, local_load, logic, qualified,
 };
 
 #[derive(Clone, Copy)]
@@ -39,10 +39,22 @@ enum Target<'a> {
 
 #[derive(Debug)]
 struct Argument<'a> {
-    value: Expr<'a>,
+    value: ArgumentValue<'a>,
     ty: Type,
     jvm: JvmType,
     name: Option<String>,
+}
+
+#[derive(Debug)]
+enum ArgumentValue<'a> {
+    Single(Expr<'a>),
+    Vararg(Vararg<'a>),
+}
+
+#[derive(Debug)]
+pub(super) enum Vararg<'a> {
+    Packed(Vec<Expr<'a>>),
+    Spread { array: Expr<'a>, nullable_element: bool },
 }
 
 impl Call<'_> {
@@ -81,9 +93,10 @@ impl Call<'_> {
                     out.push(' ');
                     identifier(out, name, declaration)?;
                     out.push(' ');
-                    let [argument] = self.arguments.as_slice() else { return Err(invalid(declaration)); };
-                    argument.value.write_at(
-                        out, Expected::Type(&argument.ty, &argument.jvm), parameters, declaration, logic::INFIX + 1,
+                    let [Argument { value: ArgumentValue::Single(value), ty, jvm, .. }] = self.arguments.as_slice()
+                        else { return Err(invalid(declaration)); };
+                    value.write_at(
+                        out, Expected::Type(ty, jvm), parameters, declaration, logic::INFIX + 1,
                     )?;
                     if binding > logic::INFIX {
                         out.push(')');
@@ -97,30 +110,60 @@ impl Call<'_> {
             Target::Function { name } => identifier(out, name, declaration)?,
         }
         out.push('(');
-        for (index, argument) in self.arguments.iter().enumerate() {
-            if index != 0 {
-                out.push_str(", ");
+        let mut separated = false;
+        for argument in &self.arguments {
+            let mut write = |value: &Expr<'_>, spread| {
+                if separated {
+                    out.push_str(", ");
+                }
+                separated = true;
+                if let Some(name) = &argument.name {
+                    identifier(out, name, declaration)?;
+                    out.push_str(" = ");
+                }
+                if spread {
+                    out.push('*');
+                    value.write_at(out, Expected::Reference, parameters, declaration, 0)
+                } else {
+                    value.write(out, &argument.ty, &argument.jvm, parameters, declaration)
+                }
+            };
+            match &argument.value {
+                ArgumentValue::Single(value) => write(value, false)?,
+                ArgumentValue::Vararg(Vararg::Spread { array, .. }) => write(array, true)?,
+                ArgumentValue::Vararg(Vararg::Packed(elements)) => {
+                    for value in elements {
+                        write(value, false)?;
+                    }
+                }
             }
-            if let Some(name) = &argument.name {
-                identifier(out, name, declaration)?;
-                out.push_str(" = ");
-            }
-            argument.value.write(out, &argument.ty, &argument.jvm, parameters, declaration)?;
         }
         out.push(')');
         Ok(())
     }
 }
 
-impl Argument<'_> {
+impl<'a> Argument<'a> {
+    fn single(value: Expr<'a>, ty: Type, jvm: JvmType, name: Option<String>) -> Self {
+        Argument { value: ArgumentValue::Single(value), ty, jvm, name }
+    }
+
+    fn depth(&self) -> u8 {
+        match &self.value {
+            ArgumentValue::Single(value) | ArgumentValue::Vararg(Vararg::Spread { array: value, .. }) => value.depth,
+            ArgumentValue::Vararg(Vararg::Packed(elements)) => elements.iter().map(|value| value.depth).max().unwrap_or(0),
+        }
+    }
+
     fn write_receiver(
         &self, out: &mut String, parameters: &[ValueParameter], declaration: &str, binding: u8, widen: bool,
     ) -> Result<(), KotlinError> {
-        let negative = binding == u8::MAX && matches!(self.value.kind, ExprKind::Literal(Literal::Int(n)) if n < 0);
+        let ArgumentValue::Single(value) = &self.value else { return Err(invalid(declaration)); };
+        let negative = binding == u8::MAX && matches!(value.kind, ExprKind::Literal(Literal::Int(n)) if n < 0);
         if widen || negative {
             out.push('(');
         }
-        self.value.write_at(
+        value.write_at(
             out, Expected::Type(&self.ty, &self.jvm), parameters, declaration,
             if widen { logic::INFIX + 1 } else { binding },
         )?;
@@ -134,6 +177,107 @@ impl Argument<'_> {
 }
 
 const REPEAT: (&str, &str, &str) = ("kotlin/text/StringsKt", "repeat", "(Ljava/lang/CharSequence;I)Ljava/lang/String;");
+const COPY_OF: (&str, &str, &str) = ("java/util/Arrays", "copyOf", "([Ljava/lang/Object;I)[Ljava/lang/Object;");
+const STRING: &str = "java/lang/String";
+
+pub(super) fn string_array_element<'a>(ty: &'a Type, jvm: &JvmType) -> Option<&'a Type> {
+    let [TypeArgument::Type(Variance::Invariant | Variance::Out, element)] = ty.arguments.as_slice()
+        else { return None; };
+    let JvmType::Array(component) = jvm else { return None; };
+    (ty.class_id() == Some("kotlin/Array") && !ty.nullable
+        && element.class_id() == Some("kotlin/String")
+        && matches!(component.as_ref(), JvmType::Object(owner) if owner == STRING)
+        && exact_type(ty, jvm, false)).then_some(element)
+}
+
+pub(super) fn spread<'a>(
+    bytecode: &Bytecode<'a, '_>, instructions: &[Instruction], locals: &Locals<'_>,
+) -> Result<Option<Vararg<'a>>, KotlinError> {
+    let [load, reload, length, copy, cast, ..] = instructions else { return Ok(None); };
+    let Some((0x19, slot)) = local_load(load) else { return Ok(None); };
+    if local_load(reload) != Some((0x19, slot)) || length.opcode != 0xbe
+        || copy.opcode != 0xb8 || cast.opcode != 0xc0
+    {
+        return Ok(None);
+    }
+    let (Operand::Constant(method), Operand::Constant(class)) = (&copy.operand, &cast.operand)
+        else { return Ok(None); };
+    let pool = &bytecode.class.pool;
+    if !matches!(pool.get(*method)?, Constant::Methodref { .. }) || pool.member_ref(*method)? != COPY_OF
+        || pool.class_name(*class)? != "[Ljava/lang/String;"
+    {
+        return Ok(None);
+    }
+    let Some(index) = locals.parameter(slot, 0x19) else { return Ok(None); };
+    let Some(context) = &locals.extension else { return Ok(None); };
+    let Some(element) = string_array_element(&context.parameters[index].ty, locals.slots[index].1)
+        else { return Ok(None); };
+    // A spread of a parameter creates the same full-length copy, including
+    // the runtime component type. A direct load is not a spread.
+    Ok(Some(Vararg::Spread {
+        array: Expr { kind: ExprKind::Parameter { index, load: 0x19 }, depth: 1 },
+        nullable_element: element.nullable,
+    }))
+}
+
+/// Recognize the writes to a private, freshly allocated compiler pack.
+/// Kotlin/JVM uses either a scratch local or `dup` to keep the array live.
+pub(super) fn packed<'a>(
+    bytecode: &Bytecode<'a, '_>,
+    instructions: &[Instruction],
+    length: i32,
+    mut lower: impl FnMut(&Instruction, &mut Vec<StackValue<'a>>) -> Result<(), KotlinError>,
+    declaration: &str,
+) -> Result<(Vararg<'a>, usize, Option<u16>), KotlinError> {
+    let invalid = || invalid(declaration);
+    let [allocate, tail @ ..] = instructions else { return Err(invalid()); };
+    let Operand::Constant(class) = allocate.operand else { return Err(invalid()); };
+    let length = usize::try_from(length).map_err(|_| invalid())?;
+    if allocate.opcode != 0xbd || bytecode.class.pool.class_name(class)? != STRING || length > tail.len() / 4 {
+        return Err(invalid());
+    }
+    let scratch = tail.first().and_then(super::local_store).and_then(|(op, slot)| (op == 0x3a).then_some(slot));
+    let mut index = 1 + usize::from(scratch.is_some());
+    let reload = |instruction: &Instruction| {
+        scratch.is_some_and(|slot| local_load(instruction) == Some((0x19, slot)))
+    };
+    let mut elements = Vec::with_capacity(length);
+    let mut value_stack = Vec::new();
+    for ordinal in 0..length {
+        let Some([array, key, ..]) = instructions.get(index..) else { return Err(invalid()); };
+        if !(if scratch.is_some() { reload(array) } else { array.opcode == 0x59 })
+            || !matches!(key.opcode, 0x02..=0x08 | 0x10..=0x13)
+        {
+            return Err(invalid());
+        }
+        lower(key, &mut value_stack)?;
+        if !matches!(value_stack.pop(), Some(StackValue::Value(Expr { kind: ExprKind::Literal(Literal::Int(key)), .. }))
+            if usize::try_from(key) == Ok(ordinal))
+        {
+            return Err(invalid());
+        }
+        index += 2;
+        while let Some(instruction) = instructions.get(index).filter(|instruction| instruction.opcode != 0x53) {
+            if scratch.is_some_and(|slot| instruction.local_access().is_some_and(|(range, _)| range.contains(&u32::from(slot)))) {
+                return Err(invalid());
+            }
+            lower(instruction, &mut value_stack)?;
+            index += 1;
+        }
+        if index == instructions.len() || value_stack.len() != 1 {
+            return Err(invalid());
+        }
+        elements.push(super::pop_value(&mut value_stack, declaration)?);
+        index += 1;
+    }
+    if scratch.is_some() {
+        if !instructions.get(index).is_some_and(reload) {
+            return Err(invalid());
+        }
+        index += 1;
+    }
+    Ok((Vararg::Packed(elements), index, scratch))
+}
 
 pub(in crate::kotlin) fn uses_stdlib_repeat(class: &ClassFile<'_>) -> Result<bool, KotlinError> {
     let pool = &class.pool;
@@ -218,9 +362,9 @@ pub(super) fn lower<'a>(
 }
 
 fn call_expression<'a>(call: Box<Call<'a>>, declaration: &str) -> Result<Expr<'a>, KotlinError> {
-    let mut depth = call.arguments.iter().map(|arg| arg.value.depth).max().unwrap_or(0);
+    let mut depth = call.arguments.iter().map(Argument::depth).max().unwrap_or(0);
     if let Target::Extension { receiver, .. } = &call.target {
-        depth = depth.max(receiver.value.depth);
+        depth = depth.max(receiver.depth());
     }
     Expr::new(ExprKind::Invocation(call), depth + 1, declaration)
 }
@@ -402,7 +546,7 @@ fn char_sequence_receiver<'a>(
         _ => return Err(invalid(declaration)),
     };
     let widen = ty.class_id() == Some("kotlin/String");
-    Ok((Argument { value, ty, jvm, name: None }, widen))
+    Ok((Argument::single(value, ty, jvm, None), widen))
 }
 
 fn receiver_argument<'a>(
@@ -414,7 +558,7 @@ fn receiver_argument<'a>(
                 || locals.extension.as_ref().is_some_and(|context|
                     value.primitive_hint(context.parameters) == Some(*primitive)))
     {
-        Ok((Argument { value, ty: ty.clone(), jvm: jvm.clone(), name: None }, false))
+        Ok((Argument::single(value, ty.clone(), jvm.clone(), None), false))
     } else if ty.class_id() == Some("kotlin/CharSequence") {
         char_sequence_receiver(value, locals, declaration)
     } else {
@@ -449,7 +593,7 @@ fn stdlib_repeat<'a>(
     {
         return Err(invalid(declaration));
     }
-    let argument = Argument { value, ty: kotlin_type("kotlin/Int"), jvm, name: None };
+    let argument = Argument::single(value, kotlin_type("kotlin/Int"), jvm, None);
     let (receiver, _) = char_sequence_receiver(super::pop_value(stack, declaration)?, locals, declaration)?;
     Ok(Call {
         target: Target::Extension { name: name.into(), receiver, widen: false, infix: false },
@@ -526,7 +670,7 @@ fn member<'a>(
     } else {
         (None, signature_parameters.as_slice())
     };
-    if !parameters_match(&function.parameters, parameters) {
+    if !member_parameters_match(&function.parameters, parameters, !default && receiver.is_none()) {
         return Err(invalid());
     }
     let base = stack.len().checked_sub(invoked.parameters.len() + usize::from(!default)).ok_or_else(invalid)?;
@@ -574,6 +718,9 @@ fn unambiguous(context: &Context<'_>, function: &Function, default: bool) -> boo
     context.members.functions.iter().all(|other| {
         if std::ptr::eq(function, other) || function.name != other.name {
             return true;
+        }
+        if function.parameters.iter().any(|parameter| parameter.vararg_element.is_some()) {
+            return false;
         }
         if default || function.receiver.is_some() || other.receiver.is_some()
             || other.parameters.iter().any(|parameter| parameter.vararg_element.is_some())
@@ -652,18 +799,41 @@ fn take_arguments<'a>(
     let mut arguments = Vec::with_capacity(parameters.len() - omitted.iter().filter(|&&omit| omit).count());
     let mut named = false;
     for (index, ((operand, parameter), jvm)) in stack.drain(start..).zip(parameters).zip(descriptor).enumerate() {
-        let StackValue::Value(value) = operand else { return Err(invalid(declaration)); };
-        if omitted.get(index) == Some(&true) {
-            if !default_placeholder(&value, &jvm) {
+        if let Some(ty) = &parameter.vararg_element {
+            let StackValue::Vararg(value) = operand else { return Err(invalid(declaration)); };
+            let JvmType::Array(component) = jvm else { return Err(invalid(declaration)); };
+            // Dropping a copy or spreading a freshly built array would change
+            // which array reaches the callee. Emit elements only for a proven pack.
+            let jvm = *component;
+            let valid = match &value {
+                Vararg::Packed(elements) => elements.iter().all(|value| {
+                    if let Some((source, actual)) = value.source_type(locals) {
+                        *actual == jvm && Expected::Type(ty, &jvm).accepts(source)
+                    } else {
+                        is_string_expression(value)
+                            || ty.nullable && matches!(value.kind, ExprKind::Literal(Literal::Null))
+                    }
+                }),
+                Vararg::Spread { nullable_element, .. } => !*nullable_element || ty.nullable,
+            };
+            if !valid || named || omitted.get(index) == Some(&true) {
                 return Err(invalid(declaration));
             }
-            named = true;
-        } else if value.stack_load() != Some(load_opcode(&jvm))
-            || value.source_type(locals).is_some_and(|(_, actual)| *actual != jvm)
-        {
-            return Err(invalid(declaration));
+            arguments.push(Argument { value: ArgumentValue::Vararg(value), ty: ty.clone(), jvm, name: None });
         } else {
-            arguments.push(Argument { value, ty: parameter.ty.clone(), jvm, name: named.then(|| parameter.name.clone()) });
+            let StackValue::Value(value) = operand else { return Err(invalid(declaration)); };
+            if omitted.get(index) == Some(&true) {
+                if !default_placeholder(&value, &jvm) {
+                    return Err(invalid(declaration));
+                }
+                named = true;
+            } else if value.stack_load() != Some(load_opcode(&jvm))
+                || value.source_type(locals).is_some_and(|(_, actual)| *actual != jvm)
+            {
+                return Err(invalid(declaration));
+            } else {
+                arguments.push(Argument::single(value, parameter.ty.clone(), jvm, named.then(|| parameter.name.clone())));
+            }
         }
     }
     Ok(arguments)
@@ -703,6 +873,16 @@ fn parameters_match(parameters: &[ValueParameter], descriptor: &[JvmType]) -> bo
     parameters.len() == descriptor.len() && parameters.iter().zip(descriptor).all(|(parameter, jvm)| {
         parameter.vararg_element.is_none() && exact_type(&parameter.ty, jvm, false)
     })
+}
+
+fn member_parameters_match(parameters: &[ValueParameter], descriptor: &[JvmType], allow_vararg: bool) -> bool {
+    if let ([fixed @ .., vararg], [jvm_fixed @ .., jvm_vararg]) = (parameters, descriptor)
+        && let Some(element) = &vararg.vararg_element
+    {
+        return allow_vararg && parameters_match(fixed, jvm_fixed)
+            && string_array_element(&vararg.ty, jvm_vararg) == Some(element);
+    }
+    parameters_match(parameters, descriptor)
 }
 
 fn public_instance(bytecode: &Bytecode<'_, '_>, signature: &super::JvmMethodSignature) -> Result<bool, KotlinError> {

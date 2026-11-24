@@ -97,6 +97,7 @@ pub(super) fn lower<'a, 'data>(bytecode: &Bytecode<'a, 'data>, instructions: Vec
     let invalid = || KotlinError::unsupported(declaration, "loop or backward control transfer");
     let shape = Shape { bytecode, instructions: &instructions[start..], locals, parameters };
     let template = if let Some(template) = shape.iterable()? { template }
+        else if let Some(template) = shape.array()? { template }
         else if let Some(template) = shape.simple()? { template }
         else { progression::recognize(&shape)?.ok_or_else(invalid)? };
     let first = shape.instructions[template.scope_start].offset;
@@ -206,6 +207,34 @@ impl<'class> Shape<'_, 'class, '_> {
         Ok(Some(Template { source: Source::Range { first, last, step: None, direction }, slot,
             element: Element::Primitive(primitive), scope_start: 2, scope_end: exit,
             first_free: slot.saturating_add(1), body: 5..body_end }))
+    }
+
+    fn array(&self) -> Result<Option<Template<'class>>, KotlinError> {
+        let [zero, save_index, length_source, length, save_length, get_index, get_length, guard,
+            array, element_index, element, save_element, ..] = self.instructions else { return Ok(None); };
+        let Some((0x36, index)) = local_store(save_index) else { return Ok(None); };
+        let Some((0x36, limit)) = local_store(save_length) else { return Ok(None); };
+        let Some((0x3a, slot)) = local_store(save_element) else { return Ok(None); };
+        let Some((0x19, source_slot)) = local_load(length_source) else { return Ok(None); };
+        let Some(parameter) = self.locals.parameter(source_slot, 0x19) else { return Ok(None); };
+        let (back, exit) = self.final_indices();
+        let body = 12;
+        if back <= body || zero.opcode != 0x03 || length.opcode != 0xbe || element.opcode != 0x32
+            || index == limit || index == slot || limit == slot
+            || index.min(limit).min(slot) < self.locals.next_slot()
+            || !slot_read(get_index, index) || !slot_read(get_length, limit) || !slot_read(element_index, index)
+            || local_load(array) != Some((0x19, source_slot))
+            || !branch_to(guard, 0xa2, &self.instructions[exit])
+            || !is_increment(&self.instructions[back - 1], index, 1)
+            || !backward(&self.instructions[back], get_index)
+            || super::invocations::string_array_element(&self.parameters[parameter].ty, self.locals.slots[parameter].1).is_none()
+        {
+            return Ok(None);
+        }
+        let Some(source) = self.atom(array, 0x19)? else { return Ok(None); };
+        Ok(Some(Template { source: Source::Iterable(source), slot, element: Element::String,
+            scope_start: body, scope_end: back - 1, first_free: index.max(limit).max(slot).saturating_add(1),
+            body: body..back - 1 }))
     }
 
     fn iterable(&self) -> Result<Option<Template<'class>>, KotlinError> {
