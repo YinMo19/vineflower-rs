@@ -263,6 +263,7 @@ impl Machine<'_, '_> {
         if name.starts_with('<') {
             return Err(self.invalid_operand("invalid method invocation name"));
         }
+        let constructor_guard = self.constructor_guard_binding(op.opcode, member, &args);
         let mut receiver = None;
         let mut super_call = false;
         if op.opcode != 0xb8 {
@@ -419,6 +420,11 @@ impl Machine<'_, '_> {
         let operands = receiver.iter().chain(&args);
         if descriptor.return_type == Type::Void {
             let order = self.order_of(operands, true)?;
+            if let Some(binding) = constructor_guard {
+                text.push(';');
+                self.defer_constructor_guard(op, binding, order.expect("void invocation has effects"), text);
+                return Ok(Effect::None);
+            }
             self.before_statement(order)?;
             text.push(';');
             Ok(Effect::Statement(text))
@@ -718,9 +724,10 @@ impl Machine<'_, '_> {
         &mut self,
         owner: &str,
         method_type: &str,
-        args: Vec<Expr>,
+        mut args: Vec<Expr>,
     ) -> Result<Effect, LiftError> {
         let receiver = self.pop_raw()?;
+        let guarded = self.fold_constructor_guard(&receiver, &mut args)?;
         match receiver.source {
             Source::This if !self.initialized_this => self.invoke_constructor(owner, method_type, args),
             Source::New(allocation) => {
@@ -735,11 +742,16 @@ impl Machine<'_, '_> {
                     .expect("constructor has effects");
                 let order = Some(self.join_order(Some(Order::at(allocation)), order)?);
                 let (text, source) =
-                    if let Some((text, origin)) = self.anonymous_construction(owner, method_type, &args)? {
+                    if !guarded
+                        && let Some((text, origin)) = self.anonymous_construction(owner, method_type, &args)?
+                    {
                         (text, Source::Anonymous(origin))
                     } else {
                         let (target, visible_args) =
                             self.constructor_target(owner, method_type, &args, None)?;
+                        if guarded && (visible_args.len() != 1 || !target.starts_with("new ")) {
+                            return Err(self.unsupported("constructor null check requires an explicit allocation argument"));
+                        }
                         let mut text = target;
                         text.append_relative_arguments(
                             visible_args.iter().map(|argument| &argument.text),

@@ -11,6 +11,7 @@ mod condy;
 mod booleans;
 mod boxing;
 mod constructor;
+mod constructor_guard;
 mod dynamic;
 mod enum_constants;
 pub(crate) mod enum_switch;
@@ -153,6 +154,7 @@ pub(crate) struct Machine<'a, 'c> {
     stack_slots: u32,
     stack: Vec<Expr>,
     prelude: Vec<Document>,
+    constructor_guard: Option<constructor_guard::ConstructorGuard>,
     bootstrap: Option<std::rc::Rc<[BootstrapMethod]>>,
     dynamic_helpers: Option<DynamicHelpers>,
     anonymous_sites: Option<AnonymousSites>,
@@ -209,6 +211,7 @@ impl<'a, 'c> Machine<'a, 'c> {
             stack_slots: 0,
             stack: Vec::new(),
             prelude: Vec::new(),
+            constructor_guard: None,
             bootstrap: None,
             dynamic_helpers: None,
             anonymous_sites: None,
@@ -436,6 +439,7 @@ impl<'a, 'c> Machine<'a, 'c> {
     pub(crate) fn step(&mut self, op: &Instruction) -> Result<Effect, LiftError> {
         self.offset = op.offset;
         self.opcode = op.opcode;
+        self.check_constructor_guard_step(op)?;
         // Stack management and the allocation half of `new` do not
         // correspond to standalone source tokens.
         self.instruction_has_source = !matches!(op.opcode, 0 | 0x57..=0x5f | 0xbb);
