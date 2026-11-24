@@ -12,6 +12,7 @@ use crate::{
     descriptor::{FieldSignature, GenericType, MethodDescriptor, Type},
     naming::{VariableNamer, VariableRenamer, is_valid_local_identifier},
     options::Options,
+    source_text::Document,
 };
 
 use super::{
@@ -471,7 +472,7 @@ impl Machine<'_, '_> {
         if let Some(expr) = self.lexical_parameter(index) {
             return self.push(expr);
         }
-        let mut expr = Expr::atom(local.ty.clone(), local.name.clone());
+        let mut expr = Expr::atom(local.ty.clone(), local.name.clone().into());
         if local.receiver {
             expr.source = Source::This;
         } else {
@@ -546,10 +547,12 @@ impl Machine<'_, '_> {
             debug_range: range,
             receiver: false,
         });
-        Ok(Effect::Statement(format!(
-            "{prefix}{name} = {};",
-            value.text
-        )))
+        let mut text = Document::from(prefix);
+        text.push_str(&name);
+        text.push_str(" = ");
+        text.append(value.text);
+        text.push(';');
+        Ok(Effect::Statement(text))
     }
 
     pub(super) fn increment(&mut self, index: u16, amount: i16) -> Result<Effect, LiftError> {
@@ -586,7 +589,7 @@ impl Machine<'_, '_> {
             _ => format!("{} -= {};", local.name, amount.unsigned_abs()),
         };
         self.before_statement(Some(Order::at(self.offset)))?;
-        Ok(Effect::Statement(text))
+        Ok(Effect::Statement(text.into()))
     }
 }
 

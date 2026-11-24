@@ -40,6 +40,7 @@ use crate::{
     legacy::NormalizedCode,
     naming::MemberRenames,
     options::Options,
+    source_text::Document,
 };
 
 use self::{
@@ -79,21 +80,21 @@ pub(crate) enum LiftError {
 
 pub(crate) enum Effect {
     None,
-    Statement(String),
+    Statement(Document),
     FieldAssignment {
-        target: String,
-        value: String,
+        target: Document,
+        value: Document,
     },
     Branch {
         target: u32,
-        when_true: String,
-        when_false: String,
+        when_true: Document,
+        when_false: Document,
     },
     Jump(u32),
-    Return(Option<String>),
-    Throw(String),
+    Return(Option<Document>),
+    Throw(Document),
     Switch {
-        selector: String,
+        selector: Document,
     },
 }
 
@@ -118,7 +119,7 @@ pub(crate) struct Machine<'a, 'c> {
     max_stack: u32,
     stack_slots: u32,
     stack: Vec<Expr>,
-    prelude: Vec<String>,
+    prelude: Vec<Document>,
     bootstrap: Option<std::rc::Rc<[BootstrapMethod]>>,
     dynamic_helpers: Option<DynamicHelpers>,
     anonymous_sites: Option<AnonymousSites>,
@@ -276,14 +277,16 @@ impl<'a, 'c> Machine<'a, 'c> {
             && self.locals.discard_branch_only(&baseline.locals)
     }
 
-    pub(crate) fn take_prelude(&mut self) -> Vec<String> {
+    pub(crate) fn take_prelude(&mut self) -> Vec<Document> {
         std::mem::take(&mut self.prelude)
     }
 
-    pub(crate) fn take_monitor_lock(&mut self, op: &Instruction) -> Result<String, LiftError> {
+    pub(crate) fn take_monitor_lock(&mut self, op: &Instruction) -> Result<Document, LiftError> {
         let lock = self.take_region_reference(op)?;
         Ok(if matches!(lock.source, Source::Null) {
-            format!("({}){}", (self.class_name)("java/lang/Object"), lock.text)
+            let mut text = lock.text;
+            text.prepend_str(&format!("({})", (self.class_name)("java/lang/Object")));
+            text
         } else {
             lock.text
         })
@@ -300,7 +303,7 @@ impl<'a, 'c> Machine<'a, 'c> {
     pub(crate) fn take_string_switch_selector(
         &mut self,
         op: &Instruction,
-    ) -> Result<String, LiftError> {
+    ) -> Result<Document, LiftError> {
         self.offset = op.offset;
         self.opcode = op.opcode;
         self.lower_pending_comparison()?;
@@ -327,7 +330,7 @@ impl<'a, 'c> Machine<'a, 'c> {
         constructor: &Instruction,
         allocation: u32,
         descriptor: &str,
-    ) -> Result<Option<String>, LiftError> {
+    ) -> Result<Option<Document>, LiftError> {
         self.offset = constructor.offset;
         self.opcode = constructor.opcode;
         self.lower_pending_comparison()?;
@@ -385,15 +388,15 @@ impl<'a, 'c> Machine<'a, 'c> {
             0x02..=0x08 => self.push(Expr::integer(i32::from(op.opcode) - 3))?,
             0x09..=0x0a => self.push(Expr::literal(
                 Type::Primitive(Primitive::Long),
-                format!("{}L", op.opcode - 0x09),
+                format!("{}L", op.opcode - 0x09).into(),
             ))?,
             0x0b..=0x0d => self.push(Expr::literal(
                 Type::Primitive(Primitive::Float),
-                format!("{}.0F", op.opcode - 0x0b),
+                format!("{}.0F", op.opcode - 0x0b).into(),
             ))?,
             0x0e..=0x0f => self.push(Expr::literal(
                 Type::Primitive(Primitive::Double),
-                format!("{}.0", op.opcode - 0x0e),
+                format!("{}.0", op.opcode - 0x0e).into(),
             ))?,
             0x10..=0x11 => {
                 let Operand::Immediate(value) = op.operand else {
@@ -464,7 +467,7 @@ impl<'a, 'c> Machine<'a, 'c> {
                 }
                 self.push(Expr {
                     source: Source::New(self.offset),
-                    ..Expr::atom(ty, String::new())
+                    ..Expr::atom(ty, Document::new())
                 })?;
             }
             0xbc | 0xbd | 0xc5 => self.new_array(op)?,
@@ -501,7 +504,7 @@ impl<'a, 'c> Machine<'a, 'c> {
                     Expr {
                         source: Source::Integer(*value),
                         precedence: named.precedence,
-                        ..Expr::literal(expr::INT, named.text)
+                        ..Expr::literal(expr::INT, named.text.into())
                     }
                 } else {
                     Expr::integer(*value)
@@ -516,7 +519,7 @@ impl<'a, 'c> Machine<'a, 'c> {
                     statement: true,
                     ..self.expression(
                         Type::Primitive(Primitive::Float),
-                        format!("{class}.intBitsToFloat(0x{:08x})", value.to_bits()),
+                        format!("{class}.intBitsToFloat(0x{:08x})", value.to_bits()).into(),
                         expr::PRIMARY,
                         [],
                         true,
@@ -529,7 +532,7 @@ impl<'a, 'c> Machine<'a, 'c> {
                     statement: true,
                     ..self.expression(
                         Type::Primitive(Primitive::Double),
-                        format!("{class}.longBitsToDouble(0x{:016x}L)", value.to_bits()),
+                        format!("{class}.longBitsToDouble(0x{:016x}L)", value.to_bits()).into(),
                         expr::PRIMARY,
                         [],
                         true,
@@ -544,13 +547,13 @@ impl<'a, 'c> Machine<'a, 'c> {
             }),
             Constant::String(_) => Expr::literal(
                 Type::Object("java/lang/String".into()),
-                constant_literal(&self.class.pool, index, None, self.options.ascii_strings)?,
+                constant_literal(&self.class.pool, index, None, self.options.ascii_strings)?.into(),
             ),
             Constant::Class(_) => {
                 let ty = self.class_type(index)?;
                 self.expression(
                     Type::Object("java/lang/Class".into()),
-                    format!("{}.class", self.render_type(&ty)),
+                    format!("{}.class", self.render_type(&ty)).into(),
                     expr::PRIMARY,
                     [],
                     true,
@@ -687,7 +690,8 @@ impl<'a, 'c> Machine<'a, 'c> {
             self.before_statement(order)?;
             for value in values.iter_mut().flatten().filter(|value| value.observable) {
                 if value.statement {
-                    self.prelude.push(format!("{};", value.text));
+                    value.text.push(';');
+                    self.prelude.push(std::mem::take(&mut value.text));
                 } else {
                     self.spill(value);
                 }
@@ -699,8 +703,9 @@ impl<'a, 'c> Machine<'a, 'c> {
     fn spill(&mut self, value: &mut Expr) {
         let name = self.locals.temporary(self.debug_offset(self.offset));
         let ty = self.render_type(&value.ty);
-        self.prelude.push(format!("{ty} {name} = {};", value.text));
-        value.text = name;
+        let mut assignment = std::mem::replace(&mut value.text, name.clone().into());
+        assignment.surround(&format!("{ty} {name} = "), ";");
+        self.prelude.push(assignment);
         value.precedence = expr::PRIMARY;
         value.source = Source::Plain;
         value.order = None;

@@ -27,10 +27,10 @@ pub(super) fn expression(
     if let Some(named) = named {
         Expr {
             precedence: named.precedence,
-            ..Expr::literal(Type::Primitive(ty), named.text)
+            ..Expr::literal(Type::Primitive(ty), named.text.into())
         }
     } else {
-        Expr::literal(Type::Primitive(ty), literal())
+        Expr::literal(Type::Primitive(ty), literal().into())
     }
 }
 

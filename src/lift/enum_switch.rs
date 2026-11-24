@@ -12,6 +12,7 @@ use crate::{
     classfile::{ClassFile, Constant, ConstantPool, ExceptionHandler, Member, find_attribute},
     context::NestedKind,
     descriptor::{MethodDescriptor, Type},
+    source_text::Document,
 };
 
 use super::{Effect, LiftError, Machine, expr::Category};
@@ -286,7 +287,7 @@ impl<'a, 'c> Machine<'a, 'c> {
         Some(self.source_field_name(object_descriptor(descriptor)?, label, descriptor))
     }
 
-    pub(super) fn enum_switch_selector(&mut self, enum_name: &str) -> Result<String, LiftError> {
+    pub(super) fn enum_switch_selector(&mut self, enum_name: &str) -> Result<Document, LiftError> {
         let selector = self.pop_category(Category::Ref)?;
         Ok(self.coerce_enum_selector(selector, enum_name)?.text)
     }
@@ -295,10 +296,9 @@ impl<'a, 'c> Machine<'a, 'c> {
         let selector = self.pop_category(Category::Ref)?;
         let selector = self.coerce_enum_selector(selector, enum_name)?;
         self.before_statement(selector.order)?;
-        Ok(Effect::Statement(format!(
-            "switch ({}) {{}}",
-            selector.text
-        )))
+        let mut statement = selector.text;
+        statement.surround("switch (", ") {}");
+        Ok(Effect::Statement(statement))
     }
 
     fn coerce_enum_selector(

@@ -5,12 +5,12 @@ use crate::{
     classfile::{ClassError, find_attribute},
     context::NestedKind,
     descriptor::{MethodDescriptor, Type},
+    source_text::Document,
 };
 
 use super::{
     Effect, LiftError, Machine,
     expr::{Category, Expr, PRIMARY, Source},
-    members::render_arguments,
 };
 
 impl Machine<'_, '_> {
@@ -34,7 +34,7 @@ impl Machine<'_, '_> {
             source: Source::OuterThis,
             ..Expr::atom(
                 Type::Object(outer.into()),
-                format!("{}.this", (self.class_name)(outer)),
+                format!("{}.this", (self.class_name)(outer)).into(),
             )
         }
     }
@@ -85,11 +85,11 @@ impl Machine<'_, '_> {
         descriptor: &str,
         args: &'args [Expr],
         target: Option<&str>,
-    ) -> Result<(String, &'args [Expr]), LiftError> {
+    ) -> Result<(Document, &'args [Expr]), LiftError> {
         let plain = || {
             target.map_or_else(
-                || format!("new {}", (self.class_name)(owner)),
-                str::to_owned,
+                || format!("new {}", (self.class_name)(owner)).into(),
+                Document::from,
             )
         };
         let Some(group) = self.group.filter(|_| self.options.decompile_inner) else {
@@ -140,7 +140,11 @@ impl Machine<'_, '_> {
             return Ok((plain(), visible_args));
         }
         let head = match target {
-            Some("super") => format!("{}.super", receiver.at(PRIMARY)),
+            Some("super") => {
+                let mut head = receiver.at(PRIMARY).into_owned();
+                head.push_str(".super");
+                head
+            }
             Some(_) => {
                 return Err(self.unsupported("constructor delegation changes enclosing instance"));
             }
@@ -154,7 +158,10 @@ impl Machine<'_, '_> {
                     .renames
                     .and_then(|plan| plan.simple_class_alias(owner))
                     .unwrap_or(member.simple_name);
-                format!("{}.new {name}", receiver.at(PRIMARY))
+                let mut head = receiver.at(PRIMARY).into_owned();
+                head.push_str(".new ");
+                head.push_str(name);
+                head
             }
         };
         Ok((head, visible_args))
@@ -343,8 +350,8 @@ impl Machine<'_, '_> {
         }
         let is_static = matches!(member.opcode, 0xb2 | 0xb3 | 0xb8);
         let skip = usize::from(!is_static);
-        let (qualifier, passed) = if is_static {
-            ((self.class_name)(owner), args)
+        let (mut qualifier, passed) = if is_static {
+            (Document::from((self.class_name)(owner)), args)
         } else {
             let Some((receiver, passed)) = args.split_first() else {
                 return Err(fail());
@@ -357,7 +364,8 @@ impl Machine<'_, '_> {
         if member.opcode < 0xb6 {
             let field_type = Type::parse(target_descriptor)?;
             let name = self.source_field_name(owner, name, target_descriptor);
-            let target = format!("{qualifier}.{name}");
+            qualifier.push('.');
+            qualifier.push_str(name);
             if matches!(member.opcode, 0xb3 | 0xb5) {
                 if signature.parameters[skip..] != [field_type]
                     || signature.return_type != Type::Void
@@ -368,14 +376,14 @@ impl Machine<'_, '_> {
                 let order = self.order_of(args, true)?;
                 self.before_statement(order)?;
                 return Ok(Some(Effect::FieldAssignment {
-                    target,
+                    target: qualifier,
                     value: value.text.clone(),
                 }));
             }
             if !passed.is_empty() || signature.return_type != field_type {
                 return Err(fail());
             }
-            self.push(self.expression(field_type, target, PRIMARY, args, true)?)?;
+            self.push(self.expression(field_type, qualifier, PRIMARY, args, true)?)?;
             return Ok(Some(Effect::None));
         }
         let target = MethodDescriptor::parse(target_descriptor)?;
@@ -387,13 +395,16 @@ impl Machine<'_, '_> {
         }
         self.record_synthetic_invocation(owner, name, target_descriptor);
         let name = self.source_invocation_name(owner, name, target_descriptor);
-        let text = format!("{qualifier}.{name}({})", render_arguments(passed));
+        qualifier.push('.');
+        qualifier.push_str(&name);
+        qualifier.append_relative_arguments(passed.iter().map(|arg| &arg.text));
         if target.return_type == Type::Void {
             let order = self.order_of(args, true)?;
             self.before_statement(order)?;
-            return Ok(Some(Effect::Statement(format!("{text};"))));
+            qualifier.push(';');
+            return Ok(Some(Effect::Statement(qualifier)));
         }
-        let expression = self.expression(target.return_type, text, PRIMARY, args, true)?;
+        let expression = self.expression(target.return_type, qualifier, PRIMARY, args, true)?;
         self.push(Expr {
             statement: true,
             ..expression

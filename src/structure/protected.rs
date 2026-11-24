@@ -1,6 +1,6 @@
 // Copyright 2000-2020 JetBrains s.r.o. Use of this source code is governed by the Apache 2.0 license that can be found in the LICENSE file.
 
-mod cleanup_locals;
+pub(super) mod cleanup_locals;
 mod finally_graph;
 mod monitor;
 

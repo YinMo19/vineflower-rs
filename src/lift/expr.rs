@@ -2,7 +2,10 @@
 
 use std::borrow::Cow;
 
-use crate::descriptor::{Primitive, Type};
+use crate::{
+    descriptor::{Primitive, Type},
+    source_text::Document,
+};
 
 use super::{LiftError, Machine};
 
@@ -69,7 +72,7 @@ pub(super) struct Comparison {
 #[derive(Clone)]
 pub(super) struct Expr {
     pub(super) ty: Type,
-    pub(super) text: String,
+    pub(super) text: Document,
     pub(super) source: Source,
     pub(super) precedence: u8,
     pub(super) order: Option<Order>,
@@ -79,7 +82,7 @@ pub(super) struct Expr {
 }
 
 impl Expr {
-    pub(super) fn atom(ty: Type, text: String) -> Self {
+    pub(super) fn atom(ty: Type, text: Document) -> Self {
         Self {
             ty,
             precedence: if text.starts_with('-') {
@@ -96,7 +99,7 @@ impl Expr {
         }
     }
 
-    pub(super) fn literal(ty: Type, text: String) -> Self {
+    pub(super) fn literal(ty: Type, text: Document) -> Self {
         Self {
             constant: true,
             ..Self::atom(ty, text)
@@ -106,7 +109,7 @@ impl Expr {
     pub(super) fn integer(value: i32) -> Self {
         Self {
             source: Source::Integer(value),
-            ..Self::literal(INT, value.to_string())
+            ..Self::literal(INT, value.to_string().into())
         }
     }
 
@@ -128,16 +131,48 @@ impl Expr {
             }
     }
 
-    pub(super) fn at(&self, min: u8) -> Cow<'_, str> {
+    pub(super) fn at(&self, min: u8) -> Cow<'_, Document> {
+        if self.needs_parens(min) {
+            let mut text = self.text.clone();
+            text.surround("(", ")");
+            Cow::Owned(text)
+        } else {
+            Cow::Borrowed(&self.text)
+        }
+    }
+
+    pub(super) fn append_at(&self, min: u8, out: &mut Document) {
+        let parens = self.needs_parens(min);
+        let starts_expression = !parens && out.is_empty();
+        if parens {
+            out.push('(');
+        }
+        out.append_ref(&self.text);
+        if starts_expression {
+            out.seal_qualifier();
+        }
+        if parens {
+            out.push(')');
+        }
+    }
+
+    pub(super) fn into_at(mut self, min: u8) -> Document {
+        self.parenthesize(min);
+        self.text
+    }
+
+    fn parenthesize(&mut self, min: u8) {
+        if self.needs_parens(min) {
+            self.text.surround("(", ")");
+        }
+    }
+
+    fn needs_parens(&self, min: u8) -> bool {
         debug_assert!(!matches!(
             self.source,
             Source::New(_) | Source::Comparison(_)
         ));
-        if self.precedence < min {
-            Cow::Owned(format!("({})", self.text))
-        } else {
-            Cow::Borrowed(&self.text)
-        }
+        self.precedence < min
     }
 
     pub(super) fn is_uninitialized(&self, this_initialized: bool) -> bool {
@@ -223,28 +258,31 @@ impl Relation {
         matches!(self, Self::Eq | Self::Ne)
     }
 
-    pub(super) fn against(self, left: &Expr, right: &Expr) -> String {
+    pub(super) fn against(self, left: &Expr, right: &Expr) -> Document {
         let precedence = if self.equality() {
             EQUALITY
         } else {
             RELATIONAL
         };
-        format!(
-            "{} {} {}",
-            left.at(precedence),
-            self.operator(),
-            right.at(precedence + 1)
-        )
+        let mut text = Document::new();
+        left.append_at(precedence, &mut text);
+        text.push(' ');
+        text.push_str(self.operator());
+        text.push(' ');
+        right.append_at(precedence + 1, &mut text);
+        text
     }
 
-    pub(super) fn against_cmp(self, cmp: &Comparison) -> String {
+    pub(super) fn against_cmp(self, cmp: &Comparison) -> Document {
         // Negating an ordered comparison is necessary to include NaN on
         // the side selected by fcmpl/fcmpg (and dcmpl/dcmpg).
         if matches!(
             (cmp.nan, self),
             (Some(-1), Self::Lt | Self::Le) | (Some(1), Self::Ge | Self::Gt)
         ) {
-            format!("!({})", self.inverse().against(&cmp.left, &cmp.right))
+            let mut text = self.inverse().against(&cmp.left, &cmp.right);
+            text.surround("!(", ")");
+            text
         } else {
             self.against(&cmp.left, &cmp.right)
         }
@@ -284,7 +322,7 @@ impl Machine<'_, '_> {
     pub(super) fn expression<'e>(
         &self,
         ty: Type,
-        text: String,
+        text: Document,
         precedence: u8,
         operands: impl IntoIterator<Item = &'e Expr> + Clone,
         effect: bool,
@@ -309,15 +347,29 @@ impl Machine<'_, '_> {
 
     pub(super) fn cast(&self, expr: Expr, ty: Type, effect: bool) -> Result<Expr, LiftError> {
         let name = self.render_type(&ty);
-        let text = format!("({name}){}", expr.at(UNARY));
+        self.cast_named(expr, ty, effect, &name)
+    }
+
+    fn cast_named(
+        &self,
+        expr: Expr,
+        ty: Type,
+        effect: bool,
+        name: &str,
+    ) -> Result<Expr, LiftError> {
+        let mut text = Document::from("(");
+        text.push_str(name);
+        text.push(')');
+        expr.append_at(UNARY, &mut text);
         self.expression(ty, text, UNARY, [&expr], effect)
     }
 
-    pub(super) fn as_int(&self, expr: Expr) -> Expr {
+    pub(super) fn as_int(&self, mut expr: Expr) -> Expr {
         if expr.ty == BOOLEAN {
+            expr.parenthesize(TERNARY + 1);
+            expr.text.push_str(" ? 1 : 0");
             Expr {
                 ty: INT,
-                text: format!("{} ? 1 : 0", expr.at(TERNARY + 1)),
                 precedence: TERNARY,
                 source: Source::Plain,
                 statement: false,
@@ -328,16 +380,16 @@ impl Machine<'_, '_> {
         }
     }
 
-    pub(super) fn boolean_value(&self, expr: Expr) -> Expr {
+    pub(super) fn boolean_value(&self, mut expr: Expr) -> Expr {
         if expr.ty == BOOLEAN {
             expr
         } else if let Source::Integer(value) = expr.source {
-            Expr::literal(BOOLEAN, ((value & 1) != 0).to_string())
+            Expr::literal(BOOLEAN, ((value & 1) != 0).to_string().into())
         } else {
-            let text = format!("({} & 1) != 0", expr.at(BIT_AND));
+            expr.parenthesize(BIT_AND);
+            expr.text.surround("(", " & 1) != 0");
             Expr {
                 ty: BOOLEAN,
-                text,
                 precedence: EQUALITY,
                 source: Source::Plain,
                 statement: false,
@@ -381,7 +433,8 @@ impl Machine<'_, '_> {
                 }
                 let value = Expr::literal(
                     ty.clone(),
-                    super::literal::integer_literal(value, Some(ty), self.options.ascii_strings),
+                    super::literal::integer_literal(value, Some(ty), self.options.ascii_strings)
+                        .into(),
                 );
                 return if invocation && *primitive != Primitive::Char {
                     self.cast(value, ty.clone(), false)
@@ -439,8 +492,7 @@ impl Machine<'_, '_> {
             expr
         };
         if let Some(name) = name {
-            let text = format!("({name}){}", expr.at(UNARY));
-            self.expression(ty, text, UNARY, [&expr], effect)
+            self.cast_named(expr, ty, effect, &name)
         } else {
             self.cast(expr, ty, effect)
         }

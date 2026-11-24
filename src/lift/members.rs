@@ -1,11 +1,10 @@
 // Copyright 2000-2018 JetBrains s.r.o. Use of this source code is governed by the Apache 2.0 license that can be found in the LICENSE file.
 
-use std::fmt::Write;
-
 use crate::{
     bytecode::{Instruction, Operand},
     classfile::Constant,
     descriptor::{MethodDescriptor, Type},
+    source_text::Document,
 };
 
 use super::{
@@ -36,7 +35,7 @@ impl Machine<'_, '_> {
             None
         };
         let mut receiver = None;
-        let access = if matches!(op.opcode, 0xb4 | 0xb5) {
+        let mut access = if matches!(op.opcode, 0xb4 | 0xb5) {
             let expr = if write {
                 let expr = self.pop_raw()?;
                 if Category::of(&expr.ty) != Some(Category::Ref) {
@@ -60,16 +59,22 @@ impl Machine<'_, '_> {
                 return Err(self.invalid_stack("uninitialized receiver used before invokespecial"));
             }
             if matches!(expr.source, Source::This) && self.super_class == Some(owner) {
-                format!("super.{source_name}")
+                Document::from("super.")
             } else {
                 let expr = self.member_receiver(expr, owner, false)?;
                 let access = if self.unnamed_enclosing_receiver(&expr) {
                     if self.current_member_named(source_name, false)? {
                         return Err(self.unsupported("an unnameable enclosing field is shadowed"));
                     }
-                    source_name.to_owned()
+                    Document::new()
                 } else {
-                    format!("{}.{source_name}", expr.at(PRIMARY))
+                    let mut head = expr.at(PRIMARY).into_owned();
+                    if head.begin_qualifier(breakable_qualifier(&expr), expr.precedence == PRIMARY)
+                    {
+                        head.end_group();
+                    }
+                    head.push('.');
+                    head
                 };
                 receiver = Some(expr);
                 access
@@ -81,10 +86,14 @@ impl Machine<'_, '_> {
         {
             // A blank static final must be assigned by simple name in its
             // declaring class, even though ordinary static writes can qualify.
-            source_name.to_owned()
+            Document::new()
         } else {
-            format!("{}.{source_name}", (self.class_name)(owner))
+            let mut head = Document::from((self.class_name)(owner));
+            head.push('.');
+            head
         };
+        self.anchor_member(&mut access, op);
+        access.push_str(source_name);
         if let Some(value) = value {
             let order = self.order_of(receiver.iter().chain([&value]), true)?;
             self.before_statement(order)?;
@@ -206,33 +215,46 @@ impl Machine<'_, '_> {
         {
             return Ok(effect);
         }
-        let qualifier = if let Some(receiver) = &receiver {
-            receiver.at(PRIMARY)
+        let unqualified = receiver
+            .as_ref()
+            .is_some_and(|receiver| self.unnamed_enclosing_receiver(receiver));
+        let (mut text, chain) = if unqualified {
+            (Document::new(), false)
+        } else if let Some(receiver) = &receiver {
+            let mut text = receiver.at(PRIMARY).into_owned();
+            let chain = text.begin_qualifier(
+                breakable_qualifier(receiver),
+                receiver.precedence == PRIMARY,
+            );
+            (text, chain)
         } else if !super_call {
-            (self.class_name)(owner).into()
+            ((self.class_name)(owner).into(), false)
         } else if matches!(tag, Constant::InterfaceMethodref { .. }) {
-            format!("{}.super", (self.class_name)(owner)).into()
+            (format!("{}.super", (self.class_name)(owner)).into(), false)
         } else {
-            std::borrow::Cow::Borrowed("super")
+            ("super".into(), false)
         };
         self.record_synthetic_invocation(owner, name, method_type);
         let source_name = self.source_invocation_name(owner, name, method_type);
-        let text = if receiver
-            .as_ref()
-            .is_some_and(|receiver| self.unnamed_enclosing_receiver(receiver))
-        {
+        if unqualified {
             if self.current_member_named(&source_name, true)? {
                 return Err(self.unsupported("an unnameable enclosing method is shadowed"));
             }
-            format!("{source_name}({})", render_arguments(&args))
         } else {
-            format!("{qualifier}.{source_name}({})", render_arguments(&args))
-        };
+            text.push('.');
+        }
+        self.anchor_member(&mut text, op);
+        text.push_str(&source_name);
+        text.append_relative_arguments(args.iter().map(|argument| &argument.text));
+        if chain {
+            text.end_group();
+        }
         let operands = receiver.iter().chain(&args);
         if descriptor.return_type == Type::Void {
             let order = self.order_of(operands, true)?;
             self.before_statement(order)?;
-            Ok(Effect::Statement(format!("{text};")))
+            text.push(';');
+            Ok(Effect::Statement(text))
         } else {
             let result = generic
                 .and_then(|call| call.return_type(&args))
@@ -405,7 +427,7 @@ impl Machine<'_, '_> {
             {
                 continue;
             }
-            let operand = std::mem::replace(value, Expr::atom(Type::Void, String::new()));
+            let operand = std::mem::replace(value, Expr::atom(Type::Void, Document::new()));
             *value = self.coerce(operand, ty, true)?;
         }
         Ok(())
@@ -452,10 +474,10 @@ impl Machine<'_, '_> {
                     visible_args
                 };
                 self.initialized_this = true;
-                Ok(Effect::Statement(format!(
-                    "{target}({});",
-                    render_arguments(visible_args)
-                )))
+                let mut text = target;
+                text.append_relative_arguments(visible_args.iter().map(|argument| &argument.text));
+                text.push(';');
+                Ok(Effect::Statement(text))
             }
             Source::New(allocation) => {
                 if !matches!(&receiver.ty, Type::Object(name) if name == owner) {
@@ -471,7 +493,11 @@ impl Machine<'_, '_> {
                     } else {
                         let (target, visible_args) =
                             self.constructor_target(owner, method_type, &args, None)?;
-                        format!("{target}({})", render_arguments(visible_args))
+                        let mut text = target;
+                        text.append_relative_arguments(
+                            visible_args.iter().map(|argument| &argument.text),
+                        );
+                        text
                     };
                 let mut value = Expr {
                     order,
@@ -484,7 +510,8 @@ impl Machine<'_, '_> {
                 let aliases = self.stack.iter().filter(|value| is_alias(value)).count();
                 if aliases == 0 {
                     self.before_statement(order)?;
-                    return Ok(Effect::Statement(format!("{};", value.text)));
+                    value.text.push(';');
+                    return Ok(Effect::Statement(value.text));
                 }
                 if aliases > 1 {
                     let pending =
@@ -646,7 +673,7 @@ impl Machine<'_, '_> {
             Part::Text(_) => true,
             Part::Arg(index) => is_string(&args[*index].ty),
         };
-        let mut text = String::new();
+        let mut text = Document::new();
         if parts.len() != 1 && !parts.iter().take(2).any(is_text) {
             text.push_str("\"\"");
         }
@@ -669,13 +696,19 @@ impl Machine<'_, '_> {
         // the distinction when every operand can be folded into a literal.
         let precedence = if args.iter().all(|arg| arg.constant) {
             let string = self.render_type(&descriptor.return_type);
-            text = format!("new {string}({text})");
+            text.surround(&format!("new {string}("), ")");
             PRIMARY
         } else {
             ADDITIVE
         };
         self.push(self.expression(descriptor.return_type, text, precedence, &args, true)?)?;
         Ok(Effect::None)
+    }
+
+    fn anchor_member(&self, text: &mut Document, op: &Instruction) {
+        if self.options.include_line_mappings && self.normalized.is_none() {
+            text.anchor(op.offset..op.offset + op.len);
+        }
     }
 }
 
@@ -694,13 +727,15 @@ fn core_throwable(name: &str) -> bool {
     )
 }
 
-pub(super) fn render_arguments(args: &[Expr]) -> String {
-    let mut text = String::new();
-    for (index, arg) in args.iter().enumerate() {
-        if index > 0 {
-            text.push_str(", ");
-        }
-        let _ = write!(text, "{}", arg.text);
-    }
-    text
+fn breakable_qualifier(receiver: &Expr) -> bool {
+    receiver.observable
+        || receiver.text.has_layout()
+        || !matches!(
+            receiver.source,
+            Source::Local(_)
+                | Source::CapturedLocal
+                | Source::Plain
+                | Source::This
+                | Source::OuterThis
+        )
 }

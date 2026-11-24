@@ -1,17 +1,19 @@
 // Copyright 2000-2020 JetBrains s.r.o. and the Vineflower contributors.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::fmt::Write;
 use std::sync::Arc;
 
-use crate::descriptor::{MethodDescriptor, Primitive, Type};
+use crate::{
+    descriptor::{MethodDescriptor, Primitive, Type},
+    source_text::Document,
+};
 
 use super::expr::{ADDITIVE, Category, Expr, Source};
 use super::{Effect, LiftError, Machine};
 
 #[derive(Clone)]
 pub(super) struct Operand {
-    text: String,
+    text: Document,
     string: bool,
     constant: bool,
 }
@@ -21,11 +23,7 @@ impl From<Expr> for Operand {
         Self {
             string: is_string(&value.ty),
             constant: value.constant,
-            text: if value.precedence <= ADDITIVE {
-                format!("({})", value.text)
-            } else {
-                value.text
-            },
+            text: value.into_at(ADDITIVE + 1),
         }
     }
 }
@@ -117,7 +115,7 @@ impl Machine<'_, '_> {
         if parts.is_empty() || parts.iter().all(|part| part.constant) {
             return Ok(None);
         }
-        let mut text = String::new();
+        let mut text = Document::new();
         if !parts.iter().take(2).any(|part| part.string) {
             text.push_str("\"\"");
         }
@@ -125,7 +123,7 @@ impl Machine<'_, '_> {
             if !text.is_empty() {
                 text.push_str(" + ");
             }
-            text.push_str(&part.text);
+            text.append_ref(&part.text);
         }
         if parts.len() == 1 && parts[0].string {
             // Appending an empty literal still creates a fresh String on the
@@ -187,9 +185,9 @@ pub(super) fn inline_value_of(args: &mut [Expr]) {
     }
 }
 
-pub(super) fn push_joined(text: &mut String, operand: &Expr) {
+pub(super) fn push_joined(text: &mut Document, operand: &Expr) {
     if !text.is_empty() {
         text.push_str(" + ");
     }
-    let _ = write!(text, "{}", operand.at(ADDITIVE + 1));
+    operand.append_at(ADDITIVE + 1, text);
 }

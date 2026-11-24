@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::bytecode::{Instruction, Operand};
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-pub(super) struct Local {
+pub(in crate::structure) struct Local {
     slot: u16,
     category: u8,
 }
@@ -23,17 +23,17 @@ impl Local {
         )
     }
 
-    pub(super) fn touches(self, instruction: &Instruction) -> bool {
+    pub(in crate::structure) fn touches(self, instruction: &Instruction) -> bool {
         self.cells()
             .any(|slot| super::local_touches(instruction, slot))
     }
 }
 
-pub(super) fn store(instruction: &Instruction) -> Option<Local> {
+pub(in crate::structure) fn store(instruction: &Instruction) -> Option<Local> {
     local(instruction, 0x36, 0x3b)
 }
 
-pub(super) fn returned(load: &Instruction, transfer: &Instruction) -> Option<Local> {
+pub(in crate::structure) fn returned(load: &Instruction, transfer: &Instruction) -> Option<Local> {
     let local = local(load, 0x15, 0x1a)?;
     (transfer.opcode == 0xac + local.category).then_some(local)
 }

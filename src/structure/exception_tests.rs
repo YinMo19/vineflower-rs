@@ -201,7 +201,7 @@ fn catch_all_ranges_can_cover_inner_catches_and_their_own_initial_store() {
     assert_eq!(Some(finally.block()), graph.block_at(20));
 
     let lines = test_method(&bytes, &handlers, &[]).unwrap();
-    let text: Vec<_> = lines.iter().map(|line| line.text.as_str()).collect();
+    let text: Vec<_> = lines.iter().map(|line| line.text.as_flat()).collect();
     assert_eq!(
         text,
         [
@@ -263,7 +263,7 @@ fn copied_cleanup_can_finish_a_try_return_while_the_catch_falls_through() {
     ];
     let lines = test_method_with_descriptor(&bytes, &handlers, &[], "(Ljava/lang/AutoCloseable;)I")
         .unwrap();
-    let text: Vec<_> = lines.iter().map(|line| line.text.as_str()).collect();
+    let text: Vec<_> = lines.iter().map(|line| line.text.as_flat()).collect();
     assert_eq!(
         text,
         [

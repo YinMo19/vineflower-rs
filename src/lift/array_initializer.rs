@@ -6,6 +6,7 @@ use crate::{
     classfile::Constant,
     context::NestedKind,
     descriptor::{Primitive, Type},
+    source_text::{ArrayStyle, Document},
 };
 
 use super::{
@@ -201,9 +202,11 @@ impl Machine<'_, '_> {
         };
         let category = Category::of(component).expect("nonvoid JVM array component");
         let mut order = Some(Order::at(instructions[plan.start].offset));
-        let mut text = format!("new {}{{", self.render_type(&plan.ty));
+        let mut text = Document::from("new ");
+        text.push_str(&self.render_type(&plan.ty));
+        let mut elements = text.array_initializer(ArrayStyle::New);
         let mut cursor = plan.start + 1;
-        for index in 0..plan.length {
+        for _ in 0..plan.length {
             cursor += 2; // verified dup and literal index
             loop {
                 let op = &instructions[cursor];
@@ -232,10 +235,7 @@ impl Machine<'_, '_> {
                     if let Some(value) = self.order_of([&value], true)? {
                         order = Some(self.join_order(order, value)?);
                     }
-                    if index != 0 {
-                        text.push_str(", ");
-                    }
-                    text.push_str(&value.text);
+                    elements.append(value.text);
                     cursor += 1;
                     break;
                 }
@@ -256,7 +256,7 @@ impl Machine<'_, '_> {
             }
         }
         debug_assert_eq!(cursor, plan.end);
-        text.push('}');
+        elements.finish();
         Ok(Expr {
             order,
             observable: true,

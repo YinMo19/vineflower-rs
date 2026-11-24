@@ -2,7 +2,10 @@
 
 use std::{mem, ops::RangeInclusive};
 
-use crate::descriptor::{Primitive, Type};
+use crate::{
+    descriptor::{Primitive, Type},
+    source_text::Document,
+};
 
 use super::{
     LiftError, Machine,
@@ -10,7 +13,7 @@ use super::{
 };
 
 pub(crate) struct SwitchValue {
-    pub(crate) yields: Vec<String>,
+    pub(crate) yields: Vec<Document>,
     ty: Type,
     order: Order,
 }
@@ -148,7 +151,7 @@ impl<'a, 'c> Machine<'a, 'c> {
     pub(crate) fn push_switch_value(
         &mut self,
         value: SwitchValue,
-        text: String,
+        text: Document,
     ) -> Result<(), LiftError> {
         self.push(Expr {
             precedence: TERNARY,

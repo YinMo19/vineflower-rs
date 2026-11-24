@@ -15,6 +15,7 @@ use crate::{
         ClassSignature, GenericType, MethodDescriptor, MethodSignature, Primitive, Type,
         TypeArgument,
     },
+    source_text::Document,
     structure::structure_with_handlers,
 };
 
@@ -79,7 +80,9 @@ impl<'c> LambdaSite<'c> {
             ("metafactory", METAFACTORY) => false,
             ("altMetafactory", ALT_METAFACTORY) => true,
             _ => {
-                return Err(machine.invalid_operand("invalid LambdaMetafactory bootstrap signature"));
+                return Err(
+                    machine.invalid_operand("invalid LambdaMetafactory bootstrap signature")
+                );
             }
         };
         let &[sam_type, target, instantiated_type, ref arguments @ ..] =
@@ -304,26 +307,23 @@ impl<'a, 'c> Machine<'a, 'c> {
                 }));
         let expression = if direct {
             let qualifier = if let Some(qualifier) = super_qualifier {
-                qualifier
+                Document::from(qualifier)
             } else if bound {
                 self.member_receiver(captures[0].clone(), site.owner, false)?
-                    .at(PRIMARY)
-                    .into_owned()
+                    .into_at(PRIMARY)
             } else {
-                self.render_type(&reference_type(site.owner)?)
+                Document::from(self.render_type(&reference_type(site.owner)?))
             };
             let name = if site.dispatch == Dispatch::Constructor {
                 "new"
             } else {
                 site.name
             };
-            self.expression(
-                factory.return_type,
-                format!("({target}){qualifier}::{name}"),
-                UNARY,
-                &captures,
-                true,
-            )?
+            let mut text = qualifier;
+            text.prepend_str(&format!("({target})"));
+            text.push_str("::");
+            text.push_str(name);
+            self.expression(factory.return_type, text, UNARY, &captures, true)?
         } else {
             // The factory captures values, not expressions. Freeze in the JVM
             // order before the adapter can defer their use to SAM invocation.
@@ -342,8 +342,9 @@ impl<'a, 'c> Machine<'a, 'c> {
             if bound && !matches!(captures[0].source, Source::This) {
                 self.before_statement(None)?;
                 let objects = (self.class_name)("java/util/Objects");
-                self.prelude
-                    .push(format!("{objects}.requireNonNull({});", captures[0].text));
+                let mut statement = captures[0].text.clone();
+                statement.surround(&format!("{objects}.requireNonNull("), ");");
+                self.prelude.push(statement);
             }
             let parameters: Vec<_> = (0..sam_count)
                 .map(|index| self.locals.lambda_parameter(index))
@@ -354,13 +355,12 @@ impl<'a, 'c> Machine<'a, 'c> {
                 } else {
                     Expr::atom(
                         site.instantiated.parameters[0].clone(),
-                        parameters[0].clone(),
+                        parameters[0].clone().into(),
                     )
                 };
                 Some(
                     self.member_receiver(value, site.owner, false)?
-                        .at(PRIMARY)
-                        .into_owned(),
+                        .into_at(PRIMARY),
                 )
             } else {
                 None
@@ -376,40 +376,47 @@ impl<'a, 'c> Machine<'a, 'c> {
             {
                 arguments.push(Expr::atom(
                     to.clone(),
-                    self.lambda_conversion(parameter, from, to)?,
+                    self.lambda_conversion(Document::from(parameter.as_str()), from, to)?,
                 ));
             }
-            let render_arguments = super::members::render_arguments;
             let source_name =
                 self.source_invocation_name(site.owner, site.name, site.implementation_descriptor);
             let call = match site.dispatch {
                 Dispatch::Constructor => {
-                    let (target, visible_arguments) = self.constructor_target(
+                    let (mut target, visible_arguments) = self.constructor_target(
                         site.owner,
                         site.implementation_descriptor,
                         &arguments,
                         None,
                     )?;
-                    format!("{target}({})", render_arguments(visible_arguments))
+                    target.append_relative_arguments(visible_arguments.iter().map(|arg| &arg.text));
+                    target
                 }
-                Dispatch::Static => format!(
-                    "{}.{source_name}({})",
-                    (self.class_name)(site.owner),
-                    render_arguments(&arguments)
-                ),
+                Dispatch::Static => {
+                    let mut call =
+                        Document::from(format!("{}.{source_name}", (self.class_name)(site.owner)));
+                    call.append_relative_arguments(arguments.iter().map(|arg| &arg.text));
+                    call
+                }
                 _ => {
-                    let receiver = super_qualifier.or(receiver).expect("instance receiver");
-                    format!("{receiver}.{source_name}({})", render_arguments(&arguments))
+                    let mut call = super_qualifier
+                        .map(Document::from)
+                        .or(receiver)
+                        .expect("instance receiver");
+                    call.push('.');
+                    call.push_str(&source_name);
+                    call.append_relative_arguments(arguments.iter().map(|arg| &arg.text));
+                    call
                 }
             };
             let body = if *instantiated_return == Type::Void {
                 call
             } else {
-                self.lambda_conversion(&call, &implementation_return, instantiated_return)?
+                self.lambda_conversion(call, &implementation_return, instantiated_return)?
             };
             let expression = self.expression(
                 factory.return_type,
-                render_lambda(&target, &parameters, &body),
+                render_lambda(&target, &parameters, body),
                 UNARY,
                 &captures,
                 true,
@@ -496,7 +503,7 @@ impl<'a, 'c> Machine<'a, 'c> {
         site: &LambdaSite<'_>,
         captures: &[Expr],
         target: &str,
-    ) -> Result<Option<String>, LiftError> {
+    ) -> Result<Option<Document>, LiftError> {
         // Multiple indy instructions can reference the same helper, including
         // recursively in hand-written bytecode; bound source expansion.
         if self.lambda_depth >= 8 || site.name == self.method_name {
@@ -587,9 +594,12 @@ impl<'a, 'c> Machine<'a, 'c> {
         }
         if let [line] = lines.as_slice()
             && line.depth == 0
-            && let Some(statement) = line.text.strip_suffix(';')
+            && line.text.ends_with(';')
         {
-            if let Some(expression) = statement.strip_prefix("return ") {
+            let mut statement = line.text.clone();
+            statement.pop();
+            if statement.starts_with("return ") {
+                statement.replace_literal_prefix("return ".len(), "");
                 // javac lowers an array constructor reference to a synthetic
                 // method whose only action is to create an array of the passed
                 // length. Matching this behavior also permits the equivalent
@@ -602,11 +612,11 @@ impl<'a, 'c> Machine<'a, 'c> {
                 {
                     let array = self.render_type(&site.implementation.return_type);
                     let creation = array.replacen("[]", &format!("[{parameter}]"), 1);
-                    if expression.strip_prefix("new ") == Some(creation.as_str()) {
-                        return Ok(Some(format!("({target}){array}::new")));
+                    if statement.strip_prefix("new ") == Some(creation.as_str()) {
+                        return Ok(Some(format!("({target}){array}::new").into()));
                     }
                 }
-                return Ok(Some(render_lambda(target, &parameters, expression)));
+                return Ok(Some(render_lambda(target, &parameters, statement)));
             }
             if site.implementation.return_type == Type::Void
                 && instructions
@@ -620,19 +630,16 @@ impl<'a, 'c> Machine<'a, 'c> {
                 return Ok(Some(render_lambda(target, &parameters, statement)));
             }
         }
-        let mut body = String::from("{");
-        for line in lines {
+        let mut body = Document::from("{");
+        for mut line in lines {
             let depth = line.depth + 1;
-            for physical in line.text.split('\n') {
-                body.push('\n');
-                for _ in 0..depth {
-                    body.push_str(&self.options.indent);
-                }
-                body.push_str(physical);
-            }
+            body.hard_line(depth);
+            line.text.offset_relative_depth(depth);
+            body.append(line.text);
         }
-        body.push_str("\n}");
-        Ok(Some(render_lambda(target, &parameters, &body)))
+        body.hard_line(0);
+        body.push('}');
+        Ok(Some(render_lambda(target, &parameters, body)))
     }
 
     fn lambda_special_qualifier(
@@ -680,17 +687,18 @@ impl<'a, 'c> Machine<'a, 'c> {
 
     fn lambda_conversion(
         &self,
-        expression: &str,
+        mut expression: Document,
         from: &Type,
         to: &Type,
-    ) -> Result<String, LiftError> {
+    ) -> Result<Document, LiftError> {
         if from == to {
-            return Ok(expression.into());
+            return Ok(expression);
         }
         let target = self.render_type(to);
         match (from, to) {
             (Type::Primitive(from), Type::Primitive(to)) if primitive_widens(*from, *to) => {
-                Ok(format!("({target})({expression})"))
+                expression.surround(&format!("({target})("), ")");
+                Ok(expression)
             }
             (Type::Primitive(from), to) if is_reference(to) => {
                 if let Type::Object(name) = to
@@ -699,16 +707,17 @@ impl<'a, 'c> Machine<'a, 'c> {
                     if !primitive_widens(*from, primitive) {
                         return Err(self.invalid_operand("invalid lambda box conversion"));
                     }
-                    let value = if *from == primitive {
-                        Cow::Borrowed(expression)
-                    } else {
-                        Cow::Owned(format!("({})({expression})", primitive.java_name()))
-                    };
-                    return Ok(format!("{target}.valueOf({value})"));
+                    if *from != primitive {
+                        expression.surround(&format!("({})(", primitive.java_name()), ")");
+                    }
+                    let mut call = Document::from(format!("{target}.valueOf"));
+                    call.append(Document::relative_delimited([expression]));
+                    return Ok(call);
                 }
                 let boxed = (self.class_name)(wrapper(*from).0);
-                let value = format!("{boxed}.valueOf({expression})");
-                Ok(format!("({target}){value}"))
+                let mut call = Document::from(format!("({target}){boxed}.valueOf"));
+                call.append(Document::relative_delimited([expression]));
+                Ok(call)
             }
             (Type::Object(from), Type::Primitive(to)) => {
                 let Some(primitive) = unboxed(from) else {
@@ -718,30 +727,30 @@ impl<'a, 'c> Machine<'a, 'c> {
                     } else {
                         "java/lang/Number"
                     };
+                    expression.surround("(", ")");
                     let converted = self.reference_cast(
-                        Expr::atom(Type::Object(from.clone()), format!("({expression})")),
+                        Expr::atom(Type::Object(from.clone()), expression),
                         Type::Object(owner.into()),
                         true,
                     )?;
-                    return Ok(format!("{}.{accessor}()", converted.at(PRIMARY)));
+                    let mut value = converted.into_at(PRIMARY);
+                    value.push_str(&format!(".{accessor}()"));
+                    return Ok(value);
                 };
                 if !primitive_widens(primitive, *to) {
                     return Err(self.invalid_operand("invalid lambda unboxing conversion"));
                 }
                 let (_, accessor) = wrapper(primitive);
-                let value = format!("({expression}).{accessor}()");
-                if primitive == *to {
-                    Ok(value)
-                } else {
-                    Ok(format!("({target}){value}"))
+                expression.surround("(", &format!(").{accessor}()"));
+                if primitive != *to {
+                    expression.prepend_str(&format!("({target})"));
                 }
+                Ok(expression)
             }
             (from, to) if is_reference(from) && is_reference(to) => {
-                let result = self.reference_cast(
-                    Expr::atom(from.clone(), format!("({expression})")),
-                    to.clone(),
-                    true,
-                )?;
+                expression.surround("(", ")");
+                let result =
+                    self.reference_cast(Expr::atom(from.clone(), expression), to.clone(), true)?;
                 Ok(result.text)
             }
             _ => Err(self.invalid_operand("invalid lambda implementation conversion")),
@@ -1251,12 +1260,14 @@ fn jdk_type_arguments(interface: &str, site: &LambdaSite<'_>) -> Option<Vec<Type
         .collect()
 }
 
-fn render_lambda(target: &str, parameters: &[String], body: &str) -> String {
-    if let [parameter] = parameters {
-        format!("({target}){parameter} -> {body}")
+fn render_lambda(target: &str, parameters: &[String], body: Document) -> Document {
+    let mut declaration = if let [parameter] = parameters {
+        Document::from(format!("({target}){parameter} -> "))
     } else {
-        format!("({target})({}) -> {body}", parameters.join(", "))
-    }
+        Document::from(format!("({target})({}) -> ", parameters.join(", ")))
+    };
+    declaration.append(body);
+    declaration
 }
 
 fn is_reference(ty: &Type) -> bool {
@@ -1410,7 +1421,7 @@ impl<'a, 'c> Machine<'a, 'c> {
                 };
                 Ok(Expr::atom(
                     ty,
-                    format!("{}.class", self.render_type(&primitive)),
+                    format!("{}.class", self.render_type(&primitive)).into(),
                 ))
             }
             ("enumConstant", Some(")Ljava/lang/Enum;"), []) => {
@@ -1434,7 +1445,7 @@ impl<'a, 'c> Machine<'a, 'c> {
                     return Err(self.invalid_operand("enumConstant does not name an enum member"));
                 }
                 let text = format!("{}.{}", (self.class_name)(owner), name);
-                self.expression(ty, text, PRIMARY, [], true)
+                self.expression(ty, text.into(), PRIMARY, [], true)
             }
             ("getStaticFinal", Some(")Ljava/lang/Object;"), [])
             | ("getStaticFinal", Some("Ljava/lang/Class;)Ljava/lang/Object;"), [_]) => {
@@ -1486,7 +1497,7 @@ impl<'a, 'c> Machine<'a, 'c> {
             {
                 return Ok(Expr::literal(
                     ty.clone(),
-                    format!("{}.{}", (self.class_name)(owner), name),
+                    format!("{}.{}", (self.class_name)(owner), name).into(),
                 ));
             }
         }
@@ -1505,7 +1516,7 @@ impl<'a, 'c> Machine<'a, 'c> {
                 let literal =
                     super::constant_literal(pool, index, None, self.options.ascii_strings)?;
                 let string = Type::Object("java/lang/String".into());
-                let value = Expr::literal(string.clone(), literal);
+                let value = Expr::literal(string.clone(), literal.into());
                 return if ty == string {
                     Ok(value)
                 } else {
@@ -1519,7 +1530,7 @@ impl<'a, 'c> Machine<'a, 'c> {
                 let class_type = Type::Object("java/lang/Class".into());
                 let value = self.expression(
                     class_type.clone(),
-                    format!("{}.class", self.render_type(&class)),
+                    format!("{}.class", self.render_type(&class)).into(),
                     PRIMARY,
                     [],
                     true,
@@ -1557,7 +1568,7 @@ impl<'a, 'c> Machine<'a, 'c> {
         };
         Ok(Expr {
             precedence,
-            ..Expr::literal(Type::Primitive(target), text)
+            ..Expr::literal(Type::Primitive(target), text.into())
         })
     }
 }

@@ -77,16 +77,41 @@ fn int_switch(prefix: &[u8], continuation: &[u8]) -> Vec<u8> {
     bytes
 }
 
+fn render(line: &Line) -> (String, Vec<(u32, usize)>) {
+    let mut text = String::new();
+    let mut mapping = line
+        .offsets
+        .iter()
+        .map(|&byte| (byte, 0))
+        .collect::<Vec<_>>();
+    line.text.render_at(
+        &mut text,
+        usize::MAX,
+        "   ",
+        false,
+        line.depth,
+        |offsets, line| {
+            mapping.extend(offsets.map(|byte| (byte, line)));
+        },
+    );
+    (text, mapping)
+}
+
 #[test]
 fn joins_return_values_with_their_bytecode_offsets() {
     let bytes = int_switch(&[0x1a], &[0xac]);
     let lines = lift(&bytes, "(I)I", 60, 0).unwrap();
     assert_eq!(lines.len(), 1);
+    let (text, mapping) = render(&lines[0]);
     assert_eq!(
-        lines[0].text,
-        "return switch (var0) { case 7 -> 2; default -> 3; };"
+        text,
+        "return switch (var0) {\n   case 7 -> 2;\n   default -> 3;\n};"
     );
-    assert_eq!(lines[0].offsets, (0..21).chain(24..26).collect::<Vec<_>>());
+    let header = (0..20).chain(25..26).map(|byte| (byte, 0));
+    assert_eq!(
+        mapping,
+        header.chain([(20, 1), (24, 2)]).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -97,13 +122,14 @@ fn groups_labels_and_retains_explicit_throws_in_assignments() {
         0x05, 0xa7, 0, 9, 0x06, 0xa7, 0, 5, 0x01, 0xbf, 0x3c, 0x1b, 0xac,
     ]);
     let lines = lift(&bytes, "(I)I", 60, 0).unwrap();
+    let (text, mapping) = render(&lines[0]);
     assert_eq!(
-        lines[0].text,
-        "int var1 = switch (var0) { case 1, 3 -> 2; case 2, 4 -> 3; default -> throw null; };"
+        text,
+        "int var1 = switch (var0) {\n   case 1, 3 -> 2;\n   case 2, 4 -> 3;\n   default -> throw null;\n};"
     );
-    assert_eq!(lines[1].text, "return var1;");
+    assert_eq!(lines[1].text.as_flat(), "return var1;");
     let throw = u32::try_from(bytes.len() - 4).unwrap();
-    assert!(lines[0].offsets.contains(&throw));
+    assert!(mapping.contains(&(throw, 3)));
 }
 
 #[test]
@@ -112,8 +138,8 @@ fn keeps_a_preceding_argument_outside_the_switch() {
     let lines = lift(&bytes, "(I)I", 60, 0).unwrap();
     assert_eq!(lines.len(), 1);
     assert_eq!(
-        lines[0].text,
-        "return Example.take(Example.side(), switch (var0) { case 7 -> 2; default -> 3; });"
+        render(&lines[0]).0,
+        "return Example.take(Example.side(), switch (var0) {\n   case 7 -> 2;\n   default -> 3;\n});"
     );
 }
 
@@ -122,8 +148,8 @@ fn composes_a_switch_used_as_the_next_selector() {
     let bytes = int_switch(&int_switch(&[0x1a], &[]), &[0xac]);
     let lines = lift(&bytes, "(I)I", 61, 0).unwrap();
     assert_eq!(
-        lines[0].text,
-        "return switch (switch (var0) { case 7 -> 2; default -> 3; }) { case 7 -> 2; default -> 3; };"
+        render(&lines[0]).0,
+        "return switch (switch (var0) {\n   case 7 -> 2;\n   default -> 3;\n}) {\n   case 7 -> 2;\n   default -> 3;\n};"
     );
 }
 
@@ -133,10 +159,14 @@ fn retains_arm_work_before_the_yield() {
     lookup(&mut bytes, 4, &[(7, 0)]);
     bytes.extend([0x05, 0xa7, 0, 8, 0xb8, 0, 9, 0x57, 0x06, 0xac]);
     let lines = lift(&bytes, "(I)I", 60, 0).unwrap();
+    let (text, mapping) = render(&lines[0]);
     assert_eq!(
-        lines[0].text,
-        "return switch (var0) { case 7 -> 2; default -> { Example.side(); yield 3; } };"
+        text,
+        "return switch (var0) {\n   case 7 -> 2;\n   default -> {\n      Example.side();\n      yield 3;\n   }\n};"
     );
+    assert!((24..27).all(|byte| mapping.contains(&(byte, 3))));
+    assert!(!mapping.iter().any(|&(byte, _)| byte == 27));
+    assert!(mapping.contains(&(28, 4)));
 }
 
 #[test]
@@ -147,9 +177,10 @@ fn keeps_a_loop_owned_by_one_rule() {
         0x05, 0xa7, 0, 16, 0x03, 0x3c, 0x1b, 0x9c, 0, 9, 0x84, 1, 1, 0xa7, 0xff, 0xf9, 0x06, 0xac,
     ]);
     let lines = lift(&bytes, "(I)I", 60, 0).unwrap();
-    assert!(lines[0].text.starts_with("return switch "));
-    assert!(lines[0].text.contains("while ("));
-    assert!(lines[0].text.contains("yield 3;"));
+    let (text, _) = render(&lines[0]);
+    assert!(text.starts_with("return switch "));
+    assert!(text.contains("\n      while ("));
+    assert!(text.contains("\n      yield 3;"));
 }
 
 #[test]
@@ -159,8 +190,8 @@ fn joins_a_single_category_two_value() {
     bytes.extend([0x09, 0xa7, 0, 4, 0x0a, 0xad]);
     let lines = lift(&bytes, "(I)J", 60, 0).unwrap();
     assert_eq!(
-        lines[0].text,
-        "return switch (var0) { case 7 -> 0L; default -> 1L; };"
+        render(&lines[0]).0,
+        "return switch (var0) {\n   case 7 -> 0L;\n   default -> 1L;\n};"
     );
 }
 
@@ -169,11 +200,19 @@ fn preserves_statement_form_before_vineflowers_java16_gate() {
     let bytes = int_switch(&[0x1a], &[0xac]);
     for (major, minor) in [(52, 0), (56, u16::MAX), (57, u16::MAX), (58, 0), (59, 0)] {
         let lines = lift(&bytes, "(I)I", major, minor).unwrap();
-        assert!(lines.iter().any(|line| line.text == "switch (var0) {"));
-        assert!(lines.iter().all(|line| !line.text.contains(" -> ")));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.text.as_flat() == "switch (var0) {")
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|line| !line.text.as_flat().contains(" -> "))
+        );
     }
     let preview = lift(&bytes, "(I)I", 60, u16::MAX).unwrap();
-    assert!(preview[0].text.starts_with("return switch "));
+    assert!(preview[0].text.as_flat().starts_with("return switch "));
 }
 
 #[test]
@@ -182,8 +221,16 @@ fn falls_back_when_an_arm_uses_the_dispatch_stack_prefix() {
     lookup(&mut bytes, 5, &[(7, 0)]);
     bytes.extend([0x05, 0x60, 0xa7, 0, 5, 0x06, 0x60, 0xac]);
     let lines = lift(&bytes, "(I)I", 60, 0).unwrap();
-    assert!(lines.iter().any(|line| line.text == "switch (var0) {"));
-    assert!(lines.iter().all(|line| !line.text.contains(" -> ")));
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.text.as_flat() == "switch (var0) {")
+    );
+    assert!(
+        lines
+            .iter()
+            .all(|line| !line.text.as_flat().contains(" -> "))
+    );
 }
 
 #[test]
@@ -192,8 +239,12 @@ fn does_not_move_a_method_return_into_a_switch_rule() {
     lookup(&mut bytes, 6, &[(7, 0), (8, 2)]);
     bytes.extend([0x04, 0xac, 0x05, 0xa7, 0, 4, 0x06, 0xac]);
     let lines = lift(&bytes, "(I)I", 60, 0).unwrap();
-    assert!(lines.iter().any(|line| line.text == "return 1;"));
-    assert!(lines.iter().all(|line| !line.text.contains(" -> ")));
+    assert!(lines.iter().any(|line| line.text.as_flat() == "return 1;"));
+    assert!(
+        lines
+            .iter()
+            .all(|line| !line.text.as_flat().contains(" -> "))
+    );
 }
 
 #[test]
@@ -204,9 +255,21 @@ fn keeps_local_declarations_outside_when_the_join_reads_them() {
         0x06, 0x3c, 0x05, 0xa7, 0, 6, 0x07, 0x3c, 0x08, 0x1b, 0x60, 0xac,
     ]);
     let lines = lift(&bytes, "(I)I", 60, 0).unwrap();
-    assert!(lines.iter().any(|line| line.text == "switch (var0) {"));
-    assert!(lines.iter().all(|line| !line.text.contains(" -> ")));
-    assert!(lines.iter().any(|line| line.text == "int var1_2;"));
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.text.as_flat() == "switch (var0) {")
+    );
+    assert!(
+        lines
+            .iter()
+            .all(|line| !line.text.as_flat().contains(" -> "))
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.text.as_flat() == "int var1_2;")
+    );
 }
 
 #[test]
@@ -215,8 +278,16 @@ fn does_not_fold_two_joined_operands_into_one_value() {
     lookup(&mut bytes, 5, &[(7, 0)]);
     bytes.extend([0x05, 0x06, 0xa7, 0, 5, 0x07, 0x08, 0x60, 0xac]);
     let lines = lift(&bytes, "(I)I", 60, 0).unwrap();
-    assert!(lines.iter().any(|line| line.text == "switch (var0) {"));
-    assert!(lines.iter().all(|line| !line.text.contains(" -> ")));
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.text.as_flat() == "switch (var0) {")
+    );
+    assert!(
+        lines
+            .iter()
+            .all(|line| !line.text.as_flat().contains(" -> "))
+    );
 }
 
 #[test]

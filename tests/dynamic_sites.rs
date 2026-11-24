@@ -78,15 +78,36 @@ impl Class {
         } else {
             ("metafactory", META)
         };
-        let handle = self.handle(6, "java/lang/invoke/LambdaMetafactory", bootstrap_name, bootstrap_descriptor);
-        let mut args = vec![self.method_type(erased), target, self.method_type(instantiated)];
+        let handle = self.handle(
+            6,
+            "java/lang/invoke/LambdaMetafactory",
+            bootstrap_name,
+            bootstrap_descriptor,
+        );
+        let mut args = vec![
+            self.method_type(erased),
+            target,
+            self.method_type(instantiated),
+        ];
         args.extend_from_slice(alternate.unwrap_or_default());
         let [high, low] = self.dynamic(18, handle, &args, name, factory).to_be_bytes();
         [0xba, high, low, 0, 0]
     }
 
-    fn constant(&mut self, bootstrap: &str, suffix: &str, args: &[u16], name: &str, ty: &str) -> [u8; 3] {
-        let handle = self.handle(6, "java/lang/invoke/ConstantBootstraps", bootstrap, &format!("{CONDY}{suffix}"));
+    fn constant(
+        &mut self,
+        bootstrap: &str,
+        suffix: &str,
+        args: &[u16],
+        name: &str,
+        ty: &str,
+    ) -> [u8; 3] {
+        let handle = self.handle(
+            6,
+            "java/lang/invoke/ConstantBootstraps",
+            bootstrap,
+            &format!("{CONDY}{suffix}"),
+        );
         let [high, low] = self.dynamic(17, handle, args, name, ty).to_be_bytes();
         [0x13, high, low]
     }
@@ -108,7 +129,13 @@ impl Class {
         self.finish_as(SAMPLE, 0x0021, &[], None)
     }
 
-    fn finish_as(mut self, name: &str, flags: u16, interfaces: &[&str], signature: Option<&str>) -> Vec<u8> {
+    fn finish_as(
+        mut self,
+        name: &str,
+        flags: u16,
+        interfaces: &[&str],
+        signature: Option<&str>,
+    ) -> Vec<u8> {
         let this = self.class(name);
         let object = self.class("java/lang/Object");
         let bootstrap_methods = self.utf8("BootstrapMethods");
@@ -152,25 +179,62 @@ fn emits_typed_unbound_bound_and_constructor_references() {
     let mut class = Class::default();
     let length = class.handle(5, "java/lang/String", "length", "()I");
     let function = "()Ljava/util/function/Function;";
-    let indy = class.lambda(length, "apply", function, "(Ljava/lang/Object;)Ljava/lang/Object;", "(Ljava/lang/String;)Ljava/lang/Integer;", None);
+    let indy = class.lambda(
+        length,
+        "apply",
+        function,
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        "(Ljava/lang/String;)Ljava/lang/Integer;",
+        None,
+    );
     class.method(9, "unbound", function, &[indy.as_slice(), &[0xb0]].concat());
 
     class.method(9, "receiver", "()Ljava/lang/String;", &[0x01, 0xb0]);
     let receiver = class.method_ref(SAMPLE, "receiver", "()Ljava/lang/String;");
     let [high, low] = receiver.to_be_bytes();
-    let indy = class.lambda(length, "getAsInt", "(Ljava/lang/String;)Ljava/util/function/IntSupplier;", "()I", "()I", None);
-    class.method(9, "bound", "()Ljava/util/function/IntSupplier;", &[&[0xb8, high, low], indy.as_slice(), &[0xb0]].concat());
+    let indy = class.lambda(
+        length,
+        "getAsInt",
+        "(Ljava/lang/String;)Ljava/util/function/IntSupplier;",
+        "()I",
+        "()I",
+        None,
+    );
+    class.method(
+        9,
+        "bound",
+        "()Ljava/util/function/IntSupplier;",
+        &[&[0xb8, high, low], indy.as_slice(), &[0xb0]].concat(),
+    );
 
     let init = class.handle(8, "java/lang/StringBuilder", "<init>", "()V");
     let supplier = "()Ljava/util/function/Supplier;";
-    let indy = class.lambda(init, "get", supplier, "()Ljava/lang/Object;", "()Ljava/lang/StringBuilder;", None);
-    class.method(9, "constructor", supplier, &[indy.as_slice(), &[0xb0]].concat());
+    let indy = class.lambda(
+        init,
+        "get",
+        supplier,
+        "()Ljava/lang/Object;",
+        "()Ljava/lang/StringBuilder;",
+        None,
+    );
+    class.method(
+        9,
+        "constructor",
+        supplier,
+        &[indy.as_slice(), &[0xb0]].concat(),
+    );
 
     let text = class.source();
-    assert!(text.contains("Function<String, Integer>)String::length"), "{text}");
+    assert!(
+        text.contains("Function<String, Integer>)String::length"),
+        "{text}"
+    );
     assert!(text.contains("DynamicSites.receiver()::length"), "{text}");
     assert_eq!(text.matches("DynamicSites.receiver()").count(), 1, "{text}");
-    assert!(text.contains("Supplier<StringBuilder>)StringBuilder::new"), "{text}");
+    assert!(
+        text.contains("Supplier<StringBuilder>)StringBuilder::new"),
+        "{text}"
+    );
 }
 
 #[test]
@@ -225,18 +289,38 @@ fn inlines_generated_bodies_and_preserves_serializable_markers() {
     let zero = class.entry(3, &0i32.to_be_bytes());
     let marker = class.class("java/lang/Cloneable");
     let factory = "()Ljava/lang/Runnable;";
-    let indy = class.lambda(helper, "run", factory, "()V", "()V", Some(&[flags, one, marker, zero]));
+    let indy = class.lambda(
+        helper,
+        "run",
+        factory,
+        "()V",
+        "()V",
+        Some(&[flags, one, marker, zero]),
+    );
     class.method(9, "factory", factory, &[indy.as_slice(), &[0xb0]].concat());
     class.method(0x100a, "lambda$factory$0", "()V", &[0xb1]);
 
     let capture = "(I)Ljava/util/function/IntUnaryOperator;";
     let helper = class.handle(6, SAMPLE, "lambda$capture$1", "(II)I");
     let indy = class.lambda(helper, "applyAsInt", capture, "(I)I", "(I)I", None);
-    class.method(9, "capture", capture, &[&[0x1a], indy.as_slice(), &[0x84, 0, 1, 0xb0]].concat());
-    class.method(0x100a, "lambda$capture$1", "(II)I", &[0x1a, 0x1b, 0x60, 0xac]);
+    class.method(
+        9,
+        "capture",
+        capture,
+        &[&[0x1a], indy.as_slice(), &[0x84, 0, 1, 0xb0]].concat(),
+    );
+    class.method(
+        0x100a,
+        "lambda$capture$1",
+        "(II)I",
+        &[0x1a, 0x1b, 0x60, 0xac],
+    );
 
     let text = class.source();
-    assert!(text.contains("Runnable & Cloneable & Serializable"), "{text}");
+    assert!(
+        text.contains("Runnable & Cloneable & Serializable"),
+        "{text}"
+    );
     assert!(text.contains("-> stack1 + "), "{text}");
     assert!(!text.contains("lambda$"), "{text}");
 }
@@ -247,13 +331,26 @@ fn retains_only_the_exact_fallback_helper_without_a_generated_name_collision() {
     let helper = class.handle(6, SAMPLE, "lambda$factory$0", "(I)I");
     let factory = "(I)Ljava/util/function/IntSupplier;";
     let indy = class.lambda(helper, "getAsInt", factory, "()I", "()I", None);
-    class.method(9, "factory", factory, &[&[0x1a], indy.as_slice(), &[0xb0]].concat());
+    class.method(
+        9,
+        "factory",
+        factory,
+        &[&[0x1a], indy.as_slice(), &[0xb0]].concat(),
+    );
     // This bytecode writes its input slot. The captured variable is a lexical
     // final in Java, so the body needs a separately named retained method.
-    class.method(0x100a, "lambda$factory$0", "(I)I", &[0x84, 0, 1, 0x1a, 0xac]);
+    class.method(
+        0x100a,
+        "lambda$factory$0",
+        "(I)I",
+        &[0x84, 0, 1, 0x1a, 0xac],
+    );
     class.method(0x100a, "lambda$factory$0", "(J)J", &[0x1e, 0xad]);
     let text = class.source();
-    assert!(text.contains("-> DynamicSites._lambda$factory$0("), "{text}");
+    assert!(
+        text.contains("-> DynamicSites._lambda$factory$0("),
+        "{text}"
+    );
     assert!(text.contains("int _lambda$factory$0("), "{text}");
     assert!(!text.contains("long _lambda$factory$0("), "{text}");
 }
@@ -261,27 +358,92 @@ fn retains_only_the_exact_fallback_helper_without_a_generated_name_collision() {
 #[test]
 fn lowers_only_representable_constant_bootstraps() {
     let mut class = Class::default();
-    let null = class.constant("nullConstant", ")Ljava/lang/Object;", &[], "ignored", "Ljava/lang/String;");
-    class.method(9, "nil", "()Ljava/lang/String;", &[null.as_slice(), &[0xb0]].concat());
-    let primitive = class.constant("primitiveClass", ")Ljava/lang/Class;", &[], "V", "Ljava/lang/Class;");
-    class.method(9, "type", "()Ljava/lang/Class;", &[primitive.as_slice(), &[0xb0]].concat());
-    let item = class.constant("enumConstant", ")Ljava/lang/Enum;", &[], "APPEND", "Ljava/nio/file/StandardOpenOption;");
-    class.method(9, "item", "()Ljava/nio/file/StandardOpenOption;", &[item.as_slice(), &[0xb0]].concat());
+    let null = class.constant(
+        "nullConstant",
+        ")Ljava/lang/Object;",
+        &[],
+        "ignored",
+        "Ljava/lang/String;",
+    );
+    class.method(
+        9,
+        "nil",
+        "()Ljava/lang/String;",
+        &[null.as_slice(), &[0xb0]].concat(),
+    );
+    let primitive = class.constant(
+        "primitiveClass",
+        ")Ljava/lang/Class;",
+        &[],
+        "V",
+        "Ljava/lang/Class;",
+    );
+    class.method(
+        9,
+        "type",
+        "()Ljava/lang/Class;",
+        &[primitive.as_slice(), &[0xb0]].concat(),
+    );
+    let item = class.constant(
+        "enumConstant",
+        ")Ljava/lang/Enum;",
+        &[],
+        "APPEND",
+        "Ljava/nio/file/StandardOpenOption;",
+    );
+    class.method(
+        9,
+        "item",
+        "()Ljava/nio/file/StandardOpenOption;",
+        &[item.as_slice(), &[0xb0]].concat(),
+    );
     let value = class.entry(3, &257i32.to_be_bytes());
-    let cast = class.constant("explicitCast", "Ljava/lang/Object;)Ljava/lang/Object;", &[value], "ignored", "B");
+    let cast = class.constant(
+        "explicitCast",
+        "Ljava/lang/Object;)Ljava/lang/Object;",
+        &[value],
+        "ignored",
+        "B",
+    );
     class.method(9, "narrow", "()B", &[cast.as_slice(), &[0xac]].concat());
-    let mut cast = class.constant("explicitCast", "Ljava/lang/Object;)Ljava/lang/Object;", &[value], "ignored", "J");
+    let mut cast = class.constant(
+        "explicitCast",
+        "Ljava/lang/Object;)Ljava/lang/Object;",
+        &[value],
+        "ignored",
+        "J",
+    );
     cast[0] = 0x14; // ldc2_w
     class.method(9, "wide", "()J", &[cast.as_slice(), &[0xad]].concat());
     let text = class.source();
-    for source in ["return null;", "return void.class;", "StandardOpenOption.APPEND;", "return (byte)(257);", "return (long)(257);"] {
+    for source in [
+        "return null;",
+        "return void.class;",
+        "StandardOpenOption.APPEND;",
+        "return (byte)(257);",
+        "return (long)(257);",
+    ] {
         assert!(text.contains(source), "missing {source}: {text}");
     }
 
     let mut class = Class::default();
     let array = class.class("[I");
-    let cache = class.constant("arrayVarHandle", "Ljava/lang/Class;)Ljava/lang/invoke/VarHandle;", &[array], "unused", "Ljava/lang/invoke/VarHandle;");
-    class.method(9, "array", "()Ljava/lang/invoke/VarHandle;", &[cache.as_slice(), &[0xb0]].concat());
+    let cache = class.constant(
+        "arrayVarHandle",
+        "Ljava/lang/Class;)Ljava/lang/invoke/VarHandle;",
+        &[array],
+        "unused",
+        "Ljava/lang/invoke/VarHandle;",
+    );
+    class.method(
+        9,
+        "array",
+        "()Ljava/lang/invoke/VarHandle;",
+        &[cache.as_slice(), &[0xb0]].concat(),
+    );
     let error = decompile(&class.finish(), &Options::default()).unwrap_err();
-    assert!(format!("{error:#?}").contains("lazy, cached JVM linkage"), "{error:#?}");
+    assert!(
+        format!("{error:#?}").contains("lazy, cached JVM linkage"),
+        "{error:#?}"
+    );
 }

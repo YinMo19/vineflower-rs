@@ -7,11 +7,11 @@ use crate::lift::{
     LiftError, Machine,
     expr::{BOOLEAN, Category, Expr, INT, Order, Source, TERNARY},
 };
-use crate::{bytecode::Instruction, descriptor::Type};
+use crate::{bytecode::Instruction, descriptor::Type, source_text::Document};
 
 pub(crate) struct JoinCode {
-    pub(crate) declarations: Vec<String>,
-    pub(crate) arms: Vec<Vec<String>>,
+    pub(crate) declarations: Vec<Document>,
+    pub(crate) arms: Vec<Vec<Document>>,
 }
 
 impl JoinCode {
@@ -24,26 +24,26 @@ impl JoinCode {
 }
 
 pub(crate) struct LocalJoinCode {
-    pub(crate) declarations: Vec<String>,
+    pub(crate) declarations: Vec<Document>,
     pub(crate) arms: Vec<Vec<LocalCopy>>,
 }
 
 pub(crate) struct LocalCopy {
-    pub(crate) statement: String,
+    pub(crate) statement: Document,
     direct: Option<(String, String)>,
 }
 
 impl LocalCopy {
     /// If the source is an immediately preceding declaration, assign to the
     /// outer binding directly. Its RHS and bytecode mapping stay in place.
-    pub(crate) fn fuse(&self, line: &mut String) -> bool {
+    pub(crate) fn fuse(&self, line: &mut Document) -> bool {
         let Some((declaration, assignment)) = &self.direct else {
             return false;
         };
         if !line.starts_with(declaration) {
             return false;
         }
-        line.replace_range(..declaration.len(), assignment);
+        line.replace_literal_prefix(declaration.len(), assignment);
         true
     }
 }
@@ -112,8 +112,8 @@ impl Machine<'_, '_> {
         &mut self,
         yes: &Self,
         no: &Self,
-        condition: &str,
-        inverse: &str,
+        condition: &Document,
+        inverse: &Document,
         control: &RangeInclusive<u32>,
         held: Option<HeldStack>,
     ) -> Result<Option<bool>, LiftError> {
@@ -154,24 +154,31 @@ impl Machine<'_, '_> {
         let Some(mut ty) = self.common_value_type(yes, no) else {
             return Ok(None);
         };
-        let condition = predicate(condition);
         let (text, precedence) = match (&yes.source, &no.source) {
             (Source::Integer(1), Source::Integer(0)) => {
                 ty = BOOLEAN;
-                (condition.into_owned(), TERNARY)
+                (condition.clone(), TERNARY)
             }
             (Source::Integer(0), Source::Integer(1)) => {
                 ty = BOOLEAN;
-                (inverse.to_owned(), TERNARY)
+                (inverse.clone(), TERNARY)
             }
-            (_, Source::Integer(0)) if yes.ty == BOOLEAN => boolean_arm(&condition, yes, true),
+            (_, Source::Integer(0)) if yes.ty == BOOLEAN => boolean_arm(condition, yes, true),
             (_, Source::Integer(1)) if yes.ty == BOOLEAN => boolean_arm(inverse, yes, false),
             (Source::Integer(0), _) if no.ty == BOOLEAN => boolean_arm(inverse, no, true),
-            (Source::Integer(1), _) if no.ty == BOOLEAN => boolean_arm(&condition, no, false),
+            (Source::Integer(1), _) if no.ty == BOOLEAN => boolean_arm(condition, no, false),
             _ => {
                 let yes = self.conditional_operand(yes, &ty, &no.ty)?;
                 let no = self.conditional_operand(no, &ty, &yes.ty)?;
-                (format!("{condition} ? {} : {}", yes.text, no.text), TERNARY)
+                let mut text = condition.clone();
+                if text.contains('?') {
+                    text.surround("(", ")");
+                }
+                text.push_str(" ? ");
+                text.append(yes.text);
+                text.push_str(" : ");
+                text.append(no.text);
+                (text, TERNARY)
             }
         };
         let mut original = held.filter(|held| {
@@ -295,13 +302,13 @@ impl Machine<'_, '_> {
             }
             let name = self.locals.temporary(self.debug_offset(offset));
             code.declarations
-                .push(format!("{} {name};", self.render_type(&ty)));
+                .push(format!("{} {name};", self.render_type(&ty)).into());
             for (arm, assignments) in arms.iter().zip(&mut code.arms) {
                 let value = arm.coerce(arm.stack[index].clone(), &ty, false)?;
-                assignments.push(format!("{name} = {};", value.text));
+                assignments.push(assignment(&name, value.text));
             }
             slots += u32::from(ty.slots());
-            merged.push(Expr::atom(ty, name));
+            merged.push(Expr::atom(ty, name.into()));
         }
         // Edge assignments execute payloads in stack order. Reject a stack
         // whose still-deferred JVM evaluations cannot be written that way.
@@ -319,7 +326,7 @@ impl Machine<'_, '_> {
         &mut self,
         offset: u32,
         before: Option<u32>,
-    ) -> Result<Vec<String>, LiftError> {
+    ) -> Result<Vec<Document>, LiftError> {
         if self.stack.is_empty() {
             return Ok(Vec::new());
         }
@@ -341,8 +348,9 @@ impl Machine<'_, '_> {
         for value in &mut stack {
             let ty = self.render_type(&value.ty);
             let name = self.locals.temporary(offset);
-            declarations.push(format!("{ty} {name} = {};", value.text));
-            *value = Expr::atom(value.ty.clone(), name);
+            let binding = Expr::atom(value.ty.clone(), name.clone().into());
+            let expr = std::mem::replace(value, binding);
+            declarations.push(assignment(&format!("{ty} {name}"), expr.text));
         }
         self.stack = stack;
         Ok(declarations)
@@ -352,7 +360,7 @@ impl Machine<'_, '_> {
         &self,
         entry: &Self,
         offset: u32,
-    ) -> Result<Vec<String>, LiftError> {
+    ) -> Result<Vec<Document>, LiftError> {
         if self.stack.len() != entry.stack.len() {
             return Err(self.invalid_stack("incompatible incoming stack height"));
         }
@@ -379,19 +387,18 @@ impl Machine<'_, '_> {
         let mut statements = Vec::with_capacity(updates.len() * 2);
         if updates.len() == 1 {
             let (to, value) = updates.pop().unwrap();
-            statements.push(format!("{} = {};", to.text, value.text));
+            statements.push(assignment(to.text.as_str(), value.text));
         } else {
             // Edge updates are parallel copies. A permutation must not
             // overwrite an old operand before another RHS has read it.
             let mut copies = Vec::with_capacity(updates.len());
             for (to, value) in updates {
                 let temporary = self.locals.temporary(offset);
-                statements.push(format!(
-                    "{} {temporary} = {};",
-                    self.render_type(&to.ty),
-                    value.text
+                statements.push(assignment(
+                    &format!("{} {temporary}", self.render_type(&to.ty)),
+                    value.text,
                 ));
-                copies.push(format!("{} = {temporary};", to.text));
+                copies.push(assignment(to.text.as_str(), temporary.into()));
             }
             statements.extend(copies);
         }
@@ -448,7 +455,7 @@ impl Machine<'_, '_> {
             } else {
                 let name = self.locals.local_name(index, &ty, debug);
                 code.declarations
-                    .push(format!("{} {name};", self.render_type(&ty)));
+                    .push(format!("{} {name};", self.render_type(&ty)).into());
                 Local {
                     name,
                     ty,
@@ -462,12 +469,12 @@ impl Machine<'_, '_> {
                     .expect("checked incoming binding");
                 if value.name != local.name {
                     let expr = arm.coerce(
-                        Expr::atom(value.ty.clone(), value.name.clone()),
+                        Expr::atom(value.ty.clone(), value.name.clone().into()),
                         &local.ty,
                         false,
                     )?;
                     assignments.push(LocalCopy {
-                        statement: format!("{} = {};", local.name, expr.text),
+                        statement: assignment(&local.name, expr.text),
                         direct: (value.ty == local.ty).then(|| {
                             (
                                 format!("{} {} = ", self.render_type(&value.ty), value.name),
@@ -498,7 +505,7 @@ impl Machine<'_, '_> {
         &self,
         entry: &Self,
         mut live: impl FnMut(u16) -> bool,
-    ) -> Result<Vec<String>, LiftError> {
+    ) -> Result<Vec<Document>, LiftError> {
         let mut assignments = Vec::new();
         for (slot, (from, to)) in self
             .locals
@@ -522,11 +529,11 @@ impl Machine<'_, '_> {
                 return Err(invalid());
             }
             let value = self.coerce(
-                Expr::atom(from.ty.clone(), from.name.clone()),
+                Expr::atom(from.ty.clone(), from.name.clone().into()),
                 &to.ty,
                 false,
             )?;
-            assignments.push(format!("{} = {};", to.name, value.text));
+            assignments.push(assignment(&to.name, value.text));
         }
         Ok(assignments)
     }
@@ -578,25 +585,21 @@ impl Machine<'_, '_> {
     }
 }
 
-fn predicate(text: &str) -> std::borrow::Cow<'_, str> {
-    if text.contains('?') {
-        format!("({text})").into()
-    } else {
-        text.into()
-    }
+fn assignment(target: &str, mut value: Document) -> Document {
+    value.prepend_str(" = ");
+    value.prepend_str(target);
+    value.push(';');
+    value
 }
 
-fn boolean_arm(condition: &str, value: &Expr, and: bool) -> (String, u8) {
-    let (operator, precedence) = if and { ("&&", 3) } else { ("||", 2) };
-    let text = if and && condition.contains(" || ") {
-        format!("({condition}) {operator} {}", value.at(precedence))
-    } else {
-        format!(
-            "{} {operator} {}",
-            predicate(condition),
-            value.at(precedence)
-        )
-    };
+fn boolean_arm(condition: &Document, value: &Expr, and: bool) -> (Document, u8) {
+    let (operator, precedence) = if and { (" && ", 3) } else { (" || ", 2) };
+    let mut text = condition.clone();
+    if text.contains('?') || (and && text.contains(" || ")) {
+        text.surround("(", ")");
+    }
+    text.push_str(operator);
+    value.append_at(precedence, &mut text);
     (text, precedence)
 }
 

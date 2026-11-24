@@ -4,7 +4,6 @@ mod annotation;
 mod anonymous;
 mod enumeration;
 mod initializers;
-mod layout;
 mod mapping;
 mod module;
 mod names;
@@ -32,6 +31,7 @@ use crate::{
     javadoc::JavadocTarget,
     lift::{DynamicHelpers, Machine, constant_literal_with_options},
     naming::MemberRenames,
+    source_text::Document,
     structure::{
         Line, StructureError,
         assertions::{Guard, Sites, interface_guards, is_guard_field},
@@ -39,7 +39,6 @@ use crate::{
     },
 };
 use enumeration::Enumeration;
-use layout::Document;
 use names::{Names, simple};
 use type_annotations::TypeNesting;
 
@@ -323,14 +322,30 @@ impl<'a, 'c> Writer<'a, 'c> {
     }
 
     fn document_line(&mut self, depth: usize, doc: &Document) {
-        for _ in 0..self.depth + depth {
+        self.document_line_with_anchors(depth, doc, |_, _| {});
+    }
+
+    fn document_line_with_anchors(
+        &mut self,
+        depth: usize,
+        doc: &Document,
+        on_anchor: impl FnMut(std::ops::Range<u32>, usize),
+    ) {
+        if !doc.has_layout() {
+            self.line(depth, doc.as_str());
+            return;
+        }
+        let depth = self.depth + depth;
+        for _ in 0..depth {
             self.body.push_str(&self.options.indent);
         }
-        self.lines += doc.render_with_crlf(
+        self.lines += doc.render_at(
             &mut self.body,
             self.options.preferred_line_length,
             &self.options.indent,
             self.options.crlf,
+            depth,
+            on_anchor,
         );
         self.body.push('\n');
         self.lines += 1;
@@ -584,7 +599,7 @@ impl<'a, 'c> Writer<'a, 'c> {
         &mut self,
         field: &Member<'a>,
         is_interface: bool,
-        initializer: Option<&str>,
+        initializer: Option<&Document>,
     ) -> Result<usize, DecompileError> {
         let pool = &self.class.pool;
         let descriptor = pool.utf8(field.descriptor_index)?;
@@ -628,6 +643,7 @@ impl<'a, 'c> Writer<'a, 'c> {
             .renames()
             .field_alias(self.owner, name, descriptor);
         out.push_str(renamed.unwrap_or(name));
+        let mut out = Document::from(out);
         if let Some(value) = find_attribute(&field.attributes, pool, "ConstantValue")? {
             let index = u16::from_be_bytes(
                 value
@@ -644,7 +660,7 @@ impl<'a, 'c> Writer<'a, 'c> {
             );
         } else if let Some(initializer) = initializer {
             out.push_str(" = ");
-            out.push_str(initializer);
+            out.append_ref(initializer);
         }
         out.push(';');
         if renamed.is_some() {
@@ -656,7 +672,7 @@ impl<'a, 'c> Writer<'a, 'c> {
             self.write_annotation(1, annotation)?;
         }
         let source_line = self.lines;
-        self.line(1, &out);
+        self.line_with_anonymous(1, &out, None)?;
         Ok(source_line)
     }
 
@@ -1155,12 +1171,24 @@ impl<'a, 'c> Writer<'a, 'c> {
             self.write_local_declarations(index, line.depth, true, &mut declarations)?;
             closed_block =
                 (line.text == "}" || line.text.starts_with("} while ")).then_some(line.depth);
+            let start = self.lines;
+            let depth = 2 + line.depth;
+            if line.text.contains('\0') {
+                self.line_with_anonymous(depth, &line.text, anonymous_sites)?;
+            } else {
+                self.document_line_with_anchors(depth, &line.text, |range, line| {
+                    if mapping {
+                        for offset in range {
+                            offsets.entry(offset).or_insert(start + line);
+                        }
+                    }
+                });
+            }
             if mapping {
                 for offset in line.offsets {
-                    offsets.entry(offset).or_insert(self.lines);
+                    offsets.entry(offset).or_insert(start);
                 }
             }
-            self.line_with_anonymous(2 + line.depth, &line.text, anonymous_sites)?;
         }
         self.write_local_declarations(line_count, 0, false, &mut declarations)?;
         if mapping && let Some(closing) = closing {

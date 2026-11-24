@@ -5,7 +5,7 @@ use std::{
     ops::RangeInclusive,
 };
 
-use crate::lift::Machine;
+use crate::{lift::Machine, source_text::Document};
 
 use super::{Emitter, Line, flow::Region};
 
@@ -28,13 +28,14 @@ struct Rule<'a> {
 }
 
 enum RuleResult {
-    Yield(String),
+    Yield(Document),
     Abrupt { inline_throw: bool },
 }
 
 struct SwitchExpression<'a> {
-    selector: &'a str,
+    selector: &'a Document,
     rules: Vec<Rule<'a>>,
+    depth: usize,
 }
 
 impl Emitter<'_> {
@@ -44,11 +45,10 @@ impl Emitter<'_> {
         region: Region<'_, 'a, 'c>,
         machine: &mut Machine<'a, 'c>,
         depth: usize,
-        selector: &str,
+        selector: &Document,
         groups: &BTreeMap<usize, Vec<CaseLabel>>,
         default: usize,
         join: usize,
-        offsets: &mut Vec<u32>,
         control: &RangeInclusive<u32>,
     ) -> bool {
         if !machine.supports_switch_expressions() {
@@ -123,14 +123,15 @@ impl Emitter<'_> {
                     }
                 })
                 .collect();
-            let expression = SwitchExpression { selector, rules };
-            let (text, mapped) = expression.inline();
-            machine.push_switch_value(value, text).ok()?;
-            Some(mapped)
+            let expression = SwitchExpression {
+                selector,
+                rules,
+                depth,
+            };
+            machine.push_switch_value(value, expression.render()).ok()
         })();
-        if let Some(mapped) = recovered {
+        if recovered.is_some() {
             machine.commit_switch_dynamic_helpers(&entry);
-            offsets.extend(mapped);
             return true;
         }
 
@@ -232,11 +233,10 @@ impl Emitter<'_> {
 }
 
 impl SwitchExpression<'_> {
-    /// Compose the proven rules as one expression using the existing inline
-    /// expression renderer, without dropping the individual rule mappings.
-    fn inline(self) -> (String, Vec<u32>) {
-        let mut text = format!("switch ({}) {{", self.selector);
-        let mut offsets = Vec::new();
+    fn render(self) -> Document {
+        let mut document = Document::from("switch (");
+        document.append_ref(self.selector);
+        document.push_str(") {");
         for Rule {
             labels,
             default,
@@ -245,54 +245,69 @@ impl SwitchExpression<'_> {
             result,
         } in self.rules
         {
+            document.hard_line(1);
+            document.anchor_offsets(
+                labels
+                    .iter()
+                    .flat_map(|label| label.offsets.iter().copied()),
+            );
             if default {
-                text.push_str(" default -> ");
                 // Explicit labels sharing this target are already covered
                 // by default; Java does not allow `case k, default`.
-                offsets.extend(
-                    labels
-                        .iter()
-                        .flat_map(|label| label.offsets.iter().copied()),
-                );
+                document.push_str("default");
             } else {
-                text.push_str(" case ");
-                for (i, label) in labels.iter().enumerate() {
-                    if i != 0 {
-                        text.push_str(", ");
+                document.push_str("case ");
+                for (index, label) in labels.iter().enumerate() {
+                    if index != 0 {
+                        document.push_str(", ");
                     }
-                    text.push_str(&label.text);
-                    offsets.extend_from_slice(&label.offsets);
+                    document.push_str(&label.text);
                 }
-                text.push_str(" -> ");
             }
-            let block = match &result {
-                RuleResult::Yield(_) => !statements.is_empty(),
-                RuleResult::Abrupt { inline_throw } => !inline_throw,
-            };
-            if block {
-                text.push('{');
-            }
-            for (i, line) in statements.into_iter().enumerate() {
-                if block || i != 0 {
-                    text.push(' ');
+            document.push_str(" -> ");
+            match result {
+                RuleResult::Yield(mut value) if statements.is_empty() => {
+                    document.anchor_offsets(trailing_offsets);
+                    value.offset_relative_depth(1);
+                    document.append(value);
+                    document.push(';');
                 }
-                text.push_str(&line.text);
-                offsets.extend(line.offsets);
-            }
-            if let RuleResult::Yield(value) = result {
-                if block {
-                    text.push_str(" yield ");
+                RuleResult::Abrupt { inline_throw: true } => {
+                    document.anchor_offsets(trailing_offsets);
+                    let [line] = <[_; 1]>::try_from(statements).expect("one inline throw");
+                    Self::append_statement(&mut document, line, 1);
                 }
-                text.push_str(&value);
-                text.push(';');
-            }
-            offsets.extend(trailing_offsets);
-            if block {
-                text.push_str(" }");
+                result => {
+                    document.push('{');
+                    for line in statements {
+                        let depth = line.depth - self.depth;
+                        document.hard_line(depth);
+                        Self::append_statement(&mut document, line, depth);
+                    }
+                    if let RuleResult::Yield(mut value) = result {
+                        document.hard_line(2);
+                        document.anchor_offsets(trailing_offsets);
+                        document.push_str("yield ");
+                        value.offset_relative_depth(2);
+                        document.append(value);
+                        document.push(';');
+                    } else {
+                        document.anchor_offsets(trailing_offsets);
+                    }
+                    document.hard_line(1);
+                    document.push('}');
+                }
             }
         }
-        text.push_str(" }");
-        (text, offsets)
+        document.hard_line(0);
+        document.push('}');
+        document
+    }
+
+    fn append_statement(document: &mut Document, mut line: Line, depth: usize) {
+        document.anchor_offsets(line.offsets);
+        line.text.offset_relative_depth(depth);
+        document.append(line.text);
     }
 }
 

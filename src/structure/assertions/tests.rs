@@ -10,7 +10,7 @@ const POOL: &[u8] = b"\xca\xfe\xba\xbe\0\0\0\x34\0\x27\
     \x01\0\x18java/lang/AssertionError\x07\0\x0f\x01\0\x06<init>\x01\0\x04(I)V\
     \x0c\0\x11\0\x12\x0a\0\x10\0\x13\x01\0\x03()V\x0c\0\x11\0\x15\x0a\0\x10\0\x16\
     \x01\0\x04Code\x01\0\x08<clinit>\x01\0\x05check\x01\0\x05(ZZ)V\
-    \x01\0\x07message\x01\0\x03()I\x0c\0\x1c\0\x1d\x0a\0\x02\0\x1e\
+    \x01\0\x07message\x01\0\x07(IIII)I\x0c\0\x1c\0\x1d\x0a\0\x02\0\x1e\
     \x01\0\x05plain\x01\0\x08constant\x01\0\x07exposes\
     \x01\0\x09condition\x0c\0\x23\0\x0c\x0a\0\x02\0\x24\x01\0\x05calls";
 
@@ -22,7 +22,7 @@ fn class(flags: u16, extra_read: bool) -> Vec<u8> {
     fn method(class: &mut Vec<u8>, name: u8, desc: u8, locals: u8, code: &[u8]) {
         class.extend_from_slice(&[0, 8, 0, name, 0, desc, 0, 1, 0, 24]);
         class.extend_from_slice(&(12 + code.len() as u32).to_be_bytes());
-        class.extend_from_slice(&[0, 3, 0, locals]);
+        class.extend_from_slice(&[0, 6, 0, locals]);
         class.extend_from_slice(&(code.len() as u32).to_be_bytes());
         class.extend_from_slice(code);
         class.extend_from_slice(&[0, 0, 0, 0]);
@@ -42,11 +42,11 @@ fn class(flags: u16, extra_read: bool) -> Vec<u8> {
         27,
         2,
         &[
-            0xb2, 0, 8, 0x9a, 0, 22, 0x1a, 0x99, 0, 7, 0x1b, 0x9a, 0, 14, 0xbb, 0, 16, 0x59, 0xb8,
-            0, 31, 0xb7, 0, 20, 0xbf, 0xb1,
+            0xb2, 0, 8, 0x9a, 0, 30, 0x1a, 0x99, 0, 7, 0x1b, 0x9a, 0, 22, 0xbb, 0, 16, 0x59, 0x10,
+            11, 0x10, 22, 0x10, 33, 0x10, 44, 0xb8, 0, 31, 0xb7, 0, 20, 0xbf, 0xb1,
         ],
     );
-    method(&mut class, 28, 29, 0, &[0x10, 42, 0xac]);
+    method(&mut class, 28, 29, 4, &[0x10, 42, 0xac]);
     method(
         &mut class,
         32,
@@ -70,8 +70,8 @@ fn class(flags: u16, extra_read: bool) -> Vec<u8> {
         21,
         0,
         &[
-            0xb2, 0, 8, 0x9a, 0, 20, 0xb8, 0, 37, 0x9a, 0, 14, 0xbb, 0, 16, 0x59, 0xb8, 0, 31,
-            0xb7, 0, 20, 0xbf, 0xb1,
+            0xb2, 0, 8, 0x9a, 0, 28, 0xb8, 0, 37, 0x9a, 0, 22, 0xbb, 0, 16, 0x59, 0x10, 11, 0x10,
+            22, 0x10, 33, 0x10, 44, 0xb8, 0, 31, 0xb7, 0, 20, 0xbf, 0xb1,
         ],
     );
     if extra_read {
@@ -87,19 +87,36 @@ fn recovers_constant_short_circuit_and_lazy_detail_but_not_a_user_throw() {
     assert!(
         source
             .text
-            .contains("assert var0 && var1 : Example.message();"),
+            .contains("assert var0 && var1 : Example.message(11, 22, 33, 44);"),
         "{}",
         source.text
     );
     assert!(
         source
             .text
-            .contains("assert Example.condition() : Example.message();")
+            .contains("assert Example.condition() : Example.message(11, 22, 33, 44);")
     );
     assert!(source.text.contains("assert false;"));
     assert!(source.text.contains("throw new AssertionError();"));
     assert!(!source.text.contains("$assertionsDisabled"));
     assert!(!source.text.contains("desiredAssertionStatus"));
+}
+
+#[test]
+fn keeps_argument_wraps_inside_the_assertion_detail() {
+    let options = Options {
+        preferred_line_length: 23,
+        ..Options::default()
+    };
+    let source = decompile(&class(0x1018, false), &options).unwrap();
+    let (_, body) = source.text.split_once("void calls()").unwrap();
+    let (_, detail) = body.split_once("message(").unwrap();
+    let (arguments, _) = detail.split_once(");").unwrap();
+    assert!(arguments.lines().count() > 1, "{}", source.text);
+    assert_eq!(
+        arguments.split_whitespace().collect::<Vec<_>>().join(" "),
+        "11, 22, 33, 44"
+    );
 }
 
 #[test]

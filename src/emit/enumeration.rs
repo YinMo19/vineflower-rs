@@ -7,6 +7,7 @@ use crate::{
     classfile::{ClassFile, Constant, Member},
     descriptor::{MethodDescriptor, Type},
     lift::{AnonymousSites, Machine},
+    source_text::Document,
 };
 
 #[path = "enumeration_subclasses.rs"]
@@ -18,7 +19,7 @@ mod tests;
 
 struct ConstantInit<'a> {
     name: &'a str,
-    arguments: String,
+    arguments: Document,
     subclass: Option<usize>,
 }
 
@@ -75,7 +76,7 @@ impl<'a> Enumeration<'a> {
                 .constants
                 .extend(names.iter().map(|&name| ConstantInit {
                     name,
-                    arguments: String::new(),
+                    arguments: Document::new(),
                     subclass: None,
                 }));
             verify_generated_lookup_methods(class, owner, None, &values_type)?;
@@ -164,7 +165,7 @@ impl<'a> Enumeration<'a> {
                 ));
             }
             let arguments = if arg_ops.is_empty() && descriptor.parameters.is_empty() {
-                String::new()
+                Document::new()
             } else {
                 let wrap = |source| DecompileError::Method {
                     name: "<clinit>".into(),
@@ -345,10 +346,8 @@ impl Writer<'_, '_> {
             self.line(1, ";");
         }
         for (index, constant) in enumeration.constants.iter().enumerate() {
-            let mut head = String::from(constant.name);
-            if !constant.arguments.is_empty() {
-                let _ = write!(head, "({})", constant.arguments);
-            }
+            let mut head = Document::from(constant.name);
+            head.append_ref(&constant.arguments);
             if let Some(id) = constant.subclass {
                 let _ = write!(head, "\0{id}\0");
             }

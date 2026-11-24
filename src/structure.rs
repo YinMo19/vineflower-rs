@@ -24,6 +24,7 @@ use crate::bytecode::{Instruction, Operand};
 use crate::cfg::ControlFlowGraph;
 use crate::classfile::ExceptionHandler;
 use crate::lift::{Effect, LiftError, Machine};
+use crate::source_text::Document;
 
 use self::flow::{Layout, Loop, LoopScope, Region, Transfer, While};
 use self::protected::Exceptions;
@@ -32,16 +33,16 @@ use self::switch_expression::CaseLabel;
 #[derive(Debug)]
 pub(crate) struct Line {
     pub depth: usize,
-    pub text: String,
+    pub text: Document,
     pub offsets: Vec<u32>,
     loop_break: Option<LoopBreak>,
 }
 
 impl Line {
-    fn new(depth: usize, text: String, offsets: Vec<u32>) -> Self {
+    fn new(depth: usize, text: impl Into<Document>, offsets: Vec<u32>) -> Self {
         Self {
             depth,
-            text,
+            text: text.into(),
             offsets,
             loop_break: None,
         }
@@ -161,8 +162,8 @@ struct Tail {
 struct Condition {
     taken: usize,
     fallthrough: usize,
-    when_true: String,
-    when_false: String,
+    when_true: Document,
+    when_false: Document,
 }
 
 struct Arm<'a, 'c> {
@@ -323,13 +324,15 @@ impl Emitter<'_> {
                     *pending = offsets;
                 }
                 Effect::Return(value) => {
-                    let text = value
-                        .map_or_else(|| "return;".to_owned(), |value| format!("return {value};"));
+                    let text = value.map_or_else(
+                        || Document::from("return;"),
+                        |value| surrounded(value, "return ", ";"),
+                    );
                     self.push(depth, text, offsets);
                     return Ok(false);
                 }
                 Effect::Throw(value) => {
-                    self.push(depth, format!("throw {value};"), offsets);
+                    self.push(depth, surrounded(value, "throw ", ";"), offsets);
                     return Ok(false);
                 }
                 Effect::Statement(_) | Effect::FieldAssignment { .. } => {
@@ -398,9 +401,11 @@ impl Emitter<'_> {
                 });
             }
             let prelude = machine.take_prelude();
-            // Nops and gotos eliminated by region formation have no source line.
-            if !prelude.is_empty()
-                || (instruction.opcode != 0 && !matches!(effect, Effect::Jump(_)))
+            // Discarding a stack value may emit the value's expression, but
+            // the pop itself has no source token. The pending value offsets
+            // still map to that statement.
+            if !matches!(instruction.opcode, 0 | 0x57 | 0x58)
+                && (!prelude.is_empty() || !matches!(effect, Effect::Jump(_)))
             {
                 offsets.extend(instruction.offset..instruction.offset + instruction.len);
             }
@@ -412,12 +417,11 @@ impl Emitter<'_> {
                 Effect::Statement(statement) => {
                     self.push(depth, statement, mem::take(&mut offsets))
                 }
-                Effect::FieldAssignment { target, value } => {
-                    self.push(
-                        depth,
-                        format!("{target} = {value};"),
-                        mem::take(&mut offsets),
-                    );
+                Effect::FieldAssignment { mut target, value } => {
+                    target.push_str(" = ");
+                    target.append(value);
+                    target.push(';');
+                    self.push(depth, target, mem::take(&mut offsets));
                 }
                 transfer if index + 1 == range.end => tail = transfer,
                 _ => return Err(self.unstructured(block)),
@@ -469,7 +473,11 @@ impl Emitter<'_> {
                 self.push(depth, statement, mem::take(offsets));
             }
             // Even a degenerate condition can evaluate a call or throw.
-            self.push(depth, format!("if ({when_false}) {{"), mem::take(offsets));
+            self.push(
+                depth,
+                surrounded(when_false, "if (", ") {"),
+                mem::take(offsets),
+            );
             self.syntax(depth, "}");
             return Ok(Some(taken));
         }
@@ -546,7 +554,7 @@ impl Emitter<'_> {
         let else_lines = assignment_lines(else_falls, otherwise.offsets);
         if join != Some(else_at) || !else_lines.is_empty() {
             self.lines.splice(else_end..else_end, else_lines);
-            then_lines.push(Line::new(depth, "} else {".into(), Vec::new()));
+            then_lines.push(Line::new(depth, "} else {", Vec::new()));
         }
         self.lines.splice(then_end..then_end, then_lines);
         let mut header = Vec::new();
@@ -560,7 +568,7 @@ impl Emitter<'_> {
         );
         header.push(Line::new(
             depth,
-            format!("if ({condition}) {{"),
+            surrounded(condition, "if (", ") {"),
             mem::take(offsets),
         ));
         self.lines.splice(start..start, header);
@@ -638,12 +646,13 @@ impl Emitter<'_> {
             };
             if next == condition.taken {
                 condition.taken = unique;
-                condition.when_true = logical(&condition.when_true, "&&", &succeeds);
-                condition.when_false = logical(&condition.when_false, "||", &fails);
+                condition.when_true = logical(mem::take(&mut condition.when_true), "&&", succeeds);
+                condition.when_false = logical(mem::take(&mut condition.when_false), "||", fails);
             } else {
                 condition.fallthrough = unique;
-                condition.when_false = logical(&condition.when_false, "&&", &succeeds);
-                condition.when_true = logical(&condition.when_true, "||", &fails);
+                condition.when_false =
+                    logical(mem::take(&mut condition.when_false), "&&", succeeds);
+                condition.when_true = logical(mem::take(&mut condition.when_true), "||", fails);
             }
             self.emitted[next] = true;
             head = next;
@@ -660,7 +669,7 @@ impl Emitter<'_> {
         region: Region<'_, 'a, 'c>,
         iteration: &mut Machine<'a, 'c>,
         depth: usize,
-    ) -> Result<(usize, usize, String), StructureError> {
+    ) -> Result<(usize, usize, Document), StructureError> {
         let header = scope.header;
         self.emitted[header] = true;
         let Tail {
@@ -714,7 +723,7 @@ impl Emitter<'_> {
             return Err(self.unstructured(header));
         };
         let guard = self.lines.len();
-        self.push(depth, format!("if ({exit_condition}) {{"), offsets);
+        self.push(depth, surrounded(exit_condition, "if (", ") {"), offsets);
         self.emit_loop_transfer(
             test.exit,
             region,
@@ -794,7 +803,8 @@ impl Emitter<'_> {
             && assignments[0].is_empty()
         {
             let offsets = mem::take(&mut self.lines[guard_line].offsets);
-            self.lines[head_line] = Line::new(depth, format!("while ({condition}) {{"), offsets);
+            self.lines[head_line] =
+                Line::new(depth, surrounded(condition, "while (", ") {"), offsets);
             self.lines.drain(guard_line..guard_line + 3);
         }
         self.label_loop(head_line, &scope);
@@ -926,7 +936,7 @@ impl Emitter<'_> {
         region: Region<'_, 'a, 'c>,
         machine: &mut Machine<'a, 'c>,
         depth: usize,
-        selector: String,
+        selector: Document,
         offsets: &mut Vec<u32>,
         control: RangeInclusive<u32>,
         dispatch: Option<&string_switch::Dispatch>,
@@ -985,7 +995,7 @@ impl Emitter<'_> {
             .or(region.stop);
         if let Some(join) = join
             && self.try_switch_expression(
-                block, region, machine, depth, &selector, &groups, default, join, offsets, &control,
+                block, region, machine, depth, &selector, &groups, default, join, &control,
             )
         {
             return Ok(Some(join));
@@ -1012,7 +1022,11 @@ impl Emitter<'_> {
             self.push(depth, statement, mem::take(offsets));
         }
         let start = self.lines.len();
-        self.push(depth, format!("switch ({selector}) {{"), mem::take(offsets));
+        self.push(
+            depth,
+            surrounded(selector, "switch (", ") {"),
+            mem::take(offsets),
+        );
         let mut arms = Vec::new();
         let mut groups = groups.into_iter().peekable();
         while let Some((target, keys)) = groups.next() {
@@ -1106,7 +1120,7 @@ impl Emitter<'_> {
         machine: &mut Machine<'a, 'c>,
         join: usize,
         arms: &[&Arm<'a, 'c>],
-    ) -> Result<(Vec<String>, Vec<Vec<String>>), StructureError> {
+    ) -> Result<(Vec<Document>, Vec<Vec<Document>>), StructureError> {
         let offset = self.offset(join);
         let exits = arms
             .iter()
@@ -1214,22 +1228,29 @@ impl Emitter<'_> {
         }
     }
 
-    fn push(&mut self, depth: usize, text: String, offsets: Vec<u32>) {
+    fn push(&mut self, depth: usize, text: impl Into<Document>, offsets: Vec<u32>) {
         self.lines.push(Line::new(depth, text, offsets));
     }
 
     fn syntax(&mut self, depth: usize, text: &str) {
-        self.push(depth, text.to_owned(), Vec::new());
+        self.push(depth, text, Vec::new());
     }
 }
 
-fn logical(left: &str, op: &str, right: &str) -> String {
-    fn at<'a>(text: &'a str, op: &str) -> std::borrow::Cow<'a, str> {
+fn surrounded(mut text: Document, prefix: &str, suffix: &str) -> Document {
+    text.surround(prefix, suffix);
+    text
+}
+
+fn logical(mut left: Document, op: &str, mut right: Document) -> Document {
+    for text in [&mut left, &mut right] {
         if text.contains('?') || (op == "&&" && text.contains(" || ")) {
-            format!("({text})").into()
-        } else {
-            text.into()
+            text.surround("(", ")");
         }
     }
-    format!("{} {op} {}", at(left, op), at(right, op))
+    left.push(' ');
+    left.push_str(op);
+    left.push(' ');
+    left.append(right);
+    left
 }

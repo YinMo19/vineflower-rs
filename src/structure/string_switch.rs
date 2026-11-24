@@ -10,6 +10,7 @@ use crate::bytecode::{Instruction, Operand};
 use crate::cfg::ControlFlowGraph;
 use crate::classfile::{Constant, ConstantPool};
 use crate::lift::{Effect, Machine, string_literal};
+use crate::source_text::Document;
 
 use super::{Emitter, Region, StructureError};
 
@@ -145,7 +146,8 @@ impl Emitter<'_> {
         let control = machine
             .control_order(dispatch)?
             .expect("switch control schedule");
-        let selector = machine.take_string_switch_selector(&self.instructions[plan.hash])?;
+        let selector: Document =
+            machine.take_string_switch_selector(&self.instructions[plan.hash])?;
         pending.extend(dispatch.offset..dispatch.offset + dispatch.len);
         self.emitted[block] = true;
         for helper in plan.helpers {

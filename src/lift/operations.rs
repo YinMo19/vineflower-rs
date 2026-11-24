@@ -6,6 +6,7 @@ use crate::{
     bytecode::{Instruction, Operand},
     classfile::{OffsetTarget, TypeArgumentTarget, TypeTarget},
     descriptor::{Primitive, Type},
+    source_text::Document,
 };
 
 use super::{
@@ -24,7 +25,8 @@ impl Machine<'_, '_> {
             let value = self.pop_category(category)?;
             let value = self.as_int(value);
             // At equal precedence a unary minus can become a prefix -- token.
-            let text = format!("-{}", value.at(UNARY + 1));
+            let mut text = Document::from("-");
+            value.append_at(UNARY + 1, &mut text);
             return self.push(self.expression(
                 category.numeric_type(),
                 text,
@@ -80,11 +82,12 @@ impl Machine<'_, '_> {
         };
         let can_throw =
             matches!(category, Category::Int | Category::Long) && matches!(operator, "/" | "%");
-        let text = format!(
-            "{} {operator} {}",
-            left.at(precedence),
-            right.at(precedence + 1)
-        );
+        let mut text = Document::new();
+        left.append_at(precedence, &mut text);
+        text.push(' ');
+        text.push_str(operator);
+        text.push(' ');
+        right.append_at(precedence + 1, &mut text);
         self.push(self.expression(ty, text, precedence, [&left, &right], can_throw)?)
     }
 
@@ -133,7 +136,7 @@ impl Machine<'_, '_> {
             source: Source::Comparison(Box::new(Comparison { left, right, nan })),
             order,
             observable,
-            ..Expr::atom(INT, String::new())
+            ..Expr::atom(INT, Document::new())
         })
     }
 
@@ -159,15 +162,11 @@ impl Machine<'_, '_> {
         } else {
             Relation::Lt
         };
-        let ordered = relation.against(&left, &right);
-        let equal = Relation::Eq.against(&left, &right);
-        self.push(self.expression(
-            INT,
-            format!("{ordered} ? {} : {equal} ? 0 : {fallback}", -fallback),
-            TERNARY,
-            [&left, &right],
-            false,
-        )?)
+        let mut text = relation.against(&left, &right);
+        let _ = write!(text, " ? {} : ", -fallback);
+        text.append(Relation::Eq.against(&left, &right));
+        let _ = write!(text, " ? 0 : {fallback}");
+        self.push(self.expression(INT, text, TERNARY, [&left, &right], false)?)
     }
 
     pub(super) fn conditional(&mut self, op: &Instruction) -> Result<Effect, LiftError> {
@@ -182,8 +181,9 @@ impl Machine<'_, '_> {
                         relation.inverse().against_cmp(&cmp),
                     )
                 } else if value.ty == BOOLEAN && relation.equality() {
-                    let truth = value.text.clone();
-                    let negation = format!("!{}", value.at(UNARY));
+                    let mut negation = Document::from("!");
+                    value.append_at(UNARY, &mut negation);
+                    let truth = value.text;
                     if matches!(relation, Relation::Eq) {
                         (negation, truth)
                     } else {
@@ -256,7 +256,7 @@ impl Machine<'_, '_> {
         relation: Relation,
         left: &Expr,
         right: &Expr,
-    ) -> Result<(String, String), LiftError> {
+    ) -> Result<(Document, Document), LiftError> {
         self.order_of([left, right], false)?;
         Ok((
             relation.against(left, right),
@@ -268,7 +268,11 @@ impl Machine<'_, '_> {
         let index = self.pop_category(Category::Int)?;
         let index = self.as_int(index);
         let (array, component) = self.array_operand(kind)?;
-        let text = format!("{}[{}]", array.at(PRIMARY), index.text);
+        let mut text = Document::new();
+        array.append_at(PRIMARY, &mut text);
+        text.push('[');
+        text.append_ref(&index.text);
+        text.push(']');
         self.push(self.expression(component, text, PRIMARY, [&array, &index], true)?)
     }
 
@@ -297,12 +301,13 @@ impl Machine<'_, '_> {
         };
         let order = self.order_of([&array, &index, &value], true)?;
         self.before_statement(order)?;
-        Ok(Effect::Statement(format!(
-            "{}[{}] = {};",
-            array.at(PRIMARY),
-            index.text,
-            value.text
-        )))
+        let mut text = array.into_at(PRIMARY);
+        text.push('[');
+        text.append(index.text);
+        text.push_str("] = ");
+        text.append(value.text);
+        text.push(';');
+        Ok(Effect::Statement(text))
     }
 
     fn array_operand(&mut self, kind: u8) -> Result<(Expr, Type), LiftError> {
@@ -344,7 +349,9 @@ impl Machine<'_, '_> {
         if !matches!(array.ty, Type::Array(_)) {
             return Err(self.invalid_stack("arraylength requires an array reference"));
         }
-        let text = format!("{}.length", array.at(PRIMARY));
+        let mut text = Document::new();
+        array.append_at(PRIMARY, &mut text);
+        text.push_str(".length");
         self.push(self.expression(INT, text, PRIMARY, [&array], true)?)
     }
 
@@ -400,9 +407,12 @@ impl Machine<'_, '_> {
             counts.push(self.as_int(count));
         }
         counts.reverse();
-        let mut text = format!("new {}", self.render_type(element));
+        let mut text = Document::from("new ");
+        text.push_str(&self.render_type(element));
         for count in &counts {
-            let _ = write!(text, "[{}]", count.text);
+            text.push('[');
+            text.append_ref(&count.text);
+            text.push(']');
         }
         for _ in dimensions..rank {
             text.push_str("[]");
@@ -458,7 +468,10 @@ impl Machine<'_, '_> {
                 .transpose()?
                 .flatten()
                 .unwrap_or_else(|| self.render_type(&ty));
-            let text = format!("{} instanceof {}", value.at(RELATIONAL), name);
+            let mut text = Document::new();
+            value.append_at(RELATIONAL, &mut text);
+            text.push_str(" instanceof ");
+            text.push_str(&name);
             self.push(self.expression(BOOLEAN, text, RELATIONAL, [&value], true)?)
         }
     }

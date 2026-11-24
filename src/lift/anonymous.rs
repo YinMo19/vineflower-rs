@@ -1,18 +1,18 @@
 // Based on Vineflower NestedClassProcessor (Apache-2.0).
 // Copyright 2000-2021 JetBrains s.r.o.
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, fmt::Write, rc::Rc};
 
 use crate::{
     bytecode::{self, Instruction, Operand},
     classfile::ClassFile,
     context::NestedKind,
     descriptor::{ClassSignature, MethodDescriptor, Type},
+    source_text::Document,
 };
 
 use super::{
     LiftError, Machine,
     expr::{Expr, Source},
-    members::render_arguments,
     nested::parameter_load_slot,
 };
 
@@ -83,7 +83,7 @@ impl Machine<'_, '_> {
         owner: &str,
         descriptor: &str,
         args: &[Expr],
-    ) -> Result<Option<String>, LiftError> {
+    ) -> Result<Option<Document>, LiftError> {
         let Some(group) = self.group.filter(|_| self.options.decompile_inner) else {
             return Ok(None);
         };
@@ -218,7 +218,7 @@ impl Machine<'_, '_> {
         } else {
             None
         };
-        let (head, visible_args) = match &class.interfaces[..] {
+        let (mut head, visible_args) = match &class.interfaces[..] {
             [] => {
                 let (mut head, visible_args) = self.constructor_target(
                     super_owner,
@@ -228,9 +228,12 @@ impl Machine<'_, '_> {
                 )?;
                 if let Some(signature) = &signature
                     && head.starts_with("new ")
+                    && !head.contains(".new ")
                 {
-                    head.truncate("new ".len());
-                    head.push_str(&signature.superclass.render(self.class_name));
+                    head.replace_literal_prefix(
+                        head.len(),
+                        &format!("new {}", signature.superclass.render(self.class_name)),
+                    );
                 }
                 (head, visible_args)
             }
@@ -242,7 +245,7 @@ impl Machine<'_, '_> {
                         || pool.class_name(*interface).map(self.class_name),
                         |interface| Ok(interface.render(self.class_name)),
                     )?;
-                (format!("new {name}"), &args[first..last])
+                (Document::from(format!("new {name}")), &args[first..last])
             }
             _ => return Err(fail()),
         };
@@ -255,10 +258,9 @@ impl Machine<'_, '_> {
             initializer_start,
             captures: (!captures.fields.is_empty()).then(|| captures.fields.into()),
         });
-        Ok(Some(format!(
-            "{head}({})\0{id}\0",
-            render_arguments(visible_args)
-        )))
+        head.append_relative_arguments(visible_args.iter().map(|arg| &arg.text));
+        let _ = write!(head, "\0{id}\0");
+        Ok(Some(head))
     }
 }
 

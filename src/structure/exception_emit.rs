@@ -4,6 +4,7 @@ use std::{mem, ops::Range};
 
 use crate::bytecode::{Instruction, Operand};
 use crate::lift::{Effect, Machine};
+use crate::source_text::Document;
 
 use super::protected::{
     Catch, ExceptionId, Monitor, ProtectedRegion, local_touches, reference_load, reference_store,
@@ -83,7 +84,7 @@ impl Emitter<'_> {
             };
             self.push(
                 depth,
-                format!("}} catch ({types} {name}) {{"),
+                Document::from(format!("}} catch ({types} {name}) {{")),
                 (store.offset..store.offset + store.len).collect(),
             );
             if self.region(
@@ -170,13 +171,14 @@ impl Emitter<'_> {
         pending: &mut Vec<u32>,
     ) -> Result<Option<usize>, StructureError> {
         let enter = &self.instructions[monitor.plan.enter_index()];
-        let lock = machine.take_monitor_lock(enter)?;
+        let mut lock = machine.take_monitor_lock(enter)?;
         let mut offsets = mem::take(pending);
         for statement in machine.take_prelude() {
             self.push(depth, statement, mem::take(&mut offsets));
         }
         offsets.extend(enter.offset..enter.offset + enter.len);
-        self.push(depth, format!("synchronized ({lock}) {{"), offsets);
+        lock.surround("synchronized (", ") {");
+        self.push(depth, lock, offsets);
         for block in monitor.plan.handler_blocks() {
             if mem::replace(&mut self.emitted[block], true) {
                 return Err(self.unstructured(block));
@@ -195,7 +197,11 @@ impl Emitter<'_> {
         } else if let Some(index) = monitor.plan.release_index(shape.start)
             && self.graph.blocks[shape.start].instructions.end == index + 1
         {
-            self.push(depth, "}".into(), vec![self.instructions[index].offset]);
+            self.push(
+                depth,
+                Document::from("}"),
+                vec![self.instructions[index].offset],
+            );
         } else {
             self.syntax(depth, "}");
         }
@@ -212,7 +218,7 @@ impl Emitter<'_> {
     ) -> Result<usize, StructureError> {
         let line = &mut self.lines[resource.acquisition];
         line.text.pop(); // Verified declaration terminator.
-        line.text = format!("try ({}) {{", line.text);
+        line.text.surround("try (", ") {");
         for block in resource.skipped {
             self.emitted[block] = true;
         }
@@ -266,9 +272,10 @@ impl Emitter<'_> {
             || !self.exceptions.contains(region.exception_arm, predecessor)
             || line.depth != depth
             || !line.offsets.contains(&initialization.offset)
-            || !line.text.ends_with(';')
+            || !line.text.as_flat().ends_with(';')
             || line
                 .text
+                .as_flat()
                 .strip_prefix(&ty)
                 .and_then(|text| text.strip_prefix(' '))
                 .and_then(|text| text.strip_prefix(name))

@@ -16,7 +16,7 @@ impl Locals<'_> {
             return None;
         }
         let local = self.slots.get(usize::from(index))?.as_ref()?;
-        if local.name != value.text || local.ty != value.ty {
+        if value.text != local.name || local.ty != value.ty {
             return None;
         }
         Some((index, self.parameter_names.contains(&local.name)))

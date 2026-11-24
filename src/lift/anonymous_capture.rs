@@ -35,7 +35,7 @@ impl Capture {
     fn expression(&self) -> Expr {
         Expr {
             source: Source::CapturedLocal,
-            ..Expr::atom(self.ty.clone(), self.name.clone())
+            ..Expr::atom(self.ty.clone(), self.name.clone().into())
         }
     }
 
@@ -230,7 +230,7 @@ impl Machine<'_, '_> {
             slot,
             field: field.into(),
             descriptor: descriptor.into(),
-            name: arg.text.clone(),
+            name: arg.text.as_str().to_owned(),
             ty,
         })))
     }

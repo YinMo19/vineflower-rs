@@ -250,6 +250,30 @@ fn ternary_can_replace_an_incoming_top_operand() {
     let lines = lift(&[0x1a, 0x59, 0x9a, 0, 5, 0x57, 0x08, 0xac], "(I)I").unwrap();
     assert_eq!(lines[0].text, "int stack1 = var0;");
     assert_eq!(lines[1].text, "return stack1 == 0 ? 5 : stack1;");
+    assert_eq!(lines[1].offsets, [2, 3, 4, 6, 7]);
+}
+
+#[test]
+fn a_discarded_call_maps_only_the_physical_invocation() {
+    let lines = lift(&[0xb8, 0, 9, 0x57, 0xb1], "()V").unwrap();
+    assert_eq!(lines[0].text, "Example.side();");
+    assert_eq!(lines[0].offsets, [0, 1, 2]);
+}
+
+#[test]
+fn boolean_composition_keeps_operand_anchors() {
+    let mut right = Document::new();
+    right.anchor(11..13);
+    right.push_str("second");
+    let condition = logical(Document::from("first"), "&&", right);
+    let statement = surrounded(condition, "if (", ") {");
+    let mut output = String::new();
+    let mut mapped = Vec::new();
+    statement.render_at(&mut output, 80, "  ", false, 0, |range, line| {
+        mapped.push((range, line));
+    });
+    assert_eq!(output, "if (first && second) {");
+    assert_eq!(mapped, [(11..13, 0)]);
 }
 
 #[test]

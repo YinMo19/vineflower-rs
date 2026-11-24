@@ -152,16 +152,19 @@ fn javac_collisions_use_tag_order_and_map_the_original_literals() {
     assert!(
         lines
             .iter()
-            .any(|line| line.text == "switch (var1) {" && line.offsets == [0, 25])
+            .any(|line| line.text.as_flat() == "switch (var1) {" && line.offsets == [0, 25])
     );
-    assert!(!lines.iter().any(|line| line.text.contains("hashCode")
-        || line.text.contains("equals")
-        || line.text.contains("var2")
-        || line.text.contains("var3")));
+    assert!(!lines.iter().any(|line| {
+        let text = line.text.as_flat();
+        text.contains("hashCode")
+            || text.contains("equals")
+            || text.contains("var2")
+            || text.contains("var3")
+    }));
     let marks = |label, offset| {
         lines
             .iter()
-            .any(|line| line.text.starts_with(label) && line.offsets == [offset])
+            .any(|line| line.text.as_flat().starts_with(label) && line.offsets == [offset])
     };
     assert!(marks(r#"case "BB":"#, 18));
     assert!(marks(r#"case "Aa":"#, 11));
@@ -181,7 +184,7 @@ fn javac_only_elides_tags_that_are_proven_default_padding() {
     assert!(
         lines
             .iter()
-            .any(|line| line.text.starts_with(r#"case "Aa":"#))
+            .any(|line| line.text.as_flat().starts_with(r#"case "Aa":"#))
     );
 
     switch_cases_at(&mut instructions, 25)[0].1 = 32;
@@ -284,7 +287,7 @@ fn null_is_kept_as_a_string_selector_not_dispatched_to_default() {
     assert!(
         lines
             .iter()
-            .any(|line| line.text == "switch ((String)null) {")
+            .any(|line| line.text.as_flat() == "switch ((String)null) {")
     );
 }
 
@@ -334,14 +337,22 @@ fn selector_array_read_occurs_once_and_a_source_alias_remains_live() {
     assert!(
         lines
             .iter()
-            .any(|line| line.text == "String[] var4 = var1;")
+            .any(|line| line.text.as_flat() == "String[] var4 = var1;")
     );
-    assert!(lines.iter().any(|line| line.text == "switch (var4[0]) {"));
-    assert!(lines.iter().any(|line| line.text == "return var4.length;"));
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.text.as_flat() == "switch (var4[0]) {")
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.text.as_flat() == "return var4.length;")
+    );
     assert_eq!(
         lines
             .iter()
-            .filter(|line| line.text.contains("var4[0]"))
+            .filter(|line| line.text.as_flat().contains("var4[0]"))
             .count(),
         1
     );

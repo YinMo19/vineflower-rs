@@ -11,6 +11,7 @@ use crate::{
     context::NestedKind,
     descriptor::MethodDescriptor,
     lift::{DynamicHelpers, Effect, Machine},
+    source_text::Document,
 };
 
 use super::{DecompileError, FINAL, INTERFACE, MethodMap, STATIC, SYNTHETIC, Writer, parse};
@@ -29,7 +30,7 @@ pub(super) struct FieldInitializers<'c> {
 }
 
 struct Declaration {
-    expression: String,
+    expression: Document,
     source_line: Option<usize>,
 }
 
@@ -52,7 +53,7 @@ struct Field {
 struct Assignment {
     field: FieldKey,
     instructions: Range<usize>,
-    expression: String,
+    expression: Document,
     helpers: BTreeSet<(u16, u16)>,
 }
 
@@ -78,10 +79,10 @@ enum Scan<'c> {
 }
 
 impl FieldInitializers<'_> {
-    pub(super) fn expression(&self, field: &Member<'_>) -> Option<&str> {
+    pub(super) fn expression(&self, field: &Member<'_>) -> Option<&Document> {
         self.declarations
             .get(&field_key(field))
-            .map(|decl| decl.expression.as_str())
+            .map(|decl| &decl.expression)
     }
 
     pub(super) fn record_line(&mut self, field: &Member<'_>, source_line: usize) {

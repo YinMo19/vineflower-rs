@@ -16,6 +16,7 @@ pub mod legacy;
 mod lift;
 pub mod naming;
 mod options;
+mod source_text;
 mod structure;
 
 pub use context::{ClassGroup, ClassGroupBuilder};

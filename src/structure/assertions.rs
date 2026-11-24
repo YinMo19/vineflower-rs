@@ -12,6 +12,7 @@ use crate::{
     cfg::ControlFlowGraph,
     classfile::{ClassFile, Code, Constant, ConstantPool, Member, TypeTarget, find_attribute},
     lift::{Effect, Machine},
+    source_text::Document,
 };
 
 mod interface;
@@ -587,9 +588,9 @@ impl Emitter<'_> {
         let condition = conditions
             .into_iter()
             .rev()
-            .fold(None::<String>, |suffix, (expr, combine)| {
+            .fold(None::<Document>, |suffix, (expr, combine)| {
                 Some(match (combine, suffix) {
-                    (Some(op), Some(right)) => logical(&expr, op, &right),
+                    (Some(op), Some(right)) => logical(expr, op, right),
                     (None, None) => expr,
                     _ => unreachable!("proven assertion test chain"),
                 })
@@ -627,10 +628,11 @@ impl Emitter<'_> {
             self.emitted[test.block] = true;
         }
         self.emitted[site.failure] = true;
-        let mut text = format!("assert {condition}");
+        let mut text = condition;
+        text.prepend_str("assert ");
         if let Some(detail) = detail {
             text.push_str(" : ");
-            text.push_str(&detail);
+            text.append(detail);
         }
         text.push(';');
         self.push(depth, text, mem::take(offsets));

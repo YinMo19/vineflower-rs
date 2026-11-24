@@ -7,6 +7,7 @@ use crate::{
     context::NestedKind,
     descriptor::MethodDescriptor,
     lift::{AnonymousSite, AnonymousSites, Machine},
+    source_text::Document,
     structure::{assertions::Sites, structure_with_assertions},
 };
 
@@ -25,11 +26,12 @@ impl<'a, 'c> Writer<'a, 'c> {
     pub(super) fn line_with_anonymous(
         &mut self,
         depth: usize,
-        text: &str,
+        doc: &Document,
         sites: Option<&AnonymousSites>,
     ) -> Result<(), DecompileError> {
+        let text = doc.as_str();
         if !text.contains('\0') {
-            self.line(depth, text);
+            self.document_line(depth, doc);
             return Ok(());
         }
         let invalid = || DecompileError::InvalidAttribute("anonymous class expression");
@@ -164,13 +166,13 @@ impl<'a, 'c> Writer<'a, 'c> {
                 .map_err(|error| wrap(Box::new(error)))?;
         let closing = if lines
             .last()
-            .is_some_and(|line| line.depth == 0 && line.text == "return;")
+            .is_some_and(|line| line.depth == 0 && line.text.as_str() == "return;")
         {
             lines.pop().map(|line| line.offsets)
         } else {
             None
         };
-        if lines.iter().any(|line| line.text == "return;") {
+        if lines.iter().any(|line| line.text.as_str() == "return;") {
             return Err(DecompileError::Unsupported {
                 feature: "nonlocal return from anonymous initializer",
             });

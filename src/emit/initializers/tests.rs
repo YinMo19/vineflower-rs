@@ -399,8 +399,7 @@ fn an_elided_default_constructor_still_maps_its_initializer() {
     assert_eq!(map.original_lines[&11], declaration + 1);
 }
 
-#[test]
-fn literal_arrays_at_the_start_of_clinit_are_declaration_initializers() {
+fn array_field_fixture() -> Fixture {
     let mut f = Fixture::new();
     let field = f.field(0x0018, "numbers", "[I");
     let code = [
@@ -412,9 +411,25 @@ fn literal_arrays_at_the_start_of_clinit_are_declaration_initializers() {
     ]
     .concat();
     f.method(0x0008, "<clinit>", "()V", &code, &[(0, 9)]);
-    let source = f.source();
+    f
+}
+
+#[test]
+fn literal_arrays_at_the_start_of_clinit_are_declaration_initializers() {
+    let source = array_field_fixture().source();
     let declaration = line_of(&source, "static final int[] numbers = new int[]{1, 2};");
     assert!(!source.text.contains("static {"));
+    assert_eq!(source.map.unwrap().methods[0].offsets[&10], declaration);
+}
+
+#[test]
+fn recovered_field_initializer_retains_its_document_breaks() {
+    let source = array_field_fixture().source_with(|options| options.preferred_line_length = 28);
+    let declaration = line_of(&source, "static final int[] numbers = new int[]{");
+    let elements = line_of(&source, "1, 2");
+    let closing = line_of(&source, "};");
+    assert_eq!(elements, declaration + 1);
+    assert_eq!(closing, elements + 1);
     assert_eq!(source.map.unwrap().methods[0].offsets[&10], declaration);
 }
 

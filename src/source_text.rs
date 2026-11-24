@@ -278,6 +278,7 @@ impl Document {
 
     /// Begin a group at an absolute indentation depth. All of its own soft
     /// breaks are applied together; children make their own fit decisions.
+    #[cfg(test)]
     pub(crate) fn begin_group(&mut self, base_depth: usize, extra_depth: usize) {
         self.begin_at(BaseDepth::Depth(base_depth), extra_depth);
     }
@@ -300,6 +301,18 @@ impl Document {
                 qualifier: false,
             },
         });
+    }
+
+    /// Preserve the formatting of an embedded member chain without letting a
+    /// containing non-member expression promote it into a later chain.
+    pub(crate) fn seal_qualifier(&mut self) {
+        if let Some(Event {
+            at: 0,
+            kind: Kind::Begin { qualifier, .. },
+        }) = self.events.first_mut()
+        {
+            *qualifier = false;
+        }
     }
 
     /// Open the group covering a qualified field/invocation, and register the
@@ -577,6 +590,7 @@ impl Document {
 
     /// A member chain ending in an invocation. Each member is paired with
     /// whether its receiver allows a break (a simple variable does not).
+    #[cfg(test)]
     pub(crate) fn invocation_chain(
         depth: usize,
         receiver: impl Into<Self>,
@@ -598,12 +612,14 @@ impl Document {
 
     /// Append the formatted fragment and return the number of emitted linefeeds.
     /// Existing text on the destination's last line contributes to the fit test.
+    #[cfg(test)]
     pub(crate) fn render(&self, out: &mut String, width: usize, indent: &str) -> usize {
         self.render_with_crlf(out, width, indent, false)
     }
 
     /// The Java emitter stores LF internally. In CRLF mode, use the original
     /// TextBuffer's two-unit separator for measurement without converting output.
+    #[cfg(test)]
     pub(crate) fn render_with_crlf(
         &self,
         out: &mut String,
@@ -658,6 +674,7 @@ impl Document {
 #[derive(Clone, Copy)]
 pub(crate) enum ArrayStyle {
     New,
+    #[cfg(test)]
     Direct,
 }
 
@@ -676,6 +693,7 @@ impl ArrayElements<'_> {
         } else {
             let extra = match self.style {
                 ArrayStyle::New => 1,
+                #[cfg(test)]
                 ArrayStyle::Direct => 2,
             };
             self.doc.begin_relative_group(0, extra);
@@ -698,6 +716,7 @@ impl ArrayElements<'_> {
                 self.doc.push('}');
                 self.doc.end_group();
             }
+            #[cfg(test)]
             ArrayStyle::Direct => {
                 self.doc.end_group();
                 self.doc.push('}');
@@ -1122,6 +1141,22 @@ mod tests {
             "    this.longField\n      .secondField\n      .call();"
         );
         assert_eq!(anchors, [(1..4, 0), (4..7, 1), (7..10, 2)]);
+    }
+
+    #[test]
+    fn composing_an_array_access_seals_the_receiver_chain() {
+        let mut expression = Document::from("instance.first()");
+        assert!(expression.begin_qualifier(true, false));
+        expression.push_str(".next()");
+        expression.end_group();
+        expression.seal_qualifier();
+        expression.push_str("[0]");
+        assert!(expression.begin_qualifier(true, true));
+        expression.push_str(".last()");
+        expression.end_group();
+        let mut out = String::new();
+        assert_eq!(expression.render(&mut out, 14, "  "), 2);
+        assert_eq!(out, "instance.first()\n    .next()[0]\n  .last()");
     }
 
     #[test]
