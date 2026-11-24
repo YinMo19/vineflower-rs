@@ -577,13 +577,22 @@ impl BranchedFinally {
                     copy: copied_exit?,
                 });
             }
-            if exits.len() > 1 && !result.loop_targets.is_empty()
+            let direct_return = exits.len() == 1
+                && monitor.is_none()
+                && result.nested_handlers.is_empty()
+                && result.tail.is_some();
+            let loop_return = exits.len() > 1 && !result.loop_targets.is_empty();
+            // A single normal cleanup path can still originate from a
+            // source return. Require its saved value to distinguish that
+            // case from a void return after the entire try statement.
+            if (direct_return || loop_return)
                 && result.shared_return.is_none() && result.monitor_exit.is_none()
                 && let Some(block) = tail
                 && let Some(resume) = ReturnResume::prove(
                     instructions, graph, routes, sample, block, result.tail_code.len(),
                     &removed, &result.loop_targets,
                 )
+                && (loop_return || resume.spill.is_some())
             {
                 result.returns.push(resume);
             } else {
