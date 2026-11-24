@@ -185,6 +185,50 @@ impl Machine<'_, '_> {
         self.class.major_version >= 65
     }
 
+    pub(crate) fn can_project_record_patterns(&self) -> bool {
+        // A projected prologue retains no bytecode position for an annotated
+        // backing cast. Leave it to the ordinary handler layer for now.
+        self.supports_null_default() && self.normalized.is_none() && self.code_type_renderer.is_none()
+    }
+
+    pub(crate) fn pattern_record_components<'c>(
+        &'c self,
+        ty: &Type,
+    ) -> Option<Vec<(&'c str, Type)>> {
+        let Type::Object(name) = ty else { return None };
+        let class = self.group.and_then(|group| group.get(name))
+            .or_else(|| (name == self.owner).then_some(self.class))?;
+        let pool = &class.pool;
+        if class.access_flags & 0x0010 == 0
+            || pool.class_name(class.super_class).ok()? != "java/lang/Record"
+            || class.signature().ok()?.is_some_and(|sig| sig.starts_with('<'))
+        {
+            return None;
+        }
+        class.record_components().ok()??.into_iter().map(|component| {
+            if component.signature(pool).ok()?.is_some() {
+                return None;
+            }
+            let name = pool.utf8(component.name_index).ok()?;
+            let desc = pool.utf8(component.descriptor_index).ok()?;
+            class.methods.iter().find(|method| {
+                method.access_flags & (0x0001 | 0x0008) == 0x0001
+                    && pool.utf8(method.name_index).ok() == Some(name)
+                    && pool.utf8(method.descriptor_index).ok().and_then(|s| s.strip_prefix("()")) == Some(desc)
+            })?;
+            Some((name, Type::parse(desc).ok()?))
+        }).collect()
+    }
+
+    pub(crate) fn pattern_record_type(&self, ty: &Type) -> String {
+        self.render_type(ty)
+    }
+
+    pub(crate) fn pattern_raw_parameter_slots(&self) -> u16 {
+        u16::from(self.method.access_flags & 0x0008 == 0)
+            + self.descriptor.parameters.iter().map(Type::slots).sum::<u16>()
+    }
+
     pub(crate) fn pattern_guard_keyword(&self) -> Option<&'static str> {
         self.supports_pattern_switch().then_some(if self.class.major_version <= 62 { " && " } else { " when " })
     }
@@ -264,7 +308,8 @@ impl Machine<'_, '_> {
             {
                 return Err(self.unsupported("annotated pattern backing cast"));
             }
-            let target = LocalWrite { index: slot, category: Category::Ref };
+            let category = Category::of(ty).ok_or_else(|| self.unsupported("invalid pattern binding type"))?;
+            let target = LocalWrite { index: slot, category };
             let value = Expr::atom(ty.clone(), Document::new());
             if self.assignment_local_destination(store, target, &value) != Some(true) {
                 return Err(self.unsupported("pattern store does not declare a fresh local of the tested type"));

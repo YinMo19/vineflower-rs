@@ -52,6 +52,7 @@ fn prove(
         exceptions: &exceptions,
         exception_redirects: BTreeMap::new(),
         assertions: None,
+        record_patterns: None,
         emitted: vec![false; graph.blocks.len()],
         lines: Vec::new(),
     };

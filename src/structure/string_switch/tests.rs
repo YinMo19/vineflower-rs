@@ -265,6 +265,7 @@ fn visible_alias_or_tag_at_an_exit_prevents_consuming_its_stores() {
                 exceptions: &exceptions,
                 exception_redirects: Default::default(),
                 assertions: None,
+                record_patterns: None,
                 emitted: vec![false; graph.blocks.len()],
                 lines: Vec::new(),
             };

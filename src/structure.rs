@@ -14,6 +14,7 @@ mod instanceof_patterns;
 mod join_tests;
 mod labeled_blocks;
 mod local_joins;
+mod pattern_record;
 mod pattern_switch;
 mod protected;
 mod string_switch;
@@ -114,7 +115,7 @@ pub(crate) fn structure_with_handlers(
 pub(crate) fn structure_with_assertions(
     instructions: &[Instruction],
     graph: &ControlFlowGraph,
-    machine: Machine<'_, '_>,
+    mut machine: Machine<'_, '_>,
     handlers: &[ExceptionHandler],
     assertions: Option<&assertions::Sites>,
 ) -> Result<Vec<Line>, StructureError> {
@@ -126,8 +127,15 @@ pub(crate) fn structure_with_assertions(
     {
         return Err(StructureError::ExceptionHandlers);
     }
+    if assertions.is_none()
+        && let Some((projected, graph, plans)) =
+            pattern_record::Plans::prove(instructions, graph, handlers, &mut machine)
+    {
+        let exceptions = Exceptions::new(&projected, &graph, &[], Some(&machine))?;
+        return structure_regions(&projected, &graph, machine, &exceptions, None, Some(&plans));
+    }
     let exceptions = Exceptions::new(instructions, graph, handlers, Some(&machine))?;
-    structure_regions(instructions, graph, machine, &exceptions, assertions)
+    structure_regions(instructions, graph, machine, &exceptions, assertions, None)
 }
 
 fn structure_regions(
@@ -136,6 +144,7 @@ fn structure_regions(
     mut machine: Machine<'_, '_>,
     exceptions: &Exceptions,
     assertions: Option<&assertions::Sites>,
+    record_patterns: Option<&pattern_record::Plans>,
 ) -> Result<Vec<Line>, StructureError> {
     if graph.blocks.is_empty() {
         return Ok(Vec::new());
@@ -147,6 +156,7 @@ fn structure_regions(
         exceptions,
         exception_redirects: BTreeMap::new(),
         assertions,
+        record_patterns,
         emitted: vec![false; graph.blocks.len()],
         lines: Vec::new(),
     };
@@ -159,6 +169,9 @@ fn structure_regions(
             return Err(emitter.unstructured(block));
         }
     }
+    if record_patterns.is_some_and(|plans| !plans.all_claimed()) {
+        return Err(StructureError::ExceptionHandlers);
+    }
     emitter.lines.retain(|line| !line.detached_declaration);
     Ok(emitter.lines)
 }
@@ -170,6 +183,7 @@ struct Emitter<'a> {
     exceptions: &'a Exceptions,
     exception_redirects: BTreeMap<usize, ExceptionRedirect>,
     assertions: Option<&'a assertions::Sites>,
+    record_patterns: Option<&'a pattern_record::Plans>,
     emitted: Vec<bool>,
     lines: Vec<Line>,
 }

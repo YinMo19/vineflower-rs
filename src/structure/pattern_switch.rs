@@ -25,7 +25,7 @@ mod values;
 #[path = "pattern_guard_tests.rs"]
 mod regressions;
 
-struct Head {
+pub(super) struct Head {
     /// The suffix replaced by the source switch, excluding selector evaluation.
     setup: usize,
     restart: u16,
@@ -36,7 +36,7 @@ struct Head {
 }
 
 impl Head {
-    fn recognize(
+    pub(super) fn recognize(
         instructions: &[Instruction],
         range: Range<usize>,
         pool: &ConstantPool<'_>,
@@ -89,6 +89,10 @@ impl Head {
             null_check,
         })
     }
+
+    pub(super) fn alias(&self) -> u16 {
+        self.alias
+    }
 }
 
 fn ends_with_null_check(instructions: &[Instruction], pool: &ConstantPool<'_>) -> bool {
@@ -112,7 +116,7 @@ fn ends_with_null_check(instructions: &[Instruction], pool: &ConstantPool<'_>) -
         )
 }
 
-fn push_zero(op: &Instruction) -> bool {
+pub(super) fn push_zero(op: &Instruction) -> bool {
     op.opcode == 0x03
         || matches!(
             (op.opcode, &op.operand),
@@ -120,7 +124,7 @@ fn push_zero(op: &Instruction) -> bool {
         )
 }
 
-fn local(op: &Instruction, store: bool, reference: bool) -> Option<u16> {
+pub(super) fn local(op: &Instruction, store: bool, reference: bool) -> Option<u16> {
     let (wide, short) = match (store, reference) {
         (false, false) => (0x15, 0x1a),
         (false, true) => (0x19, 0x2a),
@@ -297,7 +301,8 @@ impl Emitter<'_> {
             }
             // Only a genuinely unconditional pattern can dominate later
             // labels or conflict with default.
-            if arm.guard.is_none() {
+            let record = self.record_patterns.and_then(|plans| plans.get(switch.offset, self.offset(target)));
+            if arm.guard.is_none() && !record.is_some_and(|record| record.may_fail) {
                 if machine.pattern_covers(ty, &dispatch.selector) {
                     return Ok(None);
                 }
@@ -393,8 +398,14 @@ impl Emitter<'_> {
                     let store = &self.instructions[indices.end - 1];
                     binding_offsets.extend(store.offset..store.offset + store.len);
                 }
+                let record = self.record_patterns.and_then(|plans| plans.get(switch.offset, self.offset(*target)));
+                if let Some(record) = record {
+                    binding_offsets.extend(&record.offsets);
+                }
                 for &key in &arm.keys {
-                    let mut label: Document = if key == NULL_KEY {
+                    let mut label: Document = if let Some(record) = record {
+                        record.render(&mut entry)?
+                    } else if key == NULL_KEY {
                         "null".into()
                     } else {
                         match &dispatch.labels[key as usize] {
@@ -429,6 +440,11 @@ impl Emitter<'_> {
             machine.restore_local_names(names);
             machine.restore_switch_anonymous_sites(anonymous);
             return Err(error);
+        }
+        if let Some(plans) = self.record_patterns {
+            for (target, _) in &ordered {
+                plans.claim(switch.offset, self.offset(*target));
+            }
         }
         machine.commit_switch_dynamic_helpers(&baseline);
         offsets.extend(switch.offset..switch.offset + switch.len);
