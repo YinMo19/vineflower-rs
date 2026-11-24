@@ -139,7 +139,7 @@ impl Emitter<'_> {
         &mut self,
         head: usize,
         region: Region<'_, 'a, 'c>,
-        machine: &Machine<'a, 'c>,
+        machine: &mut Machine<'a, 'c>,
         condition: &mut Condition,
         offsets: &mut Vec<u32>,
         control: &mut RangeInclusive<u32>,
@@ -159,19 +159,45 @@ impl Emitter<'_> {
             {
                 return;
             }
-            let mut baseline = machine.clone();
-            let Ok(entry) = baseline.switch_arm_entry(control) else {
-                return;
-            };
-            let names = machine.local_name_checkpoint();
-            let sites = machine.switch_anonymous_checkpoint();
-            let result = self.decision_frontier(head, region, condition, &entry, &owned, control);
-            let Some(fold) = result else {
+            let mut recovered = None;
+            for consumes_operand in [false, true] {
+                if consumes_operand
+                    && (machine.stack_is_empty()
+                        || owned.len() != 1
+                        || region.exception_arm.is_some()
+                        || region.protected.is_some()
+                        || !matches!(
+                            self.instructions[self.graph.blocks[head].instructions.end - 1].opcode,
+                            0xc6 | 0xc7
+                        ))
+                {
+                    break;
+                }
+                let Ok(entry) = machine.switch_arm_entry(control) else {
+                    return;
+                };
+                let operand = if consumes_operand {
+                    let Some(operand) = machine.decision_operand_entry(&entry) else { break };
+                    Some(operand)
+                } else {
+                    None
+                };
+                let names = machine.local_name_checkpoint();
+                let sites = machine.switch_anonymous_checkpoint();
+                if let Some(fold) = self.decision_frontier(
+                    head, region, condition, (&entry, operand.as_ref()), &owned, control,
+                ) {
+                    machine.commit_switch_dynamic_helpers(&entry);
+                    recovered = Some(fold);
+                    if consumes_operand {
+                        machine.consume_decision_operand();
+                    }
+                    break;
+                }
                 machine.restore_local_names(names);
                 machine.restore_switch_anonymous_sites(sites);
-                return;
-            };
-            machine.commit_switch_dynamic_helpers(&entry);
+            }
+            let Some(fold) = recovered else { return };
             for block in fold.blocks {
                 self.emitted[block] = true;
                 owned.insert(block);
@@ -219,7 +245,7 @@ impl Emitter<'_> {
         head: usize,
         region: Region<'_, 'a, 'c>,
         condition: &Condition,
-        entry: &Machine<'a, 'c>,
+        entries: (&Machine<'a, 'c>, Option<&Machine<'a, 'c>>),
         owned: &BTreeSet<usize>,
         control: &RangeInclusive<u32>,
     ) -> Option<Fold> {
@@ -228,6 +254,8 @@ impl Emitter<'_> {
         let mut offsets = Vec::new();
         let mut tested = 0;
         let mut end = *control.end();
+        let roots = [condition.taken, condition.fallthrough];
+        let (entry, operand) = entries;
 
         // In bytecode order, stop at the first two-way cut. In particular this
         // leaves a shared *next predicate* as a frontier, rather than copying
@@ -237,7 +265,13 @@ impl Emitter<'_> {
                 !decisions.contains_key(&next)
                     && self.decision_block(head, region, next, owned, &decisions, *control.end())
             })?;
-            let (decision, mapped, last) = self.lift_decision(next, entry)?;
+            // Only the direct children receive the retained reference.
+            // Another predecessor could arrive with an empty stack.
+            let fork = operand.filter(|_| roots.contains(&next));
+            if fork.is_some() && self.graph.blocks[next].predecessors.as_slice() != [head] {
+                return None;
+            }
+            let (decision, mapped, last) = self.lift_decision(next, fork.unwrap_or(entry))?;
             frontier.remove(&next);
             match &decision {
                 Decision::Pass(target) => {
@@ -251,7 +285,9 @@ impl Emitter<'_> {
             decisions.insert(next, decision);
             offsets.extend(mapped);
             end = end.max(last);
-            if tested == 0 || frontier.len() != 2 {
+            if tested == 0 || frontier.len() != 2
+                || operand.is_some() && roots.iter().any(|root| !decisions.contains_key(root))
+            {
                 continue;
             }
             let mut leaves = frontier.iter().copied();
@@ -346,10 +382,10 @@ impl Emitter<'_> {
         let node = &self.graph.blocks[block];
         let (tail, expression) = self.instructions[node.instructions.clone()].split_last()?;
         if let &[target] = node.successors.as_slice() {
-            return Some((Decision::Pass(target), Vec::new(), tail.offset));
+            return entry.stack_is_empty().then_some((Decision::Pass(target), Vec::new(), tail.offset));
         }
-        // An empty operand stack above the enclosing prefix proves that the
-        // predicate is independent of it (even dup/pop cannot borrow from it).
+        // Every lifted test must leave an empty stack, whether it consumes
+        // the retained input or evaluates independently of the old prefix.
         let mut trial = entry.clone();
         let mut offsets = Vec::new();
         lift_test_prefix(expression, &mut trial, &mut offsets)?;
@@ -389,7 +425,7 @@ pub(super) struct AssignedTest<'a, 'c> {
 fn expression_op(op: &Instruction) -> bool {
     matches!(
         op.opcode,
-        0x00..=0x35 | 0x59..=0x83 | 0x85..=0x98 | 0xb2 | 0xb4 | 0xb6..=0xbe
+        0x00..=0x35 | 0x57 | 0x59..=0x83 | 0x85..=0x98 | 0xb2 | 0xb4 | 0xb6..=0xbe
             | 0xc0..=0xc1 | 0xc5
     )
 }

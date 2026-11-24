@@ -126,6 +126,12 @@ pub(crate) fn structure_with_assertions(
     {
         return structure_regions(&projected, &graph, machine, &[], None, Some(&plans));
     }
+    if handlers.is_empty()
+        && assertions.is_none()
+        && let Some(result) = boolean_returns::structure_with_boolean_tails(instructions, graph, &mut machine)
+    {
+        return result;
+    }
     structure_regions(instructions, graph, machine, handlers, assertions, None)
 }
 

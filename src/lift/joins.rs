@@ -356,6 +356,37 @@ impl Machine<'_, '_> {
         })
     }
 
+    pub(crate) fn returns_boolean(&self) -> bool {
+        self.descriptor.return_type == BOOLEAN
+    }
+
+    /// A duplicated reference left on the stack by a null test is safe to
+    /// read or discard on either edge once its evaluation has been spilled.
+    /// Keep the trial's staging state, but restore the one reference and
+    /// the stack slot reserved for it.
+    pub(crate) fn decision_operand_entry(&self, empty: &Self) -> Option<Self> {
+        let [value] = self.stack.as_slice() else {
+            return None;
+        };
+        if Category::of(&value.ty) != Some(Category::Ref)
+            || value.observable
+            || value.order.is_some()
+            || self.has_uninitialized_stack()
+        {
+            return None;
+        }
+        let mut entry = empty.clone();
+        entry.max_stack = self.max_stack;
+        entry.push(value.clone()).ok()?;
+        Some(entry)
+    }
+
+    pub(crate) fn consume_decision_operand(&mut self) {
+        debug_assert_eq!(self.stack.len(), 1);
+        self.stack.clear();
+        self.stack_slots = 0;
+    }
+
     /// Join two expression-only arms without evaluating either arm eagerly.
     /// The unmodified stack prefix remains below the conditional result.
     pub(crate) fn merge_conditional_stack(

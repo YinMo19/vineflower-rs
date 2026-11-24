@@ -1,10 +1,165 @@
 // Copyright 2000-2020 JetBrains s.r.o. Use of this source code is governed by the Apache 2.0 license that can be found in the LICENSE file.
 
-use std::{borrow::Cow, collections::HashSet};
+use std::{
+    borrow::Cow,
+    collections::{BTreeSet, HashSet},
+};
 
-use crate::{lift::{BooleanCondition, BooleanFact, BooleanSelection}, source_text::Document};
+use crate::{
+    bytecode::{Instruction, Operand},
+    cfg::ControlFlowGraph,
+    lift::{BooleanCondition, BooleanFact, BooleanSelection, Machine},
+    source_text::Document,
+};
 
-use super::{Arm, Emitter, Line, Region, surrounded};
+use super::{Arm, Emitter, Line, Region, StructureError, structure_regions, surrounded};
+
+#[derive(Clone, Copy)]
+struct ReturnTail {
+    value: bool,
+    transfer: u32,
+    retested: bool,
+}
+
+impl ReturnTail {
+    fn constant(value: bool, transfer: u32) -> Self {
+        ReturnTail { value, transfer, retested: false }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct Suffix {
+    empty: Option<ReturnTail>,
+    operand: [Option<ReturnTail>; 2],
+}
+
+/// A stack boolean used only by forward jumps, zero tests and `ireturn`
+/// can be returned at its producer instead. The new graph separates pure
+/// return tails without copying any evaluation, and leaves real joins to
+/// the ordinary structurer.
+fn project(
+    instructions: &[Instruction],
+    graph: &ControlFlowGraph,
+) -> Option<(Vec<Instruction>, ControlFlowGraph)> {
+    if !graph.blocks.iter().any(|block| {
+        block.predecessors.len() > 1 && block.instructions.len() == 1
+            && matches!(instructions[block.instructions.start].opcode, 0x99 | 0x9a)
+    }) {
+        return None;
+    }
+    let mut suffix = vec![Suffix::default(); graph.blocks.len()];
+    let mut producers = Vec::new();
+    for (index, block) in graph.blocks.iter().enumerate().rev() {
+        if block.successors.iter().any(|&next| next <= index) {
+            continue;
+        }
+        let ops = &instructions[block.instructions.clone()];
+        let jump = |op: &Instruction| matches!(op.opcode, 0xa7 | 0xc8);
+        suffix[index] = match (ops, block.successors.as_slice()) {
+            ([op], []) if op.opcode == 0xac => Suffix {
+                empty: None,
+                operand: [false, true].map(|value| Some(ReturnTail::constant(value, op.offset))),
+            },
+            ([op], &[next]) if jump(op) => suffix[next],
+            ([op], &[taken, fallthrough]) if matches!(op.opcode, 0x99 | 0x9a) => {
+                let (Some(taken), Some(fallthrough)) = (suffix[taken].empty, suffix[fallthrough].empty)
+                else { continue };
+                let shared = block.predecessors.len() > 1
+                    && taken.transfer == fallthrough.transfer && taken.value != fallthrough.value;
+                let operand = [false, true].map(|value| {
+                    let mut tail = if value == (op.opcode == 0x9a) { taken } else { fallthrough };
+                    tail.retested |= shared;
+                    Some(tail)
+                });
+                Suffix { empty: None, operand }
+            }
+            ([push, rest @ ..], edges) if matches!(push.opcode, 0x03 | 0x04) => {
+                let value = push.opcode == 0x04;
+                let empty = match (rest, edges) {
+                    ([ret], []) if ret.opcode == 0xac => Some(ReturnTail::constant(value, ret.offset)),
+                    ([], &[next]) => suffix[next].operand[usize::from(value)],
+                    ([op], &[next]) if jump(op) => suffix[next].operand[usize::from(value)],
+                    _ => None,
+                };
+                if !edges.is_empty() && let Some(tail) = empty {
+                    producers.push((index, tail));
+                }
+                Suffix { empty, ..Suffix::default() }
+            }
+            _ => continue,
+        };
+    }
+    let transfers: BTreeSet<_> = producers.iter().filter(|(_, tail)| tail.retested)
+        .map(|(_, tail)| tail.transfer).collect();
+    if transfers.is_empty() {
+        return None;
+    }
+    let mut cuts = vec![None; graph.blocks.len()];
+    for (block, tail) in producers {
+        if transfers.contains(&tail.transfer) {
+            cuts[block] = Some(tail.value);
+        }
+    }
+    let mut reachable = vec![false; graph.blocks.len()];
+    let mut pending = vec![0];
+    while let Some(block) = pending.pop() {
+        if !std::mem::replace(&mut reachable[block], true) && cuts[block].is_none() {
+            pending.extend(&graph.blocks[block].successors);
+        }
+    }
+    let mut projected = Vec::with_capacity(instructions.len());
+    for (index, block) in graph.blocks.iter().enumerate().filter(|(index, _)| reachable[*index]) {
+        let ops = &instructions[block.instructions.clone()];
+        let first = ops.first()?;
+        if projected.last().is_some_and(|previous: &Instruction| previous.offset >= first.offset) {
+            // The synthetic return would collide with a surviving entry.
+            return None;
+        }
+        if let Some(value) = cuts[index] {
+            projected.push(Instruction { opcode: if value { 0x04 } else { 0x03 }, ..first.clone() });
+            projected.push(Instruction {
+                offset: first.offset + first.len,
+                opcode: 0xac,
+                operand: Operand::None,
+                len: 0,
+            });
+        } else {
+            projected.extend_from_slice(ops);
+        }
+    }
+    let graph = ControlFlowGraph::build(&projected, &[]).ok()?;
+    Some((projected, graph))
+}
+
+pub(super) fn structure_with_boolean_tails(
+    instructions: &[Instruction],
+    graph: &ControlFlowGraph,
+    machine: &mut Machine<'_, '_>,
+) -> Option<Result<Vec<Line>, StructureError>> {
+    if !machine.returns_boolean() || !machine.stack_is_empty() {
+        return None;
+    }
+    let (projected, new_graph) = project(instructions, graph)?;
+    let start = instructions.first()?.offset;
+    let trial = machine.switch_arm_entry(&(start..=start)).ok()?;
+    let names = machine.local_name_checkpoint();
+    let sites = machine.switch_anonymous_checkpoint();
+    Some(match structure_regions(instructions, graph, trial.clone(), &[], None, None) {
+        Ok(lines) => {
+            machine.commit_switch_dynamic_helpers(&trial);
+            Ok(lines)
+        }
+        Err(error) => {
+            machine.restore_local_names(names);
+            machine.restore_switch_anonymous_sites(sites);
+            if matches!(error, StructureError::Flow { .. }) {
+                structure_regions(&projected, &new_graph, machine.clone(), &[], None, None)
+            } else {
+                Err(error)
+            }
+        }
+    })
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct BooleanReturn {
