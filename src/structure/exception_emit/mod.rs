@@ -12,7 +12,7 @@ use super::protected::{
     ArmId, Catch, ExceptionId, Finally, Legacy, LegacyExit, Monitor, ProtectedRegion, cleanup_locals,
     local_touches, reference_load, reference_store,
 };
-use super::{Emitter, Line, Region, StructureError};
+use super::{Arm, Emitter, Line, Region, StructureError};
 
 struct Resource {
     acquisition: usize,
@@ -223,15 +223,21 @@ impl Emitter<'_> {
         if forced_return.is_some() {
             self.syntax(depth + 1, "try {");
         }
+        let try_scope = scope.exception(clauses.join, clauses.body, Some(machine));
         let mut reaches_join = if shape.finally.is_none()
             && let Some(reaches) =
                 self.emit_try_with_monitor_departure(clauses, scope, machine, depth + 1)?
         {
             reaches
+        } else if shape.finally.is_none()
+            && let Some(join) = clauses.join
+            && try_scope.loop_header != Some(clauses.start)
+        {
+            return self.emit_catches_to_join(clauses, region, machine, depth, body_lines, join);
         } else {
             self.scoped_arm(
                 clauses.start,
-                scope.exception(clauses.join, clauses.body, Some(machine)),
+                try_scope,
                 machine,
                 depth + 1 + usize::from(forced_return.is_some()),
             )?
@@ -239,7 +245,7 @@ impl Emitter<'_> {
         // If the entire protected body is one verified resource statement,
         // the surrounding catch/finally clauses are its Java clauses. The
         // acquisition and both close paths remain inside that same scope.
-        self.fuse_resource_wrapper(body_lines, depth);
+        self.fuse_resource_wrapper(body_lines, self.lines.len(), depth);
         if let Some(transfer) = forced_return {
             let instruction = &self.instructions[transfer];
             let mut returning = machine.clone();
@@ -251,44 +257,8 @@ impl Emitter<'_> {
             self.syntax(depth + 1, "}");
         }
         for catch in &clauses.catches {
-            let store = &self.instructions[self.graph.blocks[catch.start].instructions.start];
-            let mut body = machine.clone();
-            let (types, name) = match catch.alternatives.as_slice() {
-                &[single] => body.bind_caught_exception(single, store)?,
-                types => {
-                    // The verifier supplies the handler's actual local type;
-                    // using an arbitrary alternative can incorrectly narrow
-                    // later expressions referring to the catch parameter.
-                    let common = body
-                        .caught_exception_stack_type(store.offset)?
-                        .ok_or(StructureError::ExceptionHandlers)?;
-                    let (_, name) = body.bind_caught_exception(common, store)?;
-                    let mut union = String::new();
-                    for &alternative in types {
-                        if !union.is_empty() {
-                            union.push_str(" | ");
-                        }
-                        union.push_str(&body.render_catch_type(alternative)?);
-                    }
-                    (union, name)
-                }
-            };
-            let mut header = Document::from(format!("}} catch ({types} "));
-            header.append(name);
-            header.push_str(") {");
-            self.push(
-                depth,
-                header,
-                (store.offset..store.offset + store.len).collect(),
-            );
-            if self.region(
-                catch.start,
-                scope
-                    .exception(clauses.join, catch.arm, None)
-                    .with_exception_layout(self.layout.containing_loop(catch.start)),
-                &mut body,
-                depth + 1,
-            )? {
+            let arm = self.emit_catch_arm(catch, clauses.join, scope, machine, depth)?;
+            if let Some(body) = arm.exit {
                 let join = shape.join.ok_or(StructureError::ExceptionHandlers)?;
                 Self::check_scope(body, machine, self.offset(join))?;
                 reaches_join = true;
@@ -462,6 +432,109 @@ impl Emitter<'_> {
         Ok(if reaches_join { continuation } else { None })
     }
 
+    fn emit_catch_arm<'a, 'c>(
+        &mut self,
+        catch: &Catch,
+        join: Option<usize>,
+        scope: Region<'_, 'a, 'c>,
+        machine: &Machine<'a, 'c>,
+        depth: usize,
+    ) -> Result<Arm<'a, 'c>, StructureError> {
+        let store = &self.instructions[self.graph.blocks[catch.start].instructions.start];
+        let mut body = machine.clone();
+        let (types, name) = match catch.alternatives.as_slice() {
+            &[single] => body.bind_caught_exception(single, store)?,
+            types => {
+                // The verifier supplies the handler's actual local type;
+                // an arbitrary alternative could narrow uses of the parameter.
+                let common = body
+                    .caught_exception_stack_type(store.offset)?
+                    .ok_or(StructureError::ExceptionHandlers)?;
+                let (_, name) = body.bind_caught_exception(common, store)?;
+                let mut union = String::new();
+                for &alternative in types {
+                    if !union.is_empty() {
+                        union.push_str(" | ");
+                    }
+                    union.push_str(&body.render_catch_type(alternative)?);
+                }
+                (union, name)
+            }
+        };
+        let mut header = Document::from(format!("}} catch ({types} "));
+        header.append(name);
+        header.push_str(") {");
+        self.push(depth, header, (store.offset..store.offset + store.len).collect());
+        let start = self.lines.len();
+        let mut offsets = Vec::new();
+        let reaches = self.region_with_offsets(
+            catch.start,
+            scope
+                .exception(join, catch.arm, None)
+                .with_exception_layout(self.layout.containing_loop(catch.start)),
+            &mut body,
+            depth + 1,
+            &mut offsets,
+        )?;
+        Ok(Arm { exit: reaches.then_some(body), offsets, start, end: self.lines.len() })
+    }
+
+    fn emit_catches_to_join<'a, 'c>(
+        &mut self,
+        shape: &ProtectedRegion,
+        region: Region<'_, 'a, 'c>,
+        machine: &mut Machine<'a, 'c>,
+        depth: usize,
+        try_line: usize,
+        join: usize,
+    ) -> Result<Option<usize>, StructureError> {
+        let body = self.branch_arm(
+            shape.start,
+            region.exception(Some(join), shape.body, Some(machine)),
+            machine,
+            depth + 1,
+        )?;
+        let mut body_end = body.end;
+        let mut arms = Vec::with_capacity(shape.catches.len() + 1);
+        arms.extend(body.exit.is_some().then_some(body));
+        for catch in &shape.catches {
+            let arm = self.emit_catch_arm(catch, Some(join), region, machine, depth)?;
+            if arm.exit.is_some() {
+                arms.push(arm);
+            }
+        }
+        if arms.is_empty() {
+            self.fuse_resource_wrapper(try_line, body_end, depth);
+            self.syntax(depth, "}");
+            return Ok(None);
+        }
+
+        // Handlers start with the pre-try bindings, never the try's normal
+        // exit state. Only arms completing at this stop assign its live locals.
+        for arm in &arms {
+            self.require_empty_stack(arm.exit.as_ref().expect("reaching arm"), join)?;
+        }
+        let (declarations, copies) =
+            self.merge_arms(machine, join, &arms.iter().collect::<Vec<_>>())?;
+        for (arm, copies) in arms.into_iter().zip(copies).rev() {
+            if arm.end == body_end {
+                body_end += copies.len();
+            }
+            let mut offsets = arm.offsets;
+            self.lines.splice(
+                arm.end..arm.end,
+                copies.into_iter().map(|text| Line::new(depth + 1, text, mem::take(&mut offsets))),
+            );
+        }
+        self.fuse_resource_wrapper(try_line, body_end, depth);
+        self.lines.splice(
+            try_line..try_line,
+            declarations.into_iter().map(|text| Line::new(depth, text, Vec::new())),
+        );
+        self.syntax(depth, "}");
+        Ok(Some(join))
+    }
+
     fn finish_linear_finally_locals<'a, 'c>(
         &mut self,
         machine: &mut Machine<'a, 'c>,
@@ -496,13 +569,13 @@ impl Emitter<'_> {
         Ok(())
     }
 
-    fn fuse_resource_wrapper(&mut self, wrapper: usize, depth: usize) {
-        if resource_header_length(&self.lines[wrapper + 1..], depth + 1).is_none() {
+    fn fuse_resource_wrapper(&mut self, wrapper: usize, end: usize, depth: usize) {
+        if resource_header_length(&self.lines[wrapper + 1..end], depth + 1).is_none() {
             return;
         }
-        self.lines.pop();
+        self.lines.remove(end - 1);
         self.lines.remove(wrapper);
-        for line in &mut self.lines[wrapper..] {
+        for line in &mut self.lines[wrapper..end - 2] {
             line.depth -= 1;
         }
     }
