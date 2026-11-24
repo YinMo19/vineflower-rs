@@ -36,6 +36,14 @@ enum Target<'a> {
     Member { name: String },
     Extension { name: String, receiver: Argument<'a>, widen: bool, infix: bool },
     Function { name: String },
+    FunctionValue { receiver: Argument<'a>, erasure: IntErasure },
+}
+
+#[derive(Debug)]
+enum IntErasure {
+    Object { next: u32 },
+    Number { next: u32 },
+    Unboxed,
 }
 
 #[derive(Debug)]
@@ -123,6 +131,17 @@ impl Call<'_> {
                 identifier(out, name, declaration)?;
             }
             Target::Function { name } => identifier(out, name, declaration)?,
+            Target::FunctionValue { receiver, erasure: IntErasure::Unboxed } => {
+                // Parenthesize nonlocal receivers so a call with the same
+                // name as a function-valued property cannot win resolution.
+                let grouped = !matches!(&receiver.value, ArgumentValue::Single(Expr {
+                    kind: ExprKind::Parameter { .. } | ExprKind::Local(_) | ExprKind::Capture(_), ..
+                }));
+                if grouped { out.push('('); }
+                receiver.write_receiver(out, parameters, declaration, if grouped { 0 } else { u8::MAX }, false)?;
+                if grouped { out.push(')'); }
+            }
+            Target::FunctionValue { .. } => return Err(invalid(declaration)),
         }
         out.push('(');
         let mut separated = false;
@@ -204,6 +223,8 @@ pub(in crate::kotlin) const TEXT_IMPORTS: [&str; 3] = [
 ];
 const COPY_OF: (&str, &str, &str) = ("java/util/Arrays", "copyOf", "([Ljava/lang/Object;I)[Ljava/lang/Object;");
 const STRING: &str = "java/lang/String";
+const FUNCTION0: &str = "kotlin/jvm/functions/Function0";
+const NUMBER: &str = "java/lang/Number";
 
 pub(super) fn string_array_element<'a>(ty: &'a Type, jvm: &JvmType) -> Option<&'a Type> {
     let [TypeArgument::Type(Variance::Invariant | Variance::Out, element)] = ty.arguments.as_slice()
@@ -359,6 +380,75 @@ pub(super) fn lambda_text<'a>(
     Ok(true)
 }
 
+/// A non-null Kotlin `() -> Int` is called through Function0's erased
+/// descriptor. Only the exact Number cast and virtual unboxing complete
+/// the source-level call; an erased intermediate is never printable.
+pub(super) fn function_value<'a>(
+    bytecode: &Bytecode<'a, '_>, instruction: &Instruction, locals: &Locals<'_>,
+    stack: &mut Vec<StackValue<'a>>, declaration: &str,
+) -> Result<bool, KotlinError> {
+    let pool = &bytecode.class.pool;
+    let after = instruction.offset + instruction.len;
+    if let Some(StackValue::Value(Expr { kind: ExprKind::Invocation(call), .. })) = stack.last_mut()
+        && let Target::FunctionValue { erasure, .. } = &mut call.target
+    {
+        match *erasure {
+            IntErasure::Object { next } => {
+                if next != instruction.offset || instruction.opcode != 0xc0
+                    || !matches!(instruction.operand, Operand::Constant(index) if pool.class_name(index)? == NUMBER)
+                {
+                    return Err(invalid(declaration));
+                }
+                call.result.jvm = JvmType::Object(NUMBER.into());
+                *erasure = IntErasure::Number { next: after };
+                return Ok(true);
+            }
+            IntErasure::Number { next } => {
+                if next != instruction.offset
+                    || !matches!(instruction.operand, Operand::Constant(index) if matches!(pool.get(index)?, Constant::Methodref { .. }))
+                    || bytecode.reference(instruction, 0xb6)? != Some((NUMBER, "intValue", "()I"))
+                {
+                    return Err(invalid(declaration));
+                }
+                call.result.jvm = JvmType::Primitive(Primitive::Int);
+                *erasure = IntErasure::Unboxed;
+                return Ok(true);
+            }
+            IntErasure::Unboxed => {}
+        }
+    }
+
+    let (0xb9, Operand::InvokeInterface { index, count: 1 }) = (instruction.opcode, &instruction.operand)
+        else { return Ok(false); };
+    if !matches!(pool.get(*index)?, Constant::InterfaceMethodref { .. })
+        || pool.member_ref(*index)? != (FUNCTION0, "invoke", "()Ljava/lang/Object;")
+    {
+        return Ok(false);
+    }
+    let Some(StackValue::Value(receiver)) = stack.last() else { return Ok(false); };
+    let Some((ty, jvm @ JvmType::Object(owner))) = receiver.source_type(locals) else { return Ok(false); };
+    if owner != FUNCTION0 || !ty.simple_class("kotlin/Function0") || ty.nullable {
+        return Ok(false);
+    }
+    let [TypeArgument::Type(Variance::Invariant | Variance::Out, result)] = ty.arguments.as_slice()
+        else { return Ok(false); };
+    if !result.simple_class("kotlin/Int") || result.nullable || !result.arguments.is_empty() {
+        return Ok(false);
+    }
+    let (ty, jvm, result) = (ty.clone(), jvm.clone(), result.clone());
+    let receiver = super::pop_value(stack, declaration)?;
+    let call = Box::new(Call {
+        target: Target::FunctionValue {
+            receiver: Argument::single(receiver, ty, jvm, None),
+            erasure: IntErasure::Object { next: after },
+        },
+        arguments: Vec::new(),
+        result: Value { ty: result, jvm: JvmType::Object("java/lang/Object".into()) },
+    });
+    stack.push(StackValue::Value(call_expression(call, declaration)?));
+    Ok(true)
+}
+
 pub(super) fn lower<'a>(
     bytecode: &Bytecode<'a, '_>,
     instruction: &Instruction,
@@ -430,7 +520,7 @@ pub(super) fn lower<'a>(
 
 fn call_expression<'a>(call: Box<Call<'a>>, declaration: &str) -> Result<Expr<'a>, KotlinError> {
     let mut depth = call.arguments.iter().map(Argument::depth).max().unwrap_or(0);
-    if let Target::Extension { receiver, .. } = &call.target {
+    if let Target::Extension { receiver, .. } | Target::FunctionValue { receiver, .. } = &call.target {
         depth = depth.max(receiver.depth());
     }
     Expr::new(ExprKind::Invocation(call), depth + 1, declaration)

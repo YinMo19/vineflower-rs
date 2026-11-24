@@ -1,6 +1,7 @@
 // Copyright 2026 Vineflower contributors. Licensed under the Apache License, Version 2.0.
 
 mod progression;
+mod sum;
 
 use std::ops::Range;
 
@@ -10,6 +11,8 @@ use super::{
     Bytecode, Code, Expected, Expr, ExprKind, Instruction, KotlinError, Literal, Locals, Operand,
     Primitive, ValueParameter, identifier, load_opcode, local_load, local_store, statements::{self, Statement},
 };
+
+pub(super) use sum::recognize as recognize_sum;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Element { Primitive(Primitive), String, Object }
@@ -58,13 +61,20 @@ impl Binding<'_> {
 }
 
 pub(in crate::kotlin) struct LoopBody<'a> {
-    bindings: Binding<'a>,
-    source: Source<'a>,
-    statements: Vec<Statement<'a>>,
+    form: Form<'a>,
     instructions: Vec<Instruction>,
     start: usize,
-    body: Range<usize>,
     pub lines: Vec<(u16, u16)>,
+}
+
+enum Form<'a> {
+    For {
+        bindings: Binding<'a>,
+        source: Source<'a>,
+        statements: Vec<Statement<'a>>,
+        body: Range<usize>,
+    },
+    Sum(sum::Reduction<'a>),
 }
 
 struct Template<'a> {
@@ -122,7 +132,10 @@ pub(super) fn lower<'a, 'data>(bytecode: &Bytecode<'a, 'data>, instructions: Vec
         &[super::ScopedLocal::Loop(bindings)],
     )?;
     let lines = if trace { code.line_numbers(&bytecode.class.pool)? } else { Vec::new() };
-    Ok(LoopBody { bindings, source: template.source, statements, instructions, start, body: template.body, lines })
+    Ok(LoopBody {
+        form: Form::For { bindings, source: template.source, statements, body: template.body },
+        instructions, start, lines,
+    })
 }
 
 struct Shape<'a, 'class, 'data> {
@@ -324,19 +337,31 @@ fn backward(instruction: &Instruction, target: &Instruction) -> bool {
     matches!(instruction.opcode, 0xa7 | 0xc8) && branch_to(instruction, instruction.opcode, target)
 }
 
+impl<'a> LoopBody<'a> {
+    pub(super) fn sum(
+        reduction: sum::Reduction<'a>, instructions: Vec<Instruction>, start: usize, lines: Vec<(u16, u16)>,
+    ) -> Self {
+        Self { form: Form::Sum(reduction), instructions, start, lines }
+    }
+}
+
 impl LoopBody<'_> {
     pub fn write(&self, out: &mut String, parameters: &[ValueParameter], declaration: &str,
         indent: &str, unit: &str, mut map: impl FnMut(&Instruction, usize),
     ) -> Result<(), KotlinError> {
         let instructions = &self.instructions[self.start..];
+        let (bindings, source, statements, body) = match &self.form {
+            Form::For { bindings, source, statements, body } => (bindings, source, statements, body),
+            Form::Sum(reduction) => return reduction.write(out, parameters, declaration, indent, unit, instructions, map),
+        };
         out.push_str(indent);
         out.push_str(unit);
         out.push_str("for (");
-        self.bindings.write(out, declaration)?;
+        bindings.write(out, declaration)?;
         out.push_str(" in ");
-        match &self.source {
+        match source {
             Source::Range { first, last, step, direction } => {
-                let expected = Expected::Primitive(self.bindings.element.primitive().expect("range has primitive elements"));
+                let expected = Expected::Primitive(bindings.element.primitive().expect("range has primitive elements"));
                 first.write_at(out, expected, parameters, declaration, 0)?;
                 out.push_str(match direction { Direction::Ascend => "..", Direction::Descend => " downTo ", Direction::Until => " until " });
                 last.write_at(out, expected, parameters, declaration, 0)?;
@@ -349,11 +374,11 @@ impl LoopBody<'_> {
         }
         out.push_str(") {\n");
         let (ret, instructions) = instructions.split_last().expect("for-loop has return");
-        for instruction in instructions[..self.body.start].iter().chain(&instructions[self.body.end..]) {
+        for instruction in instructions[..body.start].iter().chain(&instructions[body.end..]) {
             if instruction.opcode != 0x00 { map(instruction, 1); }
         }
         let mut line = 2;
-        for statement in &self.statements {
+        for statement in statements {
             out.push_str(indent);
             out.push_str(unit);
             out.push_str(unit);

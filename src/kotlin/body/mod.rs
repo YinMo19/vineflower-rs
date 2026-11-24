@@ -513,6 +513,12 @@ impl<'a, 'data> Bytecode<'a, 'data> {
             return loops::lower(self, decoded, start, &code, &locals, parameters, declaration, trace)
                 .map(Body::Loop);
         }
+        if Expected::Type(returns, &descriptor.return_type).primitive() == Some(Primitive::Int)
+            && let Some(reduction) = loops::recognize_sum(self, instructions, &locals, parameters, declaration)?
+        {
+            let lines = if trace { code.line_numbers(&self.class.pool)? } else { Vec::new() };
+            return Ok(Body::Loop(loops::LoopBody::sum(reduction, decoded, start, lines)));
+        }
         if let Some(branch) = instructions
             .iter()
             .position(|instruction| matches!(instruction.operand, Operand::Branch(_)))
@@ -968,7 +974,8 @@ impl<'a> Bytecode<'a, '_> {
         declaration: &str,
         scoped: &[ScopedLocal<'a>],
     ) -> Result<(), KotlinError> {
-        if dynamics::lower(self, instruction, locals, stack, declaration)?
+        if invocations::function_value(self, instruction, locals, stack, declaration)?
+            || dynamics::lower(self, instruction, locals, stack, declaration)?
             || lambdas::expression(self, instruction, locals, stack, declaration)?
         {
             return Ok(());
