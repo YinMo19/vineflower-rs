@@ -35,6 +35,10 @@ pseudocode goldens. With `VINEFLOWER_JDK_21` set, run
 `cargo test --test java_templates -- --ignored` to also recompile the output
 and check that escaped template fragments survive the round trip.
 
+With `VINEFLOWER_JDK_8` set, `cargo test --test protected_foreach -- --ignored`
+compares the output of the original `TestSwitchInTry` class and its recompiled
+source, including a null element that reaches the catch and retries the loop.
+
 ### Native scope
 
 The Rust runtime does not require a JVM. `cargo run -- input.class` writes source
@@ -43,6 +47,10 @@ compilation units and resources. Use `cargo run -- --help` for options.
 Library callers can use `vineflower_rs::decompile(bytes, &Options::default())`
 or register companion and library inputs in a `ClassGroupBuilder`.
 `ClassPath` accepts directories, archives, JDK images and lazy providers.
+Use `--ignore-invalid-bytecode` (`-iib=1`) only for legacy inputs: it currently
+accepts underreported stack bounds, proven misowned ECJ constructor bridges
+and handler-free void method tails missing their final return. Unsupported
+repairs still produce an error.
 
 The implementation separates class-file decoding, JVM instructions, CFG
 analysis, operand-stack lifting, region recovery, and source rendering.
@@ -72,6 +80,7 @@ Exact upstream comparison with all fixture bytecode and required JDKs:
 | Constructor argument patterns, record `instanceof`, nested resource returns and Kotlin extensions | 129 | 140 | 428 | 0 |
 | Boolean layout, compact records, nested monitors/resources and typed calls | 135 | 131 | 431 | 0 |
 | Nested record and nullable recovery, proven varargs, switch source maps | 138 | 127 | 432 | 0 |
+| Legacy bytecode recovery, subword calls, protected foreach, Kotlin tail calls and preview guards | 138 | 117 | 442 | 0 |
 
 All eight upstream CLI and bulk cases match. The full test remains failing
 until all 697 comparisons match.
