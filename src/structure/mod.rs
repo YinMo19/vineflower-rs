@@ -812,8 +812,8 @@ impl Emitter<'_> {
         let arm_entry = |target| {
             assigned_test
                 .as_ref()
-                .filter(|test| test.target.is_none_or(|assigned| assigned == target))
-                .map_or(&*machine, |test| &test.state)
+                .and_then(|test| test.arm_entry(target))
+                .unwrap_or(&*machine)
         };
         let then = self.instanceof_branch_arm(
             then_at, arm_region, arm_entry(then_at), depth + 1, binding.as_ref(),
@@ -825,7 +825,7 @@ impl Emitter<'_> {
         if guard_clause && then.exit.is_some() {
             return Err(self.unstructured(block));
         }
-        if assigned_test.is_none()
+        if assigned_test.as_ref().is_none_or(|test| !test.has_arm_binding())
             && start == otherwise.end
             && let (Some(yes), Some(no)) = (&then.exit, &otherwise.exit)
             && yes.same_locals(machine)
@@ -836,6 +836,9 @@ impl Emitter<'_> {
                 for statement in prelude {
                     self.push(depth, statement, mem::take(offsets));
                 }
+            }
+            if let Some(test) = assigned_test {
+                self.push(depth, test.declaration, Vec::new());
             }
             if merge.uses_yes {
                 offsets.extend(then.offsets);
@@ -869,7 +872,7 @@ impl Emitter<'_> {
         let (declarations, assignments) = if exits.is_empty() {
             (Vec::new(), Vec::new())
         } else {
-            if let Some(test) = &assigned_test {
+            if let Some(test) = assigned_test.as_ref().filter(|test| test.has_arm_binding()) {
                 machine.prefer_test_local(&test.state, test.slot);
             }
             self.merge_arms(machine, join.expect("reached an if join"), &exits)?

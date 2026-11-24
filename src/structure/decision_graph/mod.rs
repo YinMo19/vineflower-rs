@@ -27,9 +27,16 @@ impl Emitter<'_> {
         offsets: &mut Vec<u32>,
         control: &mut RangeInclusive<u32>,
     ) -> Option<AssignedTest<'a, 'c>> {
+        if let Some(leaves) = self.assigned_value_leaves(head, region)
+            && let Some(test) = self.collapse_assigned_decisions(
+                head, region, machine, condition, offsets, control, Some(leaves),
+            )
+        {
+            return Some(test);
+        }
         self.collapse_shared_assigned_test(head, region, machine, condition, offsets, control)
             .or_else(|| self.collapse_assigned_decisions(
-                head, region, machine, condition, offsets, control,
+                head, region, machine, condition, offsets, control, None,
             ))
     }
 
@@ -145,7 +152,7 @@ impl Emitter<'_> {
         offsets.extend(mapped);
         *control = *control.start()..=tail.offset;
         machine.commit_predicate_state(&mut state);
-        Some(AssignedTest { target: Some(target), state, declaration, slot })
+        Some(AssignedTest { edges: AssignmentEdges::One(target), state, declaration, slot })
     }
 
     pub(super) fn collapse_decision_graph<'a, 'c>(
@@ -431,11 +438,30 @@ impl Emitter<'_> {
 }
 
 pub(super) struct AssignedTest<'a, 'c> {
-    /// `None` means the condition has definitely assigned the local on both outcomes.
-    pub(super) target: Option<usize>,
+    edges: AssignmentEdges,
     pub(super) state: Machine<'a, 'c>,
     pub(super) declaration: Document,
     pub(super) slot: u16,
+}
+
+enum AssignmentEdges {
+    One(usize),
+    Both,
+    Neither,
+}
+
+impl<'a, 'c> AssignedTest<'a, 'c> {
+    pub(super) fn arm_entry(&self, target: usize) -> Option<&Machine<'a, 'c>> {
+        match self.edges {
+            AssignmentEdges::One(assigned) if assigned == target => Some(&self.state),
+            AssignmentEdges::Both => Some(&self.state),
+            _ => None,
+        }
+    }
+
+    pub(super) fn has_arm_binding(&self) -> bool {
+        !matches!(self.edges, AssignmentEdges::Neither)
+    }
 }
 
 fn expression_op(op: &Instruction) -> bool {

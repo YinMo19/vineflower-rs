@@ -3,7 +3,7 @@ use std::{collections::{BTreeMap, BTreeSet}, ops::{Range, RangeInclusive}};
 use crate::lift::{Effect, Machine};
 
 use super::{
-    AssignedTest, Condition, Decision, Emitter, Expression, MAX_NODES, Region,
+    AssignedTest, AssignmentEdges, Condition, Decision, Emitter, Expression, MAX_NODES, Region,
     has_test_assignment, lift_test_assignment, lift_test_prefix,
 };
 
@@ -13,6 +13,33 @@ const ASSIGNED: u8 = 2;
 type Local<'a, 'c> = (AssignedTest<'a, 'c>, Range<u32>);
 
 impl Emitter<'_> {
+    /// Recognize the two constant-producing blocks of a stack-valued test.
+    /// A fresh local can belong entirely to that test, not to either arm.
+    pub(super) fn assigned_value_leaves(
+        &self,
+        head: usize,
+        region: Region<'_, '_, '_>,
+    ) -> Option<[usize; 2]> {
+        let join = self.layout.normal_join(head, region)?;
+        let &[a, b] = self.graph.blocks[join].predecessors.as_slice() else { return None };
+        let value = |block: usize| {
+            let node = &self.graph.blocks[block];
+            if node.successors.as_slice() != [join]
+                || region.loop_transfer(block).is_some()
+                || self.layout.loops[block].is_some()
+            {
+                return None;
+            }
+            let [constant, rest @ ..] = &self.instructions[node.instructions.clone()] else {
+                return None;
+            };
+            (matches!(constant.opcode, 0x03 | 0x04)
+                && (rest.is_empty() || matches!(rest, [jump] if matches!(jump.opcode, 0xa7 | 0xc8))))
+                .then_some(constant.opcode)
+        };
+        (value(a)? != value(b)?).then_some([a.min(b), a.max(b)])
+    }
+
     pub(super) fn collapse_assigned_decisions<'a, 'c>(
         &mut self,
         head: usize,
@@ -21,6 +48,7 @@ impl Emitter<'_> {
         condition: &mut Condition,
         offsets: &mut Vec<u32>,
         control: &mut RangeInclusive<u32>,
+        value_leaves: Option<[usize; 2]>,
     ) -> Option<AssignedTest<'a, 'c>> {
         if !machine.stack_is_empty()
             || !machine.this_is_initialized()
@@ -49,13 +77,13 @@ impl Emitter<'_> {
             let mut end = *control.end();
             while reaching.len() < MAX_NODES {
                 let block = frontier.iter().copied().find(|&block| {
-                    block != join
+                    block != join && !value_leaves.is_some_and(|leaves| leaves.contains(&block))
                         && self.decision_block(head, region, block, &owned, &decisions, *control.end())
                 })?;
                 let node = &self.graph.blocks[block];
                 let incoming = incoming_paths(&node.predecessors, &reaching)?;
                 let (decision, outgoing) = self.lift_assigned_decision(
-                    block, &entry, incoming, &mut local, &mut mapped,
+                    block, &entry, incoming, &mut local, &mut mapped, value_leaves.is_some(),
                 )?;
                 tested += usize::from(matches!(decision, Decision::Test(_)));
                 end = end.max(self.instructions[node.instructions.end - 1].offset);
@@ -64,25 +92,40 @@ impl Emitter<'_> {
                 reaching.insert(block, outgoing);
                 decisions.insert(block, decision);
 
-                if frontier.len() != 2 || local.is_none() || frontier.iter().any(|&leaf| {
+                let Some((test, _)) = local.as_ref() else { continue };
+                if frontier.len() != 2 || frontier.iter().any(|&leaf| {
                     let node = &self.graph.blocks[leaf];
                     self.emitted[leaf] || !self.layout.inside(leaf, region)
                         || !node.exception_predecessors.is_empty()
-                        || incoming_paths(&node.predecessors, &reaching) != Some(ASSIGNED)
+                        || incoming_paths(&node.predecessors, &reaching).is_none_or(|paths| {
+                            value_leaves.is_none() && paths != ASSIGNED
+                        })
                 }) {
                     continue;
                 }
-                // Each successor can consume the new local only once every
-                // path to it executes a store in the reconstructed expression.
-                let mut leaves = frontier.into_iter();
+                let mut leaves = frontier.iter().copied();
                 let [first, second] = [leaves.next()?, leaves.next()?];
+                if let Some(expected) = value_leaves
+                    && (expected != [first, second]
+                        || !entry.has_fresh_test_local(&test.state, test.slot)
+                        || self.local_is_live(first, test.slot)
+                        || self.local_is_live(second, test.slot))
+                {
+                    continue;
+                }
                 let mut expression = Expression { decisions: &decisions, used: BTreeSet::new() };
                 let [when_false, when_true] = expression.test(condition, [first, second])?;
                 if expression.used.len() != tested {
                     return None;
                 }
                 let (mut test, _) = local?;
-                test.state.finish_predicate_local(test.slot, [self.offset(first), self.offset(second)]);
+                if value_leaves.is_some() {
+                    // The new variable is required inside the condition,
+                    // but no successor can read it before a new store.
+                    test.edges = AssignmentEdges::Neither;
+                } else {
+                    test.state.finish_predicate_local(test.slot, [self.offset(first), self.offset(second)]);
+                }
                 return Some((test, Condition {
                     taken: second, fallthrough: first, when_true, when_false,
                 }, decisions, mapped, end));
@@ -111,6 +154,7 @@ impl Emitter<'_> {
         mut incoming: u8,
         local: &mut Option<Local<'a, 'c>>,
         offsets: &mut Vec<u32>,
+        allows_existing_assignments: bool,
     ) -> Option<(Decision, u8)> {
         let node = &self.graph.blocks[block];
         if let &[target] = node.successors.as_slice() {
@@ -136,24 +180,25 @@ impl Emitter<'_> {
             }
         }
         lift_test_prefix(prefix, &mut trial, offsets, |trial, pair, slot| {
-            if let Some((test, _)) = local.as_ref() {
-                if slot != test.slot {
-                    return None;
-                }
+            if let Some((test, _)) = local.as_ref().filter(|(test, _)| slot == test.slot) {
                 trial.use_predicate_store_binding(&test.state, &pair[1], slot)?;
                 if lift_test_assignment(trial, pair)?.is_some() {
                     return None;
                 }
                 trial.prefer_test_local(&test.state, slot);
             } else {
-                let declaration = lift_test_assignment(trial, pair)??;
-                if !entry.has_only_predicate_local(trial, slot) {
+                let Some(declaration) = lift_test_assignment(trial, pair)? else {
+                    return allows_existing_assignments.then_some(());
+                };
+                if local.is_some() || !entry.has_only_predicate_local(trial, slot) {
                     return None;
                 }
                 let mut state = entry.clone();
                 state.prefer_test_local(trial, slot);
                 let (slots, _) = pair[1].local_access()?;
-                *local = Some((AssignedTest { target: None, state, declaration, slot }, slots));
+                *local = Some((AssignedTest {
+                    edges: AssignmentEdges::Both, state, declaration, slot,
+                }, slots));
             }
             incoming = ASSIGNED;
             Some(())
