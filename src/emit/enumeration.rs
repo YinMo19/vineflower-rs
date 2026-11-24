@@ -21,6 +21,8 @@ struct ConstantInit<'a> {
 }
 
 const CONSTRUCTOR_PREFIX: &str = "(Ljava/lang/String;I";
+const ENTRIES_TYPE: &str = "Lkotlin/enums/EnumEntries;";
+pub(super) const ENTRIES_FACTORY: &str = "kotlin/enums/EnumEntriesKt";
 
 pub(super) struct Enumeration<'a> {
     constants: Vec<ConstantInit<'a>>,
@@ -28,6 +30,7 @@ pub(super) struct Enumeration<'a> {
     constructor_bridges: BTreeSet<&'a str>,
     values_field: Option<&'a str>,
     helper: Option<&'a str>,
+    entries_initializer: Option<std::ops::Range<u32>>,
     skip_initializer: usize,
     initializer_lines: Vec<(u16, u16)>,
 }
@@ -68,6 +71,7 @@ impl<'a> Enumeration<'a> {
             constructor_bridges: BTreeSet::new(),
             values_field,
             helper: None,
+            entries_initializer: None,
             skip_initializer: 0,
             initializer_lines: Vec::new(),
         };
@@ -243,13 +247,33 @@ impl<'a> Enumeration<'a> {
         {
             return Err(pattern());
         }
+        let mut tail = tail;
+        if let Some(([load, cast, call, store], rest)) = tail.split_first_chunk::<4>()
+            && !rest.is_empty()
+            && member(class, load, 0xb2)? == Some((owner, values, values_type.as_str()))
+            && class_is(class, cast, 0xc0, "[Ljava/lang/Enum;")?
+            && member(class, call, 0xb8)? == Some((
+                ENTRIES_FACTORY, "enumEntries", "([Ljava/lang/Enum;)Lkotlin/enums/EnumEntries;",
+            ))
+            && member(class, store, 0xb3)? == Some((owner, "$ENTRIES", ENTRIES_TYPE))
+            && class.fields.iter().any(|field| {
+                field.access_flags == PRIVATE | STATIC | FINAL | SYNTHETIC
+                    && pool.utf8(field.name_index).ok() == Some("$ENTRIES")
+                    && pool.utf8(field.descriptor_index).ok() == Some(ENTRIES_TYPE)
+            })
+        {
+            // Java hides the generated backing array. Its public values()
+            // already proves an ordered snapshot of exactly those constants.
+            result.entries_initializer = Some(load.offset..store.offset + store.len);
+            tail = rest;
+        }
         result.skip_initializer = instructions.len() - tail.len();
         let start = tail[0].offset;
         if subclasses::enters_prefix(&code, tail, start) {
             return Err(unsupported("control flow enters enum construction"));
         }
         verify_generated_lookup_methods(class, owner, Some(values), &values_type)?;
-        if map_offsets && has_visible_arguments {
+        if map_offsets && (has_visible_arguments || result.entries_initializer.is_some()) {
             result.initializer_lines = code.line_numbers(pool)?;
         }
         Ok(result)
@@ -257,6 +281,10 @@ impl<'a> Enumeration<'a> {
 
     pub(super) fn hides_field(&self, field: &Member<'_>, name: &str) -> bool {
         field.access_flags & ENUM != 0 || self.values_field == Some(name)
+    }
+
+    pub(super) fn entries_initializer(&self, name: &str) -> Option<std::ops::Range<u32>> {
+        (name == "$ENTRIES").then(|| self.entries_initializer.clone()).flatten()
     }
 
     pub(super) fn hides_method(
@@ -394,15 +422,27 @@ fn values_array<'i>(
     if integer(class, length)? != Some(names.len() as i32) || !class_is(class, new, 0xbd, owner)? {
         return Err(pattern());
     }
+    let via_local = tail.first().is_some_and(|op| store_local(op, 0x3a, 0));
+    if via_local {
+        tail = &tail[1..];
+    }
     for (index, &name) in names.iter().enumerate() {
         let Some(([reference, slot, load, store], rest)) = tail.split_first_chunk::<4>() else {
             return Err(pattern());
         };
-        if reference.opcode != 0x59
+        let array = if via_local { local(reference, 0x19, 0) } else { reference.opcode == 0x59 };
+        if !array
             || integer(class, slot)? != Some(index as i32)
             || member(class, load, 0xb2)? != Some((owner, name, field_type))
             || store.opcode != 0x53
         {
+            return Err(pattern());
+        }
+        tail = rest;
+    }
+    if via_local {
+        let (reload, rest) = tail.split_first().ok_or_else(pattern)?;
+        if !local(reload, 0x19, 0) || !matches!(rest, [ret] if ret.opcode == 0xb0) {
             return Err(pattern());
         }
         tail = rest;
@@ -482,7 +522,8 @@ fn verify_values_copy(
     }
     Ok(match tail {
         [clone, cast, ret] => {
-            member(class, clone, 0xb6)? == Some((array_type, "clone", "()Ljava/lang/Object;"))
+            matches!(member(class, clone, 0xb6)?,
+                Some((name, "clone", "()Ljava/lang/Object;")) if name == array_type || name == "java/lang/Object")
                 && class_is(class, cast, 0xc0, array_type)?
                 && ret.opcode == 0xb0
         }

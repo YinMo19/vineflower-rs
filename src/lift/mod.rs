@@ -30,6 +30,7 @@ pub(crate) mod pattern_dispatch;
 pub(crate) mod qualified_new;
 pub(crate) mod scala_trait;
 mod switch_expression;
+mod undeclared_throw;
 
 pub(crate) use anonymous::{AnonymousBindings, AnonymousSite, AnonymousSites};
 pub(crate) use booleans::{BooleanCondition, BooleanFact, BooleanSelection};
@@ -113,6 +114,7 @@ pub(crate) enum Effect {
 pub(crate) enum DynamicHelper {
     Synthetic(u16, u16),
     GroovyDispatch(invoke_groovy::GroovyDispatch),
+    Rethrow(String),
 }
 
 pub(crate) type DynamicHelpers = Rc<RefCell<BTreeSet<DynamicHelper>>>;
@@ -563,7 +565,7 @@ impl<'a, 'c> Machine<'a, 'c> {
                 self.before_statement(value.order)?;
                 self.stack.clear();
                 self.stack_slots = 0;
-                return Ok(Effect::Throw(value.text));
+                return Ok(Effect::Throw(self.throw_expression(value)?));
             }
             0xc0..=0xc1 => self.type_test(op)?,
             0xa8 | 0xa9 | 0xc9 => return Err(self.unsupported("legacy jsr/ret subroutines")),

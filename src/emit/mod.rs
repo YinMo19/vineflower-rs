@@ -556,7 +556,7 @@ impl<'a, 'c> Writer<'a, 'c> {
 
         let mut needs_gap = false;
         let emit_fields = self.options.method_to_decompile.is_empty();
-        let enum_offsets = if let Some(info) = enumeration.as_mut().filter(|_| emit_fields) {
+        let mut enum_offsets = if let Some(info) = enumeration.as_mut().filter(|_| emit_fields) {
             needs_gap = true;
             self.emit_enum_constants(info)?
         } else {
@@ -581,20 +581,30 @@ impl<'a, 'c> Writer<'a, 'c> {
                     continue;
                 }
             }
-            if let Some(info) = &enumeration {
-                let name = self.class.pool.utf8(field.name_index)?;
+            let entries = if let Some(info) = &enumeration {
+                let name = pool.utf8(field.name_index)?;
                 if info.hides_field(field, name) {
                     continue;
                 }
-            }
-            if !self.hidden_field(field)?
+                info.entries_initializer(name)
+            } else {
+                None
+            };
+            if (entries.is_some() || !self.hidden_field(field)?)
                 && !self.is_component_field(field, components.as_deref())?
             {
                 if is_enum && !wrote_field {
                     self.line(0, "");
                 }
-                let source_line =
-                    self.field(field, is_interface, initializers.expression(field))?;
+                let entries_expression = entries.as_ref().map(|_| {
+                    Document::from(format!("{}.enumEntries(values())",
+                        self.names.render(enumeration::ENTRIES_FACTORY)))
+                });
+                let expression = entries_expression.as_ref().or_else(|| initializers.expression(field));
+                let source_line = self.field(field, is_interface, expression)?;
+                if self.mapping.is_some() && let Some(bytes) = entries {
+                    enum_offsets.extend(bytes.map(|offset| (offset, source_line)));
+                }
                 initializers.record_line(field, source_line);
                 wrote_field = true;
                 needs_gap = true;

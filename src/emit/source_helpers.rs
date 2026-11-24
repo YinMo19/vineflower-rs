@@ -15,15 +15,30 @@ impl Writer<'_, '_> {
     pub(super) fn write_source_helpers(&mut self, needs_gap: &mut bool) -> Result<(), DecompileError> {
         let helpers = Rc::clone(&self.dynamic_helpers);
         for helper in &*helpers.borrow() {
-            if let DynamicHelper::GroovyDispatch(bridge) = helper {
-                if *needs_gap {
-                    self.line(0, "");
-                }
-                self.write_groovy_dispatch(bridge)?;
-                *needs_gap = true;
+            if matches!(helper, DynamicHelper::Synthetic(..)) {
+                continue;
             }
+            if *needs_gap {
+                self.line(0, "");
+            }
+            match helper {
+                DynamicHelper::GroovyDispatch(bridge) => self.write_groovy_dispatch(bridge)?,
+                DynamicHelper::Rethrow(name) => self.write_rethrow(name),
+                DynamicHelper::Synthetic(..) => unreachable!("synthetic member is not a helper"),
+            }
+            *needs_gap = true;
         }
         Ok(())
+    }
+
+    fn write_rethrow(&mut self, name: &str) {
+        let throwable = self.names.render("java/lang/Throwable");
+        let runtime = self.names.render("java/lang/RuntimeException");
+        let suppression = self.names.render("java/lang/SuppressWarnings");
+        self.line(1, &format!("@{suppression}(\"unchecked\")"));
+        self.line(1, &format!("private static <$E extends {throwable}> {runtime} {name}({throwable} failure) throws $E {{"));
+        self.line(2, "throw ($E)failure;");
+        self.line(1, "}");
     }
 
     fn write_groovy_dispatch(&mut self, bridge: &GroovyDispatch) -> Result<(), DecompileError> {
