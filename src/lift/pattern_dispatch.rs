@@ -5,27 +5,39 @@ use std::ops::RangeInclusive;
 use crate::{
     bytecode::{Instruction, Operand},
     classfile::{Constant, TypeArgumentTarget, TypeTarget},
-    descriptor::{MethodDescriptor, Primitive, Type},
+    descriptor::{GenericType, MethodDescriptor, Primitive, Type, TypeArgument},
     source_text::Document,
 };
 
 use super::{
     LiftError, Machine,
-    assignment_expr::LocalWrite,
-    expr::{Category, Expr, INT, Source},
+    expr::{Category, INT, Source},
 };
 
 const BOOTSTRAP_DESCRIPTOR: &str = "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;[Ljava/lang/Object;)Ljava/lang/invoke/CallSite;";
 
 pub(crate) struct PatternDispatch {
-    pub(crate) selector: Type,
+    call_selector: Type,
     pub(crate) labels: Vec<PatternLabel>,
 }
 
 #[derive(Eq, Hash, PartialEq)]
 pub(crate) enum PatternLabel {
     Type(Type),
-    Constant(String),
+    String(String),
+    Integer(i32),
+    Enum(String),
+}
+
+fn pattern_integer_type(selector: &Type, value: i32) -> Option<Primitive> {
+    let Type::Object(name) = selector else { return None };
+    match name.as_str() {
+        "java/lang/Integer" => Some(Primitive::Int),
+        "java/lang/Byte" if i8::try_from(value).is_ok() => Some(Primitive::Byte),
+        "java/lang/Short" if i16::try_from(value).is_ok() => Some(Primitive::Short),
+        "java/lang/Character" if u16::try_from(value).is_ok() => Some(Primitive::Char),
+        _ => None,
+    }
 }
 
 impl Machine<'_, '_> {
@@ -103,9 +115,7 @@ impl Machine<'_, '_> {
             let label = match *pool.get(index)? {
                 Constant::Class(_) => {
                     let ty = self.class_type(index)?;
-                    if (enum_switch && ty != *selector)
-                        || !self.pattern_type_compatible(selector, &ty)
-                    {
+                    if (enum_switch && ty != *selector) || Category::of(&ty) != Some(Category::Ref) {
                         return Ok(None);
                     }
                     PatternLabel::Type(ty)
@@ -115,37 +125,19 @@ impl Machine<'_, '_> {
                     if !crate::naming::is_valid_local_identifier(name, self.class.major_version) {
                         return Ok(None);
                     }
-                    PatternLabel::Constant(name.into())
+                    PatternLabel::Enum(name.into())
                 }
-                Constant::String(text) if matches!(selector, Type::Object(name) if name == "java/lang/String") => {
-                    PatternLabel::Constant(super::string_literal(
-                        &pool.utf16(text)?,
-                        self.options.ascii_strings,
-                    ))
-                }
-                Constant::Integer(value) => {
-                    let Type::Object(name) = selector else {
-                        return Ok(None);
-                    };
-                    let primitive = match name.as_str() {
-                        "java/lang/Integer" => Primitive::Int,
-                        "java/lang/Byte" if i8::try_from(value).is_ok() => Primitive::Byte,
-                        "java/lang/Short" if i16::try_from(value).is_ok() => Primitive::Short,
-                        "java/lang/Character" if u16::try_from(value).is_ok() => Primitive::Char,
-                        _ => return Ok(None),
-                    };
-                    PatternLabel::Constant(super::literal::integer_literal(
-                        value,
-                        Some(&Type::Primitive(primitive)),
-                        self.options.ascii_strings,
-                    ))
-                }
+                Constant::String(text) => PatternLabel::String(super::string_literal(
+                    &pool.utf16(text)?,
+                    self.options.ascii_strings,
+                )),
+                Constant::Integer(value) if !enum_switch => PatternLabel::Integer(value),
                 _ => return Ok(None),
             };
             labels.push(label);
         }
         Ok(Some(PatternDispatch {
-            selector: selector.clone(),
+            call_selector: selector.clone(),
             labels,
         }))
     }
@@ -185,9 +177,7 @@ impl Machine<'_, '_> {
         self.class.major_version >= 65
     }
 
-    pub(crate) fn supports_null_type_pattern(&self) -> bool {
-        // The first preview allowed a type binding to accept null when
-        // paired with an explicit null label. Final Java does not.
+    pub(crate) fn is_first_pattern_preview(&self) -> bool {
         self.class.major_version == 61 && self.class.minor_version == u16::MAX
     }
 
@@ -270,36 +260,97 @@ impl Machine<'_, '_> {
     pub(crate) fn take_pattern_selector(
         &mut self,
         op: &Instruction,
-        selector: &Type,
-        has_type_labels: bool,
+        dispatch: &PatternDispatch,
+        total: Option<&Type>,
         end: u32,
-    ) -> Result<(Document, RangeInclusive<u32>), LiftError> {
+    ) -> Result<(Document, Type, RangeInclusive<u32>), LiftError> {
         self.offset = op.offset;
         self.opcode = op.opcode;
         self.lower_pending_comparison()?;
         let value = self.pop_category(Category::Ref)?;
         let control = value.order.map_or(op.offset, |order| order.first)..=end;
-        if !has_type_labels {
-            let text = if matches!(value.source, Source::Null) {
-                self.cast(value, selector.clone(), false)?.text
-            } else {
-                self.coerce(value, selector, false)?.text
-            };
-            return Ok((text, control));
-        }
-        // For pattern labels, use the descriptor type, rather than a narrower
-        // local type that could make a legal case unconditional or disjoint.
-        let text = if value.ty != *selector || matches!(value.source, Source::Null) {
-            self.reference_cast(value, selector.clone(), false)?.text
-        } else {
-            value.text
+        let is_null = matches!(value.source, Source::Null);
+        let has_types = dispatch.labels.iter().any(|label| matches!(label, PatternLabel::Type(_)));
+        let compatible = |ty: &Type| {
+            total.is_none_or(|pattern| self.pattern_covers(pattern, ty))
+                && dispatch.labels.iter().all(|label| match label {
+                    PatternLabel::Type(pattern) => self.pattern_type_compatible(ty, pattern),
+                    PatternLabel::Integer(value) => pattern_integer_type(ty, *value).is_some(),
+                    PatternLabel::String(_) => matches!(ty, Type::Object(name) if name == "java/lang/String"),
+                    PatternLabel::Enum(_) => ty == &dispatch.call_selector,
+                })
         };
-        Ok((text, control))
+        if !is_null && !self.known_assignable(&value.ty, &dispatch.call_selector) {
+            return Err(self.unsupported("pattern selector type is not proved by its operands"));
+        }
+        // Prefer the call-site type for ordinary type patterns. Use the
+        // actual lifted type when a scalar constant or total pattern needs a
+        // narrower selector than the erased bootstrap descriptor supplies.
+        let call_compatible = compatible(&dispatch.call_selector);
+        let ty = if (has_types || is_null) && call_compatible {
+            dispatch.call_selector.clone()
+        } else if !is_null && compatible(&value.ty) {
+            value.ty.clone()
+        } else if call_compatible {
+            dispatch.call_selector.clone()
+        } else {
+            return Err(self.unsupported("no safe source selector type for the pattern labels"));
+        };
+        let text = if value.ty == ty && !is_null {
+            value.text
+        } else {
+            self.reference_cast(value, ty.clone(), false)?.text
+        };
+        Ok((text, ty, control))
+    }
+
+    pub(crate) fn pattern_constant(&self, label: &PatternLabel, selector: &Type) -> Document {
+        match label {
+            PatternLabel::String(text) | PatternLabel::Enum(text) => text.as_str().into(),
+            PatternLabel::Integer(value) => super::literal::integer_literal(
+                *value,
+                Some(&Type::Primitive(pattern_integer_type(selector, *value).expect("checked selector"))),
+                self.options.ascii_strings,
+            ).into(),
+            PatternLabel::Type(_) => unreachable!("not a constant pattern label"),
+        }
+    }
+
+    pub(super) fn preserves_pattern_binding_type(
+        &self,
+        selector: Option<&Type>,
+        tested: &Type,
+        declared: &Type,
+        generic: Option<&GenericType>,
+    ) -> bool {
+        // A wider LVT declaration preserves matching only if the bootstrap
+        // tested a type guaranteed by the chosen source selector already.
+        // Integer's Comparable<Integer> supertype is fixed by Java SE; no
+        // runtime classpath is needed to validate this preview lowering.
+        let integer_comparable = matches!((selector, tested, declared),
+            (Some(Type::Object(s)), Type::Object(t), Type::Object(d))
+                if s == "java/lang/Integer" && s == t && d == "java/lang/Comparable");
+        if declared != tested && !integer_comparable
+            && !selector.is_some_and(|ty| self.pattern_covers(tested, ty) && self.pattern_covers(declared, tested))
+        {
+            return false;
+        }
+        match generic {
+            None => true,
+            Some(GenericType::Class(class)) if integer_comparable && class.nested.is_empty() => {
+                matches!(class.arguments.as_slice(),
+                    [TypeArgument::Exact(GenericType::Class(argument))]
+                        if argument.internal_name == "java/lang/Integer"
+                            && argument.arguments.is_empty() && argument.nested.is_empty())
+            }
+            _ => false,
+        }
     }
 
     pub(crate) fn pattern_binding(
         &mut self,
         ty: &Type,
+        selector: Option<&Type>,
         store: Option<(&Instruction, Option<&Instruction>, u16)>,
         offset: u32,
     ) -> Result<Document, LiftError> {
@@ -314,16 +365,7 @@ impl Machine<'_, '_> {
             {
                 return Err(self.unsupported("annotated pattern backing cast"));
             }
-            let category = Category::of(ty).ok_or_else(|| self.unsupported("invalid pattern binding type"))?;
-            let target = LocalWrite { index: slot, category };
-            let value = Expr::atom(ty.clone(), Document::new());
-            if self.assignment_local_destination(store, target, &value) != Some(true) {
-                return Err(self.unsupported("pattern store does not declare a fresh local of the tested type"));
-            }
-            let (_, declaration) = self.commit_assignment_local(store, target, ty, true);
-            let mut declaration = declaration.expect("a fresh local has a declaration");
-            declaration.pop();
-            Ok(declaration)
+            self.define_pattern_local(store, slot, ty, selector)
         } else {
             Ok(format!("{} {}", self.render_type(ty), self.locals.temporary(offset)).into())
         }

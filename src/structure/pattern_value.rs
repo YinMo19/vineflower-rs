@@ -17,7 +17,7 @@ impl Emitter<'_> {
         selector: &Document,
         arms: &[(usize, Arm)],
         staged: &[super::BoundArm<'a, 'c>],
-        default: usize,
+        source_default: Option<usize>,
         join: usize,
         control: &RangeInclusive<u32>,
         constructor_setup: Option<usize>,
@@ -30,7 +30,7 @@ impl Emitter<'_> {
             return false;
         }
         if arms.iter().any(|(target, arm)| {
-            *target == default && arm.keys.contains(&super::NULL_KEY) && !machine.supports_null_default()
+            Some(*target) == source_default && arm.keys.contains(&super::NULL_KEY) && !machine.supports_null_default()
         }) {
             return false;
         }
@@ -100,7 +100,7 @@ impl Emitter<'_> {
                 };
                 Rule {
                     labels: &bound.labels,
-                    default: if *target != default { DefaultLabel::Absent }
+                    default: if Some(*target) != source_default { DefaultLabel::Absent }
                         else if arm.keys.contains(&super::NULL_KEY) { DefaultLabel::NullDefault }
                         else { DefaultLabel::Default },
                     statements,

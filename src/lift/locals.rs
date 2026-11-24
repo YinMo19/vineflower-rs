@@ -859,6 +859,28 @@ impl<'c> Machine<'_, 'c> {
         (ty == value.ty).then_some(!same)
     }
 
+    pub(super) fn define_pattern_local(
+        &mut self,
+        store: &Instruction,
+        index: u16,
+        tested: &Type,
+        selector: Option<&Type>,
+    ) -> Result<Document, LiftError> {
+        let value = Expr::atom(tested.clone(), Document::new());
+        let target = LocalWrite { index, category: Category::Ref };
+        let (ty, debug, same) = self.resolve_local_store(store, target, &value)?;
+        let generic = self.locals.declaration_signature(&ty, debug.as_ref());
+        if same || !self.preserves_pattern_binding_type(
+            selector, tested, &ty, generic.as_ref().map(|signature| &signature.ty),
+        ) {
+            return Err(self.unsupported("pattern store does not declare a compatible fresh binding"));
+        }
+        let local = self.bind_local_store(index, ty, debug, generic, None);
+        let declaration = self.declared_local_document(index, &local)?;
+        self.locals.slots[usize::from(index)] = Some(local);
+        Ok(declaration)
+    }
+
     pub(super) fn commit_assignment_local(
         &mut self,
         op: &Instruction,

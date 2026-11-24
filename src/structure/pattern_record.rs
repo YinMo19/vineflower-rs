@@ -47,7 +47,7 @@ enum Pattern {
 impl Pattern {
     fn render(&self, machine: &mut Machine<'_, '_>) -> Result<Document, LiftError> {
         self.render_with(machine, &mut |machine, ty, store, cast, slot| {
-            machine.pattern_binding(ty, Some((store, cast, slot)), store.offset)
+            machine.pattern_binding(ty, None, Some((store, cast, slot)), store.offset)
         })
     }
 

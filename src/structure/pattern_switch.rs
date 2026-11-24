@@ -1,7 +1,7 @@
 // Copyright 2000-2024 JetBrains s.r.o. Use of this source code is governed by the Apache 2.0 license that can be found in the LICENSE file.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     mem,
     ops::Range,
 };
@@ -200,8 +200,8 @@ impl Emitter<'_> {
         let Some(dispatch) = machine.read_pattern_dispatch(&self.instructions[indy])? else {
             return Ok(None);
         };
-        let mut constants = BTreeSet::new();
-        if dispatch.labels.iter().any(|label| matches!(label, PatternLabel::Constant(text) if !constants.insert(text))) {
+        let mut constants = HashSet::new();
+        if dispatch.labels.iter().any(|label| !matches!(label, PatternLabel::Type(_)) && !constants.insert(label)) {
             return Ok(None);
         }
         let Operand::Switch { default, cases } = &switch.operand else {
@@ -219,20 +219,55 @@ impl Emitter<'_> {
                 return Ok(None);
             };
             match key {
-                NULL_KEY => null_target = Some(target),
-                k if k >= 0 && (k as usize) < by_key.len() => by_key[k as usize] = Some(target),
+                NULL_KEY => {
+                    if null_target.replace(target).is_some() {
+                        return Ok(None);
+                    }
+                }
+                k if k >= 0 && (k as usize) < by_key.len() => {
+                    if by_key[k as usize].replace(target).is_some() {
+                        return Ok(None);
+                    }
+                }
                 k if k == by_key.len() as i32 && target == default => {}
-                _ if target == default => {} // tableswitch padding
+                _ if switch.opcode == 0xaa && target == default => {} // tableswitch padding
                 _ => return Ok(None),
             }
         }
+        let mut total_key = None;
+        let mut latest_type_key = None;
         for (key, target) in by_key.into_iter().enumerate() {
-            let Some(target) = target.filter(|&target| target != default) else {
+            let key = key as i32;
+            let type_label = matches!(dispatch.labels[key as usize], PatternLabel::Type(_));
+            if type_label {
+                latest_type_key = Some(key);
+            }
+            // Javac 17 lowers a final total pattern through the JVM default,
+            // omitting its ordinary key when it would share the same target.
+            // No other bootstrap label may implicitly alias the default.
+            let target = if let Some(target) = target.filter(|&target| target != default) {
+                target
+            } else if key as usize + 1 == dispatch.labels.len()
+                && type_label
+                && machine.is_first_pattern_preview()
+                && !head.null_check
+                && null_target.unwrap_or(default) == default
+            {
+                total_key = Some(key);
+                default
+            } else {
                 return Ok(None);
             };
-            groups.entry(target).or_default().keys.push(key as i32);
+            let keys = &mut groups.entry(target).or_default().keys;
+            if keys.first().zip(latest_type_key).is_some_and(|(&first, type_key)| first < type_key) {
+                // One source arm cannot put its constants on both sides of
+                // a type test or its guard without changing priority.
+                return Ok(None);
+            }
+            keys.push(key);
         }
-        if !head.null_check {
+        let source_default = total_key.is_none().then_some(default);
+        if !head.null_check && total_key.is_none() {
             // Even when the integer switch omits -1, the bootstrap gives null
             // to its default arm, unlike a Java switch without a null label.
             let target = null_target.unwrap_or(default);
@@ -248,22 +283,22 @@ impl Emitter<'_> {
             let cfg = &self.graph.blocks[target];
             if !cfg.exception_predecessors.is_empty()
                 || !cfg.predecessors.contains(&dispatch_block)
-                || target != default && cfg.predecessors != [dispatch_block]
+                || Some(target) != source_default && cfg.predecessors != [dispatch_block]
             {
                 return Ok(None);
             }
             let (key, ty) = match arm.keys.as_slice() {
                 &[key] if key != NULL_KEY => match &dispatch.labels[key as usize] {
                     PatternLabel::Type(ty) => (key, ty),
-                    PatternLabel::Constant(_) => continue,
+                    _ => continue,
                 },
-                &[key, NULL_KEY] if null_target == Some(target) && machine.supports_null_type_pattern() => {
+                &[key, NULL_KEY] if null_target == Some(target) && machine.is_first_pattern_preview() => {
                     match &dispatch.labels[key as usize] {
                         PatternLabel::Type(ty) => {
                             arm.nullable_type = true;
                             (key, ty)
                         }
-                        PatternLabel::Constant(_) => continue,
+                        _ => continue,
                     }
                 }
                 keys if keys.iter().any(|&key| key != NULL_KEY
@@ -289,6 +324,12 @@ impl Emitter<'_> {
                         };
                         (3, slot)
                     }
+                    [_, store, ..] => {
+                        let Some(slot) = local(store, true, true) else {
+                            return Ok(None);
+                        };
+                        (2, slot)
+                    }
                     _ => return Ok(None),
                 };
                 if slot == head.alias || head.restart_store.is_some() && slot == head.restart {
@@ -310,7 +351,7 @@ impl Emitter<'_> {
                 }
                 arm.guard = guard;
             }
-            if arm.nullable_type && (arm.binding.is_none() || arm.guard.is_some()) {
+            if (arm.nullable_type || total_key == Some(key)) && (arm.binding.is_none() || arm.guard.is_some()) {
                 // The shared entry must bind the original selector as-is:
                 // checkcast permits null, and no retry may rematch that null.
                 return Ok(None);
@@ -319,9 +360,6 @@ impl Emitter<'_> {
             // labels or conflict with default.
             let record = self.record_patterns.and_then(|plans| plans.get(switch.offset, self.offset(target)));
             if arm.guard.is_none() && !record.is_some_and(|record| record.may_fail) {
-                if machine.pattern_covers(ty, &dispatch.selector) {
-                    return Ok(None);
-                }
                 pattern_types.push((key, ty));
             }
         }
@@ -368,8 +406,8 @@ impl Emitter<'_> {
                 }),
             ))
             .or(region.stop);
-        if groups.keys().any(|&target| Some(target) == join && target != default)
-            || join != Some(default) && self.graph.blocks[default].predecessors != [dispatch_block]
+        if groups.keys().any(|&target| Some(target) == join && Some(target) != source_default)
+            || join != source_default && self.graph.blocks[default].predecessors != [dispatch_block]
         {
             return Ok(None);
         }
@@ -378,7 +416,7 @@ impl Emitter<'_> {
         // Preserve the bootstrap matching order even if the bytecode lays
         // the switch blocks out differently. Null never competes with a type.
         ordered.sort_by_key(|(target, arm)| {
-            if *target == default {
+            if Some(*target) == source_default {
                 (2, 0)
             } else if arm.keys == [NULL_KEY] {
                 (0, 0)
@@ -400,12 +438,21 @@ impl Emitter<'_> {
             return Err(self.unstructured(block));
         }
         let mut offsets = tail.offsets;
-        let (selector, control) = machine.take_pattern_selector(
-            &self.instructions[head.setup],
-            &dispatch.selector,
-            dispatch.labels.iter().any(|label| matches!(label, PatternLabel::Type(_))),
+        let total = total_key.map(|key| match &dispatch.labels[key as usize] {
+            PatternLabel::Type(ty) => ty,
+            _ => unreachable!("checked total label"),
+        });
+        let (selector, selector_type, control) = machine.take_pattern_selector(
+            &self.instructions[indy],
+            &dispatch,
+            total,
             switch.offset + switch.len - 1,
         )?;
+        if pattern_types.iter().any(|&(key, ty)| Some(key) != total_key && machine.pattern_covers(ty, &selector_type)) {
+            // A source default conflicts with a total pattern, and a total
+            // pattern before the final one would dominate it.
+            return Err(self.unstructured(dispatch_block));
+        }
         let guard_keyword = machine.pattern_guard_keyword().ok_or_else(|| self.unstructured(block))?;
         let mut staged = Vec::with_capacity(ordered.len());
         let names = machine.local_name_checkpoint();
@@ -415,7 +462,7 @@ impl Emitter<'_> {
             for (target, arm) in &ordered {
                 let mut entry = baseline.clone();
                 let mut binding_offsets = Vec::new();
-                let mut labels = Vec::with_capacity(arm.keys.len());
+                let mut labels: Vec<CaseLabel> = Vec::with_capacity(arm.keys.len());
                 if let Some((indices, _)) = &arm.binding {
                     let store = &self.instructions[indices.end - 1];
                     binding_offsets.extend(store.offset..store.offset + store.len);
@@ -428,20 +475,31 @@ impl Emitter<'_> {
                     if arm.nullable_type && key == NULL_KEY {
                         continue;
                     }
+                    if key == NULL_KEY && entry.is_first_pattern_preview()
+                        && let Some(last) = labels.last_mut()
+                    {
+                        last.text.push_str(", null");
+                        continue;
+                    }
                     let mut label: Document = if let Some(record) = record {
                         record.render(&mut entry)?
                     } else if key == NULL_KEY {
                         "null".into()
                     } else {
                         match &dispatch.labels[key as usize] {
-                            PatternLabel::Constant(text) => text.as_str().into(),
                             PatternLabel::Type(ty) => entry.pattern_binding(
                                 ty,
+                                Some(&selector_type),
                                 arm.binding.as_ref().map(|(indices, slot)| {
-                                    (&self.instructions[indices.end - 1], Some(&self.instructions[indices.start + 1]), *slot)
+                                    (
+                                        &self.instructions[indices.end - 1],
+                                        (indices.len() == 3).then(|| &self.instructions[indices.start + 1]),
+                                        *slot,
+                                    )
                                 }),
                                 self.offset(*target),
                             )?,
+                            constant => entry.pattern_constant(constant, &selector_type),
                         }
                     };
                     if arm.nullable_type {
@@ -490,7 +548,7 @@ impl Emitter<'_> {
         if (restart.is_none() || constructor_setup.is_some())
             && let Some(join) = join
             && self.try_pattern_switch_value(
-                dispatch_block, within, machine, depth, &selector, &ordered, &staged, default, join,
+                dispatch_block, within, machine, depth, &selector, &ordered, &staged, source_default, join,
                 &control, constructor_setup,
             )
         {
@@ -523,7 +581,7 @@ impl Emitter<'_> {
         for (ordinal, ((target, arm), BoundArm { entry, labels })) in
             ordered.iter().zip(staged).enumerate()
         {
-            let combined_null_default = *target == default && arm.keys == [NULL_KEY]
+            let combined_null_default = Some(*target) == source_default && arm.keys == [NULL_KEY]
                 && machine.supports_null_default();
             if combined_null_default {
                 self.syntax(depth + 1, "case null, default:");
@@ -532,7 +590,7 @@ impl Emitter<'_> {
                     text.surround("case ", ":");
                     self.push(depth + 1, text, offsets);
                 }
-                if *target == default {
+                if Some(*target) == source_default {
                     self.syntax(depth + 1, "default:");
                 }
             }
@@ -565,7 +623,7 @@ impl Emitter<'_> {
             self.emitted[join] = true;
             return Ok(Some(None));
         }
-        if join == Some(default) {
+        if join.is_some() && join == source_default {
             // A dispatch directly to the continuation has no arm body. Its
             // unchanged state still participates in the stack/local join.
             live.push((super::Arm {
@@ -718,6 +776,10 @@ mod tests {
 
     const JAVA17_NULL_TYPE: &[u8] =
         include_bytes!("../../tests/smoke/java17preview/TestSwitchPatternMatchingWithNull.class");
+    const JAVA17_INTEGER_SWITCH: &[u8] =
+        include_bytes!("../../tests/smoke/java17preview/TestSwitchPatternMatching18.class");
+    const JAVA17_STRING_SWITCH: &[u8] =
+        include_bytes!("../../tests/smoke/java17preview/TestSwitchPatternMatching21.class");
 
     fn instructions(prefix: &[u8]) -> Vec<Instruction> {
         let mut instructions = decode(prefix).unwrap();
@@ -803,5 +865,68 @@ mod tests {
                 && matches!(source.downcast_ref::<StructureError>(),
                     Some(StructureError::Lift(crate::lift::LiftError::Unsupported { opcode: 0xba, .. })))
         ), "{result:?}");
+    }
+
+    #[test]
+    fn preview_integer_switch_keeps_generic_binding_and_bootstrap_priority() {
+        let source = crate::decompile(JAVA17_INTEGER_SWITCH, &Options::default()).unwrap().text;
+        assert_eq!(source.matches("switch (o)").count(), 3, "{source}");
+        assert!(source.contains("case Comparable<Integer> ") && source.contains(".compareTo("), "{source}");
+        let test2 = source.split_once("void test2(").unwrap().1.split_once("void test3(").unwrap().0;
+        let test3 = source.split_once("void test3(").unwrap().1;
+        let ordinal = |method: &str, label: &str| method.find(label).unwrap_or_else(|| panic!("{label}: {method}"));
+        assert!(ordinal(test2, "case 16, null:") < ordinal(test2, "case Integer "));
+        assert!(ordinal(test3, "case 42:") < ordinal(test3, "case Integer "));
+        assert!(ordinal(test3, "case Integer ") < ordinal(test3, "case 16, null:"));
+    }
+
+    #[test]
+    fn preview_string_switch_recovers_two_retries_and_the_nullable_total_binding() {
+        let source = crate::decompile(JAVA17_STRING_SWITCH, &Options::default()).unwrap().text;
+        assert_eq!(source.matches("switch (it)").count(), 3, "{source}");
+        let (_, rest) = source.split_once("void test2(").unwrap();
+        let (total, explicit_null) = rest.split_once("void test3(").unwrap();
+        let guards: Vec<_> = total.match_indices("Math.random()").map(|(offset, _)| offset).collect();
+        assert_eq!(guards.len(), 2, "{total}");
+        let terminal = total.lines().find(|line| line.contains("case String ") && !line.contains(" && "))
+            .unwrap_or_else(|| panic!("{total}"));
+        assert!(guards[1] < total.find(terminal).unwrap(), "{total}");
+        assert!(!total.contains("default:") && !total.contains("case null"), "{total}");
+        assert!(explicit_null.contains("case \"\", null:"), "{explicit_null}");
+    }
+
+    #[test]
+    fn preview_total_binding_does_not_invent_a_selector_cast_or_redirect_null() {
+        let parsed = ClassFile::parse(JAVA17_STRING_SWITCH).unwrap();
+        let test2 = parsed.methods.iter().find(|method| parsed.pool.utf8(method.name_index).unwrap() == "test2").unwrap();
+        let code = test2.code(&parsed.pool).unwrap().unwrap();
+        let base = code.bytes.as_ptr() as usize - JAVA17_STRING_SWITCH.as_ptr() as usize;
+        let table = decode(code.bytes).unwrap().into_iter().find(|op| op.opcode == 0xaa).unwrap();
+        let Operand::Switch { cases, .. } = table.operand else { unreachable!() };
+        assert_eq!(cases[0].0, -1);
+        assert_eq!(cases[1].0, 0);
+
+        let mut wrong_null = JAVA17_STRING_SWITCH.to_vec();
+        let first_case = base + ((table.offset as usize + 4) & !3) + 12;
+        let wrong_target = cases[1].1 as i32 - table.offset as i32;
+        wrong_null[first_case..first_case + 4].copy_from_slice(&wrong_target.to_be_bytes());
+        let mut wrong_type = JAVA17_STRING_SWITCH.to_vec();
+        assert_eq!(wrong_type[base], 0x2b); // aload_1 (the String parameter)
+        wrong_type[base] = 0x2a; // aload_0 (this)
+        for bytes in [wrong_null, wrong_type] {
+            let result = crate::decompile(&bytes, &Options::default());
+            assert!(matches!(result, Err(crate::DecompileError::Method { name, .. }) if name == "test2"));
+        }
+    }
+
+    #[test]
+    fn preview_broad_binding_requires_the_proven_generic_supertype() {
+        let signature = b"Ljava/lang/Comparable<Ljava/lang/Integer;>;";
+        let argument = JAVA17_INTEGER_SWITCH.windows(signature.len()).position(|bytes| bytes == signature).unwrap()
+            + b"Ljava/lang/Comparable<Ljava/lang/".len();
+        let mut bytes = JAVA17_INTEGER_SWITCH.to_vec();
+        bytes[argument..argument + 7].copy_from_slice(b"Boolean");
+        let result = crate::decompile(&bytes, &Options::default());
+        assert!(matches!(result, Err(crate::DecompileError::Method { name, .. }) if name == "test"));
     }
 }
