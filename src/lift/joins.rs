@@ -165,6 +165,7 @@ impl Machine<'_, '_> {
             name,
             ty,
             generic,
+            anonymous_site: None,
             debug_range,
             receiver: false,
             token_index: self.locals.new_local_token_index(slot),
@@ -357,9 +358,9 @@ impl Machine<'_, '_> {
         {
             return Ok(None);
         }
-        let yes = &yes.stack[prefix];
-        let no = &no.stack[prefix];
-        if [yes, no].into_iter().any(|value| {
+        let yes_value = &yes.stack[prefix];
+        let no_value = &no.stack[prefix];
+        if [yes_value, no_value].into_iter().any(|value| {
             value.is_uninitialized(self.initialized_this)
                 || matches!(value.source, Source::Comparison(_))
                 || value
@@ -368,9 +369,22 @@ impl Machine<'_, '_> {
         }) {
             return Ok(None);
         }
-        let Some(mut ty) = self.common_value_type(yes, no) else {
+        let Some(mut ty) = self.common_value_type(yes_value, no_value) else {
             return Ok(None);
         };
+        let origin = if self.has_anonymous_type(&ty) {
+            match (yes.anonymous_origin(yes_value), no.anonymous_origin(no_value)) {
+                (Some(a), Some(b)) if a == b => Some(a),
+                (Some(a), None) if matches!(no_value.source, Source::Null) => Some(a),
+                (None, Some(b)) if matches!(yes_value.source, Source::Null) => Some(b),
+                // Separate source constructions can share a JVM name when
+                // bytecode for a single source allocation was duplicated.
+                _ => return Ok(None),
+            }
+        } else {
+            None
+        };
+        let (yes, no) = (yes_value, no_value);
         let (condition, inverse, facts) = condition;
         let simplify = self.simplify_boolean_ternaries();
         let mut uses = [true, true];
@@ -422,6 +436,7 @@ impl Machine<'_, '_> {
         }
         self.push(Expr {
             precedence,
+            source: origin.map_or(Source::Plain, Source::Anonymous),
             order: Some(Order {
                 first: *control.start(),
                 last: [yes, no]
@@ -530,6 +545,7 @@ impl Machine<'_, '_> {
                     })?;
                 }
             }
+            self.require_denotable_type(&ty)?;
             let name = self.locals.temporary(self.debug_offset(offset));
             code.declarations
                 .push(format!("{} {name};", self.render_type(&ty)).into());
@@ -574,16 +590,20 @@ impl Machine<'_, '_> {
         }
         let offset = self.debug_offset(offset);
         let mut stack = std::mem::take(&mut self.stack);
-        let mut declarations = Vec::with_capacity(stack.len());
-        for value in &mut stack {
-            let ty = self.render_type(&value.ty);
-            let name = self.locals.temporary(offset);
-            let binding = Expr::atom(value.ty.clone(), name.clone().into());
-            let expr = std::mem::replace(value, binding);
-            declarations.push(assignment(&format!("{ty} {name}"), expr.text));
-        }
+        let declarations = stack
+            .iter_mut()
+            .map(|value| {
+                let origin = self.inferred_anonymous_origin(&value.ty, value)?;
+                let ty = if origin.is_some() { Cow::Borrowed("var") } else { Cow::Owned(self.render_type(&value.ty)) };
+                let name = self.locals.temporary(offset);
+                let mut binding = Expr::atom(value.ty.clone(), name.clone().into());
+                binding.source = origin.map_or(Source::Plain, Source::Anonymous);
+                let expr = std::mem::replace(value, binding);
+                Ok(assignment(&format!("{ty} {name}"), expr.text))
+            })
+            .collect();
         self.stack = stack;
-        Ok(declarations)
+        declarations
     }
 
     pub(crate) fn update_edge_stack(
@@ -611,6 +631,9 @@ impl Machine<'_, '_> {
             {
                 return Err(self.invalid_stack("incompatible incoming operand"));
             }
+            if let Some(origin) = entry.anonymous_origin(to) {
+                self.require_anonymous_assignment(&to.ty, origin, from)?;
+            }
             let value = self.coerce(from.clone(), &to.ty, false)?;
             updates.push((to, value));
         }
@@ -623,9 +646,15 @@ impl Machine<'_, '_> {
             // overwrite an old operand before another RHS has read it.
             let mut copies = Vec::with_capacity(updates.len());
             for (to, value) in updates {
+                if matches!(to.source, Source::Anonymous(_)) && matches!(value.source, Source::Null) {
+                    copies.push(assignment(to.text.as_str(), value.text));
+                    continue;
+                }
+                let origin = self.inferred_anonymous_origin(&to.ty, &value)?;
+                let ty = if origin.is_some() { Cow::Borrowed("var") } else { Cow::Owned(self.render_type(&to.ty)) };
                 let temporary = self.locals.temporary(offset);
                 statements.push(assignment(
-                    &format!("{} {temporary}", self.render_type(&to.ty)),
+                    &format!("{ty} {temporary}"),
                     value.text,
                 ));
                 copies.push(assignment(to.text.as_str(), temporary.into()));
@@ -726,6 +755,7 @@ impl Machine<'_, '_> {
                 let local = Local {
                     name,
                     generic: self.locals.declaration_signature(&ty, debug),
+                    anonymous_site: None,
                     ty,
                     debug_range,
                     receiver: false,
@@ -740,9 +770,13 @@ impl Machine<'_, '_> {
                 let value = arm.locals.slots[slot]
                     .as_ref()
                     .expect("checked incoming binding");
+                if local.anonymous_site.is_some_and(|site| value.anonymous_site != Some(site)) {
+                    return Err(self.invalid_local(index, "distinct anonymous source types at control-flow join"));
+                }
                 if value.name != local.name {
                     if let (Some(sites), Some(prove)) = (&mut move_sites, &mut prove_move)
                         && arm.stack_is_empty()
+                        && value.anonymous_site.is_none()
                     {
                         let declaration = arm.declared_local_document(index, value)?;
                         if let Some(moved) = prove(position, declaration.as_flat(), &value.name, true) {
@@ -767,6 +801,7 @@ impl Machine<'_, '_> {
                         target.push_str(&local.name);
                     }
                     let direct = if value.ty == local.ty
+                        && value.anonymous_site.is_none()
                         && value.generic == local.generic
                         && (self.code_type_renderer.is_none()
                             || arm.declared_local_type(index, value)? == self.declared_local_type(index, &local)?)
@@ -869,6 +904,7 @@ impl Machine<'_, '_> {
                 to.as_ref().ok_or_else(invalid)?,
             );
             if to.receiver
+                || to.anonymous_site.is_some_and(|site| from.anonymous_site != Some(site))
                 || !(self.known_assignable(&from.ty, &to.ty)
                     || (to.ty == INT && Category::of(&from.ty) == Some(Category::Int)))
             {
@@ -1027,6 +1063,7 @@ fn same_value(a: &Expr, b: &Expr) -> bool {
         && match (&a.source, &b.source) {
             (Source::Local(a), Source::Local(b)) => a == b,
             (Source::New(a), Source::New(b)) => a == b,
+            (Source::Anonymous(a), Source::Anonymous(b)) => a == b,
             (Source::Integer(a), Source::Integer(b)) => a == b,
             (Source::Boxing(a), Source::Boxing(b)) | (Source::Unboxing(a), Source::Unboxing(b)) => a == b,
             (Source::Plain, Source::Plain)

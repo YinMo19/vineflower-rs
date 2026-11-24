@@ -12,7 +12,7 @@ use crate::{
 
 use super::{
     LiftError, Machine,
-    expr::{Expr, Source},
+    expr::{AnonymousOrigin, Expr, Source},
     nested::parameter_load_slot,
 };
 
@@ -129,7 +129,7 @@ impl Machine<'_, '_> {
         owner: &str,
         descriptor: &str,
         args: &[Expr],
-    ) -> Result<Option<Document>, LiftError> {
+    ) -> Result<Option<(Document, AnonymousOrigin)>, LiftError> {
         let Some(group) = self.group.filter(|_| self.options.decompile_inner) else {
             return Ok(None);
         };
@@ -306,7 +306,7 @@ impl Machine<'_, '_> {
         });
         head.append_relative_arguments(visible_args.iter().map(|arg| &arg.text));
         let _ = write!(head, "\0{id}\0");
-        Ok(Some(head))
+        Ok(Some((head, AnonymousOrigin::new(id + 1).expect("one-based site index"))))
     }
 
     fn append_generic_reference(&self, head: &mut Document, ty: &GenericType) {

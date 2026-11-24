@@ -22,7 +22,7 @@ use crate::{
 use super::{
     CodeTypeSite, Effect, LiftError, Machine,
     assignment_expr::LocalWrite,
-    expr::{Category, Expr, INT, Order, Source},
+    expr::{AnonymousOrigin, Category, Expr, INT, Order, Source},
 };
 
 #[path = "instanceof_locals.rs"]
@@ -42,6 +42,8 @@ use local_tokens::LocalTokenIndices;
 struct Local {
     name: String,
     ty: Type,
+    /// An initialized `var` binds one exact, otherwise unnameable type.
+    anonymous_site: Option<AnonymousOrigin>,
     generic: Option<Rc<LocalSignature>>,
     debug_range: Option<(u16, u16)>,
     receiver: bool,
@@ -54,6 +56,7 @@ impl PartialEq for Local {
         // represented by the same declaration at a control-flow join.
         self.name == other.name
             && self.ty == other.ty
+            && self.anonymous_site == other.anonymous_site
             && self.generic == other.generic
             && self.debug_range == other.debug_range
             && self.receiver == other.receiver
@@ -243,6 +246,7 @@ impl<'a> Locals<'a> {
                 name: "this".into(),
                 ty: Type::Object(owner.into()),
                 generic: None,
+                anonymous_site: None,
                 debug_range: None,
                 receiver: true,
                 token_index: None,
@@ -290,6 +294,7 @@ impl<'a> Locals<'a> {
                     signature.as_ref().and_then(|sig| sig.parameters.get(ordinal))
                         == Some(&generic.ty)
                 }),
+                anonymous_site: None,
                 debug_range,
                 receiver: false,
                 token_index: None,
@@ -673,6 +678,7 @@ impl<'c> Machine<'_, 'c> {
             name,
             ty,
             generic: None,
+            anonymous_site: None,
             debug_range: range,
             receiver: false,
             token_index: self.locals.new_local_token_index(index),
@@ -752,16 +758,39 @@ impl<'c> Machine<'_, 'c> {
         } else {
             generic.as_deref()
         };
+        let origin = if same {
+            if let Some(origin) = self.locals.slots[slot].as_ref().and_then(|local| local.anonymous_site) {
+                self.require_anonymous_assignment(&ty, origin, &value)?;
+            }
+            None
+        } else {
+            self.inferred_anonymous_origin(&ty, &value)?
+        };
+        if origin.is_some() {
+            let annotation = if let Some(entry) = debug {
+                self.annotated_local_type(index, (entry.start_pc, entry.length), (&ty).into())?
+                    .is_some()
+            } else {
+                false
+            };
+            if signature.is_some() || annotation {
+                return Err(self.unsupported("inferred anonymous local cannot have an explicit source type"));
+            }
+        }
         let source = signature.and_then(|_| self.local_source_signature(&value)).map(Rc::as_ref);
         let value = self.coerce_local_assignment(value, &ty, signature, source)?;
         self.before_statement(value.order)?;
         let local = if same {
             self.locals.slots[slot].as_ref().expect("checked active binding").clone()
         } else {
-            self.bind_local_store(index, ty, debug, generic)
+            self.bind_local_store(index, ty, debug, generic, origin)
         };
         let mut text = if same {
             self.local_binding_document(index, &local, false)
+        } else if origin.is_some() {
+            let mut text = Document::from("var ");
+            self.append_local_binding(&mut text, index, &local, true);
+            text
         } else {
             self.declared_local_document(index, &local)?
         };
@@ -779,6 +808,11 @@ impl<'c> Machine<'_, 'c> {
         value: &Expr,
     ) -> Option<bool> {
         let (ty, debug, same) = self.resolve_local_store(op, target, value).ok()?;
+        // An assignment expression may need a blank declaration, for which
+        // neither the anonymous binary name nor `var` is a Java type.
+        if self.has_anonymous_type(&ty) {
+            return None;
+        }
         if same {
             if self.locals.slots[usize::from(target.index)].as_ref()?.generic.is_some() {
                 return None;
@@ -813,7 +847,7 @@ impl<'c> Machine<'_, 'c> {
             return (self.local_binding_document(index, local, false), None);
         }
         let debug = self.store_debug(op, index);
-        let local = self.bind_local_store(index, ty.clone(), debug, None);
+        let local = self.bind_local_store(index, ty.clone(), debug, None, None);
         let mut blank = self.local_type_document(&local.ty);
         blank.push(' ');
         self.append_local_binding(&mut blank, index, &local, true);
@@ -831,6 +865,7 @@ impl<'c> Machine<'_, 'c> {
     }
 
     fn declared_local_type(&self, index: u16, local: &Local) -> Result<Document, LiftError> {
+        self.require_denotable_type(&local.ty)?;
         let generic = local.generic.as_ref().map(|signature| &signature.ty);
         if let Some(range) = local.debug_range
             && let Some(annotated) = self.annotated_local_type(
@@ -859,6 +894,48 @@ impl<'c> Machine<'_, 'c> {
         let Source::Local(slot) = value.source else { return None };
         let local = self.locals.slots.get(usize::from(slot))?.as_ref()?;
         (value.ty == local.ty && value.text == local.name).then_some(local)
+    }
+
+    fn anonymous_origin(&self, value: &Expr) -> Option<AnonymousOrigin> {
+        if let Source::Anonymous(origin) = value.source {
+            Some(origin)
+        } else {
+            self.source_local(value)?.anonymous_site
+        }
+    }
+
+    pub(super) fn inferred_anonymous_origin(
+        &self,
+        ty: &Type,
+        value: &Expr,
+    ) -> Result<Option<AnonymousOrigin>, LiftError> {
+        if !self.has_anonymous_type(ty) {
+            return Ok(None);
+        }
+        if self.class.major_version < 54 {
+            return Err(self.unsupported("anonymous local type inference requires Java 10"));
+        }
+        if matches!(ty, Type::Object(_))
+            && value.ty == *ty
+            && let Some(origin) = self.anonymous_origin(value)
+        {
+            return Ok(Some(origin));
+        }
+        Err(self.unsupported("anonymous local requires an initializer of its exact type"))
+    }
+
+    fn require_anonymous_assignment(
+        &self,
+        ty: &Type,
+        origin: AnonymousOrigin,
+        value: &Expr,
+    ) -> Result<(), LiftError> {
+        if matches!(value.source, Source::Null)
+            || value.ty == *ty && self.anonymous_origin(value) == Some(origin)
+        {
+            return Ok(());
+        }
+        Err(self.unsupported("incompatible anonymous source types in assignment"))
     }
 
     fn local_source_signature(&self, value: &Expr) -> Option<&Rc<LocalSignature>> {
@@ -999,6 +1076,7 @@ impl<'c> Machine<'_, 'c> {
         ty: Type,
         debug: Option<LocalVariable<'c>>,
         generic: Option<Rc<LocalSignature>>,
+        anonymous_site: Option<AnonymousOrigin>,
     ) -> Local {
         let slot = usize::from(index);
         let width = usize::from(ty.slots());
@@ -1016,6 +1094,7 @@ impl<'c> Machine<'_, 'c> {
             name: self.locals.local_name(index, &ty, debug.as_ref()),
             generic,
             ty,
+            anonymous_site,
             debug_range: debug.map(|entry| (entry.start_pc, entry.length)),
             receiver: false,
             token_index: self.locals.new_local_token_index(index),
@@ -1126,6 +1205,68 @@ mod tests {
             assert_eq!(machine.locals.local_name(1, &ty, None), "stack10x");
             assert_eq!(machine.locals.temporary(10), "stack10xx");
         }
+    }
+
+    #[test]
+    fn anonymous_temporaries_require_a_proven_initializer_and_cannot_be_blank() {
+        let mut builder = crate::ClassGroupBuilder::new();
+        let owner = builder
+            .add(include_bytes!("../../tests/smoke/java11/TestNestedGenerics2.class"))
+            .unwrap();
+        builder
+            .add(include_bytes!("../../tests/smoke/java11/TestNestedGenerics2$1.class"))
+            .unwrap();
+        let group = builder.build().unwrap();
+        let class = group.get(&owner).unwrap();
+        let method = class.methods.iter()
+            .find(|method| class.pool.utf8(method.name_index).unwrap() == "test")
+            .unwrap();
+        let descriptor = MethodDescriptor::parse(class.pool.utf8(method.descriptor_index).unwrap())
+            .unwrap();
+        let code = method.code(&class.pool).unwrap().unwrap();
+        let instructions = decode(code.bytes).unwrap();
+        let options = Options::default();
+        let class_name = |name: &str| name.rsplit('/').next().unwrap().into();
+        let mut baseline = Machine::new(class, method, &code, &descriptor, &options, &class_name)
+            .unwrap()
+            .with_group(&group);
+        baseline.set_anonymous_sites(Rc::new(RefCell::new(Default::default())));
+
+        let mut initialized = baseline.clone();
+        let mut duplicate = baseline.clone();
+        // The fixture starts with new, dup, and invokespecial, before astore.
+        for op in &instructions[..3] {
+            initialized.step(op).unwrap();
+            duplicate.step(op).unwrap();
+        }
+        let mut null = baseline.clone();
+        null.step(&decode(&[0x01]).unwrap()[0]).unwrap();
+        assert!(matches!(
+            baseline.merge_stack(&[&initialized, &null], 7),
+            Err(LiftError::Unsupported { .. })
+        ));
+
+        let mut named = initialized.clone();
+        assert!(matches!(
+            named.step(&instructions[3]).unwrap(),
+            Effect::Statement(text) if text.starts_with("var instance = new Object()")
+        ));
+        named.step(&instructions[4]).unwrap();
+        let loaded = named.pop_raw().unwrap();
+        let origin = named.anonymous_origin(&loaded).unwrap();
+        let other = duplicate.pop_raw().unwrap();
+        assert_eq!(loaded.ty, other.ty);
+        assert!(named.require_anonymous_assignment(&loaded.ty, origin, &other).is_err());
+
+        let mut value = initialized.pop_raw().unwrap();
+        let mut unproved = Expr::atom(value.ty.clone(), "unproved".into());
+        assert!(initialized.spill(&mut unproved).is_err());
+        initialized.spill(&mut value).unwrap();
+        let statements = initialized.take_prelude();
+        assert_eq!(statements.len(), 1);
+        assert!(statements[0].starts_with("var stack"));
+        assert!(statements[0].contains(" = new Object()"));
+        assert_eq!(initialized.inferred_anonymous_origin(&value.ty, &value).unwrap(), Some(origin));
     }
 
     #[test]

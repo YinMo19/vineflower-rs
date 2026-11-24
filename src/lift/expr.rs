@@ -1,9 +1,10 @@
 // Copyright 2000-2018 JetBrains s.r.o. Use of this source code is governed by the Apache 2.0 license that can be found in the LICENSE file.
 
-use std::{borrow::Cow, num::NonZeroU32, ops::Range};
+use std::{borrow::Cow, num::{NonZeroU32, NonZeroUsize}, ops::Range};
 
 use crate::{
     bytecode::Instruction,
+    context::NestedKind,
     descriptor::{Primitive, Type},
     source_text::{Document, Infix},
 };
@@ -61,6 +62,9 @@ impl OperandOrigin {
     }
 }
 
+/// One rendered anonymous class site, not just its erased JVM name.
+pub(super) type AnonymousOrigin = NonZeroUsize;
+
 #[derive(Clone)]
 pub(super) enum Source {
     Local(u16),
@@ -81,6 +85,8 @@ pub(super) enum Source {
     This,
     OuterThis,
     New(u32),
+    /// The Java expression exposes the anonymous type of this source site.
+    Anonymous(AnonymousOrigin),
     Comparison(Box<Comparison>),
     StringBuilder(std::sync::Arc<Vec<super::concat::Operand>>),
     StringConversion(Box<Expr>),
@@ -406,6 +412,24 @@ impl Machine<'_, '_> {
         })
     }
 
+    pub(super) fn has_anonymous_type(&self, mut ty: &Type) -> bool {
+        while let Type::Array(element) = ty {
+            ty = element;
+        }
+        self.options.decompile_inner
+            && matches!(ty, Type::Object(name) if self.group.is_some_and(|group| {
+                group.nested_class(name).is_some_and(|node| matches!(node.kind, NestedKind::Anonymous))
+                    && group.is_attached(name)
+            }))
+    }
+
+    pub(super) fn require_denotable_type(&self, ty: &Type) -> Result<(), LiftError> {
+        if self.has_anonymous_type(ty) {
+            return Err(self.unsupported("anonymous class has no explicit Java type"));
+        }
+        Ok(())
+    }
+
     pub(super) fn cast(&self, expr: Expr, ty: Type, effect: bool) -> Result<Expr, LiftError> {
         let name = self.type_document(&ty);
         self.cast_named(expr, ty, effect, name)
@@ -418,6 +442,7 @@ impl Machine<'_, '_> {
         effect: bool,
         name: Document,
     ) -> Result<Expr, LiftError> {
+        self.require_denotable_type(&ty)?;
         let mut text = Document::from("(");
         text.append(name);
         text.push(')');

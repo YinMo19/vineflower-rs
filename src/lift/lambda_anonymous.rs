@@ -56,7 +56,7 @@ impl Machine<'_, '_> {
                 // A source cast around `this`, for example, can have no JVM
                 // ordering dependency but still needs the lexical receiver.
                 self.before_statement(None)?;
-                self.spill(capture);
+                self.spill(capture)?;
             }
         }
         Ok(())

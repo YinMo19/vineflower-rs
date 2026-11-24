@@ -37,7 +37,7 @@ pub(crate) use locals::IfPatternLocal;
 #[cfg(test)]
 mod tests;
 
-use std::{cell::RefCell, collections::{BTreeMap, BTreeSet}, rc::Rc};
+use std::{borrow::Cow, cell::RefCell, collections::{BTreeMap, BTreeSet}, rc::Rc};
 
 use crate::{
     ClassGroup,
@@ -796,25 +796,27 @@ impl<'a, 'c> Machine<'a, 'c> {
                     value.text.push(';');
                     self.prelude.push(std::mem::take(&mut value.text));
                 } else {
-                    self.spill(value);
+                    self.spill(value)?;
                 }
             }
         }
         Ok(())
     }
 
-    fn spill(&mut self, value: &mut Expr) {
+    fn spill(&mut self, value: &mut Expr) -> Result<(), LiftError> {
+        let origin = self.inferred_anonymous_origin(&value.ty, value)?;
         let name = self.locals.temporary(self.debug_offset(self.offset));
-        let ty = self.render_type(&value.ty);
+        let ty = if origin.is_some() { Cow::Borrowed("var") } else { Cow::Owned(self.render_type(&value.ty)) };
         let mut assignment = std::mem::replace(&mut value.text, name.clone().into());
         assignment.surround(&format!("{ty} {name} = "), ";");
         self.prelude.push(assignment);
         value.precedence = expr::PRIMARY;
-        value.source = Source::Plain;
+        value.source = origin.map_or(Source::Plain, Source::Anonymous);
         value.order = None;
         value.observable = false;
         value.statement = false;
         value.constant = false;
+        Ok(())
     }
 
     fn freeze_stack(&mut self, following: Option<Order>) -> Result<Option<Order>, LiftError> {
@@ -836,10 +838,12 @@ impl<'a, 'c> Machine<'a, 'c> {
         }
         if prior.is_some() {
             let mut stack = std::mem::take(&mut self.stack);
-            for value in stack.iter_mut().filter(|value| value.order.is_some()) {
-                self.spill(value);
-            }
+            let spilled = stack
+                .iter_mut()
+                .filter(|value| value.order.is_some())
+                .try_for_each(|value| self.spill(value));
             self.stack = stack;
+            spilled?;
         }
         Ok(prior)
     }
@@ -853,7 +857,7 @@ impl<'a, 'c> Machine<'a, 'c> {
         if order.is_some() {
             self.freeze_stack(order)?;
             for value in values.iter_mut().filter(|value| value.order.is_some()) {
-                self.spill(value);
+                self.spill(value)?;
             }
         }
         Ok(())

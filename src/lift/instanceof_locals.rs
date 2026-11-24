@@ -111,6 +111,7 @@ impl Machine<'_, '_> {
                 name,
                 ty: ty.clone(),
                 generic: None,
+                anonymous_site: None,
                 debug_range,
                 receiver: false,
                 token_index: self.locals.new_local_token_index(slot),

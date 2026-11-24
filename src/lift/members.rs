@@ -639,9 +639,9 @@ impl Machine<'_, '_> {
                     .order_of(&args, true)?
                     .expect("constructor has effects");
                 let order = Some(self.join_order(Some(Order::at(allocation)), order)?);
-                let text =
-                    if let Some(text) = self.anonymous_construction(owner, method_type, &args)? {
-                        text
+                let (text, source) =
+                    if let Some((text, origin)) = self.anonymous_construction(owner, method_type, &args)? {
+                        (text, Source::Anonymous(origin))
                     } else {
                         let (target, visible_args) =
                             self.constructor_target(owner, method_type, &args, None)?;
@@ -649,13 +649,13 @@ impl Machine<'_, '_> {
                         text.append_relative_arguments(
                             visible_args.iter().map(|argument| &argument.text),
                         );
-                        text
+                        (text, builder_constructor(owner, method_type, args))
                     };
                 let mut value = Expr {
                     order,
                     observable: true,
                     statement: true,
-                    source: builder_constructor(owner, method_type, args),
+                    source,
                     ..Expr::atom(receiver.ty, text)
                 };
                 let is_alias = |value: &Expr| matches!(value.source, Source::New(offset) if offset == allocation);
@@ -679,11 +679,13 @@ impl Machine<'_, '_> {
                         ));
                     }
                     let mut stack = std::mem::take(&mut self.stack);
-                    for item in stack.iter_mut().filter(|value| value.order.is_some()) {
-                        self.spill(item);
-                    }
-                    self.spill(&mut value);
+                    let spilled = stack
+                        .iter_mut()
+                        .filter(|value| value.order.is_some())
+                        .try_for_each(|item| self.spill(item));
                     self.stack = stack;
+                    spilled?;
+                    self.spill(&mut value)?;
                 }
                 let mut value = Some(value);
                 let mut remaining = aliases;
