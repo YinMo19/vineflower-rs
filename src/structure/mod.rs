@@ -842,7 +842,9 @@ impl Emitter<'_> {
                 }
             }
             if let Some(test) = assigned_test {
-                self.push(depth, test.declaration, Vec::new());
+                for declaration in test.into_declarations() {
+                    self.push(depth, declaration, Vec::new());
+                }
             }
             if merge.uses_yes {
                 offsets.extend(then.offsets);
@@ -876,8 +878,8 @@ impl Emitter<'_> {
         let (declarations, assignments) = if exits.is_empty() {
             (Vec::new(), Vec::new())
         } else {
-            if let Some(test) = assigned_test.as_ref().filter(|test| test.has_arm_binding()) {
-                machine.prefer_test_local(&test.state, test.slot);
+            if let Some(test) = &assigned_test {
+                test.prefer_join_locals(machine);
             }
             self.merge_arms(machine, join.expect("reached an if join"), &exits)?
         };
@@ -913,7 +915,7 @@ impl Emitter<'_> {
             header.push(Line::new(depth, statement, mem::take(offsets)));
         }
         if let Some(test) = assigned_test {
-            header.push(Line::new(depth, test.declaration, Vec::new()));
+            header.extend(test.into_declarations().map(|text| Line::new(depth, text, Vec::new())));
         }
         header.extend(
             declarations

@@ -152,7 +152,12 @@ impl Emitter<'_> {
         offsets.extend(mapped);
         *control = *control.start()..=tail.offset;
         machine.commit_predicate_state(&mut state);
-        Some(AssignedTest { edges: AssignmentEdges::One(target), state, declaration, slot })
+        Some(AssignedTest {
+            declaration,
+            more: Vec::new(),
+            primary: Some(TestBinding { target: Some(target), state, slot, more: Vec::new() }),
+            secondary: None,
+        })
     }
 
     pub(super) fn collapse_decision_graph<'a, 'c>(
@@ -438,29 +443,51 @@ impl Emitter<'_> {
 }
 
 pub(super) struct AssignedTest<'a, 'c> {
-    edges: AssignmentEdges,
-    pub(super) state: Machine<'a, 'c>,
-    pub(super) declaration: Document,
-    pub(super) slot: u16,
+    declaration: Document,
+    more: Vec<Document>,
+    primary: Option<TestBinding<'a, 'c>>,
+    secondary: Option<Box<TestBinding<'a, 'c>>>,
 }
 
-enum AssignmentEdges {
-    One(usize),
-    Both,
-    Neither,
+struct TestBinding<'a, 'c> {
+    /// `None` shares one entry state between both outcomes.
+    target: Option<usize>,
+    state: Machine<'a, 'c>,
+    slot: u16,
+    more: Vec<u16>,
+}
+
+impl TestBinding<'_, '_> {
+    fn slots(&self) -> impl Iterator<Item = u16> + '_ {
+        std::iter::once(self.slot).chain(self.more.iter().copied())
+    }
 }
 
 impl<'a, 'c> AssignedTest<'a, 'c> {
     pub(super) fn arm_entry(&self, target: usize) -> Option<&Machine<'a, 'c>> {
-        match self.edges {
-            AssignmentEdges::One(assigned) if assigned == target => Some(&self.state),
-            AssignmentEdges::Both => Some(&self.state),
-            _ => None,
-        }
+        [self.primary.as_ref(), self.secondary.as_deref()].into_iter().flatten()
+            .find(|binding| binding.target.is_none_or(|assigned| assigned == target))
+            .map(|binding| &binding.state)
     }
 
     pub(super) fn has_arm_binding(&self) -> bool {
-        !matches!(self.edges, AssignmentEdges::Neither)
+        self.primary.is_some()
+    }
+
+    pub(super) fn prefer_join_locals(&self, machine: &mut Machine<'a, 'c>) {
+        let Some(primary) = &self.primary else { return };
+        for slot in primary.slots() {
+            machine.prefer_test_local(&primary.state, slot);
+        }
+        if let Some(secondary) = &self.secondary {
+            for slot in secondary.slots().filter(|&slot| !primary.slots().any(|other| other == slot)) {
+                machine.prefer_test_local(&secondary.state, slot);
+            }
+        }
+    }
+
+    pub(super) fn into_declarations(self) -> impl Iterator<Item = Document> {
+        std::iter::once(self.declaration).chain(self.more)
     }
 }
 

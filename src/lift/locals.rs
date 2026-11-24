@@ -919,25 +919,37 @@ impl<'c> Machine<'_, 'c> {
         (ty == value.ty).then_some(!same)
     }
 
-    /// A decision graph may split an initialized slot into a separate source
-    /// declaration, but it may not change its category or evict a wide neighbor.
-    pub(crate) fn has_only_predicate_local(&self, evaluated: &Self, index: u16) -> bool {
-        let index = usize::from(index);
-        self.initialized_this == evaluated.initialized_this
-            && self.early_final_fields == evaluated.early_final_fields
-            && self.locals.slots.iter().zip(&evaluated.locals.slots).enumerate().all(
-                |(slot, (before, after))| {
-                    if slot == index {
-                        after.as_ref().is_some_and(|new| {
-                            before.as_ref().is_none_or(|old| {
-                                !old.receiver && old.ty == new.ty && old != new
-                            })
-                        })
-                    } else {
-                        before == after
-                    }
-                },
-            )
+    /// Stage a new declaration without changing the unrelated slots in the
+    /// canonical state. The caller checks any overlaps against the actual
+    /// lifted state before accepting the predicate.
+    pub(crate) fn adopt_predicate_local(&mut self, evaluated: &Self, index: u16) -> Option<()> {
+        let slot = usize::from(index);
+        let new = evaluated.locals.slots.get(slot)?.as_ref()?;
+        if self.locals.slots.get(slot)?.as_ref().is_some_and(|old| {
+            old.receiver || old.ty != new.ty || old == new
+        }) {
+            return None;
+        }
+        self.prefer_test_local(evaluated, index);
+        Some(())
+    }
+
+    pub(crate) fn predicate_slot_is_fresh(&self, index: u16) -> bool {
+        self.locals.slots.get(usize::from(index)).is_some_and(Option::is_none)
+    }
+
+    pub(crate) fn same_predicate_locals(
+        &self,
+        before: &Self,
+        assigned: &Self,
+        selected: impl Fn(u16) -> bool,
+    ) -> bool {
+        self.initialized_this == before.initialized_this
+            && self.early_final_fields == before.early_final_fields
+            && self.locals.slots.iter().zip(&before.locals.slots).zip(&assigned.locals.slots)
+                .enumerate().all(|(slot, ((actual, old), new))| {
+                    actual == if selected(slot as u16) { new } else { old }
+                })
     }
 
     /// Keep the trial's helper registrations and reconnect the accepted
