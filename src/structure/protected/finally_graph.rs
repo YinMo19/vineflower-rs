@@ -1,5 +1,6 @@
 // Copyright 2000-2020 JetBrains s.r.o. Use of this source code is governed by the Apache 2.0 license that can be found in the LICENSE file.
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
@@ -35,8 +36,63 @@ pub(in crate::structure) struct BranchedFinally {
     pub(in crate::structure) monitor_exit: Option<FinallyMonitorExit>,
     pub(in crate::structure) shared_return: Option<SharedReturn>,
     pub(in crate::structure) loop_targets: BTreeSet<usize>,
-    pub(super) nested_handlers: BTreeSet<usize>,
+    pub(super) nested_handlers: BTreeMap<usize, NestedHandler>,
     pub(super) copied_routes: BTreeSet<Route>,
+}
+
+pub(super) enum NestedHandler {
+    Catch,
+    Finally(NestedFinally),
+}
+
+pub(super) struct NestedFinally {
+    block: usize,
+    code: Range<usize>,
+}
+
+impl NestedFinally {
+    /// Compare the cleanup, not the compiler's private store/rethrow pair.
+    /// An isolated, optionally self-protected store is not a throwing block.
+    fn prove(
+        instructions: &[Instruction],
+        graph: &ControlFlowGraph,
+        routes: &[Vec<Route>],
+        handler: usize,
+    ) -> Option<Self> {
+        let entry = &graph.blocks[handler];
+        let store = &instructions[entry.instructions.start];
+        let slot = reference_store(store)?;
+        let binding = cleanup_locals::binding_slot(store)?;
+        let (block, start) = if entry.instructions.len() == 1 {
+            let &[next] = entry.successors.as_slice() else { return None; };
+            let body = &graph.blocks[next];
+            if body.predecessors != [handler]
+                || !body.exception_predecessors.is_empty()
+                || !routes[handler].is_empty()
+            {
+                return None;
+            }
+            (next, body.instructions.start)
+        } else {
+            (handler, entry.instructions.start + 1)
+        };
+        let body = &graph.blocks[block];
+        let [code @ .., load, throw] = &instructions[start..body.instructions.end] else {
+            return None;
+        };
+        if reference_load(load) != Some(slot)
+            || throw.opcode != 0xbf
+            || code.iter().any(|op| local_touches(op, slot))
+            || body.exception_successors.contains(&handler)
+            || (!body.exception_successors.is_empty()
+                && cleanup_locals::live_at_any(
+                    instructions, graph, body.exception_successors.iter().copied(), binding,
+                ))
+        {
+            return None;
+        }
+        Some(Self { block, code: start..start + code.len() })
+    }
 }
 
 pub(in crate::structure) struct FinallyMonitorExit {
@@ -226,7 +282,7 @@ impl ReturnResume {
                     || cleanup_locals::store(&instructions[store]) != Some(local)
                     || !routes[block].is_empty()
                     || copy.iter().any(|&block| !routes[block].is_empty())
-                    || cleanup_locals::live_at_any(instructions, graph, targets, local)
+                    || cleanup_locals::live_at_any(instructions, graph, targets.iter().copied(), local)
                     || instructions[node.instructions.start..load].iter().any(|op| local.touches(op))
                     || copy.iter().any(|&block| {
                         instructions[graph.blocks[block].instructions.clone()].iter().any(|op| local.touches(op))
@@ -285,7 +341,7 @@ impl BranchedFinally {
         let mut cleanup = BTreeSet::new();
         let mut rethrow = None;
         let mut boundary = BTreeSet::new();
-        let mut nested_handlers = BTreeSet::new();
+        let mut nested_handlers = BTreeMap::new();
         let mut pending = vec![entry];
         while let Some(index) = pending.pop() {
             if !dominance.contains(handler, index) {
@@ -302,10 +358,24 @@ impl BranchedFinally {
             if monitor.is_none() {
                 for &route in &routes[index] {
                     if route.handler != handler && dominance.contains(handler, route.handler) {
-                        if route.catch_type == 0 {
-                            return None;
+                        let is_finally = route.catch_type == 0;
+                        match nested_handlers.entry(route.handler) {
+                            Entry::Occupied(kind) => {
+                                if matches!(kind.get(), NestedHandler::Finally(_)) != is_finally {
+                                    return None;
+                                }
+                            }
+                            Entry::Vacant(kind) => {
+                                let proof = if is_finally {
+                                    NestedHandler::Finally(NestedFinally::prove(
+                                        instructions, graph, routes, route.handler,
+                                    )?)
+                                } else {
+                                    NestedHandler::Catch
+                                };
+                                kind.insert(proof);
+                            }
                         }
-                        nested_handlers.insert(route.handler);
                         pending.push(route.handler);
                     }
                 }
@@ -342,7 +412,7 @@ impl BranchedFinally {
         }
         if cleanup.iter().any(|&index| {
             let block = &graph.blocks[index];
-            if nested_handlers.contains(&index) {
+            if nested_handlers.contains_key(&index) {
                 !block.predecessors.is_empty()
                     || block.exception_predecessors.iter().any(|pred| !cleanup.contains(pred))
             } else {
@@ -652,8 +722,39 @@ impl BranchedFinally {
         let mut renamed = BTreeSet::new();
         let can_rename = monitor.is_none() && departure.is_none() && self.nested_handlers.is_empty();
         let mut local_renames = cleanup_locals::Renames::default();
+        let empty_tail = self.tail.filter(|_| {
+            self.tail_code.is_empty()
+                && self
+                    .nested_handlers
+                    .values()
+                    .any(|kind| matches!(kind, NestedHandler::Finally(_)))
+        });
         let mut pending = vec![(self.entry, sample_start)];
-        while let Some((pattern, sample)) = pending.pop() {
+        while let Some((mut pattern, mut sample)) = pending.pop() {
+            if let Some(tail) = empty_tail {
+                // A nested finally can leave a private goto after its inline
+                // cleanup in only one copy, before the outer cleanup resumes.
+                let mut endpoint = pattern;
+                while self.blocks.contains(&endpoint)
+                    && let Some(next) = private_forward_goto(instructions, graph, routes, endpoint)
+                {
+                    endpoint = next;
+                }
+                if endpoint == tail {
+                    pattern = tail;
+                    while sample != sample_start
+                        && let Some(next) = private_forward_goto(instructions, graph, routes, sample)
+                    {
+                        if self.blocks.contains(&sample) || body.contains(&sample)
+                            || !copies.insert(sample)
+                        {
+                            return None;
+                        }
+                        removed.insert(sample);
+                        sample = next;
+                    }
+                }
+            }
             if self.loop_targets.contains(&pattern)
                 || self.shared_return.is_some_and(|exit| exit.block == pattern)
             {
@@ -672,21 +773,41 @@ impl BranchedFinally {
                 return None;
             }
             paired.insert(pattern, sample);
-            let expected = &graph.blocks[pattern];
-            let actual = &graph.blocks[sample];
+            let nested = self.nested_handlers.get(&pattern);
+            let (pattern_block, sample_block, rethrows) =
+                if let Some(NestedHandler::Finally(expected)) = nested {
+                    let actual = NestedFinally::prove(instructions, graph, routes, sample)?;
+                    if actual.block != sample {
+                        if self.blocks.contains(&actual.block)
+                            || body.contains(&actual.block)
+                            || !copies.insert(actual.block)
+                        {
+                            return None;
+                        }
+                        removed.insert(sample);
+                    }
+                    (
+                        expected.block,
+                        actual.block,
+                        Some((expected.code.clone(), actual.code)),
+                    )
+                } else {
+                    (pattern, sample, None)
+                };
+            let expected = &graph.blocks[pattern_block];
+            let actual = &graph.blocks[sample_block];
             let trim = Some(pattern) == self.tail;
-            let nested = self.nested_handlers.contains(&pattern);
             if !trim || !self.tail_code.is_empty() {
-                if (!nested
+                if (nested.is_none()
                     && !(sample == sample_start && sample_binding.is_some())
                     && !actual.exception_predecessors.is_empty())
-                    || (nested && !actual.predecessors.is_empty())
-                    || routes[pattern].len() != routes[sample].len()
+                    || (nested.is_some() && !graph.blocks[sample].predecessors.is_empty())
+                    || routes[pattern_block].len() != routes[sample_block].len()
                 {
                     return None;
                 }
-                for (&expected, &actual) in routes[pattern].iter().zip(&routes[sample]) {
-                    if self.nested_handlers.contains(&expected.handler) {
+                for (&expected, &actual) in routes[pattern_block].iter().zip(&routes[sample_block]) {
+                    if self.nested_handlers.contains_key(&expected.handler) {
                         if expected.catch_type != actual.catch_type || expected.handler == actual.handler {
                             return None;
                         }
@@ -697,23 +818,23 @@ impl BranchedFinally {
                     }
                 }
             }
-            let start = expected.instructions.start + usize::from(pattern == handler || nested);
-            let actual_start = actual.instructions.start
-                + usize::from(nested || (sample == sample_start && sample_binding.is_some()));
-            if nested {
-                let left = reference_store(&instructions[expected.instructions.start])?;
-                let right = reference_store(&instructions[actual.instructions.start])?;
-                if left != right {
-                    renamed.extend([left, right]);
-                }
-            }
-            let end = if trim {
-                self.tail_code.end
+            let (mut expected_code, mut actual_code) = if let Some((expected, actual)) = rethrows {
+                (&instructions[expected], &instructions[actual])
             } else {
-                expected.instructions.end
+                let start = expected.instructions.start
+                    + usize::from(pattern == handler || nested.is_some());
+                let actual_start = actual.instructions.start
+                    + usize::from(nested.is_some() || (sample == sample_start && sample_binding.is_some()));
+                if matches!(nested, Some(NestedHandler::Catch)) {
+                    let left = reference_store(&instructions[expected.instructions.start])?;
+                    let right = reference_store(&instructions[actual.instructions.start])?;
+                    if left != right {
+                        renamed.extend([left, right]);
+                    }
+                }
+                let end = if trim { self.tail_code.end } else { expected.instructions.end };
+                (&instructions[start..end], &instructions[actual_start..actual.instructions.end])
             };
-            let mut expected_code = &instructions[start..end];
-            let mut actual_code = &instructions[actual_start..actual.instructions.end];
             if !trim && expected.successors.len() == 1 && actual.successors.len() == 1 {
                 // An inlined cleanup can jump over the exception handler
                 // where the handler's copy simply falls through. The
@@ -744,7 +865,7 @@ impl BranchedFinally {
                 {
                     return None;
                 }
-                removed.insert(sample);
+                removed.insert(sample_block);
                 if let Some((edge, owner)) = departure
                     && edge.source == pattern
                 {
@@ -795,7 +916,7 @@ impl BranchedFinally {
                 return None;
             }
         }
-        for &pattern in &self.nested_handlers {
+        for &pattern in self.nested_handlers.keys() {
             let &sample = paired.get(&pattern)?;
             if graph.blocks[sample].exception_predecessors.iter().any(|pred| !removed.contains(pred)) {
                 return None;
@@ -983,6 +1104,22 @@ fn goto_only(instructions: &[Instruction], graph: &ControlFlowGraph, block: usiz
     let &[next] = node.successors.as_slice() else { return None; };
     matches!(&instructions[node.instructions.clone()], [Instruction { opcode: 0xa7 | 0xc8, .. }])
         .then_some(next)
+}
+
+fn private_forward_goto(
+    instructions: &[Instruction],
+    graph: &ControlFlowGraph,
+    routes: &[Vec<Route>],
+    block: usize,
+) -> Option<usize> {
+    let node = &graph.blocks[block];
+    if node.predecessors.len() != 1
+        || !node.exception_predecessors.is_empty()
+        || !routes[block].is_empty()
+    {
+        return None;
+    }
+    goto_only(instructions, graph, block).filter(|&next| next > block)
 }
 
 fn explicit_jump(

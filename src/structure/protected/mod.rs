@@ -324,7 +324,7 @@ impl Exceptions {
                 };
                 if let Some(branch) = &mut plan.branched {
                     copied_routes.append(&mut branch.copied_routes);
-                    for handler in std::mem::take(&mut branch.nested_handlers) {
+                    for handler in std::mem::take(&mut branch.nested_handlers).into_keys() {
                         nested_finally_departures.extend(branch.loop_targets.iter().map(|&target| (handler, target)));
                     }
                 }

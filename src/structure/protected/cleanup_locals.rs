@@ -124,10 +124,10 @@ pub(super) fn reads(instruction: &Instruction, slot: u16) -> bool {
 pub(super) fn live_at_any(
     instructions: &[Instruction],
     graph: &ControlFlowGraph,
-    starts: &BTreeSet<usize>,
+    starts: impl IntoIterator<Item = usize>,
     value: Local,
 ) -> bool {
-    let mut pending: Vec<_> = starts.iter().copied().collect();
+    let mut pending: Vec<_> = starts.into_iter().collect();
     let mut seen = BTreeSet::new();
     'walk: while let Some(block) = pending.pop() {
         if !seen.insert(block) {
@@ -210,7 +210,7 @@ pub(super) fn dead_after_copy(
             })),
         }
     }
-    !live_at_any(instructions, graph, &exits, value)
+    !live_at_any(instructions, graph, exits, value)
 }
 
 fn local(instruction: &Instruction, indexed: u8, implicit: u8) -> Option<Local> {
