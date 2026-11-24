@@ -1462,6 +1462,8 @@ impl Emitter<'_> {
             .unwrap_or_default()
             .into_iter();
         let mut closing_return = None;
+        let mut implicit_break = None;
+        let mut empty_default = None;
         let mut groups = groups.into_iter().peekable();
         while let Some((target, keys, fallthrough)) = ordered
             .next()
@@ -1476,6 +1478,11 @@ impl Emitter<'_> {
             })
         {
             let last = ordered.len() == 0 && groups.peek().is_none();
+            let prior_implicit_break = implicit_break.take();
+            let default_line = (last && !numeric && !scoped_arms && labeled_tail.is_none()
+                && target == default && join == Some(default) && keys.is_empty()
+                && !arms.is_empty())
+                .then_some(self.lines.len());
             let arm_region = if let Some(next) = fallthrough {
                 switch_region.branch(Some(next))
             } else {
@@ -1507,15 +1514,21 @@ impl Emitter<'_> {
                         self.push(depth + 2, statement, mem::take(&mut offsets));
                     }
                 } else {
+                    if let Some(line) = default_line
+                        && arm.start == arm.end && arm.offsets.is_empty()
+                    {
+                        empty_default = Some((line, prior_implicit_break));
+                    }
                     arms.push(arm);
                     if labeled_tail.is_none() || !last {
                         let direct_exit = join
-                            .filter(|&join| {
-                                numeric && self.graph.blocks[target].successors.as_slice() == [join]
-                            })
+                            .filter(|&join| self.graph.blocks[target].successors.as_slice() == [join])
                             .map(|_| &instructions[self.graph.blocks[target].instructions.end - 1]);
                         let jump = direct_exit.filter(|op| matches!(op.opcode, 0xa7 | 0xc8));
                         if !last || direct_exit.is_none() || jump.is_some() {
+                            if direct_exit.is_some() && jump.is_none() {
+                                implicit_break = Some(self.lines.len());
+                            }
                             // A structural break owns the jump site, not the
                             // encoded destination bytes of the JVM branch.
                             let mapped = jump.map_or_else(Vec::new, |op| vec![op.offset]);
@@ -1552,7 +1565,20 @@ impl Emitter<'_> {
         let join = join.expect("reached a switch join");
         let exits = arms.iter().collect::<Vec<_>>();
         let (declarations, assignments) = self.merge_arms(machine, join, &exits)?;
+        if let Some((line, trailing_break)) = empty_default
+            && assignments.last().is_some_and(Vec::is_empty)
+        {
+            // The unmatched selector is a real incoming edge even when it
+            // needs no source label. Omit it only after edge-copy analysis.
+            self.lines.drain(line..self.lines.len() - 1);
+            if let Some(line) = trailing_break {
+                self.lines.remove(line);
+            }
+        }
         for (arm, assignments) in arms.into_iter().zip(assignments).rev() {
+            if assignments.is_empty() {
+                continue;
+            }
             let mut offsets = arm.offsets;
             self.lines.splice(
                 arm.end..arm.end,
