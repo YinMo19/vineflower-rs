@@ -16,6 +16,7 @@ use super::{
     syntax::{identifier, qualified},
 };
 
+mod casts;
 mod control;
 mod decisions;
 mod defaults;
@@ -102,6 +103,7 @@ enum ExprKind<'a> {
     ThisProperty { name: &'a str, primitive: Primitive },
     ClassLiteral(&'a str),
     Conditional(Box<Conditional<'a>>),
+    SafeCastComparison(Box<casts::Comparison<'a>>),
     Nullable(Box<nullable::Expression<'a>>),
 }
 
@@ -443,6 +445,11 @@ impl<'a, 'data> Bytecode<'a, 'data> {
             .iter()
             .position(|instruction| matches!(instruction.operand, Operand::Branch(_)))
         {
+            if let Some(expression) = casts::lower(
+                self, instructions, &locals, &code, (returns, &descriptor.return_type), declaration,
+            )? {
+                return self.return_expression(expression, instructions, &code, trace, None);
+            }
             if let Some(plan) = nullable::lower(
                 self,
                 &decoded,
@@ -1240,6 +1247,7 @@ impl<'a> Expr<'a> {
             ExprKind::Literal(Literal::Int(_))
             | ExprKind::Compare(_)
             | ExprKind::Not(_)
+            | ExprKind::SafeCastComparison(_)
             | ExprKind::TypeTest { .. } => Some(0x15),
             ExprKind::Literal(Literal::Long(_)) => Some(0x16),
             ExprKind::Literal(Literal::Float(_)) => Some(0x17),
@@ -1288,7 +1296,7 @@ impl<'a> Expr<'a> {
             ExprKind::Literal(Literal::Float(_)) => Some(Primitive::Float),
             ExprKind::Literal(Literal::Double(_)) => Some(Primitive::Double),
             ExprKind::Literal(_) | ExprKind::CatchLocal(_) | ExprKind::CatchMessage(_) => None,
-            ExprKind::Compare(_) | ExprKind::Not(_) | ExprKind::TypeTest { .. } => {
+            ExprKind::Compare(_) | ExprKind::Not(_) | ExprKind::TypeTest { .. } | ExprKind::SafeCastComparison(_) => {
                 Some(Primitive::Boolean)
             }
             ExprKind::BoxedInt(_) => None,
@@ -1450,6 +1458,9 @@ impl<'a> Expr<'a> {
             }
             ExprKind::Nullable(expression) => {
                 expression.write(out, expected, parameters, declaration, binding)?
+            }
+            ExprKind::SafeCastComparison(comparison) => {
+                comparison.write(out, expected, parameters, declaration, binding)?
             }
             ExprKind::TypeTest {
                 operand,

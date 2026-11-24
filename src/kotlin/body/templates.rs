@@ -433,7 +433,8 @@ fn actual<'a>(expr: &'a Expr<'_>, locals: &'a Locals<'_>) -> Shape<'a> {
             && [ &pair.0, &pair.1 ].into_iter().any(|operand|
                 actual(operand, locals) == Shape::Primitive(Primitive::Boolean)) => Shape::Primitive(Primitive::Boolean),
         ExprKind::Binary(_, primitive, _) | ExprKind::ThisProperty { primitive, .. } => Shape::Primitive(*primitive),
-        ExprKind::Compare(_) | ExprKind::Not(_) | ExprKind::TypeTest { .. } => Shape::Primitive(Primitive::Boolean),
+        ExprKind::Compare(_) | ExprKind::Not(_) | ExprKind::TypeTest { .. }
+        | ExprKind::SafeCastComparison(_) => Shape::Primitive(Primitive::Boolean),
         ExprKind::BoxedInt(_) => Shape::Object("java/lang/Integer"),
         ExprKind::ClassLiteral(_) => Shape::Object(CLASS),
         ExprKind::Conditional(_) | ExprKind::Nullable(_) => Shape::Unknown,

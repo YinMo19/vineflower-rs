@@ -12,7 +12,7 @@ pub(super) const MULTIPLICATIVE: u8 = 7;
 pub(super) const ADDITIVE: u8 = 6;
 pub(super) const INFIX: u8 = 5;
 pub(super) const RELATIONAL: u8 = 4;
-const EQUALITY: u8 = 3;
+pub(super) const EQUALITY: u8 = 3;
 const AND: u8 = 2;
 const OR: u8 = 1;
 
