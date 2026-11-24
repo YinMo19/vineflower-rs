@@ -647,6 +647,7 @@ impl Emitter<'_> {
         let held = machine.hold_control_stack(&control)?;
         let prelude = machine.take_prelude();
         let labeled_tail = region.label_scope().and_then(|scope| scope.head_tail(block));
+        let mut assigned_test = None;
         if let Some(local) = &mut binding {
             if !self.collapse_instanceof_guard(
                 block,
@@ -671,16 +672,26 @@ impl Emitter<'_> {
         )? {
             binding = proof;
         } else if labeled_tail.is_none() {
-            self.collapse_condition(
+            assigned_test = self.collapse_assigned_test(
                 block,
                 region,
                 machine,
-                depth,
                 &mut condition,
                 offsets,
                 &mut control,
-            )?;
-            self.collapse_decision_graph(block, region, machine, &mut condition, offsets, &mut control);
+            );
+            if assigned_test.is_none() {
+                self.collapse_condition(
+                    block,
+                    region,
+                    machine,
+                    depth,
+                    &mut condition,
+                    offsets,
+                    &mut control,
+                )?;
+                self.collapse_decision_graph(block, region, machine, &mut condition, offsets, &mut control);
+            }
         }
         let Condition {
             taken,
@@ -770,15 +781,24 @@ impl Emitter<'_> {
         let test = (&condition, &inverse, condition_facts);
 
         let start = self.lines.len();
-        let then =
-            self.instanceof_branch_arm(then_at, arm_region, machine, depth + 1, binding.as_ref())?;
+        let arm_entry = |target| {
+            assigned_test
+                .as_ref()
+                .filter(|test| test.target == target)
+                .map_or(&*machine, |test| &test.state)
+        };
+        let then = self.instanceof_branch_arm(
+            then_at, arm_region, arm_entry(then_at), depth + 1, binding.as_ref(),
+        )?;
         let else_depth = if guard_clause { depth } else { depth + 1 };
-        let otherwise =
-            self.instanceof_branch_arm(else_at, arm_region, machine, else_depth, binding.as_ref())?;
+        let otherwise = self.instanceof_branch_arm(
+            else_at, arm_region, arm_entry(else_at), else_depth, binding.as_ref(),
+        )?;
         if guard_clause && then.exit.is_some() {
             return Err(self.unstructured(block));
         }
-        if start == otherwise.end
+        if assigned_test.is_none()
+            && start == otherwise.end
             && let (Some(yes), Some(no)) = (&then.exit, &otherwise.exit)
             && yes.same_locals(machine)
             && no.same_locals(machine)
@@ -801,6 +821,7 @@ impl Emitter<'_> {
             return Err(self.unstructured(block));
         }
         if binding.is_none()
+            && assigned_test.is_none()
             && let Some(mut line) = self.combine_boolean_returns([&then, &otherwise], depth, test)
         {
             for statement in prelude {
@@ -820,6 +841,9 @@ impl Emitter<'_> {
         let (declarations, assignments) = if exits.is_empty() {
             (Vec::new(), Vec::new())
         } else {
+            if let Some(test) = &assigned_test {
+                machine.prefer_test_local(&test.state, test.slot);
+            }
             self.merge_arms(machine, join.expect("reached an if join"), &exits)?
         };
         let mut assignments = assignments.into_iter();
@@ -852,6 +876,9 @@ impl Emitter<'_> {
         let mut header = Vec::new();
         for statement in prelude {
             header.push(Line::new(depth, statement, mem::take(offsets)));
+        }
+        if let Some(test) = assigned_test {
+            header.push(Line::new(depth, test.declaration, Vec::new()));
         }
         header.extend(
             declarations

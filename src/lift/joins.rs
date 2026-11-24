@@ -95,6 +95,31 @@ pub(crate) struct ConditionalStackMerge {
 }
 
 impl Machine<'_, '_> {
+    /// A short-circuited test can introduce a source declaration while only
+    /// its evaluated edge has a JVM binding. Do not lose an existing slot,
+    /// including a wide binding that overlaps the new one.
+    pub(crate) fn has_fresh_test_local(&self, evaluated: &Self, slot: u16) -> bool {
+        let slot = usize::from(slot);
+        self.initialized_this == evaluated.initialized_this
+            && self.early_final_fields == evaluated.early_final_fields
+            && self.locals.slots.iter().zip(&evaluated.locals.slots).enumerate().all(
+                |(index, (before, after))| {
+                    if index == slot {
+                        before.is_none() && after.is_some()
+                    } else {
+                        before == after
+                    }
+                },
+            )
+    }
+
+    /// Prefer the declared test variable as the output binding after both
+    /// real edge states have been lifted. It is not an input to the skipped arm.
+    pub(crate) fn prefer_test_local(&mut self, evaluated: &Self, slot: u16) {
+        let slot = usize::from(slot);
+        self.locals.slots[slot].clone_from(&evaluated.locals.slots[slot]);
+    }
+
     pub(crate) fn loop_binding_type(&self, slot: u16) -> Option<&Type> {
         Some(&self.locals.slots.get(usize::from(slot))?.as_ref()?.ty)
     }
