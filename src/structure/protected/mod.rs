@@ -705,6 +705,29 @@ impl Exceptions {
             .then(|| finally.plan.instructions.clone())
     }
 
+    /// The continuation of a linear, rethrowing finally has one incoming
+    /// normal copy. Its matched prefix executes in full on that edge.
+    pub(super) fn linear_finally_resume(
+        &self,
+        shape: &ProtectedRegion,
+        graph: &ControlFlowGraph,
+        join: usize,
+    ) -> Option<Range<usize>> {
+        let finally = shape.finally.as_ref()?;
+        let landing = &graph.blocks[join];
+        let &[copy] = landing.predecessors.as_slice() else { return None; };
+        (!finally.plan.instructions.is_empty()
+            && finally.plan.branched.is_none()
+            && finally.plan.terminal_copies.is_none()
+            && shape.catches.is_empty()
+            && landing.exception_predecessors.is_empty()
+            && self.arms[shape.body.0].blocks.contains(&copy)
+            && self.cleanup_forward.contains(&copy)
+            && self.cleanup_prefix(copy) == finally.plan.instructions.len()
+            && self.cleanup_prefix(join) == 0)
+            .then(|| finally.plan.instructions.clone())
+    }
+
     fn add_arm(&mut self, region: ExceptionId, blocks: BTreeSet<usize>) -> ArmId {
         let id = ArmId(self.arms.len());
         self.arms.push(Arm { region, blocks });

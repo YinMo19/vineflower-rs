@@ -433,10 +433,53 @@ impl Emitter<'_> {
                 }
             }
             Self::record_finally_label_completion(region, shape.body, terminal, &body);
-            Self::check_scope(body, machine, self.offset(finally.block()))?;
+            if reaches_join
+                && !body.same_locals(machine)
+                && let Some(join) = continuation
+                && let Some(code) = exceptions.linear_finally_resume(shape, self.graph, join)
+            {
+                Self::check_scope(body.clone(), machine, self.offset(terminal))?;
+                self.finish_linear_finally_locals(machine, &body, code, join, depth, body_lines)?;
+            } else {
+                Self::check_scope(body, machine, self.offset(terminal))?;
+            }
         }
         self.syntax(depth, "}");
         Ok(if reaches_join { continuation } else { None })
+    }
+
+    fn finish_linear_finally_locals<'a, 'c>(
+        &mut self,
+        machine: &mut Machine<'a, 'c>,
+        cleanup: &Machine<'a, 'c>,
+        code: Range<usize>,
+        join: usize,
+        depth: usize,
+        try_line: usize,
+    ) -> Result<(), StructureError> {
+        let offset = self.offset(join);
+        // Only stores in the matched cleanup can establish a new binding.
+        // Declare it before the try, but leave its evaluation in the finally.
+        // Abrupt completion skips the continuation and needs no assignment.
+        let written: Vec<_> = code
+            .filter(|&index| !self.exceptions.skips_instruction(index))
+            .filter_map(|index| cleanup_locals::store(&self.instructions[index]))
+            .filter_map(|local| local.slots().next())
+            .collect();
+        let locals = machine.merge_locals(&[cleanup], offset, |slot| {
+            written.contains(&slot) && self.local_is_live(join, slot)
+        })?;
+        let cleanup_end = self.lines.len();
+        for copy in locals.arms.into_iter().flatten() {
+            if !self.lines[..cleanup_end].last_mut().is_some_and(|line| copy.fuse(&mut line.text)) {
+                self.push(depth + 1, copy.statement, Vec::new());
+            }
+        }
+        self.lines.splice(
+            try_line..try_line,
+            locals.declarations.into_iter().map(|text| Line::new(depth, text, Vec::new())),
+        );
+        Ok(())
     }
 
     fn fuse_resource_wrapper(&mut self, wrapper: usize, depth: usize) {
