@@ -559,14 +559,11 @@ impl Emitter<'_> {
         let mut along = machine.clone();
         for test in &site.tests {
             let ops = &self.instructions[self.graph.blocks[test.block].instructions.clone()];
-            let Some((branch, operands)) = ops.split_last() else {
+            let Some(branch) = ops.last() else {
                 return Err(StructureError::Assertion);
             };
-            for op in operands {
-                if !matches!(along.step(op), Ok(Effect::None)) || !along.take_prelude().is_empty() {
-                    return Err(StructureError::Assertion);
-                }
-            }
+            lift_operands(&mut along, ops, &mut assert_offsets)?;
+            let needs_parens = site.tests.len() > 1 && along.assertion_test_needs_parens(branch, test.taken);
             let Ok(Effect::Branch {
                 when_true,
                 when_false,
@@ -581,11 +578,12 @@ impl Emitter<'_> {
             {
                 return Err(StructureError::Assertion);
             }
-            conditions.push((
-                if test.taken { when_true } else { when_false },
-                test.combine,
-            ));
-            assert_offsets.extend(ops.iter().flat_map(offsets_of));
+            let mut condition = if test.taken { when_true } else { when_false };
+            if needs_parens {
+                condition.surround("(", ")");
+            }
+            conditions.push((condition, test.combine));
+            assert_offsets.extend(offsets_of(branch));
         }
         let condition = conditions
             .into_iter()
@@ -601,21 +599,21 @@ impl Emitter<'_> {
 
         let mut failure = along;
         let ops = &self.instructions[self.graph.blocks[site.failure].instructions.clone()];
-        let [prefix @ .., constructor, _] = ops else {
+        let [allocation, duplicate, .., constructor, _] = ops else {
             unreachable!("proven assertion throw")
         };
-        for op in prefix {
+        for op in [allocation, duplicate] {
             if !matches!(failure.step(op), Ok(Effect::None)) || !failure.take_prelude().is_empty() {
                 return Err(StructureError::Assertion);
             }
         }
+        lift_operands(&mut failure, &ops[2..ops.len() - 1], &mut assert_offsets)?;
         let detail = failure
-            .take_assertion_detail(constructor, prefix[0].offset, site.detail)
+            .take_assertion_detail(constructor, allocation.offset, site.detail)
             .map_err(|_| StructureError::Assertion)?;
         if !failure.same_locals(machine) {
             return Err(StructureError::Assertion);
         }
-        assert_offsets.extend(prefix[2..].iter().flat_map(offsets_of));
         // The synthetic guard, allocation and athrow have no source token.
         // The condition's inversion inherits invokespecial's upstream mapping.
         if !site.tests.is_empty() {
@@ -640,6 +638,45 @@ impl Emitter<'_> {
         self.push(depth, text, mem::take(offsets));
         Ok(Some(site.continuation))
     }
+}
+
+/// Lift only the operands before the final branch or constructor. In
+/// particular, a dup/store must leave its assignment in the expression:
+/// taking a statement or a spill out of the guard would evaluate it when
+/// assertions are disabled (or, for a detail, when the assertion passes).
+fn lift_operands(
+    machine: &mut Machine<'_, '_>,
+    mut ops: &[Instruction],
+    offsets: &mut Vec<u32>,
+) -> Result<(), StructureError> {
+    while let [op, _, ..] = ops {
+        let folded = if matches!(op.opcode, 0x59..=0x73 | 0x78..=0x83) {
+            machine.step_assertion_assignment(ops).map_err(|_| StructureError::Assertion)?
+        } else {
+            None
+        };
+        let consumed = if let Some(step) = folded {
+            if step.consumed >= ops.len()
+                || step.declaration.is_some()
+                || !matches!(step.effect, Effect::None)
+                || !machine.take_prelude().is_empty()
+            {
+                return Err(StructureError::Assertion);
+            }
+            offsets.extend(ops[..step.consumed].iter()
+                .filter(|op| !matches!(op.opcode, 0x59..=0x5e))
+                .flat_map(offsets_of));
+            step.consumed
+        } else {
+            if !matches!(machine.step(op), Ok(Effect::None)) || !machine.take_prelude().is_empty() {
+                return Err(StructureError::Assertion);
+            }
+            offsets.extend(offsets_of(op));
+            1
+        };
+        ops = &ops[consumed..];
+    }
+    Ok(())
 }
 
 fn offsets_of(op: &Instruction) -> std::ops::Range<u32> {

@@ -3,7 +3,7 @@ use crate::{
     bytecode::{Instruction, Operand},
     classfile::{Constant, ConstantPool},
     descriptor::{Primitive, Type},
-    source_text::Document,
+    source_text::{Document, Infix},
 };
 
 use super::{
@@ -141,6 +141,11 @@ impl LocalWrite {
     }
 }
 
+pub(super) struct LocalDestination {
+    pub(super) declaration: bool,
+    pub(super) boolean_literal: bool,
+}
+
 /// Identity introduced by an actual JVM duplication, never by matching text.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct StackAlias {
@@ -276,6 +281,7 @@ struct Candidate<'a> {
     operands: usize,
     leaves_value: bool,
     declaration: bool,
+    boolean_literal: bool,
 }
 
 impl Machine<'_, '_> {
@@ -288,12 +294,40 @@ impl Machine<'_, '_> {
         }
     }
 
+    /// `ifeq`/`ifne` use a boolean operand as-is on their positive path.
+    /// When that path is part of an assertion's short-circuit expression,
+    /// retain the precedence that the branch's document otherwise loses.
+    pub(crate) fn assertion_test_needs_parens(&self, branch: &Instruction, taken: bool) -> bool {
+        matches!((branch.opcode, taken), (0x99, false) | (0x9a, true))
+            && self.stack.last().is_some_and(|value| {
+                value.ty == BOOLEAN && value.precedence < Infix::AND.precedence
+            })
+    }
+
     /// Recover a read/modify/write or a proven store alias before generic dup
     /// lowering spills it. The caller supplies a single straight-line region.
     pub(crate) fn step_assignment(
         &mut self,
         instructions: &[Instruction],
         permits: impl Fn(usize, &Instruction) -> bool,
+    ) -> Result<Option<AssignmentStep>, LiftError> {
+        self.step_assignment_in(instructions, permits, false)
+    }
+
+    /// An assertion supplies one complete, already-owned operand block and
+    /// can retain a field write or a 0/1 assignment used by its final test.
+    pub(crate) fn step_assertion_assignment(
+        &mut self,
+        instructions: &[Instruction],
+    ) -> Result<Option<AssignmentStep>, LiftError> {
+        self.step_assignment_in(instructions, |_, _| true, true)
+    }
+
+    fn step_assignment_in(
+        &mut self,
+        instructions: &[Instruction],
+        permits: impl Fn(usize, &Instruction) -> bool,
+        assertion: bool,
     ) -> Result<Option<AssignmentStep>, LiftError> {
         let Some(first) = instructions.first() else { return Ok(None) };
         if first.opcode == 0x5c
@@ -302,7 +336,15 @@ impl Machine<'_, '_> {
             return Ok(Some(step));
         }
         let candidate = if matches!(first.opcode, 0x59..=0x5e) {
-            self.duplicated_assignment(instructions)
+            let boolean_test = assertion && matches!(instructions, [_, store, branch]
+                if matches!(branch.opcode, 0x99 | 0x9a)
+                    && store.offset.checked_add(store.len) == Some(branch.offset));
+            if assertion
+                && let Some(step) = self.duplicated_field_assignment(instructions, &permits, boolean_test)?
+            {
+                return Ok(Some(step));
+            }
+            self.duplicated_assignment(instructions, boolean_test)
         } else if let Some(binary) = Binary::of(first.opcode) {
             self.compound_assignment(instructions, binary)
         } else {
@@ -354,8 +396,11 @@ impl Machine<'_, '_> {
             self.opcode = store.opcode;
             return Ok(Some(AssignmentStep { consumed, effect: Effect::None, declaration: None }));
         }
-        let Candidate { store, target, form, order, operands, leaves_value, declaration } = candidate;
+        let Candidate { store, target, form, order, operands, leaves_value, declaration, boolean_literal } = candidate;
         let mut right = self.pop_raw()?;
+        if boolean_literal {
+            right = self.boolean_value(right);
+        }
         let left = if operands >= 2 { Some(self.pop_raw()?) } else { None };
         let implicit_update = if !leaves_value
             && matches!((form, target), (Form::Compound(_), Target::Local(_)))
@@ -482,7 +527,7 @@ impl Machine<'_, '_> {
         Ok(Some(AssignmentStep { consumed, effect, declaration: None }))
     }
 
-    fn duplicated_assignment<'a>(&self, ops: &'a [Instruction]) -> Option<(usize, Candidate<'a>)> {
+    fn duplicated_assignment<'a>(&self, ops: &'a [Instruction], boolean_test: bool) -> Option<(usize, Candidate<'a>)> {
         let [prefix @ .., value] = self.stack.as_slice() else { return None };
         if value.is_uninitialized(self.initialized_this) || matches!(value.source, Source::Comparison(_)) {
             return None;
@@ -509,7 +554,7 @@ impl Machine<'_, '_> {
             let order = self.join_order(order, Order::at(second.offset)).ok()?;
             return Some((2, Candidate {
                 store: second, target, form: Form::Assign, order: Some(order),
-                operands: 1, leaves_value: true, declaration: false,
+                operands: 1, leaves_value: true, declaration: false, boolean_literal: false,
             }));
         }
         if let Some(target) = LocalWrite::of(second) {
@@ -518,14 +563,15 @@ impl Machine<'_, '_> {
             {
                 return None;
             }
-            let declaration = self.assignment_local_destination(second, target, value)?;
+            let LocalDestination { declaration, boolean_literal } =
+                self.assignment_local_destination(second, target, value, boolean_test)?;
             if declaration && !self.initialized_this {
                 return None;
             }
             let order = self.join_order(value.order, Order::at(second.offset)).ok()?;
             return Some((2, Candidate {
                 store: second, target: Target::Local(target), form: Form::Assign, order: Some(order),
-                operands: 1, leaves_value: true, declaration,
+                operands: 1, leaves_value: true, declaration, boolean_literal,
             }));
         }
 
@@ -544,7 +590,47 @@ impl Machine<'_, '_> {
         let order = self.join_order(value.order, Order::at(store.offset)).ok()?;
         Some((consumed, Candidate {
             store, target, form: Form::Increment { text: increment, postfix: true },
-            order: Some(order), operands: 1, leaves_value: true, declaration: false,
+            order: Some(order), operands: 1, leaves_value: true, declaration: false, boolean_literal: false,
+        }))
+    }
+
+    fn duplicated_field_assignment(
+        &mut self,
+        ops: &[Instruction],
+        permits: &impl Fn(usize, &Instruction) -> bool,
+        boolean_test: bool,
+    ) -> Result<Option<AssignmentStep>, LiftError> {
+        let [dup, store, ..] = ops else { return Ok(None) };
+        let (opcode @ (0xb3 | 0xb5), Operand::Constant(index)) = (store.opcode, &store.operand) else {
+            return Ok(None);
+        };
+        let Some(value) = self.stack.last() else { return Ok(None) };
+        let pool = &self.class.pool;
+        let Ok((_, _, descriptor)) = pool.member_ref(*index) else { return Ok(None) };
+        let Ok(ty @ Type::Primitive(_)) = Type::parse(descriptor) else { return Ok(None) };
+        // The surviving JVM value is the one before assignment conversion.
+        // A boolean zero test can consume the assignment result only if the
+        // duplicate is already boolean or an exact 0/1 literal.
+        if (ty != value.ty
+            && !(boolean_test && ty == BOOLEAN && matches!(value.source, Source::Integer(0 | 1))))
+            || matches!(value.source, Source::Comparison(_))
+            || dup.opcode != store_dup_opcode(&ty, u8::from(opcode == 0xb5))
+            || self.stack_slots + u32::from(ty.slots()) > self.max_stack
+            || !self.initialized_this
+            || self.own_final_target(store)
+            || !permitted_prefix(ops, 2, permits)
+        {
+            return Ok(None);
+        }
+        self.check_constructor_guard_step(dup)?;
+        self.offset = store.offset;
+        self.opcode = store.opcode;
+        self.instruction_has_source = true;
+        let effect = self.field_with_retained_value(store, Some(ty))?;
+        Ok(Some(AssignmentStep {
+            consumed: 2,
+            effect,
+            declaration: None,
         }))
     }
 
@@ -589,13 +675,14 @@ impl Machine<'_, '_> {
         };
         Some((consumed, Candidate {
             store, target, form, order: Some(order), operands: 2 + usize::from(old.is_some()),
-            leaves_value: duplicate || old.is_some(), declaration: false,
+            leaves_value: duplicate || old.is_some(), declaration: false, boolean_literal: false,
         }))
     }
 
     fn update_destination(&self, op: &Instruction, prefix: &[Expr], value: &Expr) -> Option<Target> {
         if let Some(local) = LocalWrite::of(op)
-            && local.matches(value) && !self.assignment_local_destination(op, local, value)?
+            && local.matches(value)
+            && !self.assignment_local_destination(op, local, value, false)?.declaration
         {
             return Some(Target::Local(local));
         }

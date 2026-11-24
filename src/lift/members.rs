@@ -13,7 +13,7 @@ use crate::{
 
 use super::{
     Effect, LiftError, Machine,
-    assignment_expr::{Access, AddressPart},
+    assignment_expr::{Access, AddressPart, Form},
     concat::{CONCAT, builder_constructor, inline_value_of, is_string, push_joined},
     dynamic::LambdaSite,
     expr::{ADDITIVE, Category, Expr, Order, PRIMARY, Source},
@@ -22,6 +22,16 @@ use super::{
 
 impl Machine<'_, '_> {
     pub(super) fn field(&mut self, op: &Instruction) -> Result<Effect, LiftError> {
+        self.field_with_retained_value(op, None)
+    }
+
+    /// A preceding dup/store proof supplies the type of the retained RHS.
+    /// A retained write is an expression, so do not spill its lower stack.
+    pub(super) fn field_with_retained_value(
+        &mut self,
+        op: &Instruction,
+        retained: Option<Type>,
+    ) -> Result<Effect, LiftError> {
         let index = self.constant_index(op)?;
         let pool = &self.class.pool;
         if !matches!(pool.get(index)?, Constant::Fieldref { .. }) {
@@ -31,7 +41,11 @@ impl Machine<'_, '_> {
         let source_name = self
             .renames
             .map_or(name, |renames| renames.field_name(owner, name, descriptor));
-        let ty = Type::parse(descriptor)?;
+        let keep_value = retained.is_some();
+        let ty = match retained {
+            Some(ty) => ty,
+            None => Type::parse(descriptor)?,
+        };
         if op.opcode == 0xb2 && name == "TYPE" && descriptor == "Ljava/lang/Class;"
             && let Some(primitive) = super::boxing::unboxed(owner).map(|primitive| primitive.java_name())
                 .or_else(|| (owner == "java/lang/Void").then_some("void"))
@@ -66,11 +80,17 @@ impl Machine<'_, '_> {
             if let Some(effect) =
                 self.synthetic_outer_access(owner, name, descriptor, &expr, value.as_ref())?
             {
+                if keep_value {
+                    return Err(self.unsupported("synthetic enclosing field assignment expression"));
+                }
                 return Ok(effect);
             }
             if let Some(effect) =
                 self.synthetic_anonymous_capture(owner, name, descriptor, &expr, value.as_ref())?
             {
+                if keep_value {
+                    return Err(self.unsupported("synthetic capture field assignment expression"));
+                }
                 return Ok(effect);
             }
             self.check_instance_field_receiver(&expr, owner, name, descriptor, write)?;
@@ -128,6 +148,17 @@ impl Machine<'_, '_> {
         self.append_field_reference(&mut access, source_name, owner, name, descriptor);
         if let Some(value) = value {
             let order = self.order_of(receiver.iter().chain([&value]), true)?;
+            if keep_value {
+                let (text, precedence) = Form::Assign.render(access, Some(value.text));
+                self.push(Expr {
+                    order,
+                    precedence,
+                    observable: true,
+                    statement: true,
+                    ..Expr::atom(ty, text)
+                })?;
+                return Ok(Effect::None);
+            }
             self.before_statement(order)?;
             Ok(Effect::FieldAssignment {
                 target: access,

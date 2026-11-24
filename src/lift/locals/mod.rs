@@ -21,8 +21,8 @@ use crate::{
 
 use super::{
     CodeTypeSite, Effect, LiftError, Machine,
-    assignment_expr::LocalWrite,
-    expr::{AnonymousOrigin, Category, Expr, INT, IntFits, Order, Source},
+    assignment_expr::{LocalDestination, LocalWrite},
+    expr::{AnonymousOrigin, BOOLEAN, Category, Expr, INT, IntFits, Order, Source},
     nested::OuterAlias,
 };
 
@@ -888,7 +888,8 @@ impl<'c> Machine<'_, 'c> {
         op: &Instruction,
         target: LocalWrite,
         value: &Expr,
-    ) -> Option<bool> {
+        boolean_test: bool,
+    ) -> Option<LocalDestination> {
         let (ty, debug, same) = self.resolve_local_store(op, target, value).ok()?;
         // An assignment expression may need a blank declaration, for which
         // neither the anonymous binary name nor `var` is a Java type.
@@ -910,9 +911,16 @@ impl<'c> Machine<'_, 'c> {
             // not the type of the JVM's duplicated value.
             return None;
         }
-        // The duplicated JVM value's type also controls overload resolution
-        // and numeric promotion in its enclosing Java expression.
-        (ty == value.ty).then_some(!same)
+        // Keep the duplicated value's Java type for overload resolution
+        // and promotion. The immediate zero test is an exception: it
+        // consumes a canonical 0/1 exactly like a boolean.
+        let boolean_literal = boolean_test
+            && ty == BOOLEAN
+            && matches!(value.source, Source::Integer(0 | 1));
+        (ty == value.ty || boolean_literal).then_some(LocalDestination {
+            declaration: !same,
+            boolean_literal,
+        })
     }
 
     /// Stage a new declaration without changing the unrelated slots in the
