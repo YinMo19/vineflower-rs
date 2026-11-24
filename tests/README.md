@@ -68,6 +68,8 @@ Exact upstream comparison with all fixture bytecode and required JDKs:
 | Record patterns, resource exits and Kotlin template/member recovery | 124 | 149 | 423 | 1 |
 | Instance initializer maps, float literals and optional method signatures | 126 | 149 | 422 | 0 |
 | Grouped binary layout and Java UTF-16 literal escaping | 127 | 149 | 421 | 0 |
+| Generic local types, assignment widening and Java preview templates | 129 | 146 | 422 | 0 |
+| Constructor argument patterns, record `instanceof`, nested resource returns and Kotlin extensions | 129 | 140 | 428 | 0 |
 
 All eight upstream CLI and bulk cases match. The full test remains failing
 until all 697 comparisons match.

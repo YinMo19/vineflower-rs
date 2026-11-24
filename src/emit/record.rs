@@ -4,8 +4,10 @@ use super::{
 };
 use crate::{
     bytecode::{Instruction, Operand},
-    classfile::{Annotation, ClassError, ClassFile, Constant, Member, RecordComponent, TypeTarget},
-    descriptor::{FieldSignature, Primitive, Type},
+    classfile::{
+        Annotation, ClassError, ClassFile, Code, Constant, Member, RecordComponent, TypeTarget,
+    },
+    descriptor::{FieldSignature, MethodDescriptor, Primitive, Type},
 };
 
 impl<'a> Writer<'a, '_> {
@@ -146,33 +148,10 @@ pub(super) fn is_generated(
         && method.access_flags & VISIBILITY == class.access_flags & VISIBILITY
         && is_canonical(class, components, desc)?
     {
-        if insns.len() != 3 + 3 * components.len()
-            || !local_load(&insns[0], 0, 0x19)
-            || !method_ref(
-                class,
-                &insns[1],
-                0xb7,
-                ("java/lang/Record", "<init>", "()V"),
-            )?
-            || insns.last().is_none_or(|i| i.opcode != 0xb1)
-        {
-            return Ok(false);
-        }
-        let mut slot = 1;
-        for (i, component) in components.iter().enumerate() {
-            let name = pool.utf8(component.name_index)?;
-            let desc = pool.utf8(component.descriptor_index)?;
-            let ty = parse(desc, Type::parse)?;
-            let start = 2 + 3 * i;
-            if !local_load(&insns[start], 0, 0x19)
-                || !local_load(&insns[start + 1], slot, load_opcode(&ty))
-                || !method_ref(class, &insns[start + 2], 0xb5, (owner, name, desc))?
-            {
-                return Ok(false);
-            }
-            slot += ty.slots();
-        }
-        return Ok(true);
+        return Ok(insns.len() == 3 + 3 * components.len()
+            && record_super(class, &insns[..2])?
+            && insns.last().is_some_and(|insn| insn.opcode == 0xb1)
+            && component_assignments(class, components, &insns[2..insns.len() - 1])?);
     }
     if method.access_flags & (VISIBILITY | STATIC) == PUBLIC
         && let [object, access, ret] = insns
@@ -272,6 +251,159 @@ pub(super) fn is_generated(
         }
     }
     Ok(names.next().is_none())
+}
+
+/// A compact constructor executes all component assignments implicitly, after
+/// its body. Only the exact terminal writes can be erased.
+pub(super) fn compact_tail(
+    class: &ClassFile<'_>,
+    components: &[RecordComponent<'_>],
+    descriptor: &MethodDescriptor,
+    method: &Member<'_>,
+    code: &Code<'_>,
+    insns: &[Instruction],
+    parameter_names: &[String],
+) -> Result<Option<std::ops::Range<usize>>, DecompileError> {
+    let pool = &class.pool;
+    if !is_canonical(class, components, pool.utf8(method.descriptor_index)?)?
+        || method.access_flags & !(VISIBILITY | VARARGS) != 0
+        || !method.exceptions(pool)?.is_empty()
+        || !code.exceptions.is_empty()
+        || !method.method_type_annotations(pool, true)?.is_empty()
+        || !method.method_type_annotations(pool, false)?.is_empty()
+        || method
+            .method_parameters(pool)?
+            .iter()
+            .any(|parameter| parameter.access_flags & FINAL != 0)
+        || !insns.last().is_some_and(|op| op.opcode == 0xb1)
+    {
+        return Ok(None);
+    }
+    let end = insns.len() - 1;
+    let Some(start) = end.checked_sub(3 * components.len()).filter(|&at| at >= 2) else {
+        return Ok(None);
+    };
+    if !record_super(class, &insns[..2])?
+        || !component_assignments(class, components, &insns[start..end])?
+    {
+        return Ok(None);
+    }
+    // Compact syntax binds the component names, not the chosen debug aliases.
+    // An empty body cannot refer to them.
+    if start > 2 {
+        for (parameter, component) in parameter_names.iter().zip(components) {
+            if parameter != pool.utf8(component.name_index)? {
+                return Ok(None);
+            }
+        }
+    }
+    let body_targets = insns[2].offset..=insns[start].offset;
+    let first_temp = 1 + descriptor.parameters.iter().map(|ty| u32::from(ty.slots())).sum::<u32>();
+    let mut debug = None;
+    let owner = pool.class_name(class.this_class)?;
+    for op in &insns[2..start] {
+        if matches!(op.opcode, 0xac..=0xb1 | 0xa8 | 0xa9 | 0xc9)
+            || match &op.operand {
+                Operand::Branch(target) => !body_targets.contains(target),
+                Operand::Switch { default, cases } => !body_targets.contains(default)
+                    || cases.iter().any(|(_, target)| !body_targets.contains(target)),
+                _ => false,
+            }
+        {
+            return Ok(None);
+        }
+        if let Some((slots, read)) = op.local_access()
+            && (!read || op.opcode == 0x84)
+            && slots.start < first_temp
+        {
+            let mut index = 1;
+            let binding = descriptor.parameters.iter().zip(components).find(|(ty, _)| {
+                let start = index;
+                index += u32::from(ty.slots());
+                slots == (start..index)
+            });
+            let Some((ty, component)) = binding else {
+                // A partial category-two write or write to `this` changes
+                // the meaning of the otherwise identical terminal loads.
+                return Ok(None);
+            };
+            let load = match op.opcode {
+                0x36..=0x3a => op.opcode - 0x36 + 0x15,
+                0x3b..=0x4e => (op.opcode - 0x3b) / 4 + 0x15,
+                0x84 => 0x15,
+                _ => unreachable!("proved a local write"),
+            };
+            if load != load_opcode(ty)
+                || matches!(ty, Type::Primitive(Primitive::Boolean | Primitive::Byte
+                    | Primitive::Short | Primitive::Char))
+            {
+                return Ok(None);
+            }
+            if debug.is_none() {
+                debug = Some(code.local_variables(pool)?);
+            }
+            let mut candidates = debug.as_deref().unwrap_or_default()
+                .iter()
+                .filter(|local| u32::from(local.index) == slots.start);
+            let expected_name = pool.utf8(component.name_index)?;
+            let expected_type = pool.utf8(component.descriptor_index)?;
+            if !candidates.next().is_some_and(|local| {
+                local.start_pc == 0
+                    && u32::from(local.length) > op.offset + op.len
+                    && u32::from(local.length) > insns[end].offset
+                    && local.name == expected_name
+                    && local.descriptor == expected_type
+            }) || candidates.next().is_some()
+            {
+                return Ok(None);
+            }
+        }
+        if matches!(op.opcode, 0xb4 | 0xb5) && let Operand::Constant(index) = op.operand {
+            let (field_owner, name, descriptor) = pool.member_ref(index)?;
+            if field_owner == owner {
+                for component in components {
+                    if pool.utf8(component.name_index)? == name
+                        && pool.utf8(component.descriptor_index)? == descriptor
+                    {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+    }
+    Ok(Some(start..end))
+}
+
+fn record_super(class: &ClassFile<'_>, prefix: &[Instruction]) -> Result<bool, ClassError> {
+    let [receiver, call] = prefix else { return Ok(false) };
+    Ok(local_load(receiver, 0, 0x19)
+        && method_ref(class, call, 0xb7, ("java/lang/Record", "<init>", "()V"))?)
+}
+
+fn component_assignments(
+    class: &ClassFile<'_>,
+    components: &[RecordComponent<'_>],
+    insns: &[Instruction],
+) -> Result<bool, DecompileError> {
+    if insns.len() != 3 * components.len() {
+        return Ok(false);
+    }
+    let pool = &class.pool;
+    let owner = pool.class_name(class.this_class)?;
+    let mut slot = 1;
+    for (assignment, component) in insns.chunks_exact(3).zip(components) {
+        let name = pool.utf8(component.name_index)?;
+        let desc = pool.utf8(component.descriptor_index)?;
+        let ty = parse(desc, Type::parse)?;
+        if !local_load(&assignment[0], 0, 0x19)
+            || !local_load(&assignment[1], slot, load_opcode(&ty))
+            || !method_ref(class, &assignment[2], 0xb5, (owner, name, desc))?
+        {
+            return Ok(false);
+        }
+        slot += ty.slots();
+    }
+    Ok(true)
 }
 
 fn is_canonical(

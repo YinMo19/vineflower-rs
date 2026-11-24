@@ -216,6 +216,21 @@ fn upstream_source_goldens_without_jdk() {
             false,
         ),
         (
+            "TestRecordEmptyConstructor",
+            include_bytes!("smoke/java16/TestRecordEmptyConstructor.class"),
+            true,
+        ),
+        (
+            "TestRecordGenericVararg",
+            include_bytes!("smoke/java16/TestRecordGenericVararg.class"),
+            true,
+        ),
+        (
+            "TestRecordMixup",
+            include_bytes!("smoke/java16/TestRecordMixup.class"),
+            true,
+        ),
+        (
             "TestConstantUninlining",
             include_bytes!("smoke/java8/TestConstantUninlining.class"),
             false,

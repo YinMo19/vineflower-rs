@@ -818,6 +818,7 @@ impl<'a, 'c> Writer<'a, 'c> {
         let map_name = |name: &str| names.render(name);
         let exceptions = method.exceptions(pool)?;
         let flags = method.access_flags;
+        let mut compact = false;
 
         let (parameters, mut lines) = if let Some(code) = &code {
             if flags & (ABSTRACT | NATIVE) != 0 {
@@ -844,6 +845,27 @@ impl<'a, 'c> Writer<'a, 'c> {
                 )?
             {
                 return Ok(false);
+            }
+            let mut machine = Machine::new(self.class, method, code, &ty, self.options, &map_name)
+                .map_err(|source| method_error(Box::new(source)))?
+                .with_group(self.group);
+            if constructor
+                && let Some(components) = components
+                && let Some(tail) = record::compact_tail(
+                    self.class,
+                    components,
+                    &ty,
+                    method,
+                    code,
+                    &instructions,
+                    machine.parameter_names(),
+                )?
+            {
+                compact = true;
+                for instruction in &mut instructions[tail] {
+                    instruction.opcode = 0x00;
+                    instruction.operand = bytecode::Operand::None;
+                }
             }
             let guard = self.assertion_guard();
             let prefix = enumeration
@@ -891,9 +913,6 @@ impl<'a, 'c> Writer<'a, 'c> {
             };
             let graph = ControlFlowGraph::build(instructions, handlers)
                 .map_err(|source| method_error(Box::new(source)))?;
-            let mut machine = Machine::new(self.class, method, code, &ty, self.options, &map_name)
-                .map_err(|source| method_error(Box::new(source)))?
-                .with_group(self.group);
             if implicit_enum_super {
                 machine.mark_initialized_this();
             }
@@ -1141,103 +1160,105 @@ impl<'a, 'c> Writer<'a, 'c> {
                     },
                 );
             }
-            let mut args = Vec::with_capacity(ty.parameters.len());
-            if let Some(receiver) = self.annotated_receiver(&type_annotations, constructor)? {
-                args.push(receiver);
-            }
-            let annot_visible = method.parameter_annotations(pool, true)?;
-            let annot_invisible = method.parameter_annotations(pool, false)?;
-            let method_parameters = if self.options.use_method_parameters {
-                method.method_parameters(pool)?
-            } else {
-                Vec::new()
-            };
-            let method_name = name;
-            for (index, ((param, slot), parameter_name)) in ty
-                .parameters
-                .iter()
-                .scan(u32::from(flags & STATIC == 0), |slot, param| {
-                    let current = *slot;
-                    *slot += u32::from(param.slots());
-                    Some((param, current))
-                })
-                .zip(parameters)
-                .enumerate()
-                .skip(implicit_parameters)
-                .take(visible_parameters)
-            {
-                let mut parameter = Document::new();
-                let mut declarations = Vec::new();
-                for group in [&annot_visible, &annot_invisible] {
-                    let selected = if group.len() == visible_parameters {
-                        index
-                            .checked_sub(implicit_parameters)
-                            .and_then(|i| group.get(i))
-                    } else {
-                        let skip = ty.parameters.len().saturating_sub(group.len());
-                        index.checked_sub(skip).and_then(|i| group.get(i))
-                    };
-                    if let Some(annotations) = selected {
-                        for annotation in annotations {
-                            parameter.append(self.annotation_document(annotation, None)?);
-                            parameter.push_str(" ");
-                            declarations.push(annotation.clone());
+            if !compact {
+                let mut args = Vec::with_capacity(ty.parameters.len());
+                if let Some(receiver) = self.annotated_receiver(&type_annotations, constructor)? {
+                    args.push(receiver);
+                }
+                let annot_visible = method.parameter_annotations(pool, true)?;
+                let annot_invisible = method.parameter_annotations(pool, false)?;
+                let method_parameters = if self.options.use_method_parameters {
+                    method.method_parameters(pool)?
+                } else {
+                    Vec::new()
+                };
+                let method_name = name;
+                for (index, ((param, slot), parameter_name)) in ty
+                    .parameters
+                    .iter()
+                    .scan(u32::from(flags & STATIC == 0), |slot, param| {
+                        let current = *slot;
+                        *slot += u32::from(param.slots());
+                        Some((param, current))
+                    })
+                    .zip(parameters)
+                    .enumerate()
+                    .skip(implicit_parameters)
+                    .take(visible_parameters)
+                {
+                    let mut parameter = Document::new();
+                    let mut declarations = Vec::new();
+                    for group in [&annot_visible, &annot_invisible] {
+                        let selected = if group.len() == visible_parameters {
+                            index
+                                .checked_sub(implicit_parameters)
+                                .and_then(|i| group.get(i))
+                        } else {
+                            let skip = ty.parameters.len().saturating_sub(group.len());
+                            index.checked_sub(skip).and_then(|i| group.get(i))
+                        };
+                        if let Some(annotations) = selected {
+                            for annotation in annotations {
+                                parameter.append(self.annotation_document(annotation, None)?);
+                                parameter.push_str(" ");
+                                declarations.push(annotation.clone());
+                            }
                         }
                     }
-                }
-                if method_parameters
-                    .get(index)
-                    .is_some_and(|entry| entry.access_flags & FINAL != 0)
-                {
-                    parameter.push_str("final ");
-                }
-                let target = TypeTarget::MethodParameter((index - implicit_parameters) as u8);
-                let varargs = flags & VARARGS != 0 && index + 1 == parameter_end;
-                let rendered = if let Some(sig) = signature {
-                    let skip = if sig.parameters.len() == ty.parameters.len() {
-                        0
+                    if method_parameters
+                        .get(index)
+                        .is_some_and(|entry| entry.access_flags & FINAL != 0)
+                    {
+                        parameter.push_str("final ");
+                    }
+                    let target = TypeTarget::MethodParameter((index - implicit_parameters) as u8);
+                    let varargs = flags & VARARGS != 0 && index + 1 == parameter_end;
+                    let rendered = if let Some(sig) = signature {
+                        let skip = if sig.parameters.len() == ty.parameters.len() {
+                            0
+                        } else {
+                            implicit_parameters
+                        };
+                        self.render_type_target(
+                            &sig.parameters[index - skip],
+                            &type_annotations,
+                            target,
+                            &declarations,
+                            varargs,
+                        )?
                     } else {
-                        implicit_parameters
+                        self.render_type_target(
+                            param,
+                            &type_annotations,
+                            target,
+                            &declarations,
+                            varargs,
+                        )?
                     };
-                    self.render_type_target(
-                        &sig.parameters[index - skip],
-                        &type_annotations,
-                        target,
-                        &declarations,
-                        varargs,
-                    )?
-                } else {
-                    self.render_type_target(
-                        param,
-                        &type_annotations,
-                        target,
-                        &declarations,
-                        varargs,
-                    )?
-                };
-                parameter.append(rendered);
-                parameter.push_str(" ");
-                let start = parameter.len();
-                parameter.push_str(&parameter_name);
-                if self.options.dump_text_tokens {
-                    parameter.token_at(
-                        start..parameter.len(),
-                        Token {
-                            declaration: true,
-                            kind: TokenKind::Variable {
-                                owner: self.owner.into(),
-                                method: method_name.into(),
-                                descriptor: descriptor.into(),
-                                index: slot,
-                                name: parameter_name,
-                                parameter: true,
+                    parameter.append(rendered);
+                    parameter.push_str(" ");
+                    let start = parameter.len();
+                    parameter.push_str(&parameter_name);
+                    if self.options.dump_text_tokens {
+                        parameter.token_at(
+                            start..parameter.len(),
+                            Token {
+                                declaration: true,
+                                kind: TokenKind::Variable {
+                                    owner: self.owner.into(),
+                                    method: method_name.into(),
+                                    descriptor: descriptor.into(),
+                                    index: slot,
+                                    name: parameter_name,
+                                    parameter: true,
+                                },
                             },
-                        },
-                    );
+                        );
+                    }
+                    args.push(parameter);
                 }
-                args.push(parameter);
+                head.append(Document::delimited(self.depth + 1, args));
             }
-            head.append(Document::delimited(self.depth + 1, args));
             let generic_throws = signature.filter(|sig| !sig.throws.is_empty());
             if generic_throws.is_some() || !exceptions.is_empty() {
                 head.push_str(" throws ");
