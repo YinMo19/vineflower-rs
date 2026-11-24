@@ -5,7 +5,7 @@ use crate::{
     bytecode::{Instruction, Operand},
     classfile::Constant,
     context::NestedKind,
-    descriptor::{Primitive, Type},
+    descriptor::{MethodDescriptor, Primitive, Type},
     source_text::{ArrayStyle, Document},
 };
 
@@ -16,6 +16,34 @@ use super::{
 
 #[cfg(test)]
 mod tests;
+
+#[derive(Clone)]
+pub(super) struct ArrayArgument {
+    pub(super) call_offset: u32,
+    pub(super) descriptor: MethodDescriptor,
+    pub(super) elements: Vec<ArrayElement>,
+    pub(super) known_types: bool,
+}
+
+#[derive(Clone)]
+pub(super) struct ArrayElement {
+    pub(super) text: Document,
+    /// None denotes the null type, not its erased JVM stack type.
+    pub(super) ty: Option<Type>,
+    narrow_literal: bool,
+}
+
+impl ArrayElement {
+    pub(super) fn prepare_invocation(&mut self) {
+        if self.narrow_literal {
+            self.text.prepend_str(match self.ty {
+                Some(Type::Primitive(Primitive::Byte)) => "(byte)",
+                Some(Type::Primitive(Primitive::Short)) => "(short)",
+                _ => unreachable!("only byte and short literals need invocation narrowing"),
+            });
+        }
+    }
+}
 
 struct ArrayPlan {
     start: usize,
@@ -84,6 +112,24 @@ impl Machine<'_, '_> {
             root.end
         };
 
+        // Without a local transport, the verified dup/store sequence leaves
+        // exactly one reference. Only the next instruction in this region can
+        // consume it as varargs: a later use might no longer own the allocation.
+        let pending = if temporary.is_none() {
+            instructions
+                .get(consumed)
+                .filter(|op| (probe.permits)(consumed, op))
+                .and_then(|op| self.immediate_array_call(op, &root.ty))
+                .map(|(call_offset, descriptor)| ArrayArgument {
+                    call_offset,
+                    descriptor,
+                    elements: Vec::with_capacity(root.length),
+                    known_types: true,
+                })
+        } else {
+            None
+        };
+
         // Only the typed pass renders. Stage method retention until it has
         // also proved the element assignment conversions and operand order.
         let original_helpers = self.dynamic_helpers.take();
@@ -91,7 +137,7 @@ impl Machine<'_, '_> {
         let position = (self.offset, self.opcode);
         let has_source = self.instruction_has_source;
         let initialized = self.initialized_this;
-        let result = self.fold_array(instructions, root, &mut arrays);
+        let result = self.fold_array(instructions, root, &mut arrays, pending);
         self.initialized_this = initialized;
         let staged = mem::replace(&mut self.dynamic_helpers, original_helpers);
         if result.is_err() {
@@ -104,6 +150,42 @@ impl Machine<'_, '_> {
         }
         debug_assert!(arrays.as_slice().is_empty() && self.prelude.is_empty());
         Some(consumed)
+    }
+
+    fn immediate_array_call(&self, op: &Instruction, array: &Type) -> Option<(u32, MethodDescriptor)> {
+        if self.class.major_version < 49 {
+            return None;
+        }
+        let index = match (op.opcode, &op.operand) {
+            (0xb6..=0xb8, Operand::Constant(index))
+            | (0xb9, Operand::InvokeInterface { index, .. }) => *index,
+            _ => return None,
+        };
+        let (_, name, descriptor) = self.class.pool.member_ref(index).ok()?;
+        if name.starts_with('<')
+            || !descriptor.contains('[')
+            || self.enum_switch_action(op.offset).is_some()
+        {
+            return None;
+        }
+        let descriptor = MethodDescriptor::parse(descriptor).ok()?;
+        (descriptor.parameters.last() == Some(array)).then_some((op.offset, descriptor))
+    }
+
+    pub(super) fn render_array_argument(&self, ty: &Type, elements: Vec<ArrayElement>) -> Document {
+        let mut text = self.array_initializer_header(ty);
+        let mut initializer = text.array_initializer(ArrayStyle::New);
+        for element in elements {
+            initializer.append(element.text);
+        }
+        initializer.finish();
+        text
+    }
+
+    fn array_initializer_header(&self, ty: &Type) -> Document {
+        let mut text = Document::from("new ");
+        text.push_str(&self.render_type(ty));
+        text
     }
 
     fn array_return_temporary(&self, instructions: &[Instruction]) -> Option<u16> {
@@ -255,6 +337,7 @@ impl Machine<'_, '_> {
         instructions: &[Instruction],
         plan: ArrayPlan,
         arrays: &mut IntoIter<ArrayPlan>,
+        pending: Option<ArrayArgument>,
     ) -> Result<(), LiftError> {
         if self.stack.last().and_then(array_length) != Some(plan.length) {
             return Err(self.invalid_stack("array initializer needs its literal dimension"));
@@ -269,7 +352,7 @@ impl Machine<'_, '_> {
         let outer_stack = mem::take(&mut self.stack);
         self.stack_slots = hidden_slots;
         self.array_probe_depth += 1;
-        let expression = self.fold_array_values(instructions, plan, arrays);
+        let expression = self.fold_array_values(instructions, plan, arrays, pending);
         self.array_probe_depth -= 1;
         self.stack = outer_stack;
         self.stack_slots = slots;
@@ -282,15 +365,23 @@ impl Machine<'_, '_> {
         instructions: &[Instruction],
         plan: ArrayPlan,
         arrays: &mut IntoIter<ArrayPlan>,
+        mut pending: Option<ArrayArgument>,
     ) -> Result<Expr, LiftError> {
         let Type::Array(component) = &plan.ty else {
             unreachable!("planned an array")
         };
         let category = Category::of(component).expect("nonvoid JVM array component");
         let mut order = Some(Order::at(instructions[plan.start].offset));
-        let mut text = Document::from("new ");
-        text.push_str(&self.render_type(&plan.ty));
-        let mut elements = text.array_initializer(ArrayStyle::New);
+        let mut text = if pending.is_none() {
+            self.array_initializer_header(&plan.ty)
+        } else {
+            Document::new()
+        };
+        let mut initializer = if pending.is_none() {
+            Some(text.array_initializer(ArrayStyle::New))
+        } else {
+            None
+        };
         let mut cursor = plan.first_receiver;
         for _ in 0..plan.length {
             cursor += 2; // verified receiver and literal index
@@ -304,6 +395,13 @@ impl Machine<'_, '_> {
                     if !self.stack_is_empty() {
                         return Err(self.invalid_stack("array initializer value leaked operands"));
                     }
+                    let narrow_literal = pending.is_some()
+                        && value.ty != **component
+                        && matches!(value.source, Source::Integer(_))
+                        && matches!(
+                            **component,
+                            Type::Primitive(Primitive::Byte | Primitive::Short)
+                        );
                     let value = if category == Category::Ref {
                         if !matches!(value.source, Source::Null)
                             && !self.known_assignable(&value.ty, component)
@@ -321,7 +419,19 @@ impl Machine<'_, '_> {
                     if let Some(value) = self.order_of([&value], true)? {
                         order = Some(self.join_order(order, value)?);
                     }
-                    elements.append(value.text);
+                    if let Some(pending) = &mut pending {
+                        pending.known_types &= !self.local_argument_needs_erasure(&value);
+                        pending.elements.push(ArrayElement {
+                            ty: (!matches!(value.source, Source::Null)).then_some(value.ty),
+                            text: value.text,
+                            narrow_literal,
+                        });
+                    } else {
+                        initializer
+                            .as_mut()
+                            .expect("ordinary array initializer")
+                            .append(value.text);
+                    }
                     cursor += 1;
                     break;
                 }
@@ -332,7 +442,7 @@ impl Machine<'_, '_> {
                 {
                     let nested = arrays.next().expect("next nested plan");
                     cursor = nested.end;
-                    self.fold_array(instructions, nested, arrays)?;
+                    self.fold_array(instructions, nested, arrays, None)?;
                 } else {
                     if !matches!(self.step(op)?, Effect::None) {
                         return Err(self.unsupported("statement in array initializer"));
@@ -342,11 +452,17 @@ impl Machine<'_, '_> {
             }
         }
         debug_assert_eq!(cursor, plan.end);
-        elements.finish();
+        if let Some(initializer) = initializer {
+            initializer.finish();
+        }
+        let source = pending.map_or(Source::Plain, |pending| {
+            Source::PendingArrayArgument(Box::new(pending))
+        });
         Ok(Expr {
             order,
             observable: true,
             precedence: UNARY,
+            source,
             ..Expr::atom(plan.ty, text)
         })
     }

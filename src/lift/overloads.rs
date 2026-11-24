@@ -8,6 +8,8 @@ use crate::{
 
 use super::{
     Machine,
+    array_initializer::ArrayElement,
+    boxing::{unboxed, wrapper},
     expr::{Category, Expr, Source},
 };
 
@@ -19,6 +21,7 @@ const STATIC: u16 = 0x0008;
 const FINAL: u16 = 0x0010;
 const BRIDGE: u16 = 0x0040;
 const VARARGS: u16 = 0x0080;
+const NATIVE: u16 = 0x0100;
 const INTERFACE: u16 = 0x0200;
 const SYNTHETIC: u16 = 0x1000;
 const ENUM: u16 = 0x4000;
@@ -33,13 +36,22 @@ enum ImplicitArgument<'a> {
     Null,
 }
 
+#[derive(Clone, Copy)]
+enum ArgumentForm<'a> {
+    Fixed(&'a [Expr]),
+    Variable {
+        prefix: &'a [Expr],
+        elements: &'a [ArrayElement],
+    },
+}
+
 struct Invocation<'a> {
     name: &'a str,
     source_name: &'a str,
     descriptor: &'a str,
     parameters: &'a [Type],
-    arguments: &'a [Expr],
-    is_static: bool,
+    arguments: ArgumentForm<'a>,
+    opcode: u8,
     found: bool,
 }
 
@@ -106,29 +118,89 @@ impl<'a, 'c> Machine<'a, 'c> {
             return false;
         }
         let source_name = self.source_invocation_name(owner, name, descriptor);
+        self.prove_invocation(
+            lookup_owner,
+            owner,
+            Invocation {
+                name,
+                source_name: &source_name,
+                descriptor,
+                parameters: &method.parameters,
+                arguments: ArgumentForm::Fixed(arguments),
+                opcode,
+                found: false,
+            },
+        )
+    }
+
+    /// Prove that only the variable-arity phase applies and that it selects
+    /// the original declaration. A fixed call to the selected declaration is
+    /// also unsafe: e.g. `f(null)` does not recreate `new Object[]{null}`.
+    pub(super) fn can_expand_varargs(
+        &self,
+        lookup_owner: &str,
+        (owner, name, descriptor): (&str, &str, &str),
+        method: &MethodDescriptor,
+        prefix: &[Expr],
+        elements: &[ArrayElement],
+        opcode: u8,
+    ) -> bool {
+        let Some((Type::Array(component), fixed)) = method.parameters.split_last() else {
+            return false;
+        };
+        if lookup_owner.starts_with('[')
+            || prefix.len() != fixed.len()
+            || elements.is_empty()
+            || !prefix.iter().zip(fixed).all(|(actual, formal)| {
+                !self.local_argument_needs_erasure(actual)
+                    && strict_argument_conversion(self, expression_type(actual), formal)
+            })
+            || !elements.iter().all(|element| {
+                strict_argument_conversion(self, element.ty.as_ref(), component)
+            })
+        {
+            return false;
+        }
+        let source_name = self.source_invocation_name(owner, name, descriptor);
+        self.prove_invocation(
+            lookup_owner,
+            owner,
+            Invocation {
+                name,
+                source_name: &source_name,
+                descriptor,
+                parameters: &method.parameters,
+                arguments: ArgumentForm::Variable { prefix, elements },
+                opcode,
+                found: false,
+            },
+        )
+    }
+
+    fn prove_invocation(
+        &self,
+        lookup_owner: &str,
+        owner: &str,
+        mut call: Invocation<'_>,
+    ) -> bool {
+        let Invocation { name, source_name, descriptor, .. } = call;
+        let constructor = name == "<init>";
+        let fixed = matches!(call.arguments, ArgumentForm::Fixed(_));
         let platform_string_equals = owner == STRING
             && lookup_owner == STRING
-            && opcode == 0xb6
+            && fixed
+            && call.opcode == 0xb6
             && name == "equals"
             && source_name == name
             && descriptor == EQUALS;
         let platform_value_of = owner == STRING
             && lookup_owner == STRING
-            && opcode == 0xb8
+            && call.opcode == 0xb8
             && name == "valueOf"
             && source_name == name
             && descriptor == "(Ljava/lang/Object;)Ljava/lang/String;"
-            && matches!(arguments, [argument] if matches!(argument.ty, Type::Object(_))
-                && !matches!(argument.source, Source::Null));
-        let mut call = Invocation {
-            name,
-            source_name: &source_name,
-            descriptor,
-            parameters: &method.parameters,
-            arguments,
-            is_static: opcode == 0xb8,
-            found: false,
-        };
+            && matches!(call.arguments, ArgumentForm::Fixed([argument])
+                if matches!(argument.ty, Type::Object(_)) && !matches!(argument.source, Source::Null));
         let mut pending = vec![Cow::Borrowed(lookup_owner)];
         let mut visited = HashSet::new();
         while let Some(declaring) = pending.pop() {
@@ -140,7 +212,7 @@ impl<'a, 'c> Machine<'a, 'c> {
                 Ok(Some(class)) => class,
                 Ok(None)
                     if declaring == OBJECT
-                        && (!object_api_contains(&source_name) || platform_string_equals) =>
+                        && (!object_api_contains(source_name) || platform_string_equals) =>
                 {
                     continue;
                 }
@@ -286,12 +358,23 @@ impl Invocation<'_> {
         if machine.source_invocation_name(owner, name, descriptor) != self.source_name {
             return true;
         }
+        let variable = matches!(self.arguments, ArgumentForm::Variable { .. });
         let selected = name == self.name
             && descriptor == self.descriptor
-            && (flags & STATIC != 0) == self.is_static;
+            && (flags & STATIC != 0) == (self.opcode == 0xb8);
         if selected {
-            if flags & (VARARGS | BRIDGE | SYNTHETIC) != 0
+            if (flags & VARARGS != 0) != variable
+                || flags & (BRIDGE | SYNTHETIC) != 0
+                // The array is not packed this way for signature-polymorphic calls.
+                || variable
+                    && flags & NATIVE != 0
+                    && matches!(owner, "java/lang/invoke/MethodHandle" | "java/lang/invoke/VarHandle")
                 || !signature().is_some_and(|signature| erased_formals(signature, self.parameters))
+            {
+                return false;
+            }
+            if let ArgumentForm::Variable { prefix, elements } = self.arguments
+                && fixed_applicable(machine, prefix, elements, self.parameters)
             {
                 return false;
             }
@@ -300,6 +383,19 @@ impl Invocation<'_> {
         }
         let Ok(candidate) = MethodDescriptor::parse(descriptor) else {
             return false;
+        };
+        let arguments = match self.arguments {
+            ArgumentForm::Fixed(arguments) => arguments,
+            ArgumentForm::Variable { prefix, elements } => {
+                return self.accepts_variable_competitor(
+                    machine,
+                    prefix,
+                    elements,
+                    &candidate.parameters,
+                    flags,
+                    signature,
+                );
+            }
         };
         if candidate.parameters.len() != self.parameters.len() {
             // With the selected declaration applicable in the strict phase,
@@ -312,8 +408,7 @@ impl Invocation<'_> {
             return false;
         }
         let mut less_specific = false;
-        for ((actual, formal), competing) in self
-            .arguments
+        for ((actual, formal), competing) in arguments
             .iter()
             .zip(self.parameters)
             .zip(&candidate.parameters)
@@ -338,6 +433,57 @@ impl Invocation<'_> {
                 .iter()
                 .zip(&candidate.parameters)
                 .all(|(formal, competing)| strict_conversion(machine, formal, competing))
+    }
+
+    fn accepts_variable_competitor<'s>(
+        &self,
+        machine: &Machine<'_, '_>,
+        prefix: &[Expr],
+        elements: &[ArrayElement],
+        competing: &[Type],
+        flags: u16,
+        signature: impl FnOnce() -> Option<Option<&'s str>>,
+    ) -> bool {
+        let arity = prefix.len() + elements.len();
+        let variable = flags & VARARGS != 0;
+        if competing.len() != arity && (!variable || competing.len() > arity + 1) {
+            return true;
+        }
+        if !signature().is_some_and(|signature| erased_formals(signature, competing)) {
+            return false;
+        }
+        if fixed_applicable(machine, prefix, elements, competing) {
+            // Either strict or loose fixed arity wins before varargs.
+            return false;
+        }
+        if !variable {
+            return true;
+        }
+        let Some((Type::Array(component), fixed)) = competing.split_last() else {
+            return false;
+        };
+        let competing_at = |index| fixed.get(index).unwrap_or(component.as_ref());
+        if !expanded_argument_types(prefix, elements)
+            .enumerate()
+            .all(|(index, actual)| potential_loose_conversion(machine, actual, competing_at(index)))
+        {
+            return true;
+        }
+
+        let Some((Type::Array(component), fixed)) = self.parameters.split_last() else {
+            unreachable!("validated varargs declaration");
+        };
+        let selected_at = |index| fixed.get(index).unwrap_or(component.as_ref());
+        let mut strictly_more_specific = false;
+        // JLS 15.12.2.5: compare the expanded formals for every actual, and
+        // also the next formal when the competitor declares arity + 1.
+        // The extra comparison is required, but cannot break a tie over
+        // actuals: the selected declaration has no extra formal itself.
+        (0..arity.max(competing.len())).all(|index| {
+            let (selected, competing) = (selected_at(index), competing_at(index));
+            strictly_more_specific |= index < arity && selected != competing;
+            strict_conversion(machine, selected, competing)
+        }) && strictly_more_specific
     }
 }
 
@@ -380,6 +526,66 @@ fn reifiable_formal(source: &GenericType, mut erased: &Type) -> bool {
                 && source.nested.is_empty()
         }
         _ => false,
+    }
+}
+
+fn expression_type(value: &Expr) -> Option<&Type> {
+    (!matches!(value.source, Source::Null)).then_some(&value.ty)
+}
+
+fn expanded_argument_types<'a>(
+    prefix: &'a [Expr],
+    elements: &'a [ArrayElement],
+) -> impl Iterator<Item = Option<&'a Type>> {
+    prefix
+        .iter()
+        .map(expression_type)
+        .chain(elements.iter().map(|element| element.ty.as_ref()))
+}
+
+fn fixed_applicable(
+    machine: &Machine<'_, '_>,
+    prefix: &[Expr],
+    elements: &[ArrayElement],
+    formals: &[Type],
+) -> bool {
+    prefix.len() + elements.len() == formals.len()
+        && expanded_argument_types(prefix, elements)
+            .zip(formals)
+            .all(|(source, target)| potential_loose_conversion(machine, source, target))
+}
+
+fn strict_argument_conversion(
+    machine: &Machine<'_, '_>,
+    source: Option<&Type>,
+    target: &Type,
+) -> bool {
+    match source {
+        Some(source) => strict_conversion(machine, source, target),
+        None => Category::of(target) == Some(Category::Ref),
+    }
+}
+
+fn potential_loose_conversion(
+    machine: &Machine<'_, '_>,
+    source: Option<&Type>,
+    target: &Type,
+) -> bool {
+    let Some(source) = source else {
+        return Category::of(target) == Some(Category::Ref);
+    };
+    match (source, target) {
+        (Type::Primitive(source), Type::Object(target)) => {
+            target == wrapper(*source).0
+                || unboxed(target).is_none() && !machine.overload_final_class(target)
+        }
+        (Type::Object(source), Type::Primitive(target)) => unboxed(source)
+            .map_or_else(|| !machine.overload_final_class(source), |source| source.widens_to(*target)),
+        (Type::Primitive(_), Type::Array(_)) | (Type::Array(_), Type::Primitive(_)) => false,
+        (Type::Array(_), Type::Object(name)) | (Type::Object(name), Type::Array(_)) => {
+            matches!(name.as_str(), OBJECT | "java/lang/Cloneable" | "java/io/Serializable")
+        }
+        _ => potential_strict_conversion(machine, source, target),
     }
 }
 

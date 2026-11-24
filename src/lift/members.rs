@@ -209,7 +209,19 @@ impl Machine<'_, '_> {
             );
         }
         let (owner, name, method_type) = pool.member_ref(index)?;
-        let descriptor = MethodDescriptor::parse(method_type)?;
+        let (descriptor, pending) = if let Some(value) = self.stack.last_mut()
+            && matches!(value.source, Source::PendingArrayArgument(_))
+        {
+            let Source::PendingArrayArgument(array) =
+                std::mem::replace(&mut value.source, Source::Plain)
+            else {
+                unreachable!()
+            };
+            debug_assert_eq!(array.call_offset, op.offset);
+            (array.descriptor, Some((array.elements, array.known_types)))
+        } else {
+            (MethodDescriptor::parse(method_type)?, None)
+        };
         if count.is_some_and(|count| {
             u16::from(count) != 1 + descriptor.parameters.iter().map(Type::slots).sum::<u16>()
         }) {
@@ -278,10 +290,33 @@ impl Machine<'_, '_> {
             Some(Type::Object(owner)) => owner.as_str(),
             _ => owner,
         };
+        let enclosing_receiver = receiver
+            .as_ref()
+            .is_some_and(|receiver| self.unnamed_enclosing_receiver(receiver));
         let generic = self.generic_call(owner, name, method_type, op.opcode == 0xb8);
         let omit = self.omit_invocation_casts(lookup_owner, member, &descriptor, &args, op.opcode);
         self.coerce_arguments(&mut args, &descriptor, Some(member), generic.as_ref(), omit)?;
+        let mut expanded = None;
+        if let Some((mut elements, known_types)) = pending {
+            let (array, prefix) = args.split_last_mut().expect("array argument is the last formal");
+            if known_types
+                && !omit
+                && !enclosing_receiver
+                && !receiver.as_ref().is_some_and(|value| self.local_argument_needs_erasure(value))
+                && self.can_expand_varargs(
+                    lookup_owner, member, &descriptor, prefix, &elements, op.opcode,
+                )
+            {
+                for element in &mut elements {
+                    element.prepare_invocation();
+                }
+                expanded = Some(elements);
+            } else {
+                array.text = self.render_array_argument(&array.ty, elements);
+            }
+        }
         if op.opcode == 0xb8
+            && expanded.is_none()
             && let Some(effect) =
                 self.synthetic_nest_accessor(owner, name, method_type, &descriptor, &args)?
         {
@@ -292,9 +327,6 @@ impl Machine<'_, '_> {
         {
             return Ok(effect);
         }
-        let enclosing_receiver = receiver
-            .as_ref()
-            .is_some_and(|receiver| self.unnamed_enclosing_receiver(receiver));
         // With a declaration in the current class, a simple invocation
         // searches the same overload set as the written class qualifier.
         // A symbolic owner alone is insufficient: it may resolve upstairs.
@@ -330,10 +362,20 @@ impl Machine<'_, '_> {
         }
         self.anchor_member(&mut text, op);
         self.append_method_reference(&mut text, &source_name, owner, name, method_type);
-        text.append_relative_arguments(args.iter().map(|argument| &argument.text));
+        if let Some(elements) = &expanded {
+            let prefix = &args[..args.len() - 1];
+            text.append_relative_arguments(
+                prefix.iter().map(|argument| &argument.text)
+                    .chain(elements.iter().map(|element| &element.text)),
+            );
+        } else {
+            text.append_relative_arguments(args.iter().map(|argument| &argument.text));
+        }
         if chain {
             text.end_group();
         }
+        // JLS 15.12.4.2 translates a variable-arity tail back into an array
+        // creation. Keep the original allocation and stores in the schedule.
         let operands = receiver.iter().chain(&args);
         if descriptor.return_type == Type::Void {
             let order = self.order_of(operands, true)?;
@@ -346,7 +388,10 @@ impl Machine<'_, '_> {
                 .filter(|result| self.known_assignable(result, &descriptor.return_type))
                 .unwrap_or_else(|| descriptor.return_type.clone());
             let mut expression = self.expression(result, text, PRIMARY, operands, true)?;
-            expression.source = self.invocation_source(op.opcode, owner, name, &descriptor, receiver, args);
+            if expanded.is_none() {
+                expression.source =
+                    self.invocation_source(op.opcode, owner, name, &descriptor, receiver, args);
+            }
             if owner == "java/lang/invoke/MethodHandle" && matches!(name, "invoke" | "invokeExact")
                 || owner == "java/lang/invoke/VarHandle"
                     && matches!(

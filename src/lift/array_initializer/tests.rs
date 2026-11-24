@@ -9,14 +9,31 @@ use crate::{
 
 use super::*;
 
-// Example.side(int), Example(int[]), String, int[], Example.other:Object.
-const CLASS: &[u8] = b"\xca\xfe\xba\xbe\0\0\0\x3d\0\x17\
+// Example.side(int), Example(int[]), String, int[], Example.other:Object,
+// plus varargs calls used to test the preserved allocation and selected overload.
+const CLASS: &[u8] = b"\xca\xfe\xba\xbe\0\0\0\x3d\0\x37\
     \x01\0\x07Example\x07\0\x01\x01\0\x10java/lang/Object\x07\0\x03\
     \x01\0\x04test\x01\0\x03()V\x01\0\x04side\x01\0\x04(I)I\x0c\0\x07\0\x08\x0a\0\x02\0\x09\
     \x01\0\x06<init>\x01\0\x05([I)V\x0c\0\x0b\0\x0c\x0a\0\x02\0\x0d\
     \x01\0\x10java/lang/String\x07\0\x0f\x01\0\x02[I\x07\0\x11\
     \x01\0\x05other\x01\0\x12Ljava/lang/Object;\x0c\0\x13\0\x14\x09\0\x02\0\x15\
-    \0\x21\0\x02\0\x04\0\0\0\0\0\0\0\0";
+    \x01\0\x04take\x0c\0\x17\0\x0c\x0a\0\x02\0\x18\x01\0\x04(I)V\
+    \x01\0\x06choose\x0c\0\x1b\0\x0c\x0a\0\x02\0\x1c\x01\0\x16(Ljava/lang/Integer;)V\
+    \x01\0\x09ambiguous\x0c\0\x1f\0\x0c\x0a\0\x02\0\x20\x01\0\x17([Ljava/lang/Integer;)V\
+    \x01\0\x07collect\x01\0\x06(I[I)V\x0c\0\x23\0\x24\x0a\0\x02\0\x25\
+    \x01\0\x04refs\x01\0\x16([Ljava/lang/Object;)V\x0c\0\x27\0\x28\x0a\0\x02\0\x29\
+    \x01\0\x06narrow\x01\0\x05([B)V\x0c\0\x2b\0\x2c\x0a\0\x02\0\x2d\
+    \x01\0\x03tie\x0c\0\x2f\0\x0c\x0a\0\x02\0\x30\x01\0\x06(I[D)V\
+    \x01\0\x08specific\x0c\0\x33\0\x0c\x0a\0\x02\0\x34\x01\0\x06(J[F)V\
+    \0\x21\0\x02\0\x04\0\0\0\0\0\x0d\
+    \0\x89\0\x17\0\x0c\0\0\0\x09\0\x17\0\x1a\0\0\
+    \0\x89\0\x1b\0\x0c\0\0\0\x09\0\x1b\0\x1e\0\0\
+    \0\x89\0\x1f\0\x0c\0\0\0\x89\0\x1f\0\x22\0\0\
+    \0\x89\0\x23\0\x24\0\0\0\x89\0\x27\0\x28\0\0\
+    \0\x89\0\x2b\0\x2c\0\0\
+    \0\x89\0\x2f\0\x0c\0\0\0\x89\0\x2f\0\x32\0\0\
+    \0\x89\0\x33\0\x0c\0\0\0\x89\0\x33\0\x36\0\0\
+    \0\0";
 
 fn with_machine(
     bytes: &[u8],
@@ -323,5 +340,77 @@ fn masking_operands_does_not_relax_the_verified_stack_limit() {
         assert_eq!(machine.stack_slots, 3);
         assert_eq!(machine.stack[0].text, "0L");
         assert_eq!(machine.stack[1].text, "new int[]{1}");
+    });
+}
+
+#[test]
+fn varargs_packing_keeps_fixed_arguments_and_elements_in_evaluation_order() {
+    let bytes = [
+        0x04, 0xb8, 0, 10, // fixed argument
+        0x05, 0xbc, 10,
+        0x59, 0x03, 0x05, 0xb8, 0, 10, 0x4f, // first element
+        0x59, 0x04, 0x06, 0xb8, 0, 10, 0x4f, // second element
+        0xb8, 0, 38, 0xb1,
+    ];
+    with_machine(&bytes, "()V", false, |machine| {
+        let instructions = decode(&bytes).unwrap();
+        let graph = ControlFlowGraph::build(&instructions, &[]).unwrap();
+        let lines = structure_with_handlers(&instructions, &graph, machine, &[]).unwrap();
+        assert_eq!(lines[0].text, "collect(Example.side(1), Example.side(2), Example.side(3));");
+        assert_eq!(lines[0].offsets, (0..24).collect::<Vec<_>>());
+    });
+}
+
+#[test]
+fn varargs_unpacks_only_when_overload_resolution_still_packs_the_same_array() {
+    let bytes = [
+        // A competing fixed strict, fixed loose, and variable-arity method.
+        0x04, 0xbc, 10, 0x59, 0x03, 0x04, 0x4f, 0xb8, 0, 25,
+        0x04, 0xbc, 10, 0x59, 0x03, 0x04, 0x4f, 0xb8, 0, 29,
+        0x04, 0xbc, 10, 0x59, 0x03, 0x04, 0x4f, 0xb8, 0, 33,
+        // A fixed invocation of the same declaration would pass a null array,
+        // not an array with one null element.
+        0x04, 0xbd, 0, 4, 0x59, 0x03, 0x01, 0x53, 0xb8, 0, 42,
+        // A local array and an explicitly null array have no fresh allocation.
+        0x2a, 0xb8, 0, 42,
+        0x01, 0xb8, 0, 42,
+        // Unlike array assignment, invocation needs a cast for byte literals.
+        0x04, 0xbc, 8, 0x59, 0x03, 0x11, 0, 255, 0x54, 0xb8, 0, 46,
+        0xb1,
+    ];
+    with_machine(&bytes, "([Ljava/lang/Object;)V", false, |machine| {
+        let instructions = decode(&bytes).unwrap();
+        let graph = ControlFlowGraph::build(&instructions, &[]).unwrap();
+        let lines = structure_with_handlers(&instructions, &graph, machine, &[]).unwrap();
+        let expected = [
+            "take(new int[]{1});",
+            "choose(new int[]{1});",
+            "ambiguous(new int[]{1});",
+            "refs(new Object[]{null});",
+            "refs(var0);",
+            "refs((Object[])null);",
+            "narrow((byte)-1);",
+        ];
+        assert!(lines.len() >= expected.len());
+        for (line, expected) in lines.iter().zip(expected) {
+            assert_eq!(line.text, expected);
+        }
+    });
+}
+
+#[test]
+fn varargs_specificity_compares_the_fixed_formal_and_unused_tail() {
+    let bytes = [
+        // int... versus (int, double...) and (long, float...), respectively.
+        0x04, 0xbc, 10, 0x59, 0x03, 0x04, 0x4f, 0xb8, 0, 49,
+        0x04, 0xbc, 10, 0x59, 0x03, 0x04, 0x4f, 0xb8, 0, 53,
+        0xb1,
+    ];
+    with_machine(&bytes, "()V", false, |machine| {
+        let instructions = decode(&bytes).unwrap();
+        let graph = ControlFlowGraph::build(&instructions, &[]).unwrap();
+        let lines = structure_with_handlers(&instructions, &graph, machine, &[]).unwrap();
+        assert_eq!(lines[0].text, "tie(new int[]{1});");
+        assert_eq!(lines[1].text, "specific(1);");
     });
 }

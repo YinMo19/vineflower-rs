@@ -85,6 +85,9 @@ pub(super) enum Source {
     This,
     OuterThis,
     New(u32),
+    /// A fresh, fully initialized array for the immediately following call.
+    /// That call renders either the explicit array or the proven varargs form.
+    PendingArrayArgument(Box<super::array_initializer::ArrayArgument>),
     /// The Java expression exposes the anonymous type of this source site.
     Anonymous(AnonymousOrigin),
     Comparison(Box<Comparison>),
