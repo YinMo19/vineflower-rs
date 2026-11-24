@@ -953,6 +953,64 @@ fn multicatch_binds_the_verifier_type_without_narrowing_the_union() {
     assert!(lines.iter().any(|line| line.text == "var1.getMessage();"));
 }
 
+#[test]
+fn overriding_finally_returns_through_its_enclosing_resource() {
+    let mut bytes = [
+        0xbb, 0, 2, 0x59, 0xb7, 0, 36, 0x4d, // 0: acquire outer resource, slot 2
+        0xbb, 0, 2, 0x59, 0xb7, 0, 36, 0x4e, // 8: acquire inner resource, slot 3
+        0x2d, 0x3a, 4, // 16: save inner return
+        0x2d, 0xb6, 0, 37, // 19: close inner resource
+        0x2c, 0x3a, 5, // 23: inner finally saves overriding return
+        0x2c, 0xb6, 0, 37, // 26: close outer resource
+        0x01, 0xb0, // 30: outer finally's overriding return
+        0x3a, 4, // 32: inner primary exception
+        0x2d, 0xb6, 0, 37, // 34: close inner resource
+        0xa7, 0, 12, // 38: go to rethrow
+        0x3a, 5, 0x19, 4, 0x19, 5, 0xb6, 0, 19, // 41: add suppressed
+        0x19, 4, 0xbf, // 50: rethrow
+        0x3a, 6, // 53: inner finally entry
+        0x2c, 0x3a, 7, // 55: save its overriding return
+        0x2c, 0xb6, 0, 37, // 58: close outer resource normally even on inner exception
+        0x01, 0xb0, // 62: outer finally's overriding return
+        0x4e, // 64: outer primary exception
+        0x2c, 0xb6, 0, 37, // 65: outer exceptional close
+        0xa7, 0, 11, // 69: go to rethrow
+        0x3a, 4, 0x2d, 0x19, 4, 0xb6, 0, 19, // 72: add suppressed
+        0x2d, 0xbf, // 80: rethrow
+        0x3a, 8, 0x01, 0xb0, // 82: outer finally returns null
+    ];
+    let handlers = [
+        handler(16, 19, 32, 15),
+        handler(34, 38, 41, 15),
+        handler(8, 23, 53, 0),
+        handler(32, 55, 53, 0),
+        handler(8, 26, 64, 15),
+        handler(32, 58, 64, 15),
+        handler(65, 69, 72, 15),
+        handler(0, 30, 82, 0),
+        handler(32, 62, 82, 0),
+        handler(64, 84, 82, 0),
+    ];
+    let decompile = |bytes: &[u8]| test_method_in_class(bytes, &handlers, &[], "()LC;", true);
+    let lines = decompile(&bytes).unwrap();
+    assert_eq!(
+        lines.iter().filter(|line| line.text.as_flat().starts_with("try (")).count(),
+        2,
+    );
+    assert_eq!(lines.iter().filter(|line| line.text == "} finally {").count(), 2);
+    assert!(!lines.iter().any(|line| line.text.as_flat().contains("addSuppressed")));
+    let inner_return = lines.iter().find(|line| line.text == "return var2;").unwrap();
+    let outer_return = lines.iter().find(|line| line.text == "return null;").unwrap();
+    assert!(inner_return.depth > outer_return.depth);
+    assert_eq!(inner_return.offsets, [55]);
+    assert_eq!(outer_return.offsets, [84, 85]);
+
+    // If a different local is closed, suppression/no-suppression semantics
+    // are not interchangeable and the synthetic return is not justified.
+    bytes[58] = 0x2d;
+    assert!(decompile(&bytes).is_err());
+}
+
 fn test_method(
     bytes: &[u8],
     handlers: &[ExceptionHandler],
@@ -966,6 +1024,16 @@ pub(super) fn test_method_with_descriptor(
     handlers: &[ExceptionHandler],
     stack_map: &[u8],
     descriptor: &str,
+) -> Result<Vec<Line>, StructureError> {
+    test_method_in_class(bytes, handlers, stack_map, descriptor, false)
+}
+
+fn test_method_in_class(
+    bytes: &[u8],
+    handlers: &[ExceptionHandler],
+    stack_map: &[u8],
+    descriptor: &str,
+    closeable: bool,
 ) -> Result<Vec<Line>, StructureError> {
     fn words(buffer: &mut Vec<u8>, values: &[u16]) {
         buffer.extend(values.iter().flat_map(|value| value.to_be_bytes()));
@@ -982,7 +1050,7 @@ pub(super) fn test_method_with_descriptor(
 
     let mut class = vec![0xca, 0xfe, 0xba, 0xbe];
     let version = if stack_map.is_empty() { 49 } else { 55 };
-    words(&mut class, &[0, version, 34]); // minor, major, constant_pool_count
+    words(&mut class, &[0, version, if closeable { 39 } else { 34 }]);
     utf8(&mut class, "C"); // #1
     entry(&mut class, 7, &[1]);
     utf8(&mut class, "java/lang/Object");
@@ -1016,10 +1084,19 @@ pub(super) fn test_method_with_descriptor(
     utf8(&mut class, "()Ljava/lang/String;");
     entry(&mut class, 12, &[30, 31]);
     entry(&mut class, 10, &[28, 32]); // #33: getMessage
-    words(&mut class, &[0x0021, 2, 4, 0, 0, 2]); // public class, two methods
+    if closeable {
+        utf8(&mut class, "<init>"); // #34
+        entry(&mut class, 12, &[34, 11]);
+        entry(&mut class, 10, &[2, 35]); // #36: C.<init>
+        entry(&mut class, 10, &[2, 12]); // #37: C.close
+        entry(&mut class, 10, &[4, 35]); // #38: Object.<init>
+        words(&mut class, &[0x0021, 2, 4, 1, 9, 0, 4]); // implements AutoCloseable
+    } else {
+        words(&mut class, &[0x0021, 2, 4, 0, 0, 2]);
+    }
     words(&mut class, &[0x0009, 5, 6, 1, 7]); // public static m, Code
     let mut code = Vec::new();
-    words(&mut code, &[2, 6]); // max_stack, max_locals
+    words(&mut code, &[2, if closeable { 9 } else { 6 }]);
     code.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
     code.extend_from_slice(bytes);
     words(&mut code, &[handlers.len() as u16]);
@@ -1043,9 +1120,17 @@ pub(super) fn test_method_with_descriptor(
     }
     class.extend_from_slice(&(code.len() as u32).to_be_bytes());
     class.extend_from_slice(&code);
-    words(&mut class, &[0x0109, 20, 11, 0, 0]); // native work, class attrs
+    words(&mut class, &[0x0109, 20, 11, 0]); // native work
+    if closeable {
+        words(&mut class, &[0x0101, 10, 11, 0]); // native close
+        words(&mut class, &[0x0001, 34, 11, 1, 7, 0, 17, 1, 1, 0, 5]);
+        class.extend([0x2a, 0xb7, 0, 38, 0xb1]);
+        words(&mut class, &[0, 0]);
+    }
+    words(&mut class, &[0]); // class attrs
 
-    let class = ClassFile::parse(&class).unwrap();
+    let class_bytes = class.as_slice();
+    let class = ClassFile::parse(class_bytes).unwrap();
     let method = &class.methods[0];
     let descriptor = MethodDescriptor::parse(descriptor).unwrap();
     let code = method.code(&class.pool).unwrap().unwrap();
@@ -1054,5 +1139,10 @@ pub(super) fn test_method_with_descriptor(
     let options = Options::default();
     let render = |name: &str| name.replace('/', ".");
     let machine = Machine::new(&class, method, &code, &descriptor, &options, &render).unwrap();
+    let group = closeable.then(|| crate::ClassGroup::new([class_bytes]).unwrap());
+    let machine = match &group {
+        Some(group) => machine.with_group(group),
+        None => machine,
+    };
     structure_with_handlers(&instructions, &graph, machine, &code.exceptions)
 }

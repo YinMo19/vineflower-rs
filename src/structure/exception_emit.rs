@@ -314,16 +314,51 @@ impl Emitter<'_> {
                         return Err(self.unstructured(copy));
                     }
                 }
-                if self.region_with_offsets(
-                    terminal,
-                    cleanup_scope.with_exception_layout(self.layout.containing_loop(terminal)),
-                    &mut body,
-                    depth + 1,
-                    &mut offsets,
-                )? {
-                    return Err(self.unstructured(terminal));
+                if let Some(overriding) = finally.overriding_return() {
+                    let [Some(&ExceptionRedirect::Continue { target: normal, arm }),
+                         Some(&ExceptionRedirect::Continue { target: exceptional, arm: other })] =
+                        [self.exception_redirects.get(&overriding.normal_close),
+                         self.exception_redirects.get(&overriding.exceptional_close)]
+                    else {
+                        return Err(StructureError::ExceptionHandlers);
+                    };
+                    if normal != exceptional || arm != other || region.exception_arm != Some(arm)
+                        || !reaches_join
+                        || self.exceptions.at_start(Some(finally.arm), terminal).is_some()
+                        || mem::replace(&mut self.emitted[terminal], true)
+                    {
+                        return Err(self.unstructured(terminal));
+                    }
+                    let lifted = self.lift_block(terminal, &mut body, cleanup_scope, depth + 1, offsets)?;
+                    if !matches!(lifted.effect, Effect::None) {
+                        return Err(self.unstructured(terminal));
+                    }
+                    // The Java return supplies the saved value before the
+                    // enclosing resource closes. Its opcode belongs to the
+                    // overriding outer finally, so only map the value here.
+                    let Effect::Return(Some(mut value)) = body.step(&self.instructions[overriding.transfer])?
+                    else {
+                        return Err(self.unstructured(terminal));
+                    };
+                    let mut offsets = lifted.offsets;
+                    for statement in body.take_prelude() {
+                        self.push(depth + 1, statement, mem::take(&mut offsets));
+                    }
+                    value.surround("return ", ";");
+                    self.push(depth + 1, value, offsets);
+                    continuation = Some(overriding.normal_close);
+                } else {
+                    if self.region_with_offsets(
+                        terminal,
+                        cleanup_scope.with_exception_layout(self.layout.containing_loop(terminal)),
+                        &mut body,
+                        depth + 1,
+                        &mut offsets,
+                    )? {
+                        return Err(self.unstructured(terminal));
+                    }
+                    continuation = None;
                 }
-                continuation = None;
             } else {
                 if mem::replace(&mut self.emitted[terminal], true) {
                     return Err(self.unstructured(terminal));

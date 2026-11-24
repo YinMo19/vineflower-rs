@@ -22,6 +22,7 @@ impl Emitter<'_> {
     ) -> Result<Option<NormalExits>, StructureError> {
         let mut ambient = None;
         let mut continuation = None;
+        let mut enclosing_terminal = None;
         let mut redirects = Vec::new();
         let mut terminal_blocks = Vec::new();
         for entry in shape.join.into_iter().chain(shape.split_resource_exits.iter().copied()) {
@@ -52,6 +53,14 @@ impl Emitter<'_> {
 
             let edge = match exit {
                 CloseExit::Continue(target) => {
+                    let enclosing = self.exceptions.enclosing_terminal_copy(region.exception_arm, target);
+                    let target = enclosing.unwrap_or(target);
+                    if (enclosing.is_some() && region.stop != enclosing)
+                        || enclosing_terminal.is_some_and(|previous| previous != enclosing)
+                    {
+                        return Ok(None);
+                    }
+                    enclosing_terminal = Some(enclosing);
                     if continuation.is_some_and(|previous| previous != target) {
                         return Ok(None);
                     }
@@ -86,7 +95,8 @@ impl Emitter<'_> {
         if let Some(next) = continuation
             && (skipped.contains(&next)
                 || self.exceptions.contains(Some(shape.body), next)
-                || !self.exceptions.contains(region.exception_arm, next)
+                || (!self.exceptions.contains(region.exception_arm, next)
+                    && enclosing_terminal.flatten() != Some(next))
                 || self.exceptions.at_start(region.exception_arm, next).is_some()
                 || self.exceptions.bypass_cleanup(next) != next
                 || self.layout.loops[next].is_some()

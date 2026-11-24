@@ -4,6 +4,7 @@ pub(super) mod cleanup_locals;
 mod finally_graph;
 mod legacy_resource;
 mod monitor;
+mod overriding_finally;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
@@ -16,6 +17,7 @@ use crate::lift::Machine;
 use self::finally_graph::BranchedFinally;
 use self::legacy_resource::LegacyResource;
 use self::monitor::{MonitorHandler, MonitorPlan};
+use self::overriding_finally::OverridingReturn;
 use super::StructureError;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -93,6 +95,7 @@ struct Cleanup {
     instructions: Range<usize>,
     branched: Option<BranchedFinally>,
     terminal_copies: Option<BTreeSet<usize>>,
+    overriding_return: Option<OverridingReturn>,
     spill_offsets: Vec<(usize, usize)>,
 }
 
@@ -116,6 +119,10 @@ impl Finally {
 
     pub(super) fn terminal_copies(&self) -> Option<&BTreeSet<usize>> {
         self.plan.terminal_copies.as_ref()
+    }
+
+    pub(super) fn overriding_return(&self) -> Option<&OverridingReturn> {
+        self.plan.overriding_return.as_ref()
     }
 
     /// (return opcode, original spill store) instruction indices.
@@ -524,6 +531,22 @@ impl Exceptions {
         Ok(())
     }
 
+    pub(super) fn enclosing_terminal_copy(
+        &self,
+        arm: Option<ArmId>,
+        block: usize,
+    ) -> Option<usize> {
+        let arm = arm?;
+        let region = self.region(self.arms[arm.0].region);
+        let finally = region.finally.as_ref()?;
+        let copies = finally.terminal_copies()?;
+        let canonical = self.bypass_cleanup(block);
+        (region.body == arm
+            && region.join == Some(canonical)
+            && copies.contains(&block))
+        .then_some(canonical)
+    }
+
     fn is_cleanup_copy(&self, block: usize) -> bool {
         self.cleanup_copies.contains(&block) || self.terminal_cleanup_copies.contains(&block)
     }
@@ -603,6 +626,11 @@ impl Exceptions {
         if graph.blocks[head].successors.is_empty() {
             return self.prepare_finally(instructions, graph, table, body, handler);
         }
+        if let Some(plan) =
+            self.prove_overriding_resource_finally(instructions, graph, table, body, handler)
+        {
+            return Ok(plan);
+        }
         let mut branch =
             BranchedFinally::prove(instructions, graph, &table.by_block, body, handler)
                 .ok_or_else(unsupported)?;
@@ -644,6 +672,7 @@ impl Exceptions {
             instructions,
             branched: Some(branch),
             terminal_copies: None,
+            overriding_return: None,
             spill_offsets: Vec::new(),
         })
     }
@@ -798,6 +827,7 @@ impl Exceptions {
             instructions: start..end,
             branched: None,
             terminal_copies: terminal.then_some(exits),
+            overriding_return: None,
             spill_offsets,
         })
     }
