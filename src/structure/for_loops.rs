@@ -23,6 +23,7 @@ pub(super) struct ForLoop {
     pub(super) element: Option<Range<usize>>,
     forget: Vec<u16>,
     offsets: Vec<u32>,
+    hidden_offsets: Option<[Range<u32>; 4]>,
 }
 
 enum Style {
@@ -69,6 +70,9 @@ impl ForLoop {
         let line = &mut lines[header];
         offsets.append(&mut line.offsets);
         offsets.extend(self.offsets);
+        if let Some(hidden) = &self.hidden_offsets {
+            offsets.retain(|offset| !hidden.iter().any(|range| range.contains(offset)));
+        }
         line.text = text;
         line.offsets = offsets;
         lines.drain(self.setup);
@@ -103,6 +107,7 @@ struct Enhanced {
     holder: Document,
     helpers: [Option<u16>; 3],
     omitted_uses: Vec<usize>,
+    hidden_offsets: Option<[Range<u32>; 4]>,
 }
 
 impl Emitter<'_> {
@@ -204,6 +209,7 @@ impl Emitter<'_> {
                 element: Some(enhanced.element),
                 forget,
                 offsets,
+                hidden_offsets: enhanced.hidden_offsets,
             });
         }
         let count = count?;
@@ -220,6 +226,7 @@ impl Emitter<'_> {
             element: None,
             forget: vec![count.slot],
             offsets: useful_offsets(&self.instructions[count.update..count.update + 1]).collect(),
+            hidden_offsets: None,
         })
     }
 
@@ -370,7 +377,7 @@ impl Emitter<'_> {
             holder,
             alias_store,
             cache,
-            length,
+            array_length,
             bound_store,
             zero,
             index_store,
@@ -388,7 +395,7 @@ impl Emitter<'_> {
             return None;
         };
         if access(cache) != Some(Access::Load(Kind::Ref, alias))
-            || length.opcode != 0xbe
+            || array_length.opcode != 0xbe
             || zero.opcode != 0x03
             || access(index_store) != Some(Access::Store(Kind::Int, count.slot))
             || !distinct(&[holder_slot, alias, bound, count.slot])
@@ -456,6 +463,14 @@ impl Emitter<'_> {
                 body_start + 1,
                 count.update,
             ],
+            // Source foreach owns the holder and the binding stores; it
+            // does not have separate length, index, or element expressions.
+            hidden_offsets: Some([
+                array_length.offset..array_length.offset + array_length.len,
+                zero.offset..zero.offset + zero.len,
+                self.instructions[header_start].offset..branch.offset + branch.len,
+                array.offset..get.offset + get.len,
+            ]),
         })
     }
 
@@ -576,6 +591,7 @@ impl Emitter<'_> {
                 self.graph.blocks[header].instructions.start,
                 body_range.start,
             ],
+            hidden_offsets: None,
         })
     }
 

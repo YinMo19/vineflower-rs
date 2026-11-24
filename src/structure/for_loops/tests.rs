@@ -118,12 +118,7 @@ fn array_loop(step: u8) -> Vec<Line> {
 fn array_foreach_eliminates_only_the_three_synthetic_locals() {
     let lines = array_loop(1);
     assert_eq!(lines[0].text, "for (int var4 : var0) {");
-    assert_eq!(
-        lines[0].offsets,
-        [
-            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 22, 23, 24
-        ]
-    );
+    assert_eq!(lines[0].offsets, [0, 1, 2, 4, 6, 15, 16, 22, 23, 24]);
     assert_eq!(lines[1].text, "Example.side(var4);");
 }
 
