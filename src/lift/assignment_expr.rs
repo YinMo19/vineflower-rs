@@ -127,6 +127,20 @@ impl LocalWrite {
         matches!(value.source, Source::Local(index) if index == self.index)
             && Category::of(&value.ty) == Some(self.category)
     }
+
+    fn loads_for_return(self, load: &Instruction, ret: &Instruction) -> bool {
+        let load_kind = match load.opcode {
+            0x15..=0x19 => load.opcode - 0x15,
+            0x1a..=0x2d => (load.opcode - 0x1a) / 4,
+            _ => return false,
+        };
+        Category::for_local(load_kind) == self.category
+            && load.local_access().is_some_and(|(slots, read)| {
+                read && slots.start == u32::from(self.index)
+            })
+            && matches!(ret.opcode, 0xac..=0xb0)
+            && Category::for_local(ret.opcode - 0xac) == self.category
+    }
 }
 
 /// Identity introduced by an actual JVM duplication, never by matching text.
@@ -297,6 +311,33 @@ impl Machine<'_, '_> {
             })
         }) {
             return Ok(None);
+        }
+        if consumed == 2
+            && !candidate.leaves_value
+            && let Target::Local(target) = candidate.target
+            && let [left, _] = self.stack.as_slice()
+            && left.ty == self.descriptor.return_type
+            && let Some([load, ret]) = instructions.get(consumed..consumed + 2)
+            && target.loads_for_return(load, ret)
+            && candidate.store.offset.checked_add(candidate.store.len) == Some(load.offset)
+            && load.offset.checked_add(load.len) == Some(ret.offset)
+            && permits(consumed, load)
+            && permits(consumed + 1, ret)
+        {
+            // The final store is only read by this return. Lift the same
+            // binary expression without committing it to the local slot.
+            let effect = self.step(first)?;
+            debug_assert!(matches!(effect, Effect::None));
+            self.stack
+                .last_mut()
+                .expect("binary expression leaves one value")
+                .text
+                .omit_bytes(candidate.store.offset..ret.offset);
+            return Ok(Some(AssignmentStep {
+                consumed: consumed + 1,
+                effect,
+                declaration: None,
+            }));
         }
         let Candidate { store, target, form, order, operands, leaves_value, declaration } = candidate;
         let mut right = self.pop_raw()?;

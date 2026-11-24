@@ -60,10 +60,18 @@ fn blank_local_declaration_does_not_move_the_store_before_an_open_constructor() 
 
 #[test]
 fn ordinary_typed_compound_stores_use_one_lvalue_access() {
+    let lines = lift(&[0x1a, 0x1b, 0x60, 0x3b, 0x1a, 0x04, 0x60, 0xac], "(II)I", true);
+    assert_eq!(texts(&lines), ["var0 += var1;", "return var0 + 1;"]);
+    let lines = lift(&[0x1a, 0x04, 0x82, 0x3b, 0x1a, 0x04, 0x82, 0xac], "(Z)Z", true);
+    assert_eq!(texts(&lines), ["var0 ^= true;", "return var0 ^ true;"]);
+}
+
+#[test]
+fn terminal_update_is_the_return_value_only_for_the_exact_reloaded_slot() {
     let lines = lift(&[0x1a, 0x1b, 0x60, 0x3b, 0x1a, 0xac], "(II)I", true);
-    assert_eq!(texts(&lines), ["var0 += var1;", "return var0;"]);
-    let lines = lift(&[0x1a, 0x04, 0x82, 0x3b, 0x1a, 0xac], "(Z)Z", true);
-    assert_eq!(texts(&lines), ["var0 ^= true;", "return var0;"]);
+    assert_eq!(texts(&lines), ["return var0 + var1;"]);
+    let lines = lift(&[0x1a, 0x1b, 0x60, 0x3b, 0x1b, 0xac], "(II)I", true);
+    assert_eq!(texts(&lines), ["var0 += var1;", "return var1;"]);
 }
 
 #[test]
