@@ -22,6 +22,7 @@ pub(super) struct Region<'r, 'a, 'c> {
     pub(super) protected: Option<&'r Machine<'a, 'c>>,
     pub(super) exception_arm: Option<ArmId>,
     pub(super) switch_depth: usize,
+    pub(super) predicate: Option<&'r super::switch_expression::predicate::Scope<'r, 'a, 'c>>,
     loop_scope: Option<&'r LoopScope<'a, 'c>>,
     label_scope: Option<&'r super::labeled_blocks::Scope<'a, 'c>>,
     outer: Option<&'r Region<'r, 'a, 'c>>,
@@ -34,6 +35,7 @@ impl<'r, 'a, 'c> Region<'r, 'a, 'c> {
         layout_loop_header: None,
         protected: None,
         exception_arm: None,
+        predicate: None,
         switch_depth: 0,
         loop_scope: None,
         label_scope: None,
@@ -46,6 +48,10 @@ impl<'r, 'a, 'c> Region<'r, 'a, 'c> {
             outer: Some(self),
             ..*self
         }
+    }
+
+    pub(super) fn predicate_body(&'r self, scope: &'r super::switch_expression::predicate::Scope<'r, 'a, 'c>) -> Self {
+        Self { predicate: Some(scope), ..self.switch_body(None) }
     }
 
     pub(super) fn label_body(&'r self, scope: &'r super::labeled_blocks::Scope<'a, 'c>, stop: Option<usize>) -> Self {
@@ -137,6 +143,9 @@ impl<'r, 'a, 'c> Region<'r, 'a, 'c> {
     }
 
     fn has_stop(&self, block: usize) -> bool {
+        if self.predicate.is_some_and(|scope| !scope.cut.owns(block)) {
+            return true;
+        }
         let mut next = Some(self);
         while let Some(region) = next {
             if region.stop == Some(block) {
@@ -205,6 +214,16 @@ impl Layout {
         assertions: Option<&Sites>,
         exceptions: &Exceptions,
     ) -> Result<Self, StructureError> {
+        Self::with_predicate_cuts(graph, instructions, assertions, exceptions, &[])
+    }
+
+    pub(super) fn with_predicate_cuts(
+        graph: &ControlFlowGraph,
+        instructions: &[Instruction],
+        assertions: Option<&Sites>,
+        exceptions: &Exceptions,
+        cuts: &[super::switch_expression::predicate::Cut],
+    ) -> Result<Self, StructureError> {
         let mut immediate_dominators = Some(graph.immediate_dominators());
         let mut natural_loops =
             graph.natural_loops_with_dominators(immediate_dominators.as_deref().unwrap());
@@ -235,8 +254,12 @@ impl Layout {
                 return Err(unsupported());
             }
             let monitor_boundary = exceptions.monitor_finally_boundary(header);
+            let predicate = cuts.iter().find(|cut| cut.owns(header) && !inside(cut.header));
             let outer_transfer = |block| {
                 if monitor_boundary == Some(block) {
+                    return true;
+                }
+                if predicate.is_some_and(|cut| cut.outcomes.contains(&block)) {
                     return true;
                 }
                 let mut enclosing = parent;

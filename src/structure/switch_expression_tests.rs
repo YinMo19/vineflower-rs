@@ -197,6 +197,33 @@ fn accepts_the_if_body_falling_through_to_the_shared_bypass() {
 }
 
 #[test]
+fn keeps_definite_assignment_on_the_predicate_success_edges() {
+    let mut bytes = vec![0x1a];
+    lookup(&mut bytes, 9, &[(0, 0)]);
+    bytes.extend([
+        0x1b, 0x9e, 0, 20, 0x08, 0x3d, 0xa7, 0, 13,
+        0x1b, 0x9c, 0, 11, 0x10, 17, 0x3d, 0xa7, 0, 3,
+        0x1c, 0xac, 0x03, 0xac,
+    ]);
+    let instructions = decode(&bytes).unwrap();
+    let mut graph = ControlFlowGraph::build(&instructions, &[]).unwrap();
+    let [yes, no] = predicate::Cut::prove(&instructions, &graph, 0, None).unwrap().outcomes;
+    let arm = graph.block_at(20).unwrap();
+    graph.blocks[arm].predecessors.push(yes);
+    assert!(predicate::Cut::prove(&instructions, &graph, 0, None).is_none());
+    assert_eq!(graph.blocks[arm].predecessors.pop(), Some(yes));
+    graph.blocks[arm].exception_successors.push(no);
+    assert!(predicate::Cut::prove(&instructions, &graph, 0, None).is_none());
+
+    let lines = lift(&bytes, "(II)I", 60, 0).unwrap();
+    let declaration = lines[0].text.as_flat();
+    assert!(declaration.starts_with("int ") && declaration.ends_with(';') && !declaration.contains('='));
+    let dispatch = lines.iter().find(|line| line.text.as_flat().starts_with("predicate0False: switch")).unwrap();
+    assert_eq!(render(dispatch).0.matches("break predicate0True;").count(), 2);
+    assert_eq!(lines.iter().filter(|line| line.text.as_flat().starts_with("return ")).count(), 2);
+}
+
+#[test]
 fn joins_return_values_with_their_bytecode_offsets() {
     let bytes = int_switch(&[0x1a], &[0xac]);
     let lines = lift(&bytes, "(I)I", 60, 0).unwrap();

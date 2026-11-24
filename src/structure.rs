@@ -50,6 +50,7 @@ pub(crate) struct Line {
     pub sequence_boundary: bool,
     loop_break: Option<LoopBreak>,
     labeled_edge: Option<labeled_blocks::EdgeLine>,
+    predicate_edge: Option<switch_expression::predicate::Edge>,
     boolean_return: Option<BooleanReturn>,
     detached_declaration: bool,
 }
@@ -63,6 +64,7 @@ impl Line {
             sequence_boundary: false,
             loop_break: None,
             labeled_edge: None,
+            predicate_edge: None,
             boolean_return: None,
             detached_declaration: false,
         }
@@ -159,10 +161,17 @@ fn structure_regions(
     {
         machine.track_straight_line_ints();
     }
+    let layout = Layout::with_exceptions(graph, instructions, assertions, exceptions).or_else(|error| {
+        if machine.supports_switch_expressions() {
+            switch_expression::predicate::loop_layout(graph, instructions, assertions, exceptions, error)
+        } else {
+            Err(error)
+        }
+    })?;
     let mut emitter = Emitter {
         instructions,
         graph,
-        layout: Layout::with_exceptions(graph, instructions, assertions, exceptions)?,
+        layout,
         exceptions,
         exception_redirects: BTreeMap::new(),
         resource_epilogue: None,
@@ -263,6 +272,12 @@ impl Emitter<'_> {
             return Err(StructureError::Nesting);
         }
         loop {
+            if let Some(scope) = region.predicate
+                && let Some(outcome) = scope.outcome(block)
+            {
+                self.predicate_exit(scope, outcome, machine, depth, pending)?;
+                return Ok(false);
+            }
             block = self.exceptions.bypass_cleanup(block);
             let Some(next) = self.redirected_exception_block(block, region, machine, depth, pending)?
             else {
@@ -683,6 +698,7 @@ impl Emitter<'_> {
             .or_else(|| {
                 let abrupt = |arm| {
                     region.loop_transfer(arm).is_some()
+                        || region.predicate.is_some_and(|scope| scope.outcome(arm).is_some())
                         || self.is_terminal(arm)
                             && (machine.this_is_initialized()
                                 || self.is_prologue_throw(arm, machine))
@@ -1373,6 +1389,13 @@ impl Emitter<'_> {
             block, region, machine, depth, &selector, &groups, default, &control,
         ) {
             return self.emit_if(block, region, machine, depth, condition, None, offsets, schedule);
+        }
+        if labeled_tail.is_none() && dispatch.is_none()
+            && let Some(next) = self.try_complex_predicate_switch(
+                block, region, machine, depth, &selector, &groups, default, offsets, &control,
+            )?
+        {
+            return Ok(next);
         }
         let join = labeled_tail.or_else(|| self.layout.normal_join(block, region))
             .or_else(|| {

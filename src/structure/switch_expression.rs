@@ -13,6 +13,8 @@ use crate::{
 
 use super::{Condition, Emitter, Line, Tail, flow::Region, surrounded};
 
+pub(super) mod predicate;
+
 pub(super) struct CaseLabel {
     pub(super) text: Document,
     pub(super) offsets: Vec<u32>,
@@ -390,11 +392,15 @@ impl Emitter<'_> {
     }
 
     fn private_switch_block(&self, header: usize, region: Region<'_, '_, '_>, block: usize) -> bool {
+        self.layout.inside(block, region)
+            && self.layout.loops[block].is_none()
+            && self.plain_switch_block(header, region, block)
+    }
+
+    fn plain_switch_block(&self, header: usize, region: Region<'_, '_, '_>, block: usize) -> bool {
         let node = &self.graph.blocks[block];
         let range = node.instructions.clone();
         block > header && !self.emitted[block]
-            && self.layout.inside(block, region)
-            && self.layout.loops[block].is_none()
             && region.loop_transfer(block).is_none()
             && !self.assertion_starts(block)
             && self.exceptions.contains(region.exception_arm, block)
@@ -406,6 +412,8 @@ impl Emitter<'_> {
             && self.exceptions.finally_range(region.exception_arm, block).is_none()
             && self.exceptions.return_split(region.exception_arm, block).is_none()
             && self.exceptions.monitor_acquisition_end(block).is_none()
+            && !self.exception_redirects.contains_key(&block)
+            && self.exceptions.bypass_cleanup(block) == block
             && region.for_loop_prefix(range.start).is_none()
             && !range.into_iter().any(|index| {
                 self.exceptions.skips_instruction(index) || region.for_loop_omits(index)
