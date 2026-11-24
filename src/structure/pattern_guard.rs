@@ -2,7 +2,7 @@
 
 use std::{collections::{BTreeMap, BTreeSet}, ops::Range};
 
-use crate::{bytecode::{Instruction, Operand}, classfile::{Constant, ConstantPool}, lift::{Effect, Machine, pattern_dispatch::PatternLabel}, source_text::Document};
+use crate::{bytecode::{Instruction, Operand}, classfile::{Constant, ConstantPool}, lift::{Effect, IfPatternLocal, Machine, pattern_dispatch::PatternLabel}, source_text::Document};
 
 use super::{Emitter, Head, ends_with_null_check, local, push_zero};
 use super::super::switch_expression::{CaseLabel, DefaultLabel, Rule, RuleResult, SwitchExpression};
@@ -245,10 +245,16 @@ impl RestartLoop {
             }
             let node = &blocks[block];
             let start = if block == entry { first } else { node.instructions.start };
-            let (last, prefix) = emitter.instructions.get(start..node.instructions.end)?.split_last()?;
-            let bridge = !targets.contains(&block) && node.successors.len() == 1
-                && matches!(last.opcode, 0x00 | 0xa7 | 0xc8) && prefix.iter().all(|op| op.opcode == 0);
-            if !ancestors.contains(&block) && !bridge {
+            let (last, _) = emitter.instructions.get(start..node.instructions.end)?.split_last()?;
+            let bridge = !targets.contains(&block) && empty_transfer(emitter, block, start);
+            // The final matching edge may contain just the backing cast,
+            // the store, and a transfer. That prologue belongs in the
+            // predicate, not in its successful continuation.
+            let binding_bridge = !ancestors.contains(&block) && !targets.contains(&block)
+                && matches!(node.predecessors.as_slice(), &[pred]
+                    if emitter.instanceof_prologue(pred, if pred == entry { first } else { blocks[pred].instructions.start })
+                        .is_some_and(|site| site.success == block && empty_transfer(emitter, block, site.body_start())));
+            if !ancestors.contains(&block) && !bridge && !binding_bridge {
                 if let Some(previous) = success.replace(block) && previous != block {
                     return None;
                 }
@@ -256,7 +262,7 @@ impl RestartLoop {
             }
             if !emitter.layout.direct_loop_member(block, self.dispatch)
                 || emitter.layout.loops[block].is_some()
-                || !matches!(last.opcode, 0x99..=0xa6 | 0xaa..=0xab | 0xc6..=0xc7) && !bridge
+                || !matches!(last.opcode, 0x99..=0xa6 | 0xaa..=0xab | 0xc6..=0xc7) && !bridge && !binding_bridge
                 || node.successors.iter().any(|&next| next <= block)
             {
                 return None;
@@ -316,7 +322,7 @@ impl Guard {
         decisions.into_iter().flatten().copied().chain(self.retry_blocks())
     }
 
-    pub(super) fn document(&self, emitter: &Emitter<'_>, first: usize, machine: &Machine<'_, '_>) -> Option<Document> {
+    pub(super) fn document(&self, emitter: &mut Emitter<'_>, first: usize, machine: &mut Machine<'_, '_>) -> Option<Document> {
         match self {
             Self::Never { bytes, .. } => {
                 let mut doc = Document::new();
@@ -330,7 +336,7 @@ impl Guard {
 }
 
 impl ConditionalGuard {
-    fn document(&self, emitter: &Emitter<'_>, first: usize, machine: &Machine<'_, '_>) -> Option<Document> {
+    fn document(&self, emitter: &mut Emitter<'_>, first: usize, machine: &mut Machine<'_, '_>) -> Option<Document> {
         let mut counts = BTreeMap::<usize, usize>::new();
         for &block in &self.blocks {
             for &next in &emitter.graph.blocks[block].successors {
@@ -343,40 +349,84 @@ impl ConditionalGuard {
             return None;
         }
         let decision = self.decision(emitter, self.entry, first, machine, 0)?;
-        match decision {
-            Decision::Expr(doc) => Some(doc),
-            Decision::Literal(_) => None,
+        let Decision::Expr { text, bindings } = decision else { return None };
+        if !bindings.is_empty() && (emitter.graph.blocks[self.success].predecessors.iter().any(|pred| !self.blocks.contains(pred))
+            || bindings.iter().any(|local| self.retries.iter().any(|&retry| emitter.local_is_live(retry, local.slot()))))
+        {
+            return None;
         }
+        for local in bindings.into_iter().rev() {
+            machine.install_if_pattern_local(&local);
+        }
+        Some(text)
     }
 
-    fn decision<'a, 'c>(&self, emitter: &Emitter<'_>, mut block: usize, first: usize, machine: &Machine<'a, 'c>, depth: usize) -> Option<Decision> {
+    fn decision(&self, emitter: &mut Emitter<'_>, mut block: usize, mut first: usize, machine: &Machine<'_, '_>, depth: usize) -> Option<Decision> {
         loop {
             if block == self.success { return Some(Decision::Literal(true)); }
             if self.retries.contains(&block) { return Some(Decision::Literal(false)); }
             if !self.blocks.contains(&block) || depth >= 64 { return None; }
             let node = &emitter.graph.blocks[block];
-            if block != self.entry && empty_bridge(emitter, block) {
+            if empty_transfer(emitter, block, first) {
                 block = node.successors[0];
+                first = emitter.graph.blocks[block].instructions.start;
                 continue;
             }
-            let start = if block == self.entry { first } else { node.instructions.start };
-            let (terminal, producers) = emitter.instructions[start..node.instructions.end].split_last()?;
+            let end = node.instructions.end;
             let mut trial = machine.clone();
-            for op in producers {
-                if !matches!(trial.step(op).ok()?, Effect::None) || !trial.take_prelude().is_empty() {
-                    return None;
+            let prologue = emitter.instanceof_prologue(block, first).filter(|site| self.blocks.contains(&site.success));
+            let binding = if let Some(site) = &prologue {
+                Some(emitter.lift_guard_instanceof(block, first, site, &mut trial)?)
+            } else {
+                for op in &emitter.instructions[first..end - 1] {
+                    if !matches!(trial.step(op).ok()?, Effect::None) || !trial.take_prelude().is_empty() {
+                        return None;
+                    }
                 }
-            }
+                None
+            };
+            let terminal = &emitter.instructions[end - 1];
             let switch_type = trial.pattern_guard_switch_type(terminal);
             let effect = trial.step(terminal).ok()?;
             if !trial.take_prelude().is_empty() || !trial.same_control_stack(machine) || !trial.same_locals(machine) {
                 return None;
             }
-            let next = |target| self.decision(emitter, target, first, machine, depth + 1);
+            let bytes = emitter.instructions.get(first)?.offset..terminal.offset + terminal.len;
+            let next = |emitter: &mut Emitter<'_>, target: usize, state: &Machine<'_, '_>| {
+                self.decision(emitter, target, emitter.graph.blocks[target].instructions.start, state, depth + 1)
+            };
             let result = match effect {
                 Effect::Branch { target, when_true, when_false } => {
                     let (taken, fallthrough) = emitter.branch_targets(block, target).ok()?;
-                    Decision::select(when_true, when_false, next(taken)?, next(fallthrough)?)
+                    if let (Some(site), Some(binding)) = (prologue, binding) {
+                        let (matched, unmatched, condition) = if taken == site.success {
+                            (taken, fallthrough, when_true)
+                        } else {
+                            (fallthrough, taken, when_false)
+                        };
+                        // Only a conjunction exports a successful binding
+                        // to both the rest of the predicate and the case body.
+                        if !matches!(next(emitter, unmatched, machine)?, Decision::Literal(false)) {
+                            return None;
+                        }
+                        let start = site.body_start();
+                        let range = site.instructions();
+                        let end = if empty_transfer(emitter, matched, start) {
+                            emitter.graph.blocks[matched].instructions.end
+                        } else {
+                            range.end
+                        };
+                        let terminal = &emitter.instructions[end - 1];
+                        let prologue_bytes = emitter.instructions[range.start].offset..terminal.offset + terminal.len;
+                        trial.install_if_pattern_local(&binding);
+                        let rest = self.decision(emitter, matched, start, &trial, depth + 1)?;
+                        let (mut text, mut bindings) = Decision::and(condition, rest)?;
+                        text = Decision::anchor(text, prologue_bytes);
+                        bindings.push(binding);
+                        Decision::Expr { text, bindings }
+                    } else {
+                        Decision::select(when_true, when_false, next(emitter, taken, machine)?, next(emitter, fallthrough, machine)?)?
+                    }
                 }
                 Effect::Switch { selector } => {
                     let Operand::Switch { default, cases } = &terminal.operand else { return None };
@@ -392,17 +442,18 @@ impl ConditionalGuard {
                     let rules = groups.iter().map(|(&target, labels)| (target, labels.as_slice(), DefaultLabel::Absent))
                         .chain([(*default, &[] as &[CaseLabel], DefaultLabel::Default)])
                         .map(|(target, labels, default)| {
+                            let text = next(emitter, emitter.graph.block_at(target)?, machine)?.into_document()?;
                             Some(Rule {
                                 labels, default, statements: Vec::new(), trailing_offsets: Vec::new(),
-                                result: RuleResult::Yield(next(emitter.graph.block_at(target)?)?.into_document()),
+                                result: RuleResult::Yield(text),
                             })
                         })
                         .collect::<Option<Vec<_>>>()?;
-                    Decision::Expr(SwitchExpression { selector: &selector, rules, depth: 0 }.render())
+                    Decision::expr(SwitchExpression { selector: &selector, rules, depth: 0 }.render())
                 }
                 _ => return None,
             };
-            return Some(result.anchored(emitter.instructions.get(start)?.offset..terminal.offset + terminal.len));
+            return Some(result.anchored(bytes));
         }
     }
 }
@@ -415,10 +466,15 @@ fn private(emitter: &Emitter<'_>, block: usize) -> bool {
 }
 
 fn empty_bridge(emitter: &Emitter<'_>, block: usize) -> bool {
+    empty_transfer(emitter, block, emitter.graph.blocks[block].instructions.start)
+}
+
+fn empty_transfer(emitter: &Emitter<'_>, block: usize, first: usize) -> bool {
     let node = &emitter.graph.blocks[block];
-    node.successors.len() == 1 && emitter.instructions[node.instructions.clone()].split_last().is_some_and(|(last, prefix)| {
+    let code = &emitter.instructions[first..node.instructions.end];
+    node.successors.len() == 1 && (code.is_empty() || code.split_last().is_some_and(|(last, prefix)| {
         matches!(last.opcode, 0x00 | 0xa7 | 0xc8) && prefix.iter().all(|op| op.opcode == 0)
-    })
+    }))
 }
 
 fn integer(pool: &ConstantPool<'_>, op: &Instruction) -> Option<i32> {
@@ -430,34 +486,76 @@ fn integer(pool: &ConstantPool<'_>, op: &Instruction) -> Option<i32> {
     }
 }
 
-enum Decision { Literal(bool), Expr(Document) }
+enum Decision {
+    Literal(bool),
+    // Reverse evaluation order, so a dominating binding can append itself.
+    Expr { text: Document, bindings: Vec<IfPatternLocal> },
+}
 
 impl Decision {
-    fn into_document(self) -> Document {
-        match self { Self::Literal(true) => "true".into(), Self::Literal(false) => "false".into(), Self::Expr(doc) => doc }
+    fn expr(text: Document) -> Self {
+        Self::Expr { text, bindings: Vec::new() }
     }
 
-    fn select(mut condition: Document, inverse: Document, yes: Self, no: Self) -> Self {
+    fn into_document(self) -> Option<Document> {
+        match self {
+            Self::Literal(true) => Some("true".into()),
+            Self::Literal(false) => Some("false".into()),
+            Self::Expr { text, bindings } => bindings.is_empty().then_some(text),
+        }
+    }
+
+    fn has_bindings(&self) -> bool {
+        matches!(self, Self::Expr { bindings, .. } if !bindings.is_empty())
+    }
+
+    fn and(mut condition: Document, rest: Self) -> Option<(Document, Vec<IfPatternLocal>)> {
+        match rest {
+            Self::Literal(true) => Some((condition, Vec::new())),
+            Self::Literal(false) => None,
+            Self::Expr { text, bindings } => {
+                condition.surround("(", ") && (");
+                condition.append(text);
+                condition.push(')');
+                Some((condition, bindings))
+            }
+        }
+    }
+
+    fn select(mut condition: Document, inverse: Document, yes: Self, no: Self) -> Option<Self> {
         use Decision::Literal;
-        Self::Expr(match (yes, no) {
-            (Literal(true), Literal(false)) => condition,
-            (Literal(false), Literal(true)) => inverse,
+        Some(match (yes, no) {
+            (Literal(true), Literal(false)) => Self::expr(condition),
+            (Literal(false), Literal(true)) => Self::expr(inverse),
+            (yes, Literal(false)) if yes.has_bindings() => {
+                let (text, bindings) = Self::and(condition, yes)?;
+                Self::Expr { text, bindings }
+            }
+            (Literal(false), no) if no.has_bindings() => {
+                let (text, bindings) = Self::and(inverse, no)?;
+                Self::Expr { text, bindings }
+            }
             (yes, no) => {
                 condition.surround("(", ") ? ");
-                condition.append(yes.into_document());
+                condition.append(yes.into_document()?);
                 condition.push_str(" : ");
-                condition.append(no.into_document());
-                condition
+                condition.append(no.into_document()?);
+                Self::expr(condition)
             }
         })
     }
 
+    fn anchor(text: Document, offsets: Range<u32>) -> Document {
+        let mut result = Document::new();
+        result.anchor(offsets);
+        result.append(text);
+        result
+    }
+
     fn anchored(self, offsets: Range<u32>) -> Self {
-        if let Self::Expr(doc) = self {
-            let mut result = Document::new();
-            result.anchor(offsets);
-            result.append(doc);
-            Self::Expr(result)
-        } else { self }
+        match self {
+            Self::Expr { text, bindings } => Self::Expr { text: Self::anchor(text, offsets), bindings },
+            literal => literal,
+        }
     }
 }

@@ -1,5 +1,5 @@
 use crate::classfile::{TypeArgumentTarget, TypeTarget};
-use crate::descriptor::Primitive;
+use crate::descriptor::{GenericType, Primitive, TypeArgument};
 
 use super::{Category, Effect, Instruction, LiftError, Local, Machine, Source, Type};
 use crate::source_text::Document;
@@ -70,6 +70,26 @@ impl Machine<'_, '_> {
         slot: u16,
     ) -> Result<Option<IfPatternLocal>, LiftError> {
         self.prepare_if_binding(ty, Some(cast), store, slot)
+    }
+
+    pub(crate) fn prepare_guard_pattern_local(
+        &self,
+        ty: &Type,
+        cast: &Instruction,
+        store: &Instruction,
+        slot: u16,
+    ) -> Result<Option<IfPatternLocal>, LiftError> {
+        let Some(mut binding) = self.prepare_if_pattern_local(ty, cast, store, slot)? else {
+            return Ok(None);
+        };
+        // LVTT can restore a reifiable wildcard type such as Class<?>.
+        // An arbitrary generic local signature does not prove the test can
+        // legally be written with that type.
+        binding.local.generic = self.locals.declaration_signature(ty, self.store_debug(store, slot).as_ref())
+            .filter(|signature| matches!(&signature.ty, GenericType::Class(class)
+                if class.nested.is_empty() && !class.arguments.is_empty()
+                    && class.arguments.iter().all(|arg| matches!(arg, TypeArgument::Any))));
+        Ok(Some(binding))
     }
 
     fn prepare_if_binding(
@@ -187,6 +207,15 @@ impl Machine<'_, '_> {
         let Some(condition) = self.stack.last_mut() else {
             return Err(self.invalid_stack("missing instanceof result"));
         };
+        if let Some(signature) = &binding.local.generic
+            && let GenericType::Class(class) = &signature.ty
+        {
+            condition.text.push_str("<?");
+            for _ in 1..class.arguments.len() {
+                condition.text.push_str(", ?");
+            }
+            condition.text.push('>');
+        }
         condition.text.push(' ');
         condition.text.append(declaration);
         Ok(())

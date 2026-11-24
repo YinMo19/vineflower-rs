@@ -69,7 +69,106 @@ struct Site {
     ty: Type,
 }
 
+/// The check and backing cast must read the same JVM definition, and only
+/// the test's matching edge may enter the cast/store prologue.
+pub(super) struct MatchPrologue {
+    pub(super) success: usize,
+    load: usize,
+    cast: usize,
+    store: usize,
+    selector: u16,
+    slot: u16,
+    test_class: u16,
+    cast_class: u16,
+}
+
+impl MatchPrologue {
+    pub(super) fn body_start(&self) -> usize {
+        self.store + 1
+    }
+
+    pub(super) fn instructions(&self) -> Range<usize> {
+        self.cast - 1..self.body_start()
+    }
+
+    fn ty(&self, machine: &Machine<'_, '_>) -> Option<Type> {
+        let ty = machine.pattern_class(self.test_class).ok()?;
+        (machine.pattern_class(self.cast_class).ok()? == ty).then_some(ty)
+    }
+}
+
 impl Emitter<'_> {
+    pub(super) fn instanceof_prologue(&self, head: usize, first: usize) -> Option<MatchPrologue> {
+        let block = &self.graph.blocks[head];
+        let &[taken, fallthrough] = block.successors.as_slice() else { return None };
+        let [.., load, test, branch] = &self.instructions[first..block.instructions.end] else { return None };
+        let success = match branch.opcode {
+            0x99 => fallthrough,
+            0x9a => taken,
+            _ => return None,
+        };
+        let next = &self.graph.blocks[success];
+        if taken == fallthrough || next.predecessors != [head]
+            || !block.exception_successors.is_empty()
+            || !next.exception_predecessors.is_empty()
+            || !next.exception_successors.is_empty()
+        {
+            return None;
+        }
+        let selector = reference_local(load, false)?;
+        let [reload, cast, store, ..] = &self.instructions[next.instructions.clone()] else { return None };
+        let slot = reference_local(store, true)?;
+        if reference_local(reload, false) != Some(selector) || slot == selector {
+            return None;
+        }
+        let (0xc1, Operand::Constant(test_class), 0xc0, Operand::Constant(cast_class)) =
+            (test.opcode, &test.operand, cast.opcode, &cast.operand)
+        else {
+            return None;
+        };
+        let load = block.instructions.end - 3;
+        let cast = next.instructions.start + 1;
+        let store = cast + 1;
+        if (load..block.instructions.end).chain(cast - 1..=store)
+            .any(|index| self.exceptions.skips_instruction(index))
+        {
+            return None;
+        }
+        Some(MatchPrologue { success, load, cast, store, selector, slot, test_class: *test_class, cast_class: *cast_class })
+    }
+
+    pub(super) fn lift_guard_instanceof(
+        &mut self,
+        block: usize,
+        first: usize,
+        site: &MatchPrologue,
+        machine: &mut Machine<'_, '_>,
+    ) -> Option<IfPatternLocal> {
+        if !machine.supports_instanceof_patterns() || !machine.this_is_initialized() {
+            return None;
+        }
+        let ty = site.ty(machine)?;
+        let end = self.instanceof_alias(block, first, site).filter(|&alias| {
+            machine.if_pattern_alias_unnamed(&self.instructions[alias], site.selector)
+        }).unwrap_or(site.load + 1);
+        // Keep the expression on the stack in place of the private
+        // astore/aload pair. Its evaluation remains on the matching path of
+        // the preceding guard, and only the pattern test consumes it.
+        for op in &self.instructions[first..end] {
+            if !matches!(machine.step(op).ok()?, Effect::None) || !machine.take_prelude().is_empty() {
+                return None;
+            }
+        }
+        if !machine.if_pattern_selector(&ty) {
+            return None;
+        }
+        let local = machine.prepare_guard_pattern_local(
+            &ty, &self.instructions[site.cast], &self.instructions[site.store], site.slot,
+        ).ok()??;
+        machine.lift_if_pattern_test(&self.instructions[site.load + 1], &local).ok()?;
+        Some(local)
+    }
+
     fn instanceof_site(
         &mut self,
         head: usize,
@@ -85,27 +184,11 @@ impl Emitter<'_> {
         {
             return None;
         }
-        let block = &self.graph.blocks[head];
-        if !block.exception_successors.is_empty() {
-            return None;
-        }
-        let [taken, fallthrough] = *block.successors.as_slice() else {
-            return None;
-        };
-        let [.., load, test, branch] = &self.instructions[block.instructions.clone()] else {
-            return None;
-        };
-        let success = match branch.opcode {
-            0x99 => fallthrough, // ifeq: the matching path is not taken
-            0x9a => taken,       // ifne: the matching path is taken
-            _ => return None,
-        };
-        let next = &self.graph.blocks[success];
+        let head_range = self.graph.blocks[head].instructions.clone();
+        let site = self.instanceof_prologue(head, head_range.start)?;
+        let success = site.success;
         if self.emitted[success]
             || (!self.layout.inside(success, region) && Some(success) != allowed_exit)
-            || next.predecessors != [head]
-            || !next.exception_predecessors.is_empty()
-            || !next.exception_successors.is_empty()
             || self.layout.loops[success].is_some()
             || self
                 .exceptions
@@ -114,76 +197,45 @@ impl Emitter<'_> {
         {
             return None;
         }
-        let selector = reference_local(load, false)?;
-        let [reload, cast, store, ..] = &self.instructions[next.instructions.clone()] else {
-            return None;
-        };
-        if reference_local(reload, false) != Some(selector) {
-            return None;
-        }
-        let slot = reference_local(store, true)?;
-        if slot == selector {
-            return None;
-        }
-        let (0xc1, Operand::Constant(test_class), 0xc0, Operand::Constant(cast_class)) =
-            (test.opcode, &test.operand, cast.opcode, &cast.operand)
-        else {
-            return None;
-        };
-        let ty = machine.pattern_class(*test_class).ok()?;
-        if machine.pattern_class(*cast_class).ok()? != ty {
-            return None;
-        }
-        let load = block.instructions.end - 3;
-        let cast = next.instructions.start + 1;
-        let store = cast + 1;
-        if [load, load + 1, load + 2, cast - 1, cast, store]
-            .into_iter()
-            .any(|index| self.exceptions.skips_instruction(index))
-        {
-            return None;
-        }
-        // Javac often evaluates a selector once into an unnamed alias. Erase
-        // that store only if neither edge can observe the slot before another
-        // write. In particular, a second check or an escaping use keeps it.
-        let unmatched = if success == taken { fallthrough } else { taken };
-        let alias = load.checked_sub(1).filter(|&index| {
-            index >= block.instructions.start
-                && reference_local(&self.instructions[index], true) == Some(selector)
-                && !self.exceptions.skips_instruction(index)
-        });
-        let head_range = block.instructions.clone();
-        let alias = alias.filter(|_| {
-            let after = self.graph.blocks[success].instructions.end;
-            let use_after = self.instructions[store + 1..after]
-                .iter()
-                .find_map(|instruction| local_access(instruction, selector));
-            let escapes = use_after.unwrap_or_else(|| {
-                // A prologue's block can have more than one successor when
-                // there is a short-circuiting guard after the store.
-                match *self.graph.blocks[success].successors.as_slice() {
-                    [] => false,
-                    [only] => self.local_is_live(only, selector),
-                    [first, second] => {
-                        self.local_is_live(first, selector) || self.local_is_live(second, selector)
-                    }
-                    _ => true,
-                }
-            });
-            !escapes && !self.local_is_live(unmatched, selector)
-        });
+        let ty = site.ty(machine)?;
+        let alias = self.instanceof_alias(head, head_range.start, &site);
         Some(Site {
             success,
             beginning: head_range.start,
             alias,
             head_end: head_range.end,
-            load,
-            test: load + 1,
-            cast,
-            store,
-            slot,
+            load: site.load,
+            test: site.load + 1,
+            cast: site.cast,
+            store: site.store,
+            slot: site.slot,
             ty,
         })
+    }
+
+    fn instanceof_alias(&mut self, head: usize, first: usize, site: &MatchPrologue) -> Option<usize> {
+        // Javac often evaluates a selector once into an unnamed alias. Erase
+        // that store only if neither edge can observe the slot before another
+        // write. In particular, a second check or an escaping use keeps it.
+        let alias = site.load.checked_sub(1).filter(|&index| {
+            index >= first
+                && reference_local(&self.instructions[index], true) == Some(site.selector)
+                && !self.exceptions.skips_instruction(index)
+        })?;
+        let after = self.graph.blocks[site.success].instructions.end;
+        let escapes = self.instructions[site.body_start()..after]
+            .iter()
+            .find_map(|instruction| local_access(instruction, site.selector))
+            .unwrap_or_else(|| {
+                // The prologue can share a block with the next condition.
+                // If it does not access the alias, check every exit.
+                let successors = self.graph.blocks[site.success].successors.as_slice();
+                successors.iter().any(|&next| {
+                    self.layout.local_is_live(self.graph, self.instructions, next, site.selector)
+                })
+            });
+        let unmatched = *self.graph.blocks[head].successors.iter().find(|&&next| next != site.success)?;
+        (!escapes && !self.local_is_live(unmatched, site.selector)).then_some(alias)
     }
 
     pub(super) fn lift_instanceof_head<'a, 'c>(

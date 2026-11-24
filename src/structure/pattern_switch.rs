@@ -566,7 +566,7 @@ impl Emitter<'_> {
                     if let Some(guard) = &arm.guard {
                         let first = self.graph.blocks[shape.entry].instructions.start;
                         label.push_str(guard_keyword);
-                        label.append(guard.document(self, first, &entry).ok_or_else(|| self.unstructured(shape.entry))?);
+                        label.append(guard.document(self, first, &mut entry).ok_or_else(|| self.unstructured(shape.entry))?);
                     }
                     staged.push(BoundArm {
                         entry,
@@ -622,7 +622,7 @@ impl Emitter<'_> {
                         let first = arm.binding.as_ref().map_or(
                             self.graph.blocks[*target].instructions.start, |(indices, _)| indices.end,
                         );
-                        let mut predicate = guard.document(self, first, &entry).ok_or_else(|| self.unstructured(*target))?;
+                        let mut predicate = guard.document(self, first, &mut entry).ok_or_else(|| self.unstructured(*target))?;
                         if guard_keyword == " && " {
                             predicate.surround("(", ")");
                         }
