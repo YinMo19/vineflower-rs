@@ -13,10 +13,8 @@ const COMPANIONS: [&[u8]; 7] = [
 
 #[test]
 fn same_named_local_classes_keep_distinct_scopes_after_default_only_switch() {
-    let options = Options {
-        include_line_mappings: true,
-        ..Options::default()
-    };
+    let mut options = Options::default();
+    options.include_line_mappings = true;
     let source = decompile_group(OUTER, COMPANIONS, &options).unwrap();
     let (other_cases, default_only) = source.text.split_once("public void test2(int i)").unwrap();
     assert_eq!(other_cases.matches("\n            class LocalClass {").count(), 3);
