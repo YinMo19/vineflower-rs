@@ -38,6 +38,19 @@ impl<'a, 'c> Names<'a, 'c> {
             .map_or("", |(package, _)| package);
         let mut bindings = HashMap::new();
         bindings.insert(simple(effective).into(), effective.into());
+        if let Some(class) = group.get(name) {
+            for index in std::iter::once(class.super_class).chain(class.interfaces.iter().copied()) {
+                let Ok(parent) = class.pool.class_name(index) else { continue; };
+                let Some(member) = group.member_class(parent) else { continue; };
+                // A nested supertype can inherit the declaration of its own
+                // simple name from its enclosing ancestor. That inherited
+                // name hides a same-named single-type import in this body.
+                if member.access_flags & 0x0005 != 0 && group.is_assignable(parent, member.outer) {
+                    let leaf = renames.simple_class_alias(parent).unwrap_or(member.simple_name);
+                    bindings.entry(leaf.into()).or_insert_with(|| renames.class_name(parent).into());
+                }
+            }
+        }
         Self {
             owner: name,
             package,
