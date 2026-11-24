@@ -93,6 +93,40 @@ public abstract class ShadowedOuter {
 }
 
 #[test]
+#[ignore = "requires VINEFLOWER_JDK_8 to compile the local class and reconstructed lambda"]
+fn a_lambda_keeps_its_helpers_local_class_declaration() {
+    let jdk = PathBuf::from(env::var_os("VINEFLOWER_JDK_8").expect("set VINEFLOWER_JDK_8"));
+    let work = tempfile::tempdir().unwrap();
+    let path = work.path();
+    let source = path.join("LambdaLocal.java");
+    fs::write(&source, r#"
+package pkg;
+
+import java.util.function.Supplier;
+
+public class LambdaLocal {
+    public static Supplier<Object> make() {
+        return () -> {
+            class Local {}
+            return new Local();
+        };
+    }
+}
+"#).unwrap();
+    let javac = jdk.join("bin/javac");
+    run(Command::new(&javac).arg("-g:none").arg("-d").arg(path).arg(&source));
+    let owner = fs::read(path.join("pkg/LambdaLocal.class")).unwrap();
+    let local = fs::read(path.join("pkg/LambdaLocal$1Local.class")).unwrap();
+    let recovered = decompile_group(&owner, [local.as_slice()], &Options::default())
+        .unwrap().text;
+    assert!(recovered.contains("class Local {") && recovered.contains("return new Local();"), "{recovered}");
+    let candidate = path.join("candidate");
+    fs::create_dir(&candidate).unwrap();
+    fs::write(&source, recovered).unwrap();
+    run(Command::new(&javac).arg("-g:none").arg("-d").arg(candidate).arg(source));
+}
+
+#[test]
 #[ignore = "requires VINEFLOWER_JDK_8 for the Java 8 source/runtime round trip"]
 fn recompiled_nested_classes_read_the_same_live_fields_and_lexical_captures() {
     let jdk = PathBuf::from(env::var_os("VINEFLOWER_JDK_8").expect("set VINEFLOWER_JDK_8"));

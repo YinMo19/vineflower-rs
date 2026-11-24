@@ -3,6 +3,7 @@
 use std::{
     borrow::Cow,
     collections::{BTreeMap, HashSet},
+    rc::Rc,
     sync::Arc,
 };
 
@@ -11,6 +12,7 @@ use crate::{
     cfg::ControlFlowGraph,
     classfile::{BootstrapMethod, ClassFile, Constant, ConstantPool, Member, find_attribute},
     classpath::ClassMetadata,
+    context::NestedKind,
     descriptor::{
         ClassSignature, GenericType, MethodDescriptor, MethodSignature, Primitive, Type,
         TypeArgument,
@@ -650,14 +652,38 @@ impl<'a, 'c> Machine<'a, 'c> {
         let Ok(graph) = ControlFlowGraph::build(&instructions, &code.exceptions) else {
             return Ok(None);
         };
-        let nested_anonymous = self.group.is_some_and(|group| {
-            group.children(self.owner).any(|(_, node)| {
-                matches!(node.kind, crate::context::NestedKind::Anonymous)
-                    && node.method.as_ref().is_some_and(|(name, descriptor)| {
-                        name == site.name && descriptor == site.implementation_descriptor
-                    })
-            })
-        });
+        let mut nested_anonymous = false;
+        if let Some(group) = self.group.filter(|_| self.options.decompile_inner) {
+            let in_helper = |node: &crate::context::NestedClass| {
+                node.outer == self.owner && node.method.as_ref().is_some_and(|(name, descriptor)| {
+                    name == site.name && descriptor == site.implementation_descriptor
+                })
+            };
+            if group.children(self.owner).any(|(_, node)| {
+                matches!(node.kind, NestedKind::Local(_)) && in_helper(node)
+            }) {
+                // Local declarations are written in the helper's method
+                // body, not by expanding anonymous-construction markers.
+                return Ok(None);
+            }
+            if self.anonymous_sites.is_some() {
+                for op in &instructions {
+                    let (0xbb, Operand::Constant(index)) = (op.opcode, &op.operand) else {
+                        continue;
+                    };
+                    let owner = self.class.pool.class_name(*index)?;
+                    let Some(node) = group.nested_class(owner).filter(|node| {
+                        matches!(node.kind, NestedKind::Anonymous) && group.is_attached(owner)
+                    }) else {
+                        continue;
+                    };
+                    if !in_helper(node) {
+                        return Ok(None);
+                    }
+                    nested_anonymous = true;
+                }
+            }
+        }
         let nested_sites = if nested_anonymous {
             // A real anonymous class has observable class identity. Unlike
             // ordinary helper expressions, it may not be copied to multiple
@@ -711,7 +737,7 @@ impl<'a, 'c> Machine<'a, 'c> {
             machine.locals.inherit_lexical_scope(&self.locals);
             // Keep the outer method's registry; the final source writer
             // expands these entries after it writes the inlined lambda.
-            machine.anonymous_sites = Some(std::rc::Rc::clone(sites));
+            machine.anonymous_sites = Some(Rc::clone(sites));
             machine.set_anonymous_source(&instructions);
         }
         let mut parameters =
