@@ -19,6 +19,7 @@ use super::{
 mod control;
 mod decisions;
 mod defaults;
+mod extensions;
 mod logic;
 mod loops;
 mod statements;
@@ -27,6 +28,7 @@ mod templates;
 mod try_regions;
 
 pub(super) use defaults::{recover as parameter_defaults, verify_copy, verify_copy_defaults};
+pub(super) use extensions::Context as Extension;
 use logic::{Comparison, Conditional, Relation};
 
 pub(super) const STATIC: u16 = 0x0008;
@@ -74,6 +76,8 @@ enum ExprKind<'a> {
         index: usize,
         load: u8,
     },
+    ExtensionReceiver(extensions::Receiver),
+    BoundGetter(extensions::Read),
     LoopLocal(loops::Binding<'a>),
     CatchLocal(try_regions::Binding<'a>),
     CatchMessage(try_regions::Binding<'a>),
@@ -159,6 +163,7 @@ struct Locals<'a> {
     instance: bool,
     alias: Option<(u16, u8, usize)>,
     templates: templates::Context<'a>,
+    extension: Option<Extension<'a>>,
 }
 
 impl<'a> Locals<'a> {
@@ -168,16 +173,28 @@ impl<'a> Locals<'a> {
         parameters: &[ValueParameter],
         declaration: &str,
     ) -> Result<Self, KotlinError> {
-        if descriptor.parameters.len() != parameters.len() {
+        Self::with_extension(descriptor, instance, parameters, None, declaration)
+    }
+
+    fn with_extension(
+        descriptor: &'a MethodDescriptor,
+        instance: bool,
+        parameters: &[ValueParameter],
+        extension: Option<Extension<'a>>,
+        declaration: &str,
+    ) -> Result<Self, KotlinError> {
+        let receiver = usize::from(extension.is_some());
+        if descriptor.parameters.len() != parameters.len() + receiver {
             return Err(KotlinError::unsupported(
                 declaration,
                 "JVM parameters do not match Kotlin parameters",
             ));
         }
-        let mut next = u16::from(instance);
+        let mut next = u16::from(instance) + extension.as_ref().map_or(0, Extension::slots);
         let slots = descriptor
             .parameters
             .iter()
+            .skip(receiver)
             .map(|ty| {
                 let slot = next;
                 next += ty.slots();
@@ -189,6 +206,7 @@ impl<'a> Locals<'a> {
             instance,
             alias: None,
             templates: templates::Context::default(),
+            extension,
         })
     }
 
@@ -196,7 +214,10 @@ impl<'a> Locals<'a> {
         let parameters = self
             .slots
             .last()
-            .map_or(u16::from(self.instance), |(slot, ty)| slot + ty.slots());
+            .map_or_else(
+                || u16::from(self.instance) + self.extension.as_ref().map_or(0, Extension::slots),
+                |(slot, ty)| slot + ty.slots(),
+            );
         self.alias.map_or(parameters, |(slot, load, _)| {
             slot.saturating_add(if matches!(load, 0x16 | 0x18) { 2 } else { 1 })
         })
@@ -324,20 +345,26 @@ impl<'a, 'data> Bytecode<'a, 'data> {
         descriptor: &MethodDescriptor,
         parameters: &[ValueParameter],
         properties: &[Property],
+        extension: Option<Extension<'_>>,
         declaration: &str,
         trace: bool,
     ) -> Result<Body<'a>, KotlinError> {
-        let mut locals = Locals::new(
+        let mut locals = Locals::with_extension(
             descriptor,
             member.access_flags & STATIC == 0,
             parameters,
+            extension,
             declaration,
         )?;
         locals.templates.member = Some(member);
         locals.templates.properties = properties;
         let code = self.function_code(member, declaration)?;
         let decoded = bytecode::decode(code.bytes)?;
-        let instructions = self.parameter_checks(&decoded, &locals, parameters)?;
+        let instructions = if let Some(extension) = &locals.extension {
+            extension.parameter_checks(self, &decoded, &locals, &code.exceptions, declaration)?
+        } else {
+            self.parameter_checks(&decoded, &locals, parameters)?
+        };
         let mut start = decoded.len() - instructions.len();
         if !code.exceptions.is_empty() {
             return try_regions::lower(
@@ -545,6 +572,7 @@ impl<'a, 'data> Bytecode<'a, 'data> {
             instance: false,
             alias: None,
             templates: templates::Context::default(),
+            extension: None,
         };
         self.assignment_slice(instructions, &locals, declaration)
     }
@@ -796,6 +824,12 @@ impl<'a> Bytecode<'a, '_> {
         if templates::lower(self, instruction, locals, stack, declaration)? {
             return Ok(());
         }
+        if let Some(extension) = &locals.extension
+            && let Some(expr) = extension.getter(self, instruction, locals, stack, declaration)?
+        {
+            stack.push(StackValue::Value(expr));
+            return Ok(());
+        }
         if instruction.opcode == 0x00 {
             return Ok(());
         }
@@ -807,6 +841,8 @@ impl<'a> Bytecode<'a, '_> {
                 stack.push(StackValue::Value(Expr { kind, depth: 1 }));
             } else if locals.instance && opcode == 0x19 && slot == 0 {
                 stack.push(StackValue::This);
+            } else if let Some(kind) = locals.extension.as_ref().and_then(|extension| extension.load(opcode, slot)) {
+                stack.push(StackValue::Value(Expr { kind, depth: 1 }));
             } else {
                 let param = locals.parameter(slot, opcode).ok_or_else(|| {
                     KotlinError::unsupported(declaration, "load of non-parameter local")
@@ -1094,8 +1130,9 @@ impl<'a> Expr<'a> {
 
     fn infallible(&self) -> bool {
         match &self.kind {
-            ExprKind::Literal(_) | ExprKind::Parameter { .. } | ExprKind::LoopLocal(_)
-            | ExprKind::CatchLocal(_) | ExprKind::ThisProperty { .. } | ExprKind::ClassLiteral(_) => true,
+            ExprKind::Literal(_) | ExprKind::Parameter { .. } | ExprKind::ExtensionReceiver(_)
+            | ExprKind::LoopLocal(_) | ExprKind::CatchLocal(_) | ExprKind::ThisProperty { .. }
+            | ExprKind::ClassLiteral(_) => true,
             ExprKind::Template(template) => template.infallible(),
             ExprKind::Binary(operator, _, pair) => {
                 !matches!(operator, Operator::Divide | Operator::Remainder)
@@ -1118,6 +1155,8 @@ impl<'a> Expr<'a> {
             ExprKind::Literal(Literal::Float(_)) => Some(0x17),
             ExprKind::Literal(Literal::Double(_)) => Some(0x18),
             ExprKind::Parameter { load, .. } => Some(*load),
+            ExprKind::ExtensionReceiver(receiver) => Some(receiver.load_opcode()),
+            ExprKind::BoundGetter(read) => Some(load_opcode(&read.value().jvm)),
             ExprKind::LoopLocal(local) => Some(local.element.load()),
             ExprKind::BoxedInt(_) => Some(0x19),
             ExprKind::Template(_) | ExprKind::ClassLiteral(_) => Some(0x19),
@@ -1130,6 +1169,8 @@ impl<'a> Expr<'a> {
     fn primitive_hint(&self, parameters: &[ValueParameter]) -> Option<Primitive> {
         match &self.kind {
             ExprKind::Parameter { index, .. } => logic::primitive_type(&parameters[*index].ty),
+            ExprKind::ExtensionReceiver(receiver) => receiver.primitive(),
+            ExprKind::BoundGetter(read) => read.value().primitive(),
             ExprKind::LoopLocal(local) => local.element.primitive(),
             ExprKind::Literal(Literal::Long(_)) => Some(Primitive::Long),
             ExprKind::Literal(Literal::Float(_)) => Some(Primitive::Float),
@@ -1202,6 +1243,18 @@ impl<'a> Expr<'a> {
                     return Err(mismatch());
                 }
                 identifier(out, &parameter.name, declaration)?;
+            }
+            ExprKind::ExtensionReceiver(receiver) => {
+                if !receiver.accepts(expected) {
+                    return Err(mismatch());
+                }
+                out.push_str("this");
+            }
+            ExprKind::BoundGetter(read) => {
+                if !read.value().accepts(expected) {
+                    return Err(mismatch());
+                }
+                read.write(out, parameters, declaration)?;
             }
             ExprKind::LoopLocal(local) => {
                 if local.element.load() != expected.load() || local.element.primitive() != expected.primitive() {

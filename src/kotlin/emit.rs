@@ -91,12 +91,12 @@ pub(super) fn render<'a, 'data>(
         .map(|_| SourceMap::default());
     match &metadata.declaration {
         Declaration::Class(declaration) => {
-            let group = group.filter(|_| options.is_none_or(|options| options.decompile_inner));
+            let decompile_inner = options.is_none_or(|options| options.decompile_inner);
             render_class(
                 &mut out,
                 &bytecode,
                 declaration,
-                ClassScope { group, parent: None, indent: "", unit, depth: 0 },
+                ClassScope { group, decompile_inner, parent: None, indent: "", unit, depth: 0 },
                 mapping.as_mut().map(|map| (map, 0)),
             )?;
         }
@@ -129,6 +129,7 @@ pub(super) fn render<'a, 'data>(
                 &plan,
                 members,
                 style,
+                group,
                 mapping.as_mut().map(|map| (map, 0)),
                 false,
             )?;
@@ -195,6 +196,7 @@ fn push_file_jvm_name(out: &mut String, name: &str) {
 #[derive(Clone, Copy)]
 struct ClassScope<'scope, 'a, 'data> {
     group: Option<&'a ClassGroup<'data>>,
+    decompile_inner: bool,
     parent: Option<(&'scope Bytecode<'a, 'data>, &'scope ClassDeclaration)>,
     indent: &'scope str,
     unit: &'scope str,
@@ -209,7 +211,7 @@ fn render_class<'a, 'data>(
     mut location: Location<'_>,
 ) -> Result<(), KotlinError> {
     let invalid = |feature| error(bytecode.owner, feature);
-    let ClassScope { group, parent, indent, unit, depth } = scope;
+    let ClassScope { group, decompile_inner, parent, indent, unit, depth } = scope;
     let nested = parent.is_some();
     if depth >= 32 || declaration.name.local
         || declaration.name.relative_name().contains('.') != nested
@@ -220,7 +222,7 @@ fn render_class<'a, 'data>(
     if nested {
         file_annotations(&mut String::new(), bytecode, None, false)?;
     }
-    let children = nesting::children(bytecode, declaration, group)?;
+    let children = nesting::children(bytecode, declaration, group.filter(|_| decompile_inner))?;
     let relative_name = declaration.name.relative_name();
     let name = relative_name.rsplit('.').next().unwrap_or(relative_name);
     let types = Types {
@@ -399,6 +401,7 @@ fn render_class<'a, 'data>(
         &plan,
         &declaration.members,
         style,
+        group,
         location.as_mut().map(|(map, _)| (&mut **map, members_line)),
         data_class,
     )?;
@@ -411,7 +414,7 @@ fn render_class<'a, 'data>(
             &mut members,
             &Bytecode { class: child.class, owner },
             &child.declaration,
-            ClassScope { group, parent: Some((bytecode, declaration)), indent: &member_indent, unit, depth: depth + 1 },
+            ClassScope { group, decompile_inner, parent: Some((bytecode, declaration)), indent: &member_indent, unit, depth: depth + 1 },
             location.as_mut().map(|(map, _)| (&mut **map, members_line)),
         )?;
     }
@@ -763,7 +766,7 @@ fn plan_property<'a, 'data, 'metadata>(
                 return Err(invalid("non-abstract property without backing field"));
             }
             let Body::Expression(expr, _) =
-                bytecode.function(getter, descriptor, &[], properties, name, false)?
+                bytecode.function(getter, descriptor, &[], properties, None, name, false)?
             else {
                 return Err(invalid("getter has no return expression"));
             };
@@ -846,6 +849,7 @@ fn render_members<'a, 'data>(
     plan: &Plan<'a, 'data, '_>,
     members: &PackageDeclaration,
     style: Style<'_>,
+    group: Option<&ClassGroup<'_>>,
     mut location: Location<'_>,
     data_class: bool,
 ) -> Result<(), KotlinError> {
@@ -917,6 +921,7 @@ fn render_members<'a, 'data>(
             function,
             style,
             plan,
+            group,
             location.as_mut().map(|(map, line)| (&mut **map, *line)),
         )?;
         if let Some((_, line)) = &mut location {
@@ -1011,6 +1016,7 @@ fn render_function<'a, 'data>(
     function: &Function,
     style: Style<'_>,
     plan: &Plan<'a, 'data, '_>,
+    group: Option<&ClassGroup<'_>>,
     mut location: Location<'_>,
 ) -> Result<(), KotlinError> {
     let name = &function.name;
@@ -1038,10 +1044,8 @@ fn render_function<'a, 'data>(
         || (facade
             && (flags.modality() != Modality::Final
                 || flags.visibility()? == Visibility::Protected))
-        || (function.receiver.is_some() && !(external || abstract_function))
     {
-        return Err(types
-            .unsupported("function modifiers, contract, extension body, or context parameters"));
+        return Err(types.unsupported("function modifiers, contract, or context parameters"));
     }
     let signature = function
         .signature
@@ -1191,6 +1195,7 @@ fn render_function<'a, 'data>(
             descriptor,
             &function.parameters,
             plan.metadata_properties,
+            body::Extension::new(function, signature, method, group)?,
             name,
             location.is_some(),
         )? {

@@ -216,7 +216,7 @@ pub(super) fn class_literal<'a>(
     let pool = &bytecode.class.pool;
     // Only use an unqualified class literal when a local/property or generic
     // parameter cannot shadow it.
-    if owner != bytecode.owner || name.contains('$') || !scoped.is_empty()
+    if owner != bytecode.owner || name.contains('$') || !scoped.is_empty() || locals.extension.is_some()
         || locals.templates.properties.iter().any(|property| property.name == name)
         || find_attribute(&bytecode.class.attributes, pool, "Signature")?.is_some()
         || find_attribute(&method.attributes, pool, "Signature")?.is_some()
@@ -237,7 +237,7 @@ fn this_property<'a>(
     let Some((owner, name, descriptor)) = bytecode.reference(instruction, 0xb4)? else {
         return Err(invalid());
     };
-    if owner != bytecode.owner || !matches!(stack.last(), Some(StackValue::This)) {
+    if owner != bytecode.owner || !matches!(stack.last(), Some(StackValue::This)) || locals.extension.is_some() {
         return Err(invalid());
     }
     let ty = JvmType::parse(descriptor)?;
@@ -412,6 +412,9 @@ fn shape(ty: &JvmType) -> Shape<'_> {
 fn actual<'a>(expr: &'a Expr<'_>, locals: &'a Locals<'_>) -> Shape<'a> {
     match &expr.kind {
         ExprKind::Parameter { index, .. } => shape(locals.slots[*index].1),
+        ExprKind::ExtensionReceiver(super::extensions::Receiver::Primitive(primitive)) => Shape::Primitive(*primitive),
+        ExprKind::ExtensionReceiver(super::extensions::Receiver::Reference(receiver)) => shape(&receiver.jvm),
+        ExprKind::BoundGetter(read) => shape(&read.value().jvm),
         ExprKind::Literal(Literal::Int(value)) => Shape::IntConstant(*value),
         ExprKind::Literal(Literal::Long(_)) => Shape::Primitive(Primitive::Long),
         ExprKind::Literal(Literal::Float(_)) => Shape::Primitive(Primitive::Float),
@@ -530,6 +533,7 @@ mod tests {
             instance: false,
             alias: None,
             templates: Context::default(),
+            extension: None,
         };
         let parameter = |index, load| Expr { kind: ExprKind::Parameter { index, load }, depth: 1 };
         let mut stack = vec![

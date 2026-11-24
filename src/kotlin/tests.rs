@@ -18,6 +18,7 @@ use super::{
 // The Test* class files are upstream's Kotlin 2.0.0 Gradle fixtures, from
 // tests/upstream/plugins/kotlin/testData/src/kt/pkg. The other class files
 // come from this module's Kotlin sources (Kotlin 2.2.20, -jvm-target 1.8).
+// Extensions uses Kotlin 2.0.0 with the same JVM target.
 // ForLoops uses -jvm-target 17; TestForRange also requires the JVM 17
 // fixture to exercise Kotlin's invokedynamic message on invalid step values.
 // Hex keeps the test class files usable without a JVM or an upstream build.
@@ -52,6 +53,11 @@ const NESTING: [&str; 4] = [
     include_str!("fixtures/Nesting$Payload.class.hex"),
     include_str!("fixtures/Nesting$Settings.class.hex"),
 ];
+const EXTENSIONS: [&str; 3] = [
+    include_str!("fixtures/Extensions.class.hex"),
+    include_str!("fixtures/Extensions$Point.class.hex"),
+    include_str!("fixtures/ExtensionsKt.class.hex"),
+];
 
 pub(super) fn bytes(hex: &str) -> Vec<u8> {
     assert!(hex.lines().all(|line| line.len() % 2 == 0));
@@ -62,6 +68,102 @@ pub(super) fn bytes(hex: &str) -> Vec<u8> {
             })
         })
         .collect()
+}
+
+#[test]
+fn recovers_member_and_file_extension_receivers_with_mappings() {
+    let classes = EXTENSIONS.map(bytes);
+    let group = crate::ClassGroup::new(classes.iter().map(Vec::as_slice)).unwrap();
+    let options = crate::Options { decompile_kotlin: true, ..crate::Options::default() };
+    let mapped_options = crate::Options {
+        include_line_mappings: true,
+        ..options.clone()
+    };
+    for (class, cases) in [
+        ("parity/kotlin/Extensions", [
+            ("dot", "(Lparity/kotlin/Extensions$Point;Lparity/kotlin/Extensions$Point;)I",
+                "fun parity.kotlin.Extensions.Point.dot(other: parity.kotlin.Extensions.Point): Int",
+                "this.x * other.x + this.y * other.y", 12),
+            ("own", "(Lparity/kotlin/Extensions;Lparity/kotlin/Extensions;)I",
+                "fun Extensions.own(other: Extensions): Int", "this.x + other.x", 12),
+            ("shift", "(JIJ)J", "fun Long.shift(bits: Int, delta: Long): Long",
+                "(this shl bits) + delta", 0),
+        ].as_slice()),
+        ("parity/kotlin/ExtensionsKt", [
+            ("describe", "(Lparity/kotlin/Extensions$Point;Lparity/kotlin/Extensions$Point;)Ljava/lang/String;",
+                "fun Extensions.Point.describe(other: Extensions.Point): String", "other.label", 12),
+            ("echo", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+                "fun String.echo(other: String): String", "this", 12),
+            ("echoNullable", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+                "fun (String?).echoNullable(other: String?): String?", "this", 0),
+            ("offset", "(DD)D", "fun Double.offset(delta: Double): Double", "this - delta", 0),
+        ].as_slice()),
+    ] {
+        let source = group.decompile(class, &options).unwrap();
+        let mapped = group.decompile(class, &mapped_options).unwrap();
+        let map = mapped.map.unwrap();
+        for &(name, descriptor, declaration, expression, start) in cases {
+            let expected = format!("{declaration} = {expression}");
+            assert!(source.text.contains(expected.as_str()), "missing {expected} in {}", source.text);
+            let method = map.methods.iter().find(|method| method.name == name).unwrap();
+            assert_eq!(method.class_name, class);
+            assert_eq!(method.descriptor, descriptor);
+            assert_eq!(method.offsets.keys().next(), Some(&start));
+            let member_name = format!(".{name}(");
+            let original = include_str!("fixtures/Extensions.kt").lines()
+                .position(|line| line.contains(member_name.as_str())).unwrap() + 1;
+            let target = method.offsets[&start];
+            assert_eq!(map.original_lines.get(&(original as u16)), Some(&(target + 1)));
+            assert_eq!(
+                mapped.text.lines().nth(target).unwrap().trim_start(),
+                format!("return {expression}"),
+            );
+        }
+    }
+}
+
+#[test]
+fn rejects_unproven_extension_getters_and_wrong_receiver_slots() {
+    let [host, point, file] = EXTENSIONS.map(bytes);
+    let options = crate::Options { decompile_kotlin: true, ..crate::Options::default() };
+    let facade = "parity/kotlin/ExtensionsKt";
+    let owner = "parity/kotlin/Extensions";
+
+    let mut java_like_point = point.clone();
+    let annotation = b"Lkotlin/Metadata;";
+    let start = java_like_point.windows(annotation.len()).position(|window| window == annotation).unwrap();
+    java_like_point[start..start + annotation.len()].copy_from_slice(b"Lkotlin/Xetadata;");
+    for library in [None, Some(java_like_point.as_slice())] {
+        let group = crate::ClassGroup::new([file.as_slice()].into_iter().chain(library)).unwrap();
+        assert!(matches!(
+            group.decompile(facade, &options),
+            Err(crate::DecompileError::Kotlin(KotlinError::Unsupported { declaration, .. }))
+                if declaration == "describe"
+        ));
+    }
+
+    for (mut input, method, offset, from, to, class, expected) in [
+        (file, "echo", 0, 0x2a, 0x2b, facade, "unproven Kotlin extension parameter null guard"),
+        (host.clone(), "own", 12, 0x2b, 0x2a, owner, "bytecode outside the supported expression subset"),
+        (host, "shift", 1, 0x1d, 0x1c, owner, "load of non-parameter local"),
+    ] {
+        let index = {
+            let parsed = ClassFile::parse(&input).unwrap();
+            let member = parsed.methods.iter().find(|member| {
+                parsed.pool.utf8(member.name_index).unwrap() == method
+            }).unwrap();
+            let code = member.code(&parsed.pool).unwrap().unwrap();
+            assert_eq!(code.bytes[offset], from);
+            code.bytes.as_ptr() as usize - input.as_ptr() as usize + offset
+        };
+        input[index] = to;
+        let group = crate::ClassGroup::new([input.as_slice(), point.as_slice()]).unwrap();
+        assert!(matches!(
+            group.decompile(class, &options),
+            Err(crate::DecompileError::Kotlin(KotlinError::Unsupported { declaration, feature }))
+                if declaration == method && feature == expected
+        ));
+    }
 }
 
 #[test]
