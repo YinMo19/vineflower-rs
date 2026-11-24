@@ -31,6 +31,15 @@ impl PostTest {
         natural: &NaturalLoop,
     ) -> Option<Self> {
         let &[latch] = natural.latches.as_slice() else { return None };
+        Self::classify_latch(graph, instructions, natural, latch)
+    }
+
+    pub(super) fn classify_latch(
+        graph: &ControlFlowGraph,
+        instructions: &[Instruction],
+        natural: &NaturalLoop,
+        latch: usize,
+    ) -> Option<Self> {
         let header = natural.header;
         let exit = match graph.blocks[latch].successors.as_slice() {
             &[first, second] if first == header => second,

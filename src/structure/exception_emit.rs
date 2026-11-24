@@ -9,7 +9,7 @@ use crate::lift::{Effect, Machine};
 use crate::source_text::Document;
 
 use super::protected::{
-    ArmId, Catch, ExceptionId, Legacy, LegacyExit, Monitor, ProtectedRegion, cleanup_locals,
+    ArmId, Catch, ExceptionId, Finally, Legacy, LegacyExit, Monitor, ProtectedRegion, cleanup_locals,
     local_touches, reference_load, reference_store,
 };
 use super::{Emitter, Line, Region, StructureError};
@@ -202,8 +202,13 @@ impl Emitter<'_> {
         } else {
             (shape, region)
         };
+        let forced_return = shape.finally.as_ref().and_then(Finally::branched)
+            .and_then(|branch| branch.forced_return);
         let body_lines = self.lines.len();
         self.syntax(depth, "try {");
+        if forced_return.is_some() {
+            self.syntax(depth + 1, "try {");
+        }
         let mut reaches_join = if shape.finally.is_none()
             && let Some(reaches) =
                 self.emit_try_with_monitor_departure(clauses, scope, machine, depth + 1)?
@@ -214,13 +219,23 @@ impl Emitter<'_> {
                 clauses.start,
                 scope.exception(clauses.join, clauses.body, Some(machine)),
                 machine,
-                depth + 1,
+                depth + 1 + usize::from(forced_return.is_some()),
             )?
         };
         // If the entire protected body is one verified resource statement,
         // the surrounding catch/finally clauses are its Java clauses. The
         // acquisition and both close paths remain inside that same scope.
         self.fuse_resource_wrapper(body_lines, depth);
+        if let Some(transfer) = forced_return {
+            let instruction = &self.instructions[transfer];
+            let mut returning = machine.clone();
+            if !matches!(returning.step(instruction)?, Effect::Return(None)) {
+                return Err(self.unstructured(shape.start));
+            }
+            self.syntax(depth + 1, "} finally {");
+            self.push(depth + 2, "return;", (instruction.offset..instruction.offset + instruction.len).collect());
+            self.syntax(depth + 1, "}");
+        }
         for catch in &clauses.catches {
             let store = &self.instructions[self.graph.blocks[catch.start].instructions.start];
             let mut body = machine.clone();

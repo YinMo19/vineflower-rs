@@ -15,7 +15,7 @@ use crate::cfg::{ControlFlowGraph, NaturalLoop};
 use crate::classfile::ExceptionHandler;
 use crate::lift::Machine;
 
-use self::finally_graph::BranchedFinally;
+use self::finally_graph::{BranchedFinally, NormalCopies};
 use self::legacy_resource::LegacyResource;
 use self::monitor::{MonitorCandidates, MonitorHandler, MonitorPlan};
 use self::overriding_finally::OverridingReturn;
@@ -46,7 +46,7 @@ pub(super) struct Exceptions {
     monitor_acquisitions: BTreeMap<usize, usize>,
     monitor_finally_targets: BTreeMap<usize, usize>,
     monitor_finally_copies: BTreeMap<usize, usize>,
-    transparent_handlers: BTreeSet<usize>,
+    synthetic_handler_blocks: BTreeSet<usize>,
     omitted_instructions: BTreeSet<usize>,
 }
 
@@ -242,7 +242,7 @@ impl Exceptions {
         if let Some(machine) = machine {
             result.classify_legacy_resources(instructions, graph, &mut table, machine)?;
         }
-        result.transparent_handlers = table.elide_transparent_finally(instructions, graph);
+        result.synthetic_handler_blocks = table.elide_transparent_finally(instructions, graph);
         let mut monitors = BTreeMap::new();
         // Prove lock ownership before comparing duplicated finally bodies:
         // the compiler can allocate different synthetic slots in each copy.
@@ -285,22 +285,42 @@ impl Exceptions {
             .values()
             .map(|(monitor, covered)| (monitor.acquisition, (monitor, *covered)))
             .collect();
+        let mut overrides = BTreeMap::new();
+        for (covered, routes) in &table.by_range {
+            let &[outer] = routes.as_slice() else { continue; };
+            if outer.catch_type != 0 || monitors.contains_key(&outer.handler) {
+                continue;
+            }
+            let Some(inner) = table.overriding_void_inner(instructions, graph, covered, outer)
+            else { continue; };
+            let body = covered.iter().copied().collect();
+            let Some(branch) = BranchedFinally::prove(
+                instructions, graph, &table.by_block, &body, outer.handler, &by_acquisition,
+                &dominators, NormalCopies::OverrideVoid { handler: inner.handler },
+            ) else { continue; };
+            if !copied_routes.insert(inner)
+                || !result.synthetic_handler_blocks.insert(inner.handler)
+                || overrides.insert(outer.handler, branch).is_some()
+            {
+                return Err(unsupported());
+            }
+        }
         // Register verified normal copies before classifying bodies. A copy
         // can be an exit of both a finally and its nested typed catch.
         for (covered, routes) in &table.by_range {
             if let Some(route) = routes.iter().find(|route| route.catch_type == 0)
                 && !monitors.contains_key(&route.handler)
+                && !copied_routes.contains(route)
             {
-                let body = covered.iter().copied().collect();
-                let mut plan = result.prepare_cleanup(
-                    instructions,
-                    graph,
-                    &table,
-                    &body,
-                    route.handler,
-                    &by_acquisition,
-                    &dominators,
-                )?;
+                let mut plan = if let Some(branch) = overrides.remove(&route.handler) {
+                    result.register_branched_cleanup(route.handler, branch)?
+                } else {
+                    let body = covered.iter().copied().collect();
+                    result.prepare_cleanup(
+                        instructions, graph, &table, &body, route.handler, &by_acquisition,
+                        &dominators, routes,
+                    )?
+                };
                 if let Some(branch) = &mut plan.branched {
                     copied_routes.append(&mut branch.copied_routes);
                     for handler in std::mem::take(&mut branch.nested_handlers) {
@@ -482,8 +502,8 @@ impl Exceptions {
         })
     }
 
-    pub(super) fn transparent_handlers(&self) -> impl Iterator<Item = usize> + '_ {
-        self.transparent_handlers.iter().copied()
+    pub(super) fn synthetic_handler_blocks(&self) -> impl Iterator<Item = usize> + '_ {
+        self.synthetic_handler_blocks.iter().copied()
     }
 
     pub(super) fn allows_loop_break(
@@ -535,6 +555,54 @@ impl Exceptions {
         self.loop_finally_regions().find_map(|(region, finally)| {
             if region.start != header { return None; }
             Some(finally.branched()?.label.as_ref()?.target)
+        })
+    }
+
+    /// An inner while-loop and its enclosing do-while can have the same
+    /// bytecode header when the outer body starts with try/finally.
+    pub(super) fn finally_wrapped_loop(
+        &self,
+        instructions: &[Instruction],
+        graph: &ControlFlowGraph,
+        natural: &NaturalLoop,
+    ) -> Option<(ArmId, usize, usize, usize)> {
+        let header = natural.header;
+        let &[a, b] = natural.latches.as_slice() else { return None; };
+        self.regions.iter().find_map(|region| {
+            if region.start != header
+                || !region.catches.is_empty()
+                || {
+                    let branch = region.finally.as_ref()?.branched()?;
+                    branch.forced_return.is_some()
+                        || branch.continuation.is_none()
+                        || branch.label.is_some()
+                        || branch.monitor_exit.is_some()
+                        || !branch.loop_targets.is_empty()
+                }
+            {
+                return None;
+            }
+            let join = region.join?;
+            let body = &self.arms[region.body.0].blocks;
+            let (inner, outer) = match (body.contains(&a), body.contains(&b)) {
+                (true, false) => (a, b),
+                (false, true) => (b, a),
+                _ => return None,
+            };
+            let loop_test = &graph.blocks[header];
+            if loop_test.successors.len() != 2
+                || !loop_test.successors.contains(&inner)
+                || !loop_test.successors.contains(&join)
+                || !super::do_while::is_conditional(instructions[loop_test.instructions.end - 1].opcode)
+                || graph.blocks[inner].predecessors != [header]
+                || graph.blocks[inner].successors != [header]
+                || normal_exits(graph, body).any(|target| target != join)
+                || !matches!(&instructions[graph.blocks[inner].instructions.clone()],
+                    [Instruction { opcode: 0xa7 | 0xc8, .. }])
+            {
+                return None;
+            }
+            Some((region.body, outer, inner, join))
         })
     }
 
@@ -711,6 +779,8 @@ impl Exceptions {
         let only_body_exit = exits.first().copied().filter(|_| exits.len() == 1);
         let mut catches: Vec<Catch> = Vec::new();
         let mut handlers = BTreeSet::new();
+        let empty_catches = finally.as_mut().and_then(|finally| finally.plan.branched.as_mut())
+            .map(|branch| std::mem::take(&mut branch.empty_catches)).unwrap_or_default();
         for &route in routes.iter().filter(|route| route.catch_type != 0) {
             if let Some(catch) = catches
                 .last_mut()
@@ -725,12 +795,22 @@ impl Exceptions {
             {
                 return Err(unsupported());
             }
-            let blocks = catch_blocks(graph, dominators, &body, route.handler, self)?;
-            exits.extend(
-                normal_exits(graph, &blocks)
-                    .map(|next| self.bypass_cleanup(next))
-                    .filter(|next| !blocks.contains(next)),
-            );
+            let blocks = if empty_catches.contains(&route.handler) {
+                let target = self.bypass_cleanup(route.handler);
+                if target == route.handler {
+                    return Err(unsupported());
+                }
+                exits.insert(target);
+                BTreeSet::from([route.handler])
+            } else {
+                let blocks = catch_blocks(graph, dominators, &body, route.handler, self)?;
+                exits.extend(
+                    normal_exits(graph, &blocks)
+                        .map(|next| self.bypass_cleanup(next))
+                        .filter(|next| !blocks.contains(next)),
+                );
+                blocks
+            };
             let arm = self.add_arm(id, blocks);
             self.bindings.insert(route.handler);
             catches.push(Catch {
@@ -907,6 +987,7 @@ impl Exceptions {
         handler: usize,
         monitors: &MonitorCandidates<'_>,
         dominance: &Dominance,
+        routes: &[Route],
     ) -> Result<Cleanup, StructureError> {
         let node = &graph.blocks[handler];
         let head = if node.instructions.len() == 1 {
@@ -922,9 +1003,18 @@ impl Exceptions {
         {
             return Ok(plan);
         }
-        let mut branch = BranchedFinally::prove(
+        let branch = BranchedFinally::prove(
             instructions, graph, &table.by_block, body, handler, monitors, dominance,
+            NormalCopies::Ordinary(routes),
         ).ok_or_else(unsupported)?;
+        self.register_branched_cleanup(handler, branch)
+    }
+
+    fn register_branched_cleanup(
+        &mut self,
+        handler: usize,
+        mut branch: BranchedFinally,
+    ) -> Result<Cleanup, StructureError> {
         if let Some(exit) = &branch.monitor_exit {
             if self
                 .monitor_finally_targets
@@ -1388,6 +1478,41 @@ impl LoopDeparture {
 }
 
 impl Table {
+    fn overriding_void_inner(
+        &self,
+        instructions: &[Instruction],
+        graph: &ControlFlowGraph,
+        covered: &[usize],
+        outer: Route,
+    ) -> Option<Route> {
+        let inner = covered.iter().find_map(|&block| match self.by_block[block].as_slice() {
+            &[inner, later] if later == outer && inner.catch_type == 0 => Some(inner),
+            _ => None,
+        })?;
+        if covered.binary_search(&inner.handler).is_err()
+            || covered.iter().any(|&block| {
+                if block == inner.handler {
+                    self.by_block[block] != [outer]
+                } else {
+                    self.by_block[block] != [inner, outer]
+                }
+            })
+        {
+            return None;
+        }
+        let node = &graph.blocks[inner.handler];
+        let [store] = &instructions[node.instructions.clone()] else { return None; };
+        let slot = reference_store(store)?;
+        if !node.predecessors.is_empty()
+            || node.successors.len() != 1
+            || node.exception_predecessors.iter().any(|pred| covered.binary_search(pred).is_err())
+            || instructions.iter().any(|op| cleanup_locals::reads(op, slot))
+        {
+            return None;
+        }
+        Some(inner)
+    }
+
     fn elide_transparent_finally(
         &mut self,
         instructions: &[Instruction],

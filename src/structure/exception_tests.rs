@@ -697,7 +697,6 @@ fn empty_finally_forwards_to_the_same_ordered_dispatch_around_a_catch_only_retry
     let (graph, regions) = classify(&bytes, &handlers);
     let regions = regions.unwrap();
     assert_eq!(
-        regions.transparent_handlers().collect::<Vec<_>>(),
         [graph.block_at(17).unwrap(), graph.block_at(19).unwrap()],
     );
     let lines = test_method_with_descriptor(&bytes, &handlers, &[], "()V").unwrap();

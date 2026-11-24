@@ -189,7 +189,15 @@ pub(super) struct Loop {
     pub(super) post_test: Option<PostTest>,
     pub(super) exit: Option<usize>,
     pub(super) exception_body: Option<ArmId>,
+    pub(super) wrapped: Option<While>,
     parent: Option<usize>,
+}
+
+impl Loop {
+    pub(super) fn wrapped_while(self) -> Option<Self> {
+        let test = self.wrapped?;
+        Some(Self { test: Some(test), post_test: None, exit: Some(test.exit), wrapped: None, ..self })
+    }
 }
 
 pub(super) struct Layout {
@@ -280,10 +288,13 @@ impl Layout {
                 .flat_map(|&block| graph.blocks[block].successors.iter().copied())
                 .filter(|&next| !inside(next) && !outer_transfer(next))
                 .collect();
-            let exception_body = exceptions.loop_finally_regions().find_map(|(region, _)| {
-                (region.start == header && natural_loop.latches.iter().any(|&latch| {
-                    !exceptions.contains(Some(region.body), latch)
-                })).then_some(region.body)
+            let wrapped = exceptions.finally_wrapped_loop(instructions, graph, &natural_loop);
+            let exception_body = wrapped.map(|(arm, ..)| arm).or_else(|| {
+                exceptions.loop_finally_regions().find_map(|(region, _)| {
+                    (region.start == header && natural_loop.latches.iter().any(|&latch| {
+                        !exceptions.contains(Some(region.body), latch)
+                    })).then_some(region.body)
+                })
             }).or_else(|| exceptions.retry_loop_body(header));
             let mirrored_exit = {
                 let mut targets = exceptions
@@ -316,7 +327,12 @@ impl Layout {
                 },
                 _ => None,
             };
-            let post_test = PostTest::classify(graph, instructions, &natural_loop);
+            let post_test = if let Some((_, latch, _, _)) = wrapped {
+                Some(PostTest::classify_latch(graph, instructions, &natural_loop, latch)
+                    .ok_or_else(unsupported)?)
+            } else {
+                PostTest::classify(graph, instructions, &natural_loop)
+            };
             // A header that already executes body code can branch to an
             // early method exit. Keep such abrupt tails in the body when
             // the unique conditional latch supplies the normal continuation.
@@ -330,9 +346,9 @@ impl Layout {
                         }
                         let node = &graph.blocks[target];
                         node.successors.is_empty()
-                            && node.exception_successors.is_empty()
                             && node.exception_predecessors.is_empty()
                             && node.predecessors.iter().copied().all(inside)
+                            && (node.exception_successors.is_empty() || wrapped.is_some())
                             && matches!(instructions[node.instructions.end - 1].opcode, 0xac..=0xb1 | 0xbf)
                     })
             });
@@ -446,6 +462,7 @@ impl Layout {
                 post_test: post_test.filter(|test| Some(test.exit()) == exit),
                 exit,
                 exception_body,
+                wrapped: wrapped.map(|(_, _, body, exit)| While { body, exit }),
                 parent,
             });
         }

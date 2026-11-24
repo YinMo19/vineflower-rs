@@ -180,7 +180,7 @@ fn structure_regions(
         emitted: vec![false; graph.blocks.len()],
         lines: Vec::new(),
     };
-    for block in exceptions.transparent_handlers() {
+    for block in exceptions.synthetic_handler_blocks() {
         emitter.emitted[block] = true;
     }
     emitter.region(0, Region::METHOD, &mut machine, 0)?;
@@ -1078,6 +1078,12 @@ impl Emitter<'_> {
         }
         pending.clear();
         let head_line = self.lines.len();
+        if shape.wrapped.is_some() {
+            let test = shape.post_test.ok_or_else(|| self.unstructured(header))?;
+            self.emit_post_test_loop(header, test, region, machine, depth)?;
+            self.lines[head_line].sequence_boundary = true;
+            return Ok(Some((test.exit(), None)));
+        }
         if let Some(test) = shape.post_test
             && let Some(exit) = self.try_post_test_loop(header, test, region, machine, depth)
         {
@@ -1733,7 +1739,19 @@ impl Emitter<'_> {
             return Ok(true);
         }
         let mut arm = baseline.clone();
-        let reaches = self.run_region(start, region, &mut arm, depth, &mut Vec::new(), at_loop_entry, None)?;
+        let reaches = if let Some(shape) = self.layout.loops[start]
+            .filter(|_| at_loop_entry)
+            .and_then(Loop::wrapped_while)
+        {
+            let expected = shape.exit.expect("wrapped while has an exit");
+            let exit = self.emit_loop(start, shape, region, &mut arm, depth, &mut Vec::new())?;
+            if exit != Some((expected, None)) || region.stop != Some(expected) {
+                return Err(self.unstructured(start));
+            }
+            true
+        } else {
+            self.run_region(start, region, &mut arm, depth, &mut Vec::new(), at_loop_entry, None)?
+        };
         if reaches {
             Self::check_scope(
                 arm,

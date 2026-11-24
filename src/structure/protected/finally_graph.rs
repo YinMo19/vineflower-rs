@@ -13,6 +13,11 @@ use super::{
     reference_store,
 };
 
+pub(super) enum NormalCopies<'a> {
+    Ordinary(&'a [Route]),
+    OverrideVoid { handler: usize },
+}
+
 pub(in crate::structure) struct BranchedFinally {
     pub(in crate::structure) entry: usize,
     pub(in crate::structure) continuation: Option<usize>,
@@ -20,6 +25,8 @@ pub(in crate::structure) struct BranchedFinally {
     pub(super) blocks: BTreeSet<usize>,
     pub(super) body_join: Option<usize>,
     pub(super) projected_entries: BTreeSet<usize>,
+    pub(super) empty_catches: BTreeSet<usize>,
+    pub(in crate::structure) forced_return: Option<usize>,
     pub(super) returns: Vec<ReturnResume>,
     pub(in crate::structure) label: Option<LabelResume>,
     pub(super) prefix_block: Option<usize>,
@@ -247,6 +254,7 @@ impl BranchedFinally {
         handler: usize,
         monitors: &MonitorCandidates<'_>,
         dominance: &Dominance,
+        normal: NormalCopies<'_>,
     ) -> Option<Self> {
         let start = &graph.blocks[handler];
         if handler == 0 || !start.predecessors.is_empty() || body.contains(&handler) {
@@ -468,6 +476,8 @@ impl BranchedFinally {
             blocks: cleanup,
             body_join: None,
             projected_entries: BTreeSet::new(),
+            empty_catches: BTreeSet::new(),
+            forced_return: None,
             returns: Vec::new(),
             label: None,
             prefix_block: None,
@@ -487,7 +497,7 @@ impl BranchedFinally {
                 _ => return None,
             };
             let (tail, removed, copied_exit, copied_routes) = result.match_copy(
-                instructions, graph, routes, body, handler, sample, pair, projection,
+                instructions, graph, routes, body, handler, sample, None, pair, projection,
             )?;
             result.copied_routes.extend(copied_routes);
             if let Some((edge, owner)) = projection {
@@ -513,6 +523,47 @@ impl BranchedFinally {
                 if !result.removed.insert(block) {
                     return None;
                 }
+            }
+        }
+        if let NormalCopies::OverrideVoid { handler } = normal {
+            result.resume_overriding_void(instructions, graph, routes, handler, continuing)?;
+            return Some(result);
+        }
+        if let NormalCopies::Ordinary(handlers) = normal
+            && monitor.is_none()
+            && projection.is_none()
+            && result.tail.is_some()
+            && result.tail_code.is_empty()
+            && result.loop_targets.is_empty()
+            && result.shared_return.is_none()
+            && result.nested_handlers.is_empty()
+            && !continuing.is_empty()
+        {
+            for route in handlers.iter().filter(|route| route.catch_type != 0) {
+                let sample = route.handler;
+                let node = &graph.blocks[sample];
+                if result.empty_catches.contains(&sample)
+                    || body.contains(&sample)
+                    || !node.predecessors.is_empty()
+                    || node.exception_predecessors.iter().any(|pred| !body.contains(pred))
+                {
+                    continue;
+                }
+                let Some(binding) = cleanup_locals::binding_slot(&instructions[node.instructions.start])
+                else { continue; };
+                let Some((Some(tail), removed, _, _)) = result.match_copy(
+                    instructions, graph, routes, body, handler, sample, Some(binding), None, None,
+                ) else { continue; };
+                if continuing.values().any(|&other| {
+                    other != Some(tail)
+                        && other.and_then(|block| goto_only(instructions, graph, block))
+                            .is_none_or(|next| Some(next) != goto_only(instructions, graph, tail))
+                }) || !removed.is_disjoint(&result.removed) {
+                    continue;
+                }
+                result.empty_catches.insert(sample);
+                result.removed.extend(removed);
+                continuing.insert(sample, Some(tail));
             }
         }
         result.label = LabelResume::prove(
@@ -572,7 +623,7 @@ impl BranchedFinally {
         {
             return None;
         }
-        if exits.len() > 1 {
+        if exits.len() + result.empty_catches.len() > 1 {
             result.body_join = result.continuation.or_else(|| continuing.first_key_value().map(|(&entry, _)| entry));
             result.projected_entries = continuing.into_keys().collect();
         } else {
@@ -589,6 +640,7 @@ impl BranchedFinally {
         body: &BTreeSet<usize>,
         handler: usize,
         sample_start: usize,
+        sample_binding: Option<cleanup_locals::Local>,
         monitor: Option<MonitorCopy<'_>>,
         departure: Option<(MonitorDeparture, &MonitorPlan)>,
     ) -> Option<(Option<usize>, BTreeSet<usize>, Option<usize>, BTreeSet<Route>)> {
@@ -598,6 +650,8 @@ impl BranchedFinally {
         let mut continuation = None;
         let mut copied_routes = BTreeSet::new();
         let mut renamed = BTreeSet::new();
+        let can_rename = monitor.is_none() && departure.is_none() && self.nested_handlers.is_empty();
+        let mut local_renames = cleanup_locals::Renames::default();
         let mut pending = vec![(self.entry, sample_start)];
         while let Some((pattern, sample)) = pending.pop() {
             if self.loop_targets.contains(&pattern)
@@ -623,7 +677,9 @@ impl BranchedFinally {
             let trim = Some(pattern) == self.tail;
             let nested = self.nested_handlers.contains(&pattern);
             if !trim || !self.tail_code.is_empty() {
-                if (!nested && !actual.exception_predecessors.is_empty())
+                if (!nested
+                    && !(sample == sample_start && sample_binding.is_some())
+                    && !actual.exception_predecessors.is_empty())
                     || (nested && !actual.predecessors.is_empty())
                     || routes[pattern].len() != routes[sample].len()
                 {
@@ -642,7 +698,8 @@ impl BranchedFinally {
                 }
             }
             let start = expected.instructions.start + usize::from(pattern == handler || nested);
-            let actual_start = actual.instructions.start + usize::from(nested);
+            let actual_start = actual.instructions.start
+                + usize::from(nested || (sample == sample_start && sample_binding.is_some()));
             if nested {
                 let left = reference_store(&instructions[expected.instructions.start])?;
                 let right = reference_store(&instructions[actual.instructions.start])?;
@@ -672,7 +729,10 @@ impl BranchedFinally {
                 || !actual_code
                     .iter()
                     .zip(expected_code)
-                    .all(|(a, b)| same_instruction(a, b))
+                    .all(|(a, b)| {
+                        same_instruction(a, b)
+                            || (can_rename && local_renames.match_access(b, a))
+                    })
             {
                 return None;
             }
@@ -755,11 +815,103 @@ impl BranchedFinally {
                 return None;
             }
         }
+        if !local_renames.is_empty() || sample_binding.is_some() {
+            self.verify_local_copies(
+                instructions, graph, handler, sample_start, sample_binding, &paired, &local_renames,
+            )?;
+        }
         let copied_exit = departure.and_then(|(edge, _)| paired.get(&edge.source).copied());
         if self.tail.is_some() != continuation.is_some() {
             return None;
         }
         Some((continuation, removed, copied_exit, copied_routes))
+    }
+
+    fn verify_local_copies(
+        &self,
+        instructions: &[Instruction],
+        graph: &ControlFlowGraph,
+        handler: usize,
+        sample_entry: usize,
+        sample_binding: Option<cleanup_locals::Local>,
+        paired: &BTreeMap<usize, usize>,
+        renames: &cleanup_locals::Renames,
+    ) -> Option<()> {
+        let mut pattern_ranges = BTreeMap::new();
+        let mut sample_ranges = BTreeMap::new();
+        for (&pattern, &sample) in paired {
+            let expected = &graph.blocks[pattern].instructions;
+            let actual = &graph.blocks[sample].instructions;
+            let left = expected.start + usize::from(pattern == handler);
+            let right = actual.start + usize::from(sample == sample_entry && sample_binding.is_some());
+            let (a, b) = if Some(pattern) == self.tail {
+                let end = self.tail_code.end;
+                (left..end, right..right + end - left)
+            } else {
+                (left..expected.end, right..actual.end)
+            };
+            if instructions[a.clone()].iter().zip(&instructions[b.clone()])
+                .any(|(pattern, sample)| !renames.keeps_bijection(pattern, sample))
+            {
+                return None;
+            }
+            pattern_ranges.insert(pattern, a);
+            sample_ranges.insert(sample, b);
+        }
+        let private = |ranges, entry, local| {
+            cleanup_locals::private_copy_local(instructions, graph, ranges, entry, local)
+        };
+        let dead = |ranges, local| cleanup_locals::dead_after_copy(instructions, graph, ranges, local);
+        if sample_binding.is_some_and(|local| !private(&sample_ranges, sample_entry, local))
+            || renames.pairs().any(|(a, b)| {
+                !private(&pattern_ranges, self.entry, a) || !private(&sample_ranges, sample_entry, b)
+                    // The retained copy runs on paths formerly owned by the
+                    // sibling. Neither lane may affect their live-out state.
+                    || !dead(&sample_ranges, a) || !dead(&pattern_ranges, b)
+            })
+        {
+            return None;
+        }
+        Some(())
+    }
+
+    fn resume_overriding_void(
+        &mut self,
+        instructions: &[Instruction],
+        graph: &ControlFlowGraph,
+        routes: &[Vec<Route>],
+        inner_handler: usize,
+        continuing: BTreeMap<usize, Option<usize>>,
+    ) -> Option<()> {
+        if self.tail.is_none()
+            || self.shared_return.is_some()
+            || self.monitor_exit.is_some()
+            || !self.loop_targets.is_empty()
+            || !self.returns.is_empty()
+            || continuing.len() != 2
+        {
+            return None;
+        }
+        let &[on_throw] = graph.blocks[inner_handler].successors.as_slice() else { return None; };
+        continuing.get(&on_throw)?;
+        for tail in continuing.values() {
+            let tail = (*tail)?;
+            let node = &graph.blocks[tail];
+            let start = node.instructions.start + self.tail_code.len();
+            if !matches!(&instructions[start..node.instructions.end], [Instruction { opcode: 0xb1, .. }])
+                || !routes[tail].is_empty()
+                || !node.exception_predecessors.is_empty()
+                || node.predecessors.iter().any(|pred| !self.removed.contains(pred))
+            {
+                return None;
+            }
+            self.removed.insert(tail);
+        }
+        let (&entry, &tail) = continuing.iter().find(|&(&entry, _)| entry != on_throw)?;
+        self.forced_return = Some(graph.blocks[tail?].instructions.end - 1);
+        self.body_join = Some(entry);
+        self.projected_entries = continuing.into_keys().collect();
+        Some(())
     }
 }
 
@@ -824,6 +976,13 @@ fn before_unconditional_jump(code: &[Instruction]) -> &[Instruction] {
         [body @ .., last] if matches!(last.opcode, 0xa7 | 0xc8) => body,
         _ => code,
     }
+}
+
+fn goto_only(instructions: &[Instruction], graph: &ControlFlowGraph, block: usize) -> Option<usize> {
+    let node = &graph.blocks[block];
+    let &[next] = node.successors.as_slice() else { return None; };
+    matches!(&instructions[node.instructions.clone()], [Instruction { opcode: 0xa7 | 0xc8, .. }])
+        .then_some(next)
 }
 
 fn explicit_jump(
