@@ -185,6 +185,12 @@ impl Machine<'_, '_> {
         self.class.major_version >= 65
     }
 
+    pub(crate) fn supports_null_type_pattern(&self) -> bool {
+        // The first preview allowed a type binding to accept null when
+        // paired with an explicit null label. Final Java does not.
+        self.class.major_version == 61 && self.class.minor_version == u16::MAX
+    }
+
     pub(crate) fn can_project_record_patterns(&self) -> bool {
         // A projected prologue retains no bytecode position for an annotated
         // backing cast. Leave it to the ordinary handler layer for now.

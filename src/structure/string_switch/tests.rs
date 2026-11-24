@@ -264,6 +264,7 @@ fn visible_alias_or_tag_at_an_exit_prevents_consuming_its_stores() {
                 layout: Layout::new(graph, &instructions, None).unwrap(),
                 exceptions: &exceptions,
                 exception_redirects: Default::default(),
+                resource_epilogue: None,
                 assertions: None,
                 record_patterns: None,
                 emitted: vec![false; graph.blocks.len()],

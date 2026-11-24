@@ -6,13 +6,9 @@ use super::{
 
 pub(super) const INDENT: &str = "   ";
 
-pub(super) fn identifier(
-    out: &mut String,
-    name: &str,
-    declaration: &str,
-) -> Result<(), KotlinError> {
+pub(super) fn plain_identifier(name: &str) -> bool {
     let mut chars = name.bytes();
-    let regular = chars
+    chars
         .next()
         .is_some_and(|c| c.is_ascii_alphabetic() || c == b'_')
         && chars.all(|c| c.is_ascii_alphanumeric() || c == b'_')
@@ -46,8 +42,15 @@ pub(super) fn identifier(
                 | "var"
                 | "when"
                 | "while"
-        );
-    if regular {
+        )
+}
+
+pub(super) fn identifier(
+    out: &mut String,
+    name: &str,
+    declaration: &str,
+) -> Result<(), KotlinError> {
+    if plain_identifier(name) {
         out.push_str(name);
     } else {
         if name.is_empty()

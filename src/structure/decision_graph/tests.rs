@@ -51,6 +51,7 @@ fn prove(
         layout: Layout::new(&graph, instructions, None).unwrap(),
         exceptions: &exceptions,
         exception_redirects: BTreeMap::new(),
+        resource_epilogue: None,
         assertions: None,
         record_patterns: None,
         emitted: vec![false; graph.blocks.len()],

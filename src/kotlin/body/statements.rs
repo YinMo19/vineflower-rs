@@ -42,7 +42,7 @@ impl Statement<'_> {
                     // Kotlin println is compiled to the Object overload. Keep
                     // nontrivial reference overloads (e.g. CharArray) distinct.
                     let cast = match &expr.kind {
-                        ExprKind::Literal(Literal::String(_)) => "",
+                        ExprKind::Literal(Literal::String(_)) | ExprKind::Template(_) => "",
                         ExprKind::Parameter { index, .. }
                             if matches!(
                                 parameters[*index].ty.class_id(),
@@ -63,7 +63,7 @@ impl Statement<'_> {
                 }
                 PrintOperand::String => {
                     let cast = match &expr.kind {
-                        ExprKind::Literal(Literal::String(_)) => "",
+                        ExprKind::Literal(Literal::String(_)) | ExprKind::Template(_) => "",
                         ExprKind::Literal(Literal::Null) => " as kotlin.String?",
                         ExprKind::Parameter { index, .. }
                             if parameters[*index].ty.class_id() == Some("kotlin/String") =>
@@ -90,6 +90,24 @@ impl Statement<'_> {
             out.push_str(cast);
         }
         out.push(')');
+        Ok(())
+    }
+
+    pub fn trace(
+        &self,
+        bytecode: &Bytecode<'_, '_>,
+        instructions: &[Instruction],
+        mut visit: impl FnMut(&Instruction),
+    ) -> Result<(), KotlinError> {
+        let mut instructions = instructions[self.instructions.clone()]
+            .iter()
+            .filter(|instruction| !matches!(instruction.opcode, 0x00 | 0x5f))
+            .peekable();
+        while let Some(instruction) = instructions.next() {
+            if !super::templates::elided_trace(bytecode, instruction, instructions.peek().copied())? {
+                visit(instruction);
+            }
+        }
         Ok(())
     }
 }

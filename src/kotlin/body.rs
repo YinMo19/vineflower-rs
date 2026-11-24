@@ -3,7 +3,7 @@
 //! The bytecode subset accepted by the Kotlin declaration writer. Every
 //! instruction is consumed by a proven compiler pattern or typed expression.
 
-use std::{borrow::Cow, fmt::Write};
+use std::{borrow::Cow, fmt::Write, ops::Range};
 
 use crate::{
     bytecode::{self, Instruction, Operand},
@@ -12,7 +12,7 @@ use crate::{
 };
 
 use super::{
-    JvmFieldSignature, JvmMethodSignature, KotlinError, Type, ValueParameter,
+    JvmFieldSignature, JvmMethodSignature, KotlinError, Property, Type, ValueParameter,
     syntax::{identifier, qualified},
 };
 
@@ -23,6 +23,7 @@ mod logic;
 mod loops;
 mod statements;
 mod switches;
+mod templates;
 mod try_regions;
 
 pub(super) use defaults::{recover as parameter_defaults, verify_copy, verify_copy_defaults};
@@ -57,6 +58,7 @@ pub(super) struct Assignment<'a> {
     pub field: &'a str,
     pub descriptor: &'a str,
     pub value: Expr<'a>,
+    pub rhs_offsets: Option<Range<u32>>,
 }
 
 #[derive(Debug)]
@@ -84,6 +86,9 @@ enum ExprKind<'a> {
         negative: bool,
     },
     BoxedInt(Box<Expr<'a>>),
+    Template(templates::Template<'a>),
+    ThisProperty { name: &'a str, primitive: Primitive },
+    ClassLiteral(&'a str),
     Conditional(Box<Conditional<'a>>),
 }
 
@@ -153,6 +158,7 @@ struct Locals<'a> {
     slots: Vec<(u16, &'a JvmType)>,
     instance: bool,
     alias: Option<(u16, u8, usize)>,
+    templates: templates::Context<'a>,
 }
 
 impl<'a> Locals<'a> {
@@ -182,6 +188,7 @@ impl<'a> Locals<'a> {
             slots,
             instance,
             alias: None,
+            templates: templates::Context::default(),
         })
     }
 
@@ -226,6 +233,7 @@ enum StackValue<'a> {
     This,
     Value(Expr<'a>),
     PrintStream,
+    StringBuilder(templates::Builder<'a>),
     /// The two Long operands remain immediately below this stack marker.
     LongOrder,
 }
@@ -276,7 +284,7 @@ impl<'a, 'data> Bytecode<'a, 'data> {
                 .try_into()
                 .map_err(|_| KotlinError::unsupported(declaration, "invalid ConstantValue"))?,
         );
-        self.literal(index, declaration)
+        self.literal(self.class.pool.get(index)?, declaration)
             .map(|literal| Some(Expr::literal(literal)))
     }
 
@@ -315,6 +323,7 @@ impl<'a, 'data> Bytecode<'a, 'data> {
         member: &Member<'data>,
         descriptor: &MethodDescriptor,
         parameters: &[ValueParameter],
+        properties: &[Property],
         declaration: &str,
         trace: bool,
     ) -> Result<Body<'a>, KotlinError> {
@@ -324,6 +333,8 @@ impl<'a, 'data> Bytecode<'a, 'data> {
             parameters,
             declaration,
         )?;
+        locals.templates.member = Some(member);
+        locals.templates.properties = properties;
         let code = self.function_code(member, declaration)?;
         let decoded = bytecode::decode(code.bytes)?;
         let instructions = self.parameter_checks(&decoded, &locals, parameters)?;
@@ -518,8 +529,35 @@ impl<'a, 'data> Bytecode<'a, 'data> {
                 "non-returning initializer",
             ));
         }
+        self.assignment_slice(statements, &locals, declaration)
+    }
+
+    /// Lower the verified user segment of a Kotlin singleton's `<clinit>`.
+    /// The declaration planner separately consumes the allocation shell and
+    /// terminal return.
+    pub(super) fn static_assignments(
+        &self,
+        instructions: &[Instruction],
+        declaration: &str,
+    ) -> Result<Vec<Assignment<'a>>, KotlinError> {
+        let locals = Locals {
+            slots: Vec::new(),
+            instance: false,
+            alias: None,
+            templates: templates::Context::default(),
+        };
+        self.assignment_slice(instructions, &locals, declaration)
+    }
+
+    fn assignment_slice(
+        &self,
+        statements: &[Instruction],
+        locals: &Locals<'_>,
+        declaration: &str,
+    ) -> Result<Vec<Assignment<'a>>, KotlinError> {
         let mut stack = Vec::new();
         let mut assignments = Vec::new();
+        let mut rhs_start = None;
         for instruction in statements {
             let opcode = if locals.instance { 0xb5 } else { 0xb3 };
             if let Some((owner, field, descriptor)) = self.reference(instruction, opcode)? {
@@ -542,9 +580,18 @@ impl<'a, 'data> Bytecode<'a, 'data> {
                     field,
                     descriptor,
                     value,
+                    rhs_offsets: rhs_start.take().map(|start| start..instruction.offset),
                 });
             } else {
-                self.expression(instruction, &locals, &mut stack, declaration)?;
+                // A leading aload_0 is the receiver of the proven putfield.
+                // Only the surviving right hand side maps to the property.
+                if instruction.opcode != 0x00
+                    && !(locals.instance && stack.is_empty()
+                        && local_load(instruction) == Some((0x19, 0)))
+                {
+                    rhs_start.get_or_insert(instruction.offset);
+                }
+                self.expression(instruction, locals, &mut stack, declaration)?;
             }
         }
         if !stack.is_empty() {
@@ -746,6 +793,9 @@ impl<'a> Bytecode<'a, '_> {
         declaration: &str,
         scoped: &[ScopedLocal<'a>],
     ) -> Result<(), KotlinError> {
+        if templates::lower(self, instruction, locals, stack, declaration)? {
+            return Ok(());
+        }
         if instruction.opcode == 0x00 {
             return Ok(());
         }
@@ -780,14 +830,22 @@ impl<'a> Bytecode<'a, '_> {
             (0x0e..=0x0f, _) => Expr::literal(Literal::Double(f64::from(op - 0x0e))),
             (0x10..=0x11, Operand::Immediate(n)) => Expr::literal(Literal::Int(*n)),
             (0x12..=0x14, Operand::Constant(index)) => {
-                let literal = self.literal(*index, declaration)?;
-                if matches!(literal, Literal::Long(_) | Literal::Double(_)) != (op == 0x14) {
-                    return Err(KotlinError::unsupported(
-                        declaration,
-                        "invalid constant load category",
-                    ));
+                let pool = &self.class.pool;
+                let constant = pool.get(*index)?;
+                if let Constant::Class(name) = constant
+                    && op != 0x14
+                {
+                    templates::class_literal(self, pool.utf8(*name)?, locals, declaration, scoped)?
+                } else {
+                    let literal = self.literal(constant, declaration)?;
+                    if matches!(literal, Literal::Long(_) | Literal::Double(_)) != (op == 0x14) {
+                        return Err(KotlinError::unsupported(
+                            declaration,
+                            "invalid constant load category",
+                        ));
+                    }
+                    Expr::literal(literal)
                 }
-                Expr::literal(literal)
             }
             (0x60..=0x73, _) => {
                 let group = (op - 0x60) / 4;
@@ -896,8 +954,8 @@ impl<'a> Bytecode<'a, '_> {
             )))
     }
 
-    fn literal(&self, index: u16, declaration: &str) -> Result<Literal<'a>, KotlinError> {
-        Ok(match *self.class.pool.get(index)? {
+    fn literal(&self, constant: &Constant<'_>, declaration: &str) -> Result<Literal<'a>, KotlinError> {
+        Ok(match *constant {
             Constant::Integer(value) => Literal::Int(value),
             Constant::Long(value) => Literal::Long(value),
             Constant::Float(value) => Literal::Float(value),
@@ -940,7 +998,7 @@ pub(super) fn local_load(instruction: &Instruction) -> Option<(u8, u16)> {
     }
 }
 
-fn local_store(instruction: &Instruction) -> Option<(u8, u16)> {
+pub(super) fn local_store(instruction: &Instruction) -> Option<(u8, u16)> {
     match (instruction.opcode, &instruction.operand) {
         (op @ 0x36..=0x3a, Operand::Local(slot)) => Some((op, *slot)),
         (op @ 0x3b..=0x4e, Operand::None) => {
@@ -974,6 +1032,24 @@ impl<'a> Expr<'a> {
             kind: ExprKind::Literal(literal),
             depth: 1,
         }
+    }
+
+    /// A store equal to the JVM default may be omitted by the compiler.
+    /// Non-null references have no corresponding Kotlin literal.
+    pub(super) fn default_field(ty: &Type, jvm: &JvmType) -> Option<Self> {
+        let literal = match jvm {
+            JvmType::Primitive(primitive) if Expected::Type(ty, jvm).primitive() == Some(*primitive) => {
+                match primitive {
+                    Primitive::Long => Literal::Long(0),
+                    Primitive::Float => Literal::Float(0.0),
+                    Primitive::Double => Literal::Double(0.0),
+                    _ => Literal::Int(0),
+                }
+            }
+            JvmType::Object(_) | JvmType::Array(_) if ty.nullable => Literal::Null,
+            _ => return None,
+        };
+        Some(Self::literal(literal))
     }
 
     fn new(kind: ExprKind<'a>, depth: u8, declaration: &str) -> Result<Self, KotlinError> {
@@ -1019,7 +1095,8 @@ impl<'a> Expr<'a> {
     fn infallible(&self) -> bool {
         match &self.kind {
             ExprKind::Literal(_) | ExprKind::Parameter { .. } | ExprKind::LoopLocal(_)
-            | ExprKind::CatchLocal(_) => true,
+            | ExprKind::CatchLocal(_) | ExprKind::ThisProperty { .. } | ExprKind::ClassLiteral(_) => true,
+            ExprKind::Template(template) => template.infallible(),
             ExprKind::Binary(operator, _, pair) => {
                 !matches!(operator, Operator::Divide | Operator::Remainder)
                     && pair.0.infallible()
@@ -1043,6 +1120,8 @@ impl<'a> Expr<'a> {
             ExprKind::Parameter { load, .. } => Some(*load),
             ExprKind::LoopLocal(local) => Some(local.element.load()),
             ExprKind::BoxedInt(_) => Some(0x19),
+            ExprKind::Template(_) | ExprKind::ClassLiteral(_) => Some(0x19),
+            ExprKind::ThisProperty { primitive, .. } => Some(load_opcode(&JvmType::Primitive(*primitive))),
             ExprKind::Binary(_, primitive, _) => Some(load_opcode(&JvmType::Primitive(*primitive))),
             ExprKind::Conditional(_) => None,
         }
@@ -1060,6 +1139,8 @@ impl<'a> Expr<'a> {
                 Some(Primitive::Boolean)
             }
             ExprKind::BoxedInt(_) => None,
+            ExprKind::Template(_) | ExprKind::ClassLiteral(_) => None,
+            ExprKind::ThisProperty { primitive, .. } => Some(*primitive),
             ExprKind::Conditional(conditional) => conditional.primitive_hint(parameters),
             ExprKind::Binary(operator, primitive, pair) => {
                 if *primitive == Primitive::Int
@@ -1242,6 +1323,31 @@ impl<'a> Expr<'a> {
                     binding,
                 )?;
             }
+            ExprKind::Template(template) => {
+                if !matches!(expected, Expected::Reference)
+                    && !matches!(expected, Expected::Type(ty, JvmType::Object(name))
+                        if ty.class_id() == Some("kotlin/String") && name == "java/lang/String")
+                {
+                    return Err(mismatch());
+                }
+                template.write(out, parameters, declaration)?;
+            }
+            ExprKind::ThisProperty { name, primitive } => {
+                if expected.primitive() != Some(*primitive) {
+                    return Err(mismatch());
+                }
+                out.push_str("this.");
+                identifier(out, name, declaration)?;
+            }
+            ExprKind::ClassLiteral(name) => {
+                if !matches!(expected, Expected::Reference)
+                    || parameters.iter().any(|parameter| parameter.name == *name)
+                {
+                    return Err(mismatch());
+                }
+                identifier(out, name, declaration)?;
+                out.push_str("::class.java");
+            }
         }
         Ok(())
     }
@@ -1372,13 +1478,17 @@ fn nonfinite(value: f64) -> &'static str {
 
 pub(super) fn write_string(out: &mut String, value: impl Iterator<Item = u16>) {
     out.push('"');
+    write_string_contents(out, value);
+    out.push('"');
+}
+
+fn write_string_contents(out: &mut String, value: impl Iterator<Item = u16>) {
     for c in char::decode_utf16(value) {
         match c {
             Ok(c) => escaped_char(out, c, '"'),
             Err(unit) => write!(out, "\\u{:04X}", unit.unpaired_surrogate()).unwrap(),
         }
     }
-    out.push('"');
 }
 
 fn escaped_char(out: &mut String, c: char, quote: char) {

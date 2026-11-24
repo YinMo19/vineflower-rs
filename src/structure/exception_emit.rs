@@ -1,5 +1,7 @@
 // Copyright 2000-2020 JetBrains s.r.o. Use of this source code is governed by the Apache 2.0 license that can be found in the LICENSE file.
 
+mod resource_exits;
+
 use std::{mem, ops::Range};
 
 use crate::bytecode::{Instruction, Operand};
@@ -7,7 +9,7 @@ use crate::lift::{Effect, Machine};
 use crate::source_text::Document;
 
 use super::protected::{
-    Catch, ExceptionId, Legacy, LegacyExit, Monitor, ProtectedRegion, cleanup_locals,
+    ArmId, Catch, ExceptionId, Legacy, LegacyExit, Monitor, ProtectedRegion, cleanup_locals,
     local_touches, reference_load, reference_store,
 };
 use super::{Emitter, Line, Region, StructureError};
@@ -16,16 +18,17 @@ struct Resource {
     acquisition: usize,
     reference_prefix: Option<usize>,
     slot: u16,
-    body_stop: usize,
+    body_stop: Option<usize>,
     exit: ResourceExit,
     skipped: Vec<usize>,
-    redirects: Vec<usize>,
+    redirects: Vec<(usize, ExceptionRedirect)>,
     fulfilled_return: Option<usize>,
+    epilogue: Option<(usize, u32)>,
 }
 
 #[derive(Clone, Copy)]
 enum ResourceExit {
-    Continue(usize),
+    Continue(Option<usize>),
     Return { spill: usize, transfer: usize },
     DelegateReturn { recipient: ExceptionId, value: ReturnValue },
 }
@@ -38,8 +41,25 @@ pub(super) struct ReturnValue {
 
 #[derive(Clone, Copy)]
 pub(super) enum ExceptionRedirect {
-    Continue(usize),
+    Continue { target: usize, arm: ArmId },
     Return { recipient: ExceptionId, value: ReturnValue },
+    ReturnAtEdge { transfer: usize, arm: ArmId },
+    ReturnSpill { store: usize, arm: ArmId },
+}
+
+struct NormalExits {
+    close: usize,
+    stop: Option<usize>,
+    exit: ResourceExit,
+    redirects: Vec<(usize, ExceptionRedirect)>,
+    terminal_blocks: Vec<usize>,
+    fulfilled_return: Option<usize>,
+}
+
+struct ClosePattern {
+    slot: u16,
+    nullable: bool,
+    member: u16,
 }
 
 enum CloseExit {
@@ -126,11 +146,24 @@ fn merge_nested_resource(lines: &mut Vec<Line>, outer: usize, depth: usize) {
 }
 
 impl Emitter<'_> {
-    pub(super) fn redirected_exception_block(&self, block: usize) -> Result<usize, StructureError> {
-        match self.exception_redirects.get(&block) {
-            None => Ok(block),
-            Some(&ExceptionRedirect::Continue(next)) => Ok(next),
-            Some(ExceptionRedirect::Return { .. }) => Err(self.unstructured(block)),
+    pub(super) fn redirected_exception_block<'a, 'c>(
+        &mut self,
+        block: usize,
+        region: Region<'_, 'a, 'c>,
+        machine: &mut Machine<'a, 'c>,
+        depth: usize,
+        pending: &mut Vec<u32>,
+    ) -> Result<Option<usize>, StructureError> {
+        match self.exception_redirects.get(&block).copied() {
+            None | Some(ExceptionRedirect::ReturnSpill { .. }) => Ok(Some(block)),
+            Some(ExceptionRedirect::Continue { target, arm }) if region.exception_arm == Some(arm) => {
+                Ok(Some(target))
+            }
+            Some(ExceptionRedirect::ReturnAtEdge { transfer, arm }) if region.exception_arm == Some(arm) => {
+                self.emit_resource_return_transfer(transfer, machine, depth, pending)?;
+                Ok(None)
+            }
+            _ => Err(self.unstructured(block)),
         }
     }
 
@@ -377,7 +410,7 @@ impl Emitter<'_> {
             .ok_or_else(|| self.unstructured(shape.start))?;
         let mut terminal = None;
         let exit = match legacy.exit {
-            LegacyExit::Continue(next) => ResourceExit::Continue(next),
+            LegacyExit::Continue(next) => ResourceExit::Continue(Some(next)),
             LegacyExit::Return {
                 spill,
                 block,
@@ -416,11 +449,12 @@ impl Emitter<'_> {
                 acquisition,
                 reference_prefix: None,
                 slot: legacy.slot,
-                body_stop: shape.join.ok_or(StructureError::ExceptionHandlers)?,
+                body_stop: shape.join,
                 exit,
                 skipped,
                 redirects: Vec::new(),
                 fulfilled_return: None,
+                epilogue: None,
             },
             region,
             machine,
@@ -515,38 +549,34 @@ impl Emitter<'_> {
         }
         let next = match resource.exit {
             ResourceExit::Continue(next) => {
-                if self.exception_redirects.contains_key(&resource.body_stop)
-                    || resource
-                        .redirects
-                        .iter()
-                        .any(|entry| self.exception_redirects.contains_key(entry))
+                if resource.body_stop.is_some_and(|stop| self.exception_redirects.contains_key(&stop))
+                    || resource.redirects.iter().any(|(entry, _)| self.exception_redirects.contains_key(entry))
                 {
                     return Err(StructureError::ExceptionHandlers);
                 }
-                for &entry in &resource.redirects {
-                    self.exception_redirects
-                        .insert(entry, ExceptionRedirect::Continue(resource.body_stop));
+                for &(entry, transfer) in &resource.redirects {
+                    self.exception_redirects.insert(entry, transfer);
                 }
                 let reaches_stop = self.scoped_arm(
                     shape.start,
-                    region.exception(Some(resource.body_stop), shape.body, Some(machine)),
+                    region.exception(resource.body_stop, shape.body, Some(machine)),
                     machine,
                     depth + 1,
                 );
-                for entry in resource.redirects {
+                for (entry, _) in resource.redirects {
                     self.exception_redirects.remove(&entry);
                 }
-                if !reaches_stop? {
+                if reaches_stop? != next.is_some() {
                     return Err(self.unstructured(shape.start));
                 }
-                Some(next)
+                next
             }
             ResourceExit::Return { spill, transfer } => {
                 self.emit_resource_return(shape, spill, transfer, region, machine, depth + 1)?;
                 None
             }
             ResourceExit::DelegateReturn { recipient, value } => {
-                let landing = resource.body_stop;
+                let landing = resource.body_stop.ok_or(StructureError::ExceptionHandlers)?;
                 if self.exception_redirects.contains_key(&landing) {
                     return Err(self.unstructured(landing));
                 }
@@ -567,6 +597,9 @@ impl Emitter<'_> {
                 None
             }
         };
+        if let Some(epilogue) = resource.epilogue {
+            self.resource_epilogue = Some(epilogue);
+        }
         merge_nested_resource(&mut self.lines, resource.acquisition, depth);
         self.syntax(depth, "}");
         machine.forget_resource_local(resource.slot);
@@ -602,18 +635,32 @@ impl Emitter<'_> {
         if !matches!(tail.effect, Effect::None) {
             return Err(self.unstructured(spill));
         }
-        let transfer = &self.instructions[transfer];
-        let Effect::Return(Some(mut value)) = body.step(transfer)? else {
-            return Err(self.unstructured(spill));
-        };
         let mut offsets = tail.offsets;
-        for statement in body.take_prelude() {
-            self.push(depth, statement, mem::take(&mut offsets));
-        }
-        offsets.extend(transfer.offset..transfer.offset + transfer.len);
-        value.surround("return ", ";");
-        self.push(depth, value, offsets);
+        self.emit_resource_return_transfer(transfer, &mut body, depth, &mut offsets)?;
         Self::check_scope(body, baseline, self.offset(spill))
+    }
+
+    fn emit_resource_return_transfer(
+        &mut self,
+        transfer: usize,
+        machine: &mut Machine<'_, '_>,
+        depth: usize,
+        offsets: &mut Vec<u32>,
+    ) -> Result<(), StructureError> {
+        let instruction = &self.instructions[transfer];
+        let Effect::Return(Some(mut value)) = machine.step(instruction)? else {
+            return Err(StructureError::ExceptionHandlers);
+        };
+        if !machine.stack_is_empty() {
+            return Err(StructureError::StackJoin { offset: instruction.offset });
+        }
+        for statement in machine.take_prelude() {
+            self.push(depth, statement, mem::take(offsets));
+        }
+        offsets.extend(instruction.offset..instruction.offset + instruction.len);
+        value.surround("return ", ";");
+        self.push(depth, value, mem::take(offsets));
+        Ok(())
     }
 
     // javac's modern resource lowering has two close paths. The exception
@@ -756,122 +803,16 @@ impl Emitter<'_> {
         if !nullable && !self.allocates_nonnull(predecessor, machine)? {
             return Ok(None);
         }
-        let Some((normal_close, close_exit)) =
-            self.match_normal_resource_close(normal_cleanup, slot, nullable, close_method, machine)?
-        else {
+        let pattern = ClosePattern { slot, nullable, member: close_method };
+        let Some(normal) = (if shape.split_resource_exits.is_empty() {
+            self.prove_single_resource_exit(id, shape, machine, primary.start, pattern, &mut skipped)?
+        } else {
+            self.prove_split_resource_exits(shape, region, machine, primary.start, pattern, &mut skipped)?
+        }) else {
             return Ok(None);
         };
-        if normal_cleanup != normal_close {
-            skipped.push(normal_cleanup);
-        }
-        skipped.push(normal_close);
-        let mut fulfilled_return = None;
-        let mut return_transfer = None;
-        let exit = match close_exit {
-            CloseExit::Continue(next) => {
-                if skipped.contains(&next)
-                    || self
-                        .layout
-                        .local_is_live(self.graph, self.instructions, next, slot)
-                {
-                    return Ok(None);
-                }
-                match self.exception_redirects.get(&next).copied() {
-                    Some(ExceptionRedirect::Return { recipient, value }) if recipient == id => {
-                        let Some(exit) = self.resource_body_return(
-                            shape,
-                            normal_cleanup,
-                            normal_close,
-                            primary.start,
-                            value,
-                        ) else {
-                            return Ok(None);
-                        };
-                        fulfilled_return = Some(next);
-                        exit
-                    }
-                    _ => ResourceExit::Continue(next),
-                }
-            }
-            CloseExit::Return {
-                block,
-                transfer,
-                local,
-            } => {
-                if block != normal_close
-                    && self.graph.blocks[block]
-                        .predecessors
-                        .iter()
-                        .any(|pred| !skipped.contains(pred))
-                {
-                    return Ok(None);
-                }
-                if block != normal_close {
-                    skipped.push(block);
-                }
-                return_transfer = Some(transfer);
-                let Some(exit) = self.resource_body_return(
-                    shape,
-                    normal_cleanup,
-                    normal_close,
-                    primary.start,
-                    ReturnValue { local, transfer },
-                ) else {
-                    return Ok(None);
-                };
-                exit
-            }
-        };
-
+        let normal_close = normal.close;
         let ambient = &self.graph.blocks[normal_close].exception_successors;
-        let mut body_stop = normal_cleanup;
-        let mut redirects = Vec::new();
-        if !shape.split_resource_exits.is_empty() {
-            let ResourceExit::Continue(next) = exit else {
-                return Ok(None);
-            };
-            if self.exceptions.contains(Some(shape.body), next)
-                || !self.exceptions.contains(region.exception_arm, next)
-                || self.exceptions.at_start(region.exception_arm, next).is_some()
-                || self.exceptions.bypass_cleanup(next) != next
-                || self.layout.loops[next].is_some()
-                || region.loop_transfer(next).is_some()
-                || !self.graph.blocks[next].exception_predecessors.is_empty()
-            {
-                return Ok(None);
-            }
-            for &entry in &shape.split_resource_exits {
-                let Some((close, CloseExit::Continue(target))) =
-                    self.match_normal_resource_close(entry, slot, nullable, close_method, machine)?
-                else {
-                    return Ok(None);
-                };
-                if next != target
-                    || skipped.contains(&entry)
-                    || skipped.contains(&close)
-                    || self.graph.blocks[close].exception_successors != *ambient
-                    || self.exceptions.at_start(region.exception_arm, entry).is_some()
-                    || self.exceptions.at_start(region.exception_arm, close).is_some()
-                {
-                    return Ok(None);
-                }
-                if entry != close {
-                    skipped.push(entry);
-                }
-                skipped.push(close);
-                redirects.push(entry);
-            }
-            redirects.push(normal_cleanup);
-            if redirects.iter().any(|&entry| {
-                self.graph.blocks[entry]
-                    .predecessors
-                    .iter()
-                    .any(|&pred| !self.exceptions.contains(Some(shape.body), pred))
-            }) {
-                return Ok(None);
-            }
-            body_stop = next;
-        }
         if self.graph.blocks[suppression.start].exception_successors != *ambient
             || self.graph.blocks[rethrow].exception_successors != *ambient
             || !self.graph.blocks[exceptional_close]
@@ -880,6 +821,9 @@ impl Emitter<'_> {
                 .copied()
                 .filter(|&handler| handler != suppression.start)
                 .eq(ambient.iter().copied())
+            || !self.exceptions.matches_dispatch(suppression.start, normal_close, None)
+            || !self.exceptions.matches_dispatch(rethrow, normal_close, None)
+            || !self.exceptions.matches_dispatch(exceptional_close, normal_close, Some(suppression.start))
             || self
                 .exceptions
                 .at_start(region.exception_arm, normal_cleanup)
@@ -893,9 +837,8 @@ impl Emitter<'_> {
                     || self.exceptions.bypass_cleanup(block) != block
                     || self.exceptions.cleanup_prefix(block) != 0
                     || (!self.exceptions.contains(region.exception_arm, block)
-                        && !return_transfer.is_some_and(|transfer|
-                            self.graph.blocks[block].instructions.contains(&transfer)
-                                && self.graph.blocks[block].exception_successors.is_empty()))
+                        && !(normal.terminal_blocks.contains(&block)
+                            && self.graph.blocks[block].exception_successors.is_empty()))
                     || (!self.graph.blocks[block].exception_predecessors.is_empty()
                         && !self.exceptions.contains(Some(primary.arm), block))
                     || self.graph.blocks[block].predecessors.iter().any(|pred| {
@@ -917,12 +860,138 @@ impl Emitter<'_> {
                 shape, predecessor, slot, acquisition, machine,
             ),
             slot,
-            body_stop,
-            exit,
+            body_stop: normal.stop,
+            exit: normal.exit,
             skipped,
-            redirects,
+            redirects: normal.redirects,
+            fulfilled_return: normal.fulfilled_return,
+            epilogue: self.resource_epilogue_jump(shape, region, normal_close, normal.exit, nullable),
+        }))
+    }
+
+    fn resource_epilogue_jump(
+        &self,
+        shape: &ProtectedRegion,
+        region: Region<'_, '_, '_>,
+        close: usize,
+        exit: ResourceExit,
+        nullable: bool,
+    ) -> Option<(usize, u32)> {
+        if nullable
+            || !shape.split_resource_exits.is_empty()
+            || region.exception_arm.is_some()
+            || region.loop_header.is_some()
+            || region.switch_depth != 0
+            || region.stop.is_some()
+        {
+            return None;
+        }
+        let ResourceExit::Continue(Some(target)) = exit else {
+            return None;
+        };
+        let [_, _, jump] = self.block_instructions(close) else {
+            return None;
+        };
+        let [returned] = self.block_instructions(target) else {
+            return None;
+        };
+        // Upstream keeps the outgoing goto offset on the method epilogue
+        // after removing the unguarded close.
+        (matches!(jump.opcode, 0xa7 | 0xc8)
+            && returned.opcode == 0xb1
+            && self.graph.blocks[target].predecessors == [close]
+            && self.graph.blocks[target].exception_predecessors.is_empty())
+        .then_some((target, jump.offset))
+    }
+
+    fn prove_single_resource_exit(
+        &mut self,
+        id: ExceptionId,
+        shape: &ProtectedRegion,
+        machine: &Machine<'_, '_>,
+        primary: usize,
+        pattern: ClosePattern,
+        skipped: &mut Vec<usize>,
+    ) -> Result<Option<NormalExits>, StructureError> {
+        let Some(entry) = shape.join else { return Ok(None) };
+        let Some((close, exit)) = self.match_normal_resource_close(
+            entry, pattern.slot, pattern.nullable, pattern.member, machine,
+        )? else {
+            return Ok(None);
+        };
+        if entry != close {
+            skipped.push(entry);
+        }
+        skipped.push(close);
+        let mut fulfilled_return = None;
+        let mut terminal_blocks = Vec::new();
+        let exit = match exit {
+            CloseExit::Continue(next) => {
+                if skipped.contains(&next)
+                    || self.layout.local_is_live(self.graph, self.instructions, next, pattern.slot)
+                {
+                    return Ok(None);
+                }
+                match self.exception_redirects.get(&next).copied() {
+                    Some(ExceptionRedirect::Return { recipient, value }) if recipient == id => {
+                        let Some(exit) = self.resource_body_return(shape, entry, close, primary, value)
+                        else {
+                            return Ok(None);
+                        };
+                        fulfilled_return = Some(next);
+                        exit
+                    }
+                    _ => ResourceExit::Continue(Some(next)),
+                }
+            }
+            CloseExit::Return { block, transfer, local } => {
+                if block != close {
+                    if self.graph.blocks[block].predecessors.iter().any(|&pred| pred != entry && pred != close) {
+                        return Ok(None);
+                    }
+                    skipped.push(block);
+                    terminal_blocks.push(block);
+                }
+                let Some(exit) = self.resource_body_return(
+                    shape, entry, close, primary, ReturnValue { local, transfer },
+                ) else {
+                    return Ok(None);
+                };
+                exit
+            }
+        };
+        Ok(Some(NormalExits {
+            close,
+            stop: Some(entry),
+            exit,
+            redirects: Vec::new(),
+            terminal_blocks,
             fulfilled_return,
         }))
+    }
+
+    fn exclusive_resource_spill(
+        &self,
+        shape: &ProtectedRegion,
+        landing: usize,
+        local: cleanup_locals::Local,
+    ) -> Option<(usize, usize)> {
+        let &[spill] = self.graph.blocks[landing].predecessors.as_slice() else {
+            return None;
+        };
+        let block = &self.graph.blocks[spill];
+        let store = block.instructions.end - 1;
+        (self.exceptions.contains(Some(shape.body), spill)
+            && self.exceptions.at_start(Some(shape.body), spill).is_none()
+            && self.exceptions.bypass_cleanup(spill) == spill
+            && !self.exceptions.skips_binding(spill)
+            && !self.exceptions.skips_instruction(store)
+            && self.exceptions.return_split(Some(shape.body), spill).is_none()
+            && self.exceptions.cleanup_prefix(spill) == 0
+            && self.exceptions.monitor_acquisition_end(spill).is_none()
+            && block.successors == [landing]
+            && cleanup_locals::store(&self.instructions[store]) == Some(local))
+        .then_some((spill, store))
     }
 
     fn resource_body_return(
@@ -936,22 +1005,10 @@ impl Emitter<'_> {
         if self.protected_resource_slot_overlap(value.local, close, primary) {
             return None;
         }
-        let predecessors = self.graph.blocks[landing].predecessors.as_slice();
-        if let &[spill] = predecessors {
-            let block = &self.graph.blocks[spill];
-            let store = block.instructions.end - 1;
-            if self.exceptions.contains(Some(shape.body), spill)
-                && self.exceptions.at_start(Some(shape.body), spill).is_none()
-                && !self.exceptions.skips_binding(spill)
-                && !self.exceptions.skips_instruction(store)
-                && self.exceptions.cleanup_prefix(spill) == 0
-                && self.exceptions.monitor_acquisition_end(spill).is_none()
-                && block.successors == [landing]
-                && cleanup_locals::store(&self.instructions[store]) == Some(value.local)
-            {
-                return Some(ResourceExit::Return { spill, transfer: value.transfer });
-            }
+        if let Some((spill, _)) = self.exclusive_resource_spill(shape, landing, value.local) {
+            return Some(ResourceExit::Return { spill, transfer: value.transfer });
         }
+        let predecessors = self.graph.blocks[landing].predecessors.as_slice();
 
         // If a child closes first, the spill belongs to that child, not
         // the parent. Assign the obligation to the one lexical child whose
@@ -1169,6 +1226,12 @@ impl Emitter<'_> {
                 return Err(self.unstructured(block));
             }
             range.end = end;
+        }
+        if let Some(&ExceptionRedirect::ReturnSpill { store, arm }) = self.exception_redirects.get(&block) {
+            if region.exception_arm != Some(arm) || range.end != store + 1 || !range.contains(&store) {
+                return Err(self.unstructured(block));
+            }
+            range.end = store;
         }
         Ok(())
     }

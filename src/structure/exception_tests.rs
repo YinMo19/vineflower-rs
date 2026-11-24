@@ -10,7 +10,7 @@ use crate::options::Options;
 use super::protected::Exceptions;
 use super::{Line, StructureError, structure_with_handlers};
 
-fn handler(start_pc: u16, end_pc: u16, handler_pc: u16, catch_type: u16) -> ExceptionHandler {
+pub(super) fn handler(start_pc: u16, end_pc: u16, handler_pc: u16, catch_type: u16) -> ExceptionHandler {
     ExceptionHandler {
         start_pc,
         end_pc,
@@ -785,6 +785,29 @@ fn split_normal_resource_copies_must_rejoin_at_the_same_continuation() {
     );
     assert!(!lines.iter().any(|line| line.text.as_flat().contains("close()")));
 
+    let mut returned = bytes.to_vec();
+    returned[22..25].copy_from_slice(&[0, 0x08, 0x3e]); // nop; iconst_5; istore_3
+    returned[28] = 38; // 26: ifnull 64
+    returned[37] = 29; // 35: goto 64
+    returned[62] = 0x03;
+    returned.extend([0xac, 0x1d, 0xac]); // 62: return 0; 64: iload_3; ireturn
+    let int_descriptor = "(Ljava/lang/AutoCloseable;Z)I";
+    let lines = test_method_with_descriptor(&returned, &handlers, &[], int_descriptor).unwrap();
+    let early = lines.iter().find(|line| line.text == "return 5;").unwrap();
+    let later = lines.iter().find(|line| line.text == "return 0;").unwrap();
+    assert!(early.depth > later.depth);
+    assert!(early.offsets.contains(&65));
+    assert_eq!(later.offsets, [62, 63]);
+
+    returned[6..9].copy_from_slice(&[0, 0x03, 0x3e]); // Same slot, different exit.
+    returned[62] = 0x1d;
+    let lines = test_method_with_descriptor(&returned, &handlers, &[], int_descriptor).unwrap();
+    for (value, transfer) in [("return 0;", 63), ("return 5;", 65)] {
+        let line = lines.iter().find(|line| line.text == value).unwrap();
+        assert!(line.depth > 0);
+        assert!(line.offsets.contains(&transfer));
+    }
+
     bytes[28] = 37;
     bytes[37] = 28;
     // Both branches of the second close now agree on a different return.
@@ -938,7 +961,7 @@ fn test_method(
     test_method_with_descriptor(bytes, handlers, stack_map, "(Ljava/lang/AutoCloseable;)V")
 }
 
-fn test_method_with_descriptor(
+pub(super) fn test_method_with_descriptor(
     bytes: &[u8],
     handlers: &[ExceptionHandler],
     stack_map: &[u8],

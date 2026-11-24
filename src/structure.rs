@@ -158,6 +158,7 @@ fn structure_regions(
         layout: Layout::new(graph, instructions, assertions)?,
         exceptions,
         exception_redirects: BTreeMap::new(),
+        resource_epilogue: None,
         assertions,
         record_patterns,
         emitted: vec![false; graph.blocks.len()],
@@ -188,6 +189,7 @@ struct Emitter<'a> {
     layout: Layout,
     exceptions: &'a Exceptions,
     exception_redirects: BTreeMap<usize, ExceptionRedirect>,
+    resource_epilogue: Option<(usize, u32)>,
     assertions: Option<&'a assertions::Sites>,
     record_patterns: Option<&'a pattern_record::Plans>,
     emitted: Vec<bool>,
@@ -255,7 +257,11 @@ impl Emitter<'_> {
         }
         loop {
             block = self.exceptions.bypass_cleanup(block);
-            block = self.redirected_exception_block(block)?;
+            let Some(next) = self.redirected_exception_block(block, region, machine, depth, pending)?
+            else {
+                return Ok(false);
+            };
+            block = next;
             let first_header = mem::take(&mut enter_loop);
             if !first_header {
                 if region.stop == Some(block) {
@@ -335,7 +341,11 @@ impl Emitter<'_> {
             } = tail;
             match effect {
                 Effect::None => {
-                    block = self.single_successor(block)?;
+                    let next = self.single_successor(block)?;
+                    if self.record_labeled_break(block, next, region, machine, depth, first_line, &mut offsets)? {
+                        return Ok(false);
+                    }
+                    block = next;
                     *pending = offsets;
                 }
                 Effect::Jump(target) => {
@@ -388,7 +398,7 @@ impl Emitter<'_> {
                         *pending = offsets;
                         continue;
                     }
-                    let Some(next) = self.emit_switch(
+                    let Some(next) = self.emit_switch_or_labeled(
                         block,
                         region,
                         machine,
@@ -396,7 +406,6 @@ impl Emitter<'_> {
                         selector,
                         &mut offsets,
                         control,
-                        None,
                     )?
                     else {
                         return Ok(false);
@@ -405,6 +414,14 @@ impl Emitter<'_> {
                     *pending = offsets;
                 }
                 Effect::Return(value) => {
+                    if value.is_none()
+                        && let Some((epilogue, jump)) = self.resource_epilogue
+                        && epilogue == block
+                    {
+                        self.resource_epilogue = None;
+                        offsets.clear();
+                        offsets.push(jump);
+                    }
                     let text = value.map_or_else(
                         || Document::from("return;"),
                         |value| surrounded(value, "return ", ";"),
@@ -1319,14 +1336,13 @@ impl Emitter<'_> {
                     .push(CaseLabel { text, offsets });
             }
         }
-        if let Some((condition, schedule)) = self.try_predicate_switch(
+        let labeled_tail = region.label_scope().and_then(|scope| scope.head_tail(block));
+        if labeled_tail.is_none() && let Some((condition, schedule)) = self.try_predicate_switch(
             block, region, machine, depth, &selector, &groups, default, &control,
         ) {
             return self.emit_if(block, region, machine, depth, condition, None, offsets, schedule);
         }
-        let join = self
-            .layout
-            .normal_join(block, region)
+        let join = labeled_tail.or_else(|| self.layout.normal_join(block, region))
             .or_else(|| {
                 let mut targets = groups.keys().copied().peekable();
                 let arms = std::iter::from_fn(|| {
@@ -1340,7 +1356,7 @@ impl Emitter<'_> {
                 self.layout.common_join(self.graph, region, arms)
             })
             .or(region.stop);
-        if let Some(join) = join
+        if labeled_tail.is_none() && let Some(join) = join
             && self.try_switch_expression(
                 block, region, machine, depth, &selector, &groups, default, join, &control,
             )
@@ -1414,7 +1430,9 @@ impl Emitter<'_> {
                     }
                 } else {
                     arms.push(arm);
-                    self.syntax(depth + 2, "break;");
+                    if labeled_tail.is_none() || groups.peek().is_some() {
+                        self.syntax(depth + 2, "break;");
+                    }
                 }
             }
             if scoped_arms {

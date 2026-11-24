@@ -3,7 +3,7 @@ use std::borrow::Cow;
 
 use super::{DecompileError, Document, Token, TokenKind, Writer, parse, symbols};
 use crate::{
-    classfile::{Annotation, ElementValue, Member},
+    classfile::{Annotation, Attribute, ElementValue, Member, find_attribute},
     descriptor::{Primitive, Type},
     lift::{constant_literal_with_options, string_literal},
 };
@@ -15,6 +15,41 @@ impl<'a> Writer<'a, '_> {
                 self.write_annotation(depth, &annotation)?;
             }
         }
+        Ok(())
+    }
+
+    pub(super) fn class_deprecation(&mut self, depth: usize) -> Result<(), DecompileError> {
+        if find_attribute(&self.class.attributes, &self.class.pool, "Deprecated")?.is_none() {
+            return Ok(());
+        }
+        let visible = self.class.annotations(true)?;
+        let invisible = self.class.annotations(false)?;
+        self.deprecation_comment(depth, visible.iter().chain(&invisible))
+    }
+
+    pub(super) fn member_deprecation(
+        &mut self,
+        depth: usize,
+        attributes: &[Attribute<'a>],
+        annotations: &[Annotation],
+    ) -> Result<(), DecompileError> {
+        if find_attribute(attributes, &self.class.pool, "Deprecated")?.is_some() {
+            self.deprecation_comment(depth, annotations)?;
+        }
+        Ok(())
+    }
+
+    fn deprecation_comment<'b>(
+        &mut self,
+        depth: usize,
+        annotations: impl IntoIterator<Item = &'b Annotation>,
+    ) -> Result<(), DecompileError> {
+        for annotation in annotations {
+            if self.class.pool.utf8(annotation.type_index)? == "Ljava/lang/Deprecated;" {
+                return Ok(());
+            }
+        }
+        self.line(depth, "/** @deprecated */");
         Ok(())
     }
 

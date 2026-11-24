@@ -29,6 +29,7 @@ pub(super) struct Exceptions {
     regions: Vec<ProtectedRegion>,
     arms: Vec<Arm>,
     entries: BTreeMap<(Option<ArmId>, usize), ExceptionId>,
+    routes: Vec<Vec<Route>>,
     bindings: BTreeSet<usize>,
     return_splits: BTreeMap<usize, usize>,
     cleanup_prefixes: BTreeMap<usize, usize>,
@@ -218,6 +219,7 @@ impl Exceptions {
         }
         let owners = result.link()?;
         result.verify_dispatch(&table, &owners)?;
+        result.routes = table.by_block;
         Ok(result)
     }
 
@@ -314,6 +316,18 @@ impl Exceptions {
 
     pub(super) fn arm_blocks(&self, arm: ArmId) -> impl Iterator<Item = usize> + '_ {
         self.arms[arm.0].blocks.iter().copied()
+    }
+
+    pub(super) fn matches_dispatch(
+        &self,
+        sample: usize,
+        original: usize,
+        ignored_handler: Option<usize>,
+    ) -> bool {
+        self.routes[sample]
+            .iter()
+            .filter(|route| Some(route.handler) != ignored_handler)
+            .eq(&self.routes[original])
     }
 
     pub(super) fn region(&self, id: ExceptionId) -> &ProtectedRegion {

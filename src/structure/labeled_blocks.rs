@@ -1,14 +1,17 @@
-use std::{cell::RefCell, mem, ops::RangeInclusive};
+use std::{cell::RefCell, collections::BTreeSet, mem, ops::RangeInclusive};
 
-use crate::{bytecode::Operand, lift::Machine};
+use crate::{bytecode::Operand, lift::Machine, source_text::Document};
 
-use super::{Arm, Condition, Emitter, Line, Region, StructureError, instanceof_patterns};
+use super::{Arm, Condition, Emitter, Line, Region, StructureError, instanceof_patterns, protected::ArmId};
+
+mod resource_switch;
 
 pub(super) struct Scope<'a, 'c> {
     head: usize,
     tail: usize,
     join: usize,
     name: String,
+    edges: Edges,
     exits: RefCell<Vec<Exit<'a, 'c>>>,
 }
 
@@ -33,6 +36,17 @@ struct Plan {
     tail: usize,
     join: usize,
     break_count: usize,
+    edges: Edges,
+}
+
+enum Edges {
+    Explicit,
+    Resource { arm: ArmId, abrupt_entries: BTreeSet<usize> },
+}
+
+enum Head {
+    If(Condition),
+    Switch(Document),
 }
 
 impl Emitter<'_> {
@@ -111,17 +125,22 @@ impl Emitter<'_> {
         if break_count == 0 || cfg[join].predecessors.iter().any(|&pred| pred < head || pred > tail) {
             return None;
         }
-        Some(Plan { tail, join, break_count })
+        Some(Plan { tail, join, break_count, edges: Edges::Explicit })
     }
 
     fn labeled_plain_block(&self, block: usize, region: Region<'_, '_, '_>) -> bool {
+        self.graph.blocks[block].exception_successors.is_empty()
+            && self.labeled_region_block(block, region)
+    }
+
+    fn labeled_region_block(&self, block: usize, region: Region<'_, '_, '_>) -> bool {
         let node = &self.graph.blocks[block];
         self.exceptions.contains(region.exception_arm, block)
             && self.exceptions.at_start(region.exception_arm, block).is_none()
             && self.exceptions.bypass_cleanup(block) == block
             && !self.exception_redirects.contains_key(&block)
             && self.layout.loops[block].is_none()
-            && node.exception_predecessors.is_empty() && node.exception_successors.is_empty()
+            && node.exception_predecessors.is_empty()
             && node.instructions.clone().all(|index| {
                 !self.exceptions.skips_instruction(index)
                     && !matches!(self.instructions[index].opcode, 0xc2 | 0xc3)
@@ -155,17 +174,56 @@ impl Emitter<'_> {
         let Some(plan) = plan else {
             return self.emit_if(head, region, machine, depth, condition, binding, offsets, control);
         };
+        self.emit_labeled(head, region, machine, depth, Head::If(condition), offsets, control, plan)
+    }
+
+    pub(super) fn emit_switch_or_labeled<'a, 'c>(
+        &mut self,
+        head: usize,
+        region: Region<'_, 'a, 'c>,
+        machine: &mut Machine<'a, 'c>,
+        depth: usize,
+        selector: Document,
+        offsets: &mut Vec<u32>,
+        control: RangeInclusive<u32>,
+    ) -> Result<Option<usize>, StructureError> {
+        let plan = if machine.this_is_initialized() && machine.stack_is_empty() {
+            self.labeled_resource_switch(head, region)
+        } else {
+            None
+        };
+        let Some(plan) = plan else {
+            return self.emit_switch(head, region, machine, depth, selector, offsets, control, None);
+        };
+        self.emit_labeled(head, region, machine, depth, Head::Switch(selector), offsets, control, plan)
+    }
+
+    fn emit_labeled<'a, 'c>(
+        &mut self,
+        head: usize,
+        region: Region<'_, 'a, 'c>,
+        machine: &mut Machine<'a, 'c>,
+        depth: usize,
+        kind: Head,
+        offsets: &mut Vec<u32>,
+        control: RangeInclusive<u32>,
+        plan: Plan,
+    ) -> Result<Option<usize>, StructureError> {
         let scope = Scope {
             head,
             tail: plan.tail,
             join: plan.join,
             name: format!("label{}", self.offset(plan.join)),
+            edges: plan.edges,
             exits: RefCell::new(Vec::with_capacity(plan.break_count)),
         };
         let label_region = region.label_body(&scope, Some(plan.join));
         let start = self.lines.len();
         let mut body = machine.clone();
-        let next = self.emit_if(head, label_region, &mut body, depth + 1, condition, None, offsets, control)?;
+        let next = match kind {
+            Head::If(condition) => self.emit_if(head, label_region, &mut body, depth + 1, condition, None, offsets, control)?,
+            Head::Switch(selector) => self.emit_switch(head, label_region, &mut body, depth + 1, selector, offsets, control, None)?,
+        };
         if next != Some(plan.tail) { return Err(self.unstructured(head)); }
         let boundary = self.lines.len();
         let normal = self.branch_arm(plan.tail, label_region, &body, depth + 1)?;
@@ -214,18 +272,30 @@ impl Emitter<'_> {
         first_line: usize,
         offsets: &mut Vec<u32>,
     ) -> Result<bool, StructureError> {
-        let Some(scope) = region.label_scope().filter(|scope| scope.join == to) else { return Ok(false); };
-        if block <= scope.head || block >= scope.tail || !self.labeled_plain_block(block, region) {
+        let Some(scope) = region.label_scope() else { return Ok(false); };
+        let jump = match &scope.edges {
+            Edges::Explicit if scope.join == to && block != scope.tail
+                && self.labeled_plain_block(block, region) =>
+            {
+                Some(self.explicit_jump(block, to).ok_or_else(|| self.unstructured(block))?)
+            }
+            Edges::Resource { arm, abrupt_entries } if region.exception_arm == Some(*arm)
+                && abrupt_entries.contains(&to) && self.labeled_region_block(block, region) =>
+            {
+                self.explicit_jump(block, to)
+            }
+            _ => return Ok(false),
+        };
+        if block <= scope.head || block >= scope.tail {
             return Err(self.unstructured(block));
         }
-        let jump = self.explicit_jump(block, to).ok_or_else(|| self.unstructured(block))?;
         let mut exits = scope.exits.borrow_mut();
         let edge = exits.len();
         exits.push(Exit { block, state: machine.clone() });
         if let Some(line) = self.lines.get_mut(first_line) {
             line.labeled_edge = Some(EdgeLine::First(edge));
         }
-        offsets.push(jump);
+        offsets.extend(jump);
         let mut line = Line::new(depth, format!("break {};", scope.name), mem::take(offsets));
         line.labeled_edge = Some(EdgeLine::Break(edge));
         self.lines.push(line);

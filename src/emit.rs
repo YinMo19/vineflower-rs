@@ -406,6 +406,7 @@ impl<'a, 'c> Writer<'a, 'c> {
         let is_annotation = flags & ANNOTATION != 0;
         let components = self.class.record_components()?;
         let permitted = self.class.permitted_subclasses()?;
+        self.class_deprecation(0)?;
         if self.depth == 0
             && self
                 .names
@@ -731,6 +732,7 @@ impl<'a, 'c> Writer<'a, 'c> {
             out.append_ref(initializer);
         }
         out.push(';');
+        self.member_deprecation(1, &field.attributes, &declarations)?;
         if renamed.is_some() {
             let ty = ty.render(|name| name.replace('/', "."));
             self.line(1, &format!("// $VF: renamed from: {name} {ty}"));
@@ -1019,6 +1021,7 @@ impl<'a, 'c> Writer<'a, 'c> {
             if needs_gap {
                 self.line(0, "");
             }
+            self.member_deprecation(1, &method.attributes, &annotations)?;
             if renamed.is_some() {
                 let java_name = |name: &str| name.replace('/', ".");
                 let args = ty

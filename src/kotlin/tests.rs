@@ -41,8 +41,19 @@ const FOR_RANGE: &str = include_str!("fixtures/TestForRange.class.hex");
 const FOR_LOOPS: &str = include_str!("fixtures/ForLoops.class.hex");
 const TRY_REGIONS: &str = include_str!("fixtures/TryRegions.class.hex");
 const TRY_THROWABLE: &str = include_str!("fixtures/TestTryCatchThrowable.class.hex");
+pub(super) const INDY_TEMPLATE: &str = include_str!("fixtures/TestStringInterpolation.class.hex");
+const CLASSIC_TEMPLATE: &str = include_str!("fixtures/TestClassicStringInterpolation.class.hex");
+const OBJECT: &str = include_str!("fixtures/TestObject.class.hex");
+const COMPANION_HOST: &str = include_str!("fixtures/TestCompanionObject.class.hex");
+const COMPANION_CHILD: &str = include_str!("fixtures/TestCompanionObject$Companion.class.hex");
+const NESTING: [&str; 4] = [
+    include_str!("fixtures/Nesting.class.hex"),
+    include_str!("fixtures/Nesting$Factory.class.hex"),
+    include_str!("fixtures/Nesting$Payload.class.hex"),
+    include_str!("fixtures/Nesting$Settings.class.hex"),
+];
 
-fn bytes(hex: &str) -> Vec<u8> {
+pub(super) fn bytes(hex: &str) -> Vec<u8> {
     assert!(hex.lines().all(|line| line.len() % 2 == 0));
     hex.lines()
         .flat_map(|line| {
@@ -51,6 +62,68 @@ fn bytes(hex: &str) -> Vec<u8> {
             })
         })
         .collect()
+}
+
+#[test]
+fn renders_original_indy_and_classic_templates_with_mappings() {
+    let options = crate::Options {
+        decompile_kotlin: true,
+        include_line_mappings: true,
+        dump_original_lines: true,
+        unit_test_mode: true,
+        remove_synthetic: false,
+        ..crate::Options::default()
+    };
+    for (fixture, golden) in [
+        (
+            INDY_TEMPLATE,
+            include_str!("../../tests/upstream/plugins/kotlin/testData/results/pkg/TestStringInterpolation.dec"),
+        ),
+        (
+            CLASSIC_TEMPLATE,
+            include_str!("../../tests/upstream/plugins/kotlin/testData/results/pkg/TestClassicStringInterpolation.dec"),
+        ),
+    ] {
+        let source = crate::decompile(&bytes(fixture), &options).unwrap();
+        assert_eq!(source.text, golden, "{}", source.class_name);
+    }
+}
+
+#[test]
+fn braces_interpolation_names_before_literal_identifier_characters() {
+    for (fixture, old, new) in [
+        (INDY_TEMPLATE, b"\x01 5".as_slice(), b"\x01a$".as_slice()),
+        (CLASSIC_TEMPLATE, b"\x01\x00\x02 5", b"\x01\x00\x02a$"),
+    ] {
+        let mut data = bytes(fixture);
+        let start = data.windows(old.len()).position(|window| window == old).unwrap();
+        data[start..start + old.len()].copy_from_slice(new);
+        let class = ClassFile::parse(&data).unwrap();
+        let source = decompile_class(&class).unwrap().expect("Kotlin source");
+        assert!(source.contains(r#"System.out.println("${x}a\$")"#), "{source}");
+    }
+}
+
+#[test]
+fn rejects_unmatched_concat_recipe_and_wrong_append_overload() {
+    for (fixture, old, new) in [
+        (INDY_TEMPLATE, b"\x01 \x01".as_slice(), b"\x01 !".as_slice()),
+        (CLASSIC_TEMPLATE, b"(C)Ljava/lang/StringBuilder;", b"(Z)Ljava/lang/StringBuilder;"),
+        (
+            INDY_TEMPLATE,
+            b"(ILjava/lang/String;)Ljava/lang/String;",
+            b"(ILjava/lang/Double;)Ljava/lang/String;",
+        ),
+    ] {
+        let mut data = bytes(fixture);
+        let start = data.windows(old.len()).position(|window| window == old).unwrap();
+        data[start..start + old.len()].copy_from_slice(new);
+        let class = ClassFile::parse(&data).unwrap();
+        assert!(matches!(
+            decompile_class(&class),
+            Err(KotlinError::Unsupported { declaration, .. }) if declaration == "stringInterpolation"
+        ));
+    }
 }
 
 fn render(hex: &str) -> String {
@@ -67,11 +140,38 @@ fn renders_class_from_kotlin_metadata_and_bytecode() {
         concat!(
             "package parity.kotlin\n\n",
             "public class Declaration(public val id: Int, public var active: Boolean) {\n",
-            "   public val label: String = \"ok\"\n\n",
+            "   public final val label: String = \"ok\"\n\n",
             "   public fun twice(x: Int): Int = x * 2\n",
             "}\n",
         )
     );
+}
+
+#[test]
+fn restores_jvm_default_fields_without_claiming_a_constructor_store() {
+    let input = bytes(include_str!("fixtures/FieldDefaults.class.hex"));
+    let options = crate::Options {
+        decompile_kotlin: true,
+        include_line_mappings: true,
+        ..crate::Options::default()
+    };
+    let recovered = crate::decompile(&input, &options).unwrap();
+    for declaration in [
+        "   public final val disabled: Boolean = false",
+        "   public final var empty: Long = 0L",
+        "   public final val absent: String? = null",
+    ] {
+        assert!(recovered.text.lines().any(|line| line == declaration));
+    }
+    let map = recovered.map.unwrap();
+    let constructor = map.methods.iter().find(|entry| entry.name == "<init>").unwrap();
+    assert_eq!(constructor.offsets.keys().copied().collect::<Vec<_>>(), [5, 6]);
+    for &line in constructor.offsets.values() {
+        assert_eq!(
+            recovered.text.lines().nth(line),
+            Some("   public final val literal: Int = 7"),
+        );
+    }
 }
 
 #[test]
@@ -477,6 +577,134 @@ fn rejects_different_cleanup_copies_or_returns_from_unspilled_slots() {
             declaration, feature: "unsupported Kotlin exception region"
         }) if declaration == name));
     }
+}
+
+#[test]
+fn recovers_singleton_initializer_and_instance_and_static_updates() {
+    let source = render(OBJECT);
+    assert_eq!(
+        source,
+        concat!(
+            "package pkg\n\n",
+            "public object TestObject {\n",
+            "   public const val objectConstVal: Int = 926\n",
+            "   private final var objectVar: Int = 42\n",
+            "   public final val objectVal: Regex = kotlin.text.Regex(\"\")\n\n",
+            "   public fun objectFun() {\n",
+            "      objectVar--\n",
+            "   }\n\n",
+            "   @kotlin.jvm.JvmStatic\n",
+            "   public fun objectJvmStaticFun() {\n",
+            "      objectVar++\n",
+            "   }\n",
+            "}\n",
+        )
+    );
+}
+
+#[test]
+fn recovers_companion_storage_and_static_forwarders_once() {
+    let host = bytes(COMPANION_HOST);
+    let child = bytes(COMPANION_CHILD);
+    let group = crate::ClassGroup::new([host.as_slice(), child.as_slice()]).unwrap();
+    let options = crate::Options {
+        decompile_kotlin: true,
+        ..crate::Options::default()
+    };
+    let source = group.decompile("pkg/TestCompanionObject$Companion", &options).unwrap();
+    assert_eq!(source.file_extension, "kt");
+    assert_eq!(
+        source.text,
+        concat!(
+            "package pkg\n\n",
+            "public class TestCompanionObject {\n",
+            "   public fun notInCompanion() {\n",
+            "      System.out.println(\"notInCompanion\")\n",
+            "   }\n\n",
+            "   public companion object {\n",
+            "      public final val companionVal: String = \"inCompanion\"\n",
+            "      @kotlin.jvm.JvmStatic\n",
+            "      public final val companionValJvmStatic: String = \"inCompanionJvmStatic\"\n\n",
+            "      public fun inCompanion() {\n",
+            "         System.out.println(\"inCompanion\")\n",
+            "      }\n\n",
+            "      @kotlin.jvm.JvmStatic\n",
+            "      public fun inCompanionJvmStatic() {\n",
+            "         System.out.println(\"inCompanionJvmStatic\")\n",
+            "      }\n",
+            "   }\n",
+            "}\n",
+        )
+    );
+    assert!(matches!(
+        decompile_class(&ClassFile::parse(&host).unwrap()),
+        Err(KotlinError::Unsupported { feature: "Kotlin nested class does not match the class group", .. })
+    ));
+}
+
+#[test]
+fn recovers_typed_static_nested_declarations_and_mapped_companion() {
+    let classes = NESTING.map(bytes);
+    let group = crate::ClassGroup::new(classes.iter().map(Vec::as_slice)).unwrap();
+    let options = crate::Options {
+        decompile_kotlin: true,
+        include_line_mappings: true,
+        ..crate::Options::default()
+    };
+    let source = group.decompile("parity/kotlin/Nesting", &options).unwrap();
+    for fragment in [
+        "   public companion object Factory {\n      @kotlin.jvm.JvmStatic\n      public fun size(value: Long): Long",
+        "   public class Payload(public val value: Int) {\n      public fun doubled(value: Int): Int",
+        "   public object Settings {\n      public final val enabled: Boolean = true",
+        "      @kotlin.jvm.JvmStatic\n      public fun valueOrDefault(value: Int = 3): Int",
+    ] {
+        assert!(source.text.contains(fragment), "missing {fragment:?} in {}", source.text);
+    }
+    let map = source.map.unwrap();
+    for (name, class, line) in [
+        ("size", "Factory", "         return value + 1L"),
+        ("doubled", "Payload", "         return value * 2"),
+        ("valueOrDefault", "Settings", "         return value"),
+    ] {
+        let method = map.methods.iter().find(|method| method.name == name).unwrap();
+        assert_eq!(method.class_name, format!("parity/kotlin/Nesting${class}"));
+        assert_eq!(source.text.lines().nth(method.offsets[&0]), Some(line));
+    }
+}
+
+#[test]
+fn rejects_invalid_singleton_shell_and_companion_forwarding() {
+    fn replace_opcode(data: &mut [u8], name: &str, offset: usize, from: u8, to: u8) {
+        let index = {
+            let class = ClassFile::parse(data).unwrap();
+            let method = class.methods.iter().find(|method| {
+                class.pool.utf8(method.name_index).unwrap() == name
+            }).unwrap();
+            let code = method.code(&class.pool).unwrap().unwrap();
+            assert_eq!(code.bytes[offset], from);
+            code.bytes.as_ptr() as usize - data.as_ptr() as usize + offset
+        };
+        data[index] = to;
+    }
+    let mut object = bytes(OBJECT);
+    replace_opcode(&mut object, "<clinit>", 3, 0x59, 0x00);
+    assert!(matches!(
+        decompile_class(&ClassFile::parse(&object).unwrap()),
+        Err(KotlinError::Unsupported { feature: "Kotlin singleton constructor or allocation shell", .. })
+    ));
+    let mut classes = NESTING.map(bytes);
+    replace_opcode(&mut classes[0], "size", 3, 0x1e, 0x1f);
+    let group = crate::ClassGroup::new(classes.iter().map(Vec::as_slice)).unwrap();
+    let options = crate::Options {
+        decompile_kotlin: true,
+        ..crate::Options::default()
+    };
+    assert!(matches!(
+        group.decompile("parity/kotlin/Nesting", &options),
+        Err(crate::DecompileError::Kotlin(KotlinError::Unsupported {
+            feature: "unproven @JvmStatic companion forwarder", ..
+        }))
+    ));
 }
 
 #[test]

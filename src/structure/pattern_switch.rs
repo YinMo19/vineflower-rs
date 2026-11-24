@@ -161,6 +161,7 @@ struct Arm {
     /// The recognized `aload alias; [checkcast T;] astore local` prologue.
     binding: Option<(Range<usize>, u16)>,
     guard: Option<guards::Guard>,
+    nullable_type: bool,
 }
 
 struct BoundArm<'a, 'c> {
@@ -250,20 +251,23 @@ impl Emitter<'_> {
             {
                 return Ok(None);
             }
-            let [key] = arm.keys.as_slice() else {
-                if arm.keys.iter().any(|&key| {
-                    key != NULL_KEY
-                        && matches!(dispatch.labels[key as usize], PatternLabel::Type(_))
-                }) {
-                    return Ok(None);
+            let (key, ty) = match arm.keys.as_slice() {
+                &[key] if key != NULL_KEY => match &dispatch.labels[key as usize] {
+                    PatternLabel::Type(ty) => (key, ty),
+                    PatternLabel::Constant(_) => continue,
+                },
+                &[key, NULL_KEY] if null_target == Some(target) && machine.supports_null_type_pattern() => {
+                    match &dispatch.labels[key as usize] {
+                        PatternLabel::Type(ty) => {
+                            arm.nullable_type = true;
+                            (key, ty)
+                        }
+                        PatternLabel::Constant(_) => continue,
+                    }
                 }
-                continue;
-            };
-            if *key == NULL_KEY {
-                continue;
-            }
-            let PatternLabel::Type(ty) = &dispatch.labels[*key as usize] else {
-                continue;
+                keys if keys.iter().any(|&key| key != NULL_KEY
+                    && matches!(dispatch.labels[key as usize], PatternLabel::Type(_))) => return Ok(None),
+                _ => continue,
             };
             let mut body_start = cfg.instructions.start;
             let body = &self.instructions[cfg.instructions.clone()];
@@ -294,10 +298,15 @@ impl Emitter<'_> {
                 body_start += width;
             }
             if let Some(proof) = &restart {
-                let Some(guard) = proof.arm(self, target, body_start, *key, &targets) else {
+                let Some(guard) = proof.arm(self, target, body_start, key, &targets) else {
                     return Ok(None);
                 };
                 arm.guard = guard;
+            }
+            if arm.nullable_type && (arm.binding.is_none() || arm.guard.is_some()) {
+                // The shared entry must bind the original selector as-is:
+                // checkcast permits null, and no retry may rematch that null.
+                return Ok(None);
             }
             // Only a genuinely unconditional pattern can dominate later
             // labels or conflict with default.
@@ -306,7 +315,7 @@ impl Emitter<'_> {
                 if machine.pattern_covers(ty, &dispatch.selector) {
                     return Ok(None);
                 }
-                pattern_types.push((*key, ty));
+                pattern_types.push((key, ty));
             }
         }
         for arm in groups.values() {
@@ -403,6 +412,9 @@ impl Emitter<'_> {
                     binding_offsets.extend(&record.offsets);
                 }
                 for &key in &arm.keys {
+                    if arm.nullable_type && key == NULL_KEY {
+                        continue;
+                    }
                     let mut label: Document = if let Some(record) = record {
                         record.render(&mut entry)?
                     } else if key == NULL_KEY {
@@ -419,6 +431,9 @@ impl Emitter<'_> {
                             )?,
                         }
                     };
+                    if arm.nullable_type {
+                        label.surround("null, ", "");
+                    }
                     if let Some(guard) = &arm.guard {
                         let first = arm.binding.as_ref().map_or(
                             self.graph.blocks[*target].instructions.start, |(indices, _)| indices.end,
@@ -654,13 +669,16 @@ fn groups_can_own_return(
 
 #[cfg(test)]
 mod tests {
-    use crate::{bytecode::decode, classfile::ClassFile};
+    use crate::{ClassGroup, Options, bytecode::decode, classfile::ClassFile};
 
     use super::*;
 
     const CLASS: &[u8] = b"\xca\xfe\xba\xbe\0\0\0\x3d\0\x05\
         \x01\0\x01T\x07\0\x01\x01\0\x10java/lang/Object\x07\0\x03\
         \0\x21\0\x02\0\x04\0\0\0\0\0\0\0\0";
+
+    const JAVA17_NULL_TYPE: &[u8] =
+        include_bytes!("../../tests/smoke/java17preview/TestSwitchPatternMatchingWithNull.class");
 
     fn instructions(prefix: &[u8]) -> Vec<Instruction> {
         let mut instructions = decode(prefix).unwrap();
@@ -719,5 +737,27 @@ mod tests {
         assert!(touches_slot(&code[1], 3));
         assert!(touches_slot(&code[2], 3));
         assert!(!touches_slot(&code[2], 4));
+    }
+
+    #[test]
+    fn javac_17_combined_null_label_binds_the_original_nullable_value() {
+        let group = ClassGroup::new([JAVA17_NULL_TYPE]).unwrap();
+        let source = group.decompile("pkg/TestSwitchPatternMatchingWithNull", &Options::default()).unwrap().text;
+        assert_eq!(source.matches("case null, Integer i").count(), 2, "{source}");
+        assert_eq!(source.matches("System.out.println((Object)i);").count(), 2, "{source}");
+        assert!(!source.contains("requireNonNull"), "{source}");
+    }
+
+    #[test]
+    fn final_java_does_not_emit_a_combined_null_and_binding_label() {
+        let mut class = JAVA17_NULL_TYPE.to_vec();
+        class[4..8].copy_from_slice(&[0, 0, 0, 65]);
+        let group = ClassGroup::new([class.as_slice()]).unwrap();
+        let result = group.decompile("pkg/TestSwitchPatternMatchingWithNull", &Options::default());
+        assert!(matches!(&result,
+            Err(crate::DecompileError::Method { name, source, .. }) if name == "test"
+                && matches!(source.downcast_ref::<StructureError>(),
+                    Some(StructureError::Lift(crate::lift::LiftError::Unsupported { opcode: 0xba, .. })))
+        ), "{result:?}");
     }
 }

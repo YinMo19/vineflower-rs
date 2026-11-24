@@ -1,6 +1,6 @@
 // Copyright 2026 Vineflower contributors. Licensed under the Apache License, Version 2.0.
 
-use std::collections::HashMap;
+use std::{borrow::Cow, collections::HashMap, ops::Range};
 
 use crate::{
     Options,
@@ -20,6 +20,8 @@ use super::{
 
 mod data;
 mod multifile;
+mod nesting;
+mod objects;
 mod trace;
 
 #[derive(Clone, Copy)]
@@ -31,10 +33,10 @@ struct Style<'a> {
 
 type Location<'a> = Option<(&'a mut SourceMap, usize)>;
 
-pub(super) fn render(
-    class: &ClassFile<'_>,
+pub(super) fn render<'a, 'data>(
+    class: &'a ClassFile<'data>,
     metadata: &Metadata,
-    group: Option<&ClassGroup<'_>>,
+    group: Option<&'a ClassGroup<'data>>,
     options: Option<&Options>,
 ) -> Result<(String, Option<SourceMap>), KotlinError> {
     let owner = class.pool.class_name(class.this_class)?;
@@ -89,20 +91,13 @@ pub(super) fn render(
         .map(|_| SourceMap::default());
     match &metadata.declaration {
         Declaration::Class(declaration) => {
-            let types = Types {
-                declaration: owner,
-                package,
-                owner: Some(&declaration.name),
-                owner_parameters: &declaration.type_parameters,
-                local_parameters: &[],
-            };
+            let group = group.filter(|_| options.is_none_or(|options| options.decompile_inner));
             render_class(
                 &mut out,
                 &bytecode,
-                &types,
                 declaration,
-                unit,
-                mapping.as_mut(),
+                ClassScope { group, parent: None, indent: "", unit, depth: 0 },
+                mapping.as_mut().map(|map| (map, 0)),
             )?;
         }
         Declaration::FileFacade(members) | Declaration::MultifilePart(members) => {
@@ -121,7 +116,7 @@ pub(super) fn render(
                 owner_parameters: &[],
                 local_parameters: &[],
             };
-            let plan = Plan::new(&bytecode, members, None, true)?;
+            let plan = Plan::new(&bytecode, members, None, Layout::File)?;
             let style = Style {
                 indent: "",
                 unit,
@@ -197,25 +192,44 @@ fn push_file_jvm_name(out: &mut String, name: &str) {
     out.push_str(")\n");
 }
 
-fn render_class(
+#[derive(Clone, Copy)]
+struct ClassScope<'scope, 'a, 'data> {
+    group: Option<&'a ClassGroup<'data>>,
+    parent: Option<(&'scope Bytecode<'a, 'data>, &'scope ClassDeclaration)>,
+    indent: &'scope str,
+    unit: &'scope str,
+    depth: u8,
+}
+
+fn render_class<'a, 'data>(
     out: &mut String,
-    bytecode: &Bytecode<'_, '_>,
-    types: &Types<'_>,
+    bytecode: &Bytecode<'a, 'data>,
     declaration: &ClassDeclaration,
-    unit: &str,
-    mapping: Option<&mut SourceMap>,
+    scope: ClassScope<'_, 'a, 'data>,
+    mut location: Location<'_>,
 ) -> Result<(), KotlinError> {
     let invalid = |feature| error(bytecode.owner, feature);
-    if declaration.name.local
-        || declaration.name.relative_name().contains('.')
+    let ClassScope { group, parent, indent, unit, depth } = scope;
+    let nested = parent.is_some();
+    if depth >= 32 || declaration.name.local
+        || declaration.name.relative_name().contains('.') != nested
         || declaration.name.jvm_internal_name() != bytecode.owner
-        || !declaration.nested_names.is_empty()
-        || declaration.companion_name.is_some()
     {
-        return Err(invalid(
-            "nested, local or companion classes require class-group analysis",
-        ));
+        return Err(invalid("invalid local or nested Kotlin class identity"));
     }
+    if nested {
+        file_annotations(&mut String::new(), bytecode, None, false)?;
+    }
+    let children = nesting::children(bytecode, declaration, group)?;
+    let relative_name = declaration.name.relative_name();
+    let name = relative_name.rsplit('.').next().unwrap_or(relative_name);
+    let types = Types {
+        declaration: bytecode.owner,
+        package: declaration.name.package(),
+        owner: Some(&declaration.name),
+        owner_parameters: &declaration.type_parameters,
+        local_parameters: &[],
+    };
     let data_class = declaration.flags.has(10);
     if declaration.flags.has_annotations()
         || declaration.flags.0 & (0b11_1101 << 9) != 0
@@ -226,9 +240,27 @@ fn render_class(
             "class modifiers, annotations, or context receivers",
         ));
     }
-    let interface = match declaration.kind {
-        ClassKind::Class => false,
-        ClassKind::Interface => true,
+    let interface = declaration.kind == ClassKind::Interface;
+    let singleton = match declaration.kind {
+        ClassKind::Class | ClassKind::Interface => None,
+        ClassKind::Object | ClassKind::CompanionObject => {
+            if data_class || !declaration.type_parameters.is_empty()
+                || declaration.flags.modality() != Modality::Final
+                || declaration.companion_name.is_some()
+            {
+                return Err(invalid("nontrivial singleton declaration"));
+            }
+            let host = if declaration.kind == ClassKind::CompanionObject {
+                let (host, owner) = parent.ok_or_else(|| invalid("companion object requires its owning class"))?;
+                if owner.companion_name.as_deref() != Some(name) {
+                    return Err(invalid("companion object does not match its owner's metadata"));
+                }
+                Some((host, name))
+            } else {
+                None
+            };
+            Some(objects::Singleton::validate(bytecode, declaration, host)?)
+        }
         _ => return Err(invalid("class kind")),
     };
     if interface != (bytecode.class.access_flags & 0x0200 != 0) {
@@ -248,6 +280,7 @@ fn render_class(
         return Err(invalid("nested type aliases"));
     }
     let constructor = match declaration.constructors.as_slice() {
+        _ if singleton.is_some() => None,
         [] if interface => None,
         [constructor]
             if !interface && !constructor.flags.has(4) && !constructor.flags.has_annotations() =>
@@ -260,23 +293,44 @@ fn render_class(
     if hierarchy == Modality::Sealed || (interface && hierarchy != Modality::Abstract) {
         return Err(invalid("sealed or non-abstract interface declarations"));
     }
-    if declaration.flags.visibility()? == Visibility::Protected {
+    if !nested && declaration.flags.visibility()? == Visibility::Protected {
         return Err(invalid("protected top-level class"));
     }
-    let plan = Plan::new(bytecode, &declaration.members, constructor, false)?;
+    let layout = if let Some(singleton) = &singleton {
+        Layout::Singleton(singleton)
+    } else if declaration.companion_name.is_some() {
+        Layout::CompanionHost
+    } else {
+        Layout::Class
+    };
+    let plan = Plan::new(bytecode, &declaration.members, constructor, layout)?;
     if data_class {
         data::validate(bytecode, declaration, &plan)?;
     }
+    out.push_str(indent);
     out.push_str(visibility(declaration.flags.visibility()?)?);
     out.push_str(modality(hierarchy, interface));
     if data_class {
         out.push_str("data ");
     }
-    out.push_str(if interface { "interface " } else { "class " });
-    identifier(out, declaration.name.relative_name(), bytecode.owner)?;
+    match declaration.kind {
+        ClassKind::Interface => out.push_str("interface "),
+        ClassKind::Class => out.push_str("class "),
+        ClassKind::Object => out.push_str("object "),
+        ClassKind::CompanionObject => {
+            out.push_str("companion object");
+            if name != "Companion" {
+                out.push(' ');
+            }
+        }
+        _ => unreachable!(),
+    }
+    if declaration.kind != ClassKind::CompanionObject || name != "Companion" {
+        identifier(out, name, bytecode.owner)?;
+    }
     type_parameters(
         out,
-        types,
+        &types,
         &declaration.type_parameters,
         TypeParameters::Class,
     )?;
@@ -310,7 +364,7 @@ fn render_class(
                     if data_class && property.flags.visibility()? == Visibility::Public {
                         out.push_str(if property.mutable() { "var " } else { "val " });
                     } else {
-                        property_prefix(out, property, false)?;
+                        property_prefix(out, property, false, false)?;
                     }
                 }
                 let default =
@@ -323,34 +377,53 @@ fn render_class(
                                 constructor.parameters.as_slice(),
                             )
                         });
-                value_parameter(out, types, parameter, false, default)?;
+                value_parameter(out, &types, parameter, false, default)?;
             }
             out.push(')');
         }
     }
-    type_constraints(out, types, &declaration.type_parameters)?;
+    type_constraints(out, &types, &declaration.type_parameters)?;
     let mut members = String::new();
+    let member_indent = if indent.is_empty() { Cow::Borrowed(unit) }
+        else { Cow::Owned(format!("{indent}{unit}")) };
     let style = Style {
-        indent: unit,
+        indent: &member_indent,
         unit,
         interface,
     };
-    let location = mapping.map(|map| (map, trace::line_count(out) + 1));
+    let members_line = location.as_ref().map_or(0, |(_, base)| *base + trace::line_count(out) + 1);
     render_members(
         &mut members,
         bytecode,
-        types,
+        &types,
         &plan,
         &declaration.members,
         style,
-        location,
+        location.as_mut().map(|(map, _)| (&mut **map, members_line)),
         data_class,
     )?;
+    for child in children {
+        if !members.is_empty() {
+            members.push('\n');
+        }
+        let owner = child.class.pool.class_name(child.class.this_class)?;
+        render_class(
+            &mut members,
+            &Bytecode { class: child.class, owner },
+            &child.declaration,
+            ClassScope { group, parent: Some((bytecode, declaration)), indent: &member_indent, unit, depth: depth + 1 },
+            location.as_mut().map(|(map, _)| (&mut **map, members_line)),
+        )?;
+    }
+    if let Some(singleton) = &singleton {
+        singleton.verify_host_methods()?;
+    }
     if members.is_empty() {
         out.push('\n');
     } else {
         out.push_str(" {\n");
         out.push_str(&members);
+        out.push_str(indent);
         out.push_str("}\n");
     }
     Ok(())
@@ -358,13 +431,36 @@ fn render_class(
 
 type Field<'a, 'data> = &'a Member<'data>;
 
+#[derive(Clone, Copy)]
+enum Layout<'scope, 'a, 'data> {
+    Class,
+    CompanionHost,
+    File,
+    Singleton(&'scope objects::Singleton<'a, 'data>),
+}
+
+impl<'scope, 'a, 'data> Layout<'scope, 'a, 'data> {
+    fn file(self) -> bool {
+        matches!(self, Self::File)
+    }
+
+    fn singleton(self) -> Option<&'scope objects::Singleton<'a, 'data>> {
+        match self {
+            Self::Singleton(singleton) => Some(singleton),
+            _ => None,
+        }
+    }
+}
+
 struct PlannedProperty<'a, 'data, 'metadata> {
     property: &'metadata Property,
     field: Option<Field<'a, 'data>>,
-    initializer: Option<Expr<'a>>,
+    initializer: Option<objects::Initializer<'a>>,
+    initializer_offsets: Option<Range<u32>>,
     getter: Option<Expr<'a>>,
     setter_visibility: Option<Visibility>,
     promoted: bool,
+    jvm_static: bool,
 }
 
 struct Plan<'a, 'data, 'metadata> {
@@ -372,7 +468,9 @@ struct Plan<'a, 'data, 'metadata> {
     ordered: Vec<usize>,
     promoted: Vec<Option<usize>>,
     parameters: &'metadata [ValueParameter],
-    static_members: bool,
+    initialization_method: Option<Field<'a, 'data>>,
+    metadata_properties: &'metadata [Property],
+    layout: Layout<'metadata, 'a, 'data>,
 }
 
 impl<'a, 'data, 'metadata> Plan<'a, 'data, 'metadata> {
@@ -380,18 +478,20 @@ impl<'a, 'data, 'metadata> Plan<'a, 'data, 'metadata> {
         bytecode: &Bytecode<'a, 'data>,
         members: &'metadata PackageDeclaration,
         constructor: Option<&'metadata Constructor>,
-        facade: bool,
+        layout: Layout<'metadata, 'a, 'data>,
     ) -> Result<Self, KotlinError> {
+        let singleton = layout.singleton();
+        let storage = singleton.map_or(bytecode, |singleton| &singleton.storage);
         let mut properties = members
             .properties
             .iter()
             .filter(|p| p.flags.member_kind() != MemberKind::FakeOverride)
-            .map(|p| plan_property(bytecode, p, facade))
+            .map(|p| plan_property(bytecode, p, &members.properties, layout))
             .collect::<Result<Vec<_>, _>>()?;
         let mut field_index = HashMap::new();
         for (index, property) in properties.iter().enumerate() {
             if let Some(field) = property.field {
-                let pool = &bytecode.class.pool;
+                let pool = &storage.class.pool;
                 if field_index
                     .insert(
                         (
@@ -406,7 +506,13 @@ impl<'a, 'data, 'metadata> Plan<'a, 'data, 'metadata> {
                 }
             }
         }
-        if field_index.len() != bytecode.class.fields.len() {
+        let expected_fields = storage.class.fields.iter().filter(|field| match layout {
+            Layout::CompanionHost => field.access_flags & STATIC == 0,
+            Layout::Singleton(singleton) => !std::ptr::eq(*field, singleton.instance)
+                && (!singleton.is_companion() || field.access_flags & STATIC != 0),
+            _ => true,
+        }).count();
+        if field_index.len() != expected_fields {
             return Err(error(
                 bytecode.owner,
                 "JVM fields without Kotlin declarations",
@@ -415,36 +521,28 @@ impl<'a, 'data, 'metadata> Plan<'a, 'data, 'metadata> {
         let parameters = constructor.map_or(&[][..], |con| con.parameters.as_slice());
         let mut promoted = vec![None; parameters.len()];
         let mut ordered = Vec::new();
-        let static_initializer = JvmMethodSignature {
-            name: "<clinit>".to_owned(),
-            descriptor: MethodDescriptor {
-                parameters: Vec::new(),
-                return_type: JvmType::Void,
-            },
+        let clinit = if matches!(layout, Layout::Class | Layout::File) {
+            let signature = JvmMethodSignature {
+                name: "<clinit>".to_owned(),
+                descriptor: MethodDescriptor {
+                    parameters: Vec::new(),
+                    return_type: JvmType::Void,
+                },
+            };
+            let initialization = bytecode.find_method(&signature)?.map(|method| {
+                let assignments = bytecode.initialization(
+                    method, &signature.descriptor, &[], None, bytecode.owner,
+                )?;
+                Ok::<_, KotlinError>((assignments, method))
+            }).transpose()?;
+            if !layout.file() && initialization.as_ref().is_some_and(|(assignments, _)| !assignments.is_empty()) {
+                return Err(error(bytecode.owner, "static initializer inside a Kotlin class"));
+            }
+            initialization
+        } else {
+            None
         };
-        let clinit = bytecode
-            .find_method(&static_initializer)?
-            .map(|method| {
-                bytecode.initialization(
-                    method,
-                    &static_initializer.descriptor,
-                    &[],
-                    None,
-                    bytecode.owner,
-                )
-            })
-            .transpose()?;
-        if !facade
-            && clinit
-                .as_ref()
-                .is_some_and(|assignments| !assignments.is_empty())
-        {
-            return Err(error(
-                bytecode.owner,
-                "static initializer inside a Kotlin class",
-            ));
-        }
-        let assignments = if let Some(constructor) = constructor {
+        let initialization = if let Some(constructor) = constructor {
             let signature = constructor
                 .signature
                 .as_ref()
@@ -453,18 +551,24 @@ impl<'a, 'data, 'metadata> Plan<'a, 'data, 'metadata> {
             let method = bytecode
                 .find_method(signature)?
                 .ok_or_else(|| error(bytecode.owner, "missing JVM constructor"))?;
-            bytecode.initialization(
+            let assignments = bytecode.initialization(
                 method,
                 &signature.descriptor,
                 parameters,
                 Some("java/lang/Object"),
                 bytecode.owner,
-            )?
+            )?;
+            Some((assignments, method))
         } else {
-            clinit.unwrap_or_default()
+            clinit
         };
+        let (assignments, initialization_method) = initialization
+            .map_or_else(|| (Vec::new(), None), |(assignments, method)| (assignments, Some(method)));
         let mut next_candidate = Some(0);
-        for assignment in assignments {
+        let singleton_assignments = singleton.map(objects::Singleton::assignments).transpose()?;
+        for assignment in assignments.into_iter().map(objects::Initialization::from)
+            .chain(singleton_assignments.into_iter().flatten())
+        {
             let Some(&index) = field_index.get(&(assignment.field, assignment.descriptor)) else {
                 return Err(error(
                     bytecode.owner,
@@ -494,16 +598,19 @@ impl<'a, 'data, 'metadata> Plan<'a, 'data, 'metadata> {
                 next_candidate = Some(parameter + 1);
             } else {
                 state.initializer = Some(assignment.value);
+                state.initializer_offsets = assignment.rhs_offsets;
                 ordered.push(index);
                 next_candidate = None;
             }
         }
-        for state in &properties {
+        for (index, state) in properties.iter_mut().enumerate() {
             if state.field.is_some() && state.initializer.is_none() && !state.promoted {
-                return Err(error(
-                    &state.property.name,
-                    "no proven backing field initializer",
-                ));
+                let property = state.property;
+                let signature = property.signature.field.as_ref().unwrap();
+                let default = Expr::default_field(&property.ty, &signature.descriptor)
+                    .ok_or_else(|| error(&property.name, "no proven backing field initializer"))?;
+                state.initializer = Some(objects::Initializer::Expression(default));
+                ordered.push(index);
             }
         }
         Ok(Self {
@@ -511,7 +618,9 @@ impl<'a, 'data, 'metadata> Plan<'a, 'data, 'metadata> {
             ordered,
             promoted,
             parameters,
-            static_members: facade,
+            initialization_method,
+            metadata_properties: &members.properties,
+            layout,
         })
     }
 }
@@ -519,11 +628,21 @@ impl<'a, 'data, 'metadata> Plan<'a, 'data, 'metadata> {
 fn plan_property<'a, 'data, 'metadata>(
     bytecode: &Bytecode<'a, 'data>,
     property: &'metadata Property,
-    static_member: bool,
+    properties: &'metadata [Property],
+    layout: Layout<'metadata, 'a, 'data>,
 ) -> Result<PlannedProperty<'a, 'data, 'metadata>, KotlinError> {
     let name = &property.name;
     let invalid = |feature| error(name, feature);
-    if property.flags.has_annotations()
+    let singleton = layout.singleton();
+    let jvm_static = if let Some(singleton) = singleton {
+        singleton.property_static(property.signature.annotations_method.as_ref(), name)?
+    } else {
+        false
+    };
+    let storage = singleton.map_or(bytecode, |singleton| &singleton.storage);
+    let static_field = layout.file() || singleton.is_some();
+    let static_accessor = layout.file() || jvm_static && singleton.is_some_and(|singleton| !singleton.is_companion());
+    if (property.flags.has_annotations() || property.signature.annotations_method.is_some()) && !jvm_static
         || property.flags.member_kind() != MemberKind::Declaration
         || property.flags.has(14)
         || property.flags.has(16)
@@ -531,7 +650,6 @@ fn plan_property<'a, 'data, 'metadata>(
         || property.late_init()
         || property.delegated()
         || property.jvm_flags != 0
-        || property.signature.annotations_method.is_some()
         || property.signature.delegate_method.is_some()
         || property.receiver.is_some()
         || !property.type_parameters.is_empty()
@@ -542,7 +660,7 @@ fn plan_property<'a, 'data, 'metadata>(
             "property modifiers, extension, annotations, or context parameters",
         ));
     }
-    if static_member
+    if layout.file()
         && (property.flags.modality() != Modality::Final
             || property.flags.visibility()? == Visibility::Protected)
     {
@@ -553,9 +671,11 @@ fn plan_property<'a, 'data, 'metadata>(
         property,
         field: None,
         initializer: None,
+        initializer_offsets: None,
         getter: None,
         setter_visibility: None,
         promoted: false,
+        jvm_static,
     };
     let field = property
         .signature
@@ -565,11 +685,11 @@ fn plan_property<'a, 'data, 'metadata>(
             if signature.name != *name {
                 return Err(invalid("renamed backing field"));
             }
-            let field = bytecode
+            let field = storage
                 .find_field(signature)?
                 .ok_or_else(|| invalid("missing JVM backing field"))?;
             if abstract_property
-                || (field.access_flags & STATIC != 0) != static_member
+                || (field.access_flags & STATIC != 0) != static_field
                 || (field.access_flags & FINAL != 0) == property.mutable()
                 || (!property.constant() && field.access_flags & 0x0002 == 0)
                 || field.access_flags & (0x0040 | 0x0080) != 0
@@ -581,27 +701,31 @@ fn plan_property<'a, 'data, 'metadata>(
             Ok((
                 signature,
                 field,
-                bytecode.class.pool.utf8(field.descriptor_index)?,
+                storage.class.pool.utf8(field.descriptor_index)?,
             ))
         })
         .transpose()?;
     if let Some((_, member, _)) = field {
         state.field = Some(member);
-        state.initializer = bytecode.constant(member, name)?;
+        state.initializer = storage.constant(member, name)?.map(objects::Initializer::Expression);
     }
     if property.constant() != state.initializer.is_some()
-        || (property.constant() && (property.mutable() || !static_member))
+        || (property.constant() && (property.mutable() || !static_field))
     {
         return Err(invalid(
             "constant property lacks a static literal ConstantValue",
         ));
     }
+    if jvm_static && (field.is_none() || property.signature.getter.is_none()) {
+        return Err(invalid("@JvmStatic property without a known backing field and getter"));
+    }
+    let implicit_flags = Flags(property.flags.0 & if jvm_static { 0x3e } else { 0x3f });
     let getter_flags = property
         .getter_flags
-        .unwrap_or(Flags(property.flags.0 & 0x3f));
+        .unwrap_or(implicit_flags);
     let setter_flags = property
         .setter_flags
-        .unwrap_or(Flags(property.flags.0 & 0x3f));
+        .unwrap_or(implicit_flags);
     if property.setter_parameter.is_some()
         || setter_flags.has(6)
         || getter_flags.0 & 0x181 != 0
@@ -616,7 +740,7 @@ fn plan_property<'a, 'data, 'metadata>(
         let getter = checked_method(
             bytecode,
             signature,
-            static_member,
+            static_accessor,
             abstract_property,
             false,
             name,
@@ -629,13 +753,17 @@ fn plan_property<'a, 'data, 'metadata>(
             if getter_flags.has(6) || descriptor.return_type != field.descriptor {
                 return Err(invalid("custom getter over a backing field"));
             }
-            bytecode.default_getter(getter, field, raw, name)?;
+            if let Some(singleton) = singleton {
+                singleton.getter(getter, signature, field, raw, jvm_static, name)?;
+            } else {
+                bytecode.default_getter(getter, field, raw, name)?;
+            }
         } else if !abstract_property {
             if !getter_flags.has(6) || property.mutable() {
                 return Err(invalid("non-abstract property without backing field"));
             }
             let Body::Expression(expr, _) =
-                bytecode.function(getter, descriptor, &[], name, false)?
+                bytecode.function(getter, descriptor, &[], properties, name, false)?
             else {
                 return Err(invalid("getter has no return expression"));
             };
@@ -651,7 +779,7 @@ fn plan_property<'a, 'data, 'metadata>(
         let setter = checked_method(
             bytecode,
             signature,
-            static_member,
+            static_accessor,
             abstract_property,
             false,
             name,
@@ -667,7 +795,11 @@ fn plan_property<'a, 'data, 'metadata>(
             if descriptor.parameters[0] != field.descriptor {
                 return Err(invalid("JVM setter and field type mismatch"));
             }
-            bytecode.default_setter(setter, field, raw, &property.ty, name)?;
+            if let Some(singleton) = singleton {
+                singleton.setter(setter, signature, field, raw, jvm_static, name)?;
+            } else {
+                bytecode.default_setter(setter, field, raw, &property.ty, name)?;
+            }
         } else if !abstract_property {
             return Err(invalid("setter without backing field"));
         }
@@ -707,11 +839,11 @@ fn checked_method<'a, 'data>(
     Ok(method)
 }
 
-fn render_members(
+fn render_members<'a, 'data>(
     out: &mut String,
-    bytecode: &Bytecode<'_, '_>,
+    bytecode: &Bytecode<'a, 'data>,
     types: &Types<'_>,
-    plan: &Plan<'_, '_, '_>,
+    plan: &Plan<'a, 'data, '_>,
     members: &PackageDeclaration,
     style: Style<'_>,
     mut location: Location<'_>,
@@ -731,16 +863,40 @@ fn render_members(
         types.write(out, &alias.underlying)?;
         out.push('\n');
     }
-    for property in &plan.properties {
-        if !property.promoted && (property.initializer.is_none() || property.property.constant()) {
-            render_property(out, types, property, plan.parameters, style)?;
-        }
-    }
-    for &index in &plan.ordered {
-        render_property(out, types, &plan.properties[index], plan.parameters, style)?;
-    }
+    let mut initializer_trace = if location.is_some()
+        && let Some(member) = plan.initialization_method
+        && plan.ordered.iter().any(|&index| plan.properties[index].initializer_offsets.is_some())
+    {
+        Some((
+            trace::Trace::new(bytecode, member)?,
+            bytecode.code(member, bytecode.owner)?.line_numbers(&bytecode.class.pool)?,
+        ))
+    } else {
+        None
+    };
     if let Some((_, line)) = &mut location {
         *line += trace::line_count(out);
+    }
+    let properties = plan.properties.iter().filter(|property| {
+        !property.promoted && (property.initializer.is_none() || property.property.constant())
+    }).chain(plan.ordered.iter().map(|&index| &plan.properties[index]));
+    for property in properties {
+        let start = out.len();
+        if let Some((_, line)) = &location
+            && let Some((trace, _)) = &mut initializer_trace
+            && let Some(offsets) = &property.initializer_offsets
+        {
+            trace.offsets(offsets.clone(), *line);
+        }
+        render_property(out, types, property, plan.parameters, style, !plan.layout.file())?;
+        if let Some((_, line)) = &mut location {
+            *line += trace::line_count(&out[start..]);
+        }
+    }
+    if let Some((trace, original)) = initializer_trace
+        && let Some((map, _)) = &mut location
+    {
+        trace.finish(map, original);
     }
     for function in &members.functions {
         let kind = function.flags.member_kind();
@@ -760,7 +916,7 @@ fn render_members(
             types,
             function,
             style,
-            plan.static_members,
+            plan,
             location.as_mut().map(|(map, line)| (&mut **map, *line)),
         )?;
         if let Some((_, line)) = &mut location {
@@ -774,12 +930,18 @@ fn property_prefix(
     out: &mut String,
     property: &Property,
     interface: bool,
+    explicit_final: bool,
 ) -> Result<(), KotlinError> {
     out.push_str(visibility(property.flags.visibility()?)?);
     if property.constant() {
         out.push_str("const ");
     }
-    out.push_str(modality(property.flags.modality(), interface));
+    let kind = property.flags.modality();
+    if explicit_final && kind == Modality::Final && !property.constant() {
+        out.push_str("final ");
+    } else {
+        out.push_str(modality(kind, interface));
+    }
     out.push_str(if property.mutable() { "var " } else { "val " });
     Ok(())
 }
@@ -790,11 +952,16 @@ fn render_property(
     planned: &PlannedProperty<'_, '_, '_>,
     parameters: &[ValueParameter],
     style: Style<'_>,
+    class_member: bool,
 ) -> Result<(), KotlinError> {
     let property = planned.property;
     let types = types.local(&property.name, &[]);
+    if planned.jvm_static {
+        out.push_str(style.indent);
+        out.push_str("@kotlin.jvm.JvmStatic\n");
+    }
     out.push_str(style.indent);
-    property_prefix(out, property, style.interface)?;
+    property_prefix(out, property, style.interface, class_member && !style.interface)?;
     identifier(out, &property.name, &property.name)?;
     out.push_str(": ");
     types.write(out, &property.ty)?;
@@ -837,14 +1004,14 @@ fn render_property(
     Ok(())
 }
 
-fn render_function(
+fn render_function<'a, 'data>(
     out: &mut String,
-    bytecode: &Bytecode<'_, '_>,
+    bytecode: &Bytecode<'a, 'data>,
     types: &Types<'_>,
     function: &Function,
     style: Style<'_>,
-    facade: bool,
-    location: Location<'_>,
+    plan: &Plan<'a, 'data, '_>,
+    mut location: Location<'_>,
 ) -> Result<(), KotlinError> {
     let name = &function.name;
     let Style {
@@ -857,7 +1024,9 @@ fn render_function(
     let external = flags.has(12);
     let abstract_function = flags.modality() == Modality::Abstract;
     let inline = flags.has(10);
-    if flags.has_annotations()
+    let facade = plan.layout.file();
+    let singleton = plan.layout.singleton();
+    if flags.has_annotations() && singleton.is_none()
         || flags.has(13)
         || flags.has(14)
         || flags.has(16)
@@ -878,10 +1047,16 @@ fn render_function(
         .signature
         .as_ref()
         .ok_or_else(|| types.unsupported("function lacks JVM identity"))?;
+    let jvm_static = if let Some(singleton) = singleton {
+        singleton.function_static(signature, flags.has_annotations(), name)?
+    } else {
+        false
+    };
+    let static_member = facade || jvm_static && singleton.is_some_and(|singleton| !singleton.is_companion());
     let method = checked_method(
         bytecode,
         signature,
-        facade,
+        static_member,
         abstract_function,
         external,
         name,
@@ -893,7 +1068,7 @@ fn render_function(
         return Err(types.unsupported("JVM parameters do not match Kotlin function"));
     }
     let defaults = if function.receiver.is_none() {
-        body::parameter_defaults(bytecode, signature, &function.parameters, !facade, name)?
+        body::parameter_defaults(bytecode, signature, &function.parameters, !static_member, name)?
     } else {
         Vec::new()
     };
@@ -903,12 +1078,19 @@ fn render_function(
         return Err(types.unsupported("JVM return does not match Kotlin Unit"));
     }
     let overrides_any =
-        !facade && function.receiver.is_none() && overrides_any(&signature.name, descriptor);
+        !static_member && function.receiver.is_none() && overrides_any(&signature.name, descriptor);
     if overrides_any && (signature.name != *name || flags.visibility()? != Visibility::Public) {
         return Err(types.unsupported("invalid override of kotlin.Any method"));
     }
     let show_return =
         !unit || function.returns.abbreviated.is_some() || !function.returns.annotations.is_empty();
+    if jvm_static {
+        out.push_str(indent);
+        out.push_str("@kotlin.jvm.JvmStatic\n");
+        if let Some((_, header)) = &mut location {
+            *header += 1;
+        }
+    }
     out.push_str(indent);
     out.push_str(visibility(flags.visibility()?)?);
     if overrides_any {
@@ -971,10 +1153,44 @@ fn render_function(
     }
     type_constraints(out, &types, &function.type_parameters)?;
     if !abstract_function && !external {
+        if descriptor.parameters.is_empty() && descriptor.return_type == JvmType::Void
+            && let Some(singleton) = singleton
+            && let Some(update) = singleton.int_update(method, name)?
+        {
+            if !plan.properties.iter().any(|state| {
+                let property = state.property;
+                property.name == update.field && property.mutable()
+                    && !property.ty.nullable && property.ty.class_id() == Some("kotlin/Int")
+                    && property.signature.field.as_ref().is_some_and(|field| {
+                        field.descriptor == JvmType::Primitive(Primitive::Int)
+                    })
+            }) {
+                return Err(types.unsupported("singleton update does not name a mutable Int property"));
+            }
+            out.push_str(" {\n");
+            out.push_str(indent);
+            out.push_str(indent_unit);
+            identifier(out, update.field, name)?;
+            out.push_str(if update.increment { "++\n" } else { "--\n" });
+            out.push_str(indent);
+            out.push_str("}\n");
+            if let Some((map, header)) = location {
+                let mut trace = trace::Trace::new(bytecode, method)?;
+                let code = bytecode.code(method, name)?;
+                let (ret, statement) = update.instructions.split_last().expect("update ends with return");
+                for instruction in statement {
+                    trace.instruction(instruction, header + 1);
+                }
+                trace.instruction(ret, header + 2);
+                trace.finish(map, code.line_numbers(&bytecode.class.pool)?);
+            }
+            return Ok(());
+        }
         match bytecode.function(
             method,
             descriptor,
             &function.parameters,
+            plan.metadata_properties,
             name,
             location.is_some(),
         )? {
@@ -1023,11 +1239,9 @@ fn render_function(
                     statement.write(out, &function.parameters, name)?;
                     out.push('\n');
                     if let Some(trace) = &mut trace {
-                        for instruction in &block.instructions[statement.instructions] {
-                            if !matches!(instruction.opcode, 0x00 | 0x5f) {
-                                trace.instruction(instruction, line);
-                            }
-                        }
+                        statement.trace(bytecode, &block.instructions, |instruction| {
+                            trace.instruction(instruction, line);
+                        })?;
                         line += 1;
                     }
                 }
