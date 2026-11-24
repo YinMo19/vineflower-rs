@@ -299,6 +299,11 @@ impl Machine<'_, '_> {
         permits: impl Fn(usize, &Instruction) -> bool,
     ) -> Result<Option<AssignmentStep>, LiftError> {
         let Some(first) = instructions.first() else { return Ok(None) };
+        if first.opcode == 0x5c
+            && let Some(step) = self.array_compound_without_spill(instructions, &permits)?
+        {
+            return Ok(Some(step));
+        }
         let candidate = if matches!(first.opcode, 0x59..=0x5e) {
             self.duplicated_assignment(instructions)
         } else if let Some(binary) = Binary::of(first.opcode) {
@@ -307,12 +312,7 @@ impl Machine<'_, '_> {
             None
         };
         let Some((consumed, candidate)) = candidate else { return Ok(None) };
-        if instructions[..consumed].iter().enumerate().any(|(index, op)| {
-            !permits(index, op) || (index != 0 && {
-                let prev = &instructions[index - 1];
-                prev.offset.checked_add(prev.len) != Some(op.offset)
-            })
-        }) {
+        if !permitted_prefix(instructions, consumed, &permits) {
             return Ok(None);
         }
         if consumed == 2
@@ -415,6 +415,72 @@ impl Machine<'_, '_> {
             text.push(';');
             Ok(Some(AssignmentStep { consumed, effect: Effect::Statement(text), declaration }))
         }
+    }
+
+    /// `dup2; xaload; rhs; op; [narrow]; [dup_x2]; xastore` retains
+    /// only the exact address, never an independently used stack reference.
+    /// Java's compound lvalue executes the null/bounds check before `rhs`.
+    fn array_compound_without_spill(
+        &mut self,
+        ops: &[Instruction],
+        permits: &impl Fn(usize, &Instruction) -> bool,
+    ) -> Result<Option<AssignmentStep>, LiftError> {
+        let [_, load, rhs, operation, ..] = ops else { return Ok(None) };
+        let [.., array, index] = self.stack.as_slice() else { return Ok(None) };
+        let Type::Array(component) = &array.ty else { return Ok(None) };
+        if !matches!(**component, Type::Primitive(primitive) if primitive != Primitive::Boolean)
+            || array.is_open_array()
+            || Category::of(&index.ty) != Some(Category::Int)
+            || matches!(index.source, Source::Comparison(_))
+        {
+            return Ok(None);
+        }
+        let ty = component.as_ref().clone();
+        let expected_store = array_store_opcode(&ty);
+        let (Some(binary), Some(right_type), Some((store, consumed, narrow))) = (
+            Binary::of(operation.opcode), numeric_literal_type(&self.class.pool, rhs), find_store(ops, 4, true),
+        ) else { return Ok(None) };
+        let duplicate = matches!(ops[consumed - 2].opcode, 0x59..=0x5e);
+        let width = u32::from(ty.slots());
+        let scratch = 2.max(width + u32::from(right_type.slots())).max(if duplicate { 2 * width } else { 0 });
+        if load.opcode != expected_store - 0x21 || store.opcode != expected_store
+            || Category::of(&ty) != Some(binary.left) || Category::of(&right_type) != Some(binary.right)
+            || !binary.assignment_conversion(&ty, &right_type, narrow)
+            || duplicate && ops[consumed - 2].opcode != store_dup_opcode(&ty, 2)
+            || self.stack_slots + scratch > self.max_stack
+            || !permitted_prefix(ops, consumed, permits)
+        {
+            return Ok(None);
+        }
+        let checked = self.join_order(self.order_of([array, index], false)?, Order::at(load.offset))?;
+        let order = self.join_order(Some(checked), Order::at(store.offset))?;
+        let effect = self.step(rhs)?;
+        debug_assert!(matches!(effect, Effect::None));
+        let right = self.pop_raw()?;
+        let index = self.pop_raw()?;
+        let array = self.pop_raw()?;
+        self.offset = store.offset;
+        self.opcode = store.opcode;
+        self.instruction_has_source = true;
+        if !duplicate {
+            self.before_statement(Some(order))?;
+        }
+        let form = match binary.increment().filter(|_| is_one(&right)) {
+            Some(text) => Form::Increment { text, postfix: !duplicate },
+            None => Form::Compound(binary),
+        };
+        let (mut text, precedence) = form.render(self.array_write_target(array, index), Some(right.text));
+        text.omit_bytes(load.offset..load.offset + load.len);
+        let arithmetic_end = &ops[3 + usize::from(narrow.is_some())];
+        text.omit_bytes(operation.offset..arithmetic_end.offset + arithmetic_end.len);
+        let effect = if duplicate {
+            self.push(Expr { order: Some(order), precedence, observable: true, statement: true, ..Expr::atom(ty, text) })?;
+            Effect::None
+        } else {
+            text.push(';');
+            Effect::Statement(text)
+        };
+        Ok(Some(AssignmentStep { consumed, effect, declaration: None }))
     }
 
     fn duplicated_assignment<'a>(&self, ops: &'a [Instruction]) -> Option<(usize, Candidate<'a>)> {
@@ -580,6 +646,40 @@ pub(super) fn one_instruction(
         _ => return None,
     };
     (Category::of(&ty) == Some(category)).then_some(ty)
+}
+
+fn numeric_literal_type(pool: &ConstantPool<'_>, op: &Instruction) -> Option<Type> {
+    let primitive = match (op.opcode, &op.operand) {
+        (0x02..=0x08, _) | (0x10..=0x11, Operand::Immediate(_)) => Primitive::Int,
+        (0x09..=0x0a, _) => Primitive::Long,
+        (0x0b..=0x0d, _) => Primitive::Float,
+        (0x0e..=0x0f, _) => Primitive::Double,
+        (0x12..=0x13, Operand::Constant(index)) => match pool.get(*index).ok()? {
+            Constant::Integer(_) => Primitive::Int,
+            Constant::Float(_) => Primitive::Float,
+            _ => return None,
+        },
+        (0x14, Operand::Constant(index)) => match pool.get(*index).ok()? {
+            Constant::Long(_) => Primitive::Long,
+            Constant::Double(_) => Primitive::Double,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some(Type::Primitive(primitive))
+}
+
+fn permitted_prefix(
+    instructions: &[Instruction],
+    consumed: usize,
+    permits: &impl Fn(usize, &Instruction) -> bool,
+) -> bool {
+    instructions[..consumed].iter().enumerate().all(|(index, op)| {
+        permits(index, op) && (index == 0 || {
+            let prev = &instructions[index - 1];
+            prev.offset.checked_add(prev.len) == Some(op.offset)
+        })
+    })
 }
 
 fn find_store(

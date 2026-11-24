@@ -75,6 +75,21 @@ fn a_duplicate_store_is_redundant_only_for_the_loaded_binding() {
 }
 
 #[test]
+fn an_array_compound_lvalue_evaluates_the_array_and_index_once_in_order() {
+    let bytecode = [
+        0xb8, 0, 28, 0xb8, 0, 24, // getArray(); index()
+        0x5c, 0x2e, 0x05, 0x68, 0x5b, 0x4f, 0xac,
+    ];
+    let lines = lift(&bytecode, "()I", true);
+    assert_eq!(lines.len(), 1, "{:?}", texts(&lines));
+    let line = &lines[0].text;
+    assert!(line.starts_with("return "), "{line}");
+    assert!(line.ends_with("getArray()[Example.index()] *= 2;"), "{line}");
+    assert_eq!(line.matches("getArray").count(), 1, "{line}");
+    assert_eq!(line.matches("index").count(), 1, "{line}");
+}
+
+#[test]
 fn terminal_update_is_the_return_value_only_for_the_exact_reloaded_slot() {
     let lines = lift(&[0x1a, 0x1b, 0x60, 0x3b, 0x1a, 0xac], "(II)I", true);
     assert_eq!(texts(&lines), ["return var0 + var1;"]);

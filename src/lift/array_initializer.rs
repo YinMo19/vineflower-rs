@@ -455,6 +455,7 @@ impl Machine<'_, '_> {
         if self.stack.last().and_then(array_length) != Some(plan.length) {
             return Err(self.invalid_stack("array initializer needs its literal dimension"));
         }
+        let dimension = self.stack.last().and_then(Expr::deferred_operand_origin);
         let slots = self.stack_slots;
         // With dup, the array remains below the receiver and index. A local
         // store leaves only the latter two on the stack while evaluating a RHS.
@@ -465,7 +466,7 @@ impl Machine<'_, '_> {
         let outer_stack = mem::take(&mut self.stack);
         self.stack_slots = hidden_slots;
         self.array_probe_depth += 1;
-        let expression = self.fold_array_values(instructions, plan, arrays, pending);
+        let expression = self.fold_array_values(instructions, plan, arrays, pending, dimension);
         self.array_probe_depth -= 1;
         self.stack = outer_stack;
         self.stack_slots = slots;
@@ -479,6 +480,7 @@ impl Machine<'_, '_> {
         plan: ArrayPlan,
         arrays: &mut IntoIter<ArrayPlan>,
         mut pending: Option<ArrayArgument>,
+        dimension: Option<super::expr::OperandOrigin>,
     ) -> Result<Expr, LiftError> {
         let Type::Array(component) = &plan.ty else {
             unreachable!("planned an array")
@@ -490,6 +492,17 @@ impl Machine<'_, '_> {
         } else {
             Document::new()
         };
+        let map_elements = self.options.include_line_mappings && pending.is_none()
+            && plan.first_receiver == plan.start + 1;
+        if map_elements {
+            // Vineflower anchors the visible element expressions and the
+            // consuming store/return, not the array compiler scaffolding.
+            let allocation = &instructions[plan.start];
+            if let Some(dimension) = dimension {
+                text.omit_bytes(dimension.bytes());
+            }
+            text.omit_bytes(allocation.offset..allocation.offset + allocation.len);
+        }
         let mut initializer = if pending.is_none() {
             Some(text.array_initializer(ArrayStyle::New))
         } else {
@@ -497,6 +510,7 @@ impl Machine<'_, '_> {
         };
         let mut cursor = plan.first_receiver;
         for _ in 0..plan.length {
+            let receiver = cursor;
             cursor += 2; // verified receiver and literal index
             loop {
                 let op = &instructions[cursor];
@@ -515,7 +529,12 @@ impl Machine<'_, '_> {
                             **component,
                             Type::Primitive(Primitive::Byte | Primitive::Short)
                         );
-                    let value = self.array_initializer_element(value, component)?;
+                    let mut value = self.array_initializer_element(value, component)?;
+                    if map_elements {
+                        let index = &instructions[receiver + 1];
+                        value.text.omit_bytes(instructions[receiver].offset..index.offset + index.len);
+                        value.text.omit_bytes(op.offset..op.offset + op.len);
+                    }
                     if let Some(value) = self.order_of([&value], true)? {
                         order = Some(self.join_order(order, value)?);
                     }
