@@ -284,7 +284,9 @@ fn common_post_super_assignments_move_once_and_keep_both_constructor_maps() {
             .methods
             .iter()
             .filter(|method| method.name == "<init>" && method.descriptor == descriptor);
-        assert_eq!(method.next().unwrap().offsets[&4], declaration);
+        let offsets = &method.next().unwrap().offsets;
+        assert_eq!(offsets[&5], declaration);
+        assert!((4..9).filter(|&offset| offset != 5).all(|offset| !offsets.contains_key(&offset)));
         assert!(method.next().is_none());
     }
     assert_eq!(map.original_lines[&11], declaration + 1);
@@ -390,12 +392,20 @@ fn an_elided_default_constructor_still_maps_its_initializer() {
     ]
     .concat();
     f.method(1, "<init>", "()V", &code, &[(0, 10), (4, 11)]);
+    f.method(1, "answer", "()I", &[0x04, 0xac], &[(0, 15)]);
     let source = f.source();
     let declaration = line_of(&source, "int value = 1;");
+    let return_line = line_of(&source, "return 1;");
     assert!(!source.text.contains("Fixture()"));
     let map = source.map.unwrap();
-    assert_eq!(map.methods[0].name, "<init>");
-    assert_eq!(map.methods[0].offsets[&4], declaration);
+    let [constructor, answer] = map.methods.as_slice() else {
+        panic!("expected initializer and method maps");
+    };
+    assert_eq!(constructor.name, "<init>");
+    assert_eq!(constructor.offsets.first_key_value(), Some((&5, &declaration)));
+    assert_eq!(constructor.offsets.len(), 1);
+    assert_eq!(answer.name, "answer");
+    assert_eq!(answer.offsets[&0], return_line);
     assert_eq!(map.original_lines[&11], declaration + 1);
 }
 

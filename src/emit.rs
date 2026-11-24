@@ -1071,10 +1071,12 @@ impl<'a, 'c> Writer<'a, 'c> {
             modifier(&mut head, flags, SYNCHRONIZED, "synchronized ");
             modifier(&mut head, flags, NATIVE, "native ");
             modifier(&mut head, flags, STRICT, "strictfp ");
+            // The JVM descriptor was parsed and used to lift the body.
+            // An invalid optional Signature supplies no trustworthy type
+            // arguments; render the verified erased declaration instead.
             let signature = self
                 .member_signature(method)?
-                .map(|sig| parse(sig, MethodSignature::parse))
-                .transpose()?;
+                .and_then(|signature| MethodSignature::parse(signature).ok());
             let signature = signature.as_ref().filter(|sig| {
                 sig.parameters.len() == parameters.len()
                     || sig.parameters.len() == visible_parameters

@@ -1,6 +1,6 @@
 // Copyright 2000-2018 JetBrains s.r.o. Use of this source code is governed by the Apache 2.0 license that can be found in the LICENSE file.
 
-use std::fmt::Write;
+use std::fmt::{Display, UpperExp, Write};
 
 use crate::{
     Options,
@@ -16,11 +16,21 @@ pub(crate) fn constant_literal(
     expected: Option<&Type>,
     ascii: bool,
 ) -> Result<String, LiftError> {
+    constant_in_context(pool, index, expected, ascii, true)
+}
+
+fn constant_in_context(
+    pool: &ConstantPool<'_>,
+    index: u16,
+    expected: Option<&Type>,
+    ascii: bool,
+    group_arithmetic: bool,
+) -> Result<String, LiftError> {
     Ok(match pool.get(index)? {
         Constant::Integer(value) => integer_literal(*value, expected, ascii),
         Constant::Long(value) => format!("{value}L"),
-        Constant::Float(value) => float_literal(*value),
-        Constant::Double(value) => double_literal(*value),
+        Constant::Float(value) => float_literal(*value, group_arithmetic),
+        Constant::Double(value) => double_literal(*value, group_arithmetic),
         Constant::String(index) => string_literal(&pool.utf16(*index)?, ascii),
         Constant::Utf8(text) => string_literal(&text.utf16(), ascii),
         _ => return Err(LiftError::UnrepresentableConstant(index)),
@@ -39,7 +49,7 @@ pub(crate) fn constant_literal_with_options(
     {
         return Ok(symbolic.text);
     }
-    constant_literal(pool, index, expected, options.ascii_strings)
+    constant_in_context(pool, index, expected, options.ascii_strings, false)
 }
 
 pub(super) fn integer_literal(value: i32, expected: Option<&Type>, ascii: bool) -> String {
@@ -52,33 +62,47 @@ pub(super) fn integer_literal(value: i32, expected: Option<&Type>, ascii: bool) 
     }
 }
 
-pub(super) fn float_literal(value: f32) -> String {
-    if value.is_nan() {
-        "(0.0F / 0.0F)".into()
-    } else if value.is_infinite() {
-        if value.is_sign_negative() {
-            "(-1.0F / 0.0F)"
-        } else {
-            "(1.0F / 0.0F)"
-        }
-        .into()
+pub(super) fn float_literal(value: f32, grouped: bool) -> String {
+    if value.is_finite() {
+        let magnitude = value.abs();
+        finite_decimal(value, magnitude != 0.0 && !(1e-3..1e7).contains(&magnitude), "F")
     } else {
-        format!("{value:?}F")
+        exceptional_decimal(value.is_nan(), value.is_sign_negative(), "F", grouped)
     }
 }
 
-pub(super) fn double_literal(value: f64) -> String {
-    if value.is_nan() {
-        "(0.0 / 0.0)".into()
-    } else if value.is_infinite() {
-        if value.is_sign_negative() {
-            "(-1.0 / 0.0)"
-        } else {
-            "(1.0 / 0.0)"
-        }
-        .into()
+pub(super) fn double_literal(value: f64, grouped: bool) -> String {
+    if value.is_finite() {
+        let magnitude = value.abs();
+        finite_decimal(value, magnitude != 0.0 && !(1e-3..1e7).contains(&magnitude), "")
     } else {
-        format!("{value:?}")
+        exceptional_decimal(value.is_nan(), value.is_sign_negative(), "", grouped)
+    }
+}
+
+fn finite_decimal(value: impl Display + UpperExp, scientific: bool, suffix: &str) -> String {
+    // Rust's standard formatter supplies round-trippable shortest digits.
+    // Java's spelling uses its own exponent threshold and a decimal point.
+    let mut text = String::with_capacity(26);
+    if scientific {
+        let _ = write!(text, "{value:E}");
+    } else {
+        let _ = write!(text, "{value}");
+    }
+    if !text.contains('.') {
+        let exponent = text.find('E').unwrap_or(text.len());
+        text.insert_str(exponent, ".0");
+    }
+    text.push_str(suffix);
+    text
+}
+
+fn exceptional_decimal(nan: bool, negative: bool, suffix: &str, grouped: bool) -> String {
+    let numerator = if nan { "0.0" } else if negative { "-1.0" } else { "1.0" };
+    if grouped {
+        format!("({numerator}{suffix} / 0.0{suffix})")
+    } else {
+        format!("{numerator}{suffix} / 0.0{suffix}")
     }
 }
 
@@ -136,5 +160,26 @@ mod tests {
             integer_literal(0x27, Some(&Type::Primitive(Primitive::Char)), false),
             "'\\''"
         );
+    }
+
+    #[test]
+    fn floating_literals_preserve_subnormal_and_signed_zero_bits() {
+        for (value, java) in [
+            (f32::from_bits(1), "1.0E-45F"),
+            (-0.0, "-0.0F"),
+            (0.001, "0.001F"),
+            (1e7, "1.0E7F"),
+            (f32::MAX, "3.4028235E38F"),
+        ] {
+            let output = float_literal(value, false);
+            assert_eq!(output, java);
+            assert_eq!(
+                output.strip_suffix('F').unwrap().parse::<f32>().unwrap().to_bits(),
+                value.to_bits(),
+            );
+        }
+        assert_eq!(double_literal(f64::from_bits(1), false), "5.0E-324");
+        assert_eq!(double_literal(f64::INFINITY, true), "(1.0 / 0.0)");
+        assert_eq!(float_literal(f32::NEG_INFINITY, false), "-1.0F / 0.0F");
     }
 }

@@ -586,10 +586,10 @@ impl<'a, 'c> Machine<'a, 'c> {
                 }
             }
             Constant::Float(value) => {
-                numeric::expression(Primitive::Float, named(), || literal::float_literal(*value))
+                numeric::expression(Primitive::Float, named(), || literal::float_literal(*value, true))
             }
             Constant::Double(value) => numeric::expression(Primitive::Double, named(), || {
-                literal::double_literal(*value)
+                literal::double_literal(*value, true)
             }),
             Constant::String(_) => Expr::literal(
                 Type::Object("java/lang/String".into()),

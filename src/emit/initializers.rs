@@ -112,13 +112,18 @@ impl FieldInitializers<'_> {
                 feature: "recovered initializer for a hidden field",
             });
         }
-        for ((name, descriptor), moved) in self.methods {
+        for ((name, descriptor), moved) in self.methods.into_iter().rev() {
             let offsets = moved.mappings.into_iter().flat_map(|(field, offsets)| {
                 let line = self.declarations[&field].source_line.expect("verified field line");
                 offsets.into_iter().map(move |offset| (offset, line))
             });
+            let order = if name == "<init>" {
+                InitializerMapOrder::ClassDeclarations
+            } else {
+                InitializerMapOrder::Retained
+            };
             merge_initializer_mapping(
-                writer, name, descriptor, offsets, moved.original_lines, InitializerMapOrder::Retained,
+                writer, name, descriptor, offsets, moved.original_lines, order,
             );
         }
         Ok(())
@@ -605,17 +610,26 @@ impl<'c> Writer<'_, 'c> {
         };
         for assignment in prefix.assignments.into_iter().take(count) {
             if self.mapping.is_some() {
-                let mut body = assignment.instructions;
-                if mode == Mode::Interface {
-                    // Retain the interface initializer tracer's established
-                    // mapping of the RHS, without the putstatic.
-                    body.end -= 1;
+                let mut body = &prefix.instructions[assignment.instructions];
+                if mode != Mode::Static {
+                    // A declaration has no explicit putfield/putstatic.
+                    body = &body[..body.len() - 1];
                 }
+                let receiver = (mode == Mode::Instance
+                    && !body.iter().any(|op| matches!(op.opcode, 0x59..=0x5e)))
+                    .then(|| {
+                        let mut loads = body.iter().filter(|op| loads_this(op));
+                        let first = loads.next()?;
+                        // The assignment proof has exactly `this, rhs` at
+                        // the store. With one unaliased receiver load that
+                        // load cannot participate in the moved expression.
+                        loads.next().is_none().then_some(first.offset)
+                    })
+                    .flatten();
                 moved.mappings.push((
                     assignment.field,
-                    prefix.instructions[body]
-                        .iter()
-                        .filter(|op| op.opcode != 0)
+                    body.iter()
+                        .filter(|op| op.opcode != 0 && receiver != Some(op.offset))
                         .flat_map(|op| op.offset..op.offset + op.len)
                         .collect(),
                 ));
@@ -661,10 +675,13 @@ fn expression_opcode(opcode: u8) -> bool {
     !matches!(opcode, 0x36..=0x4e | 0x84 | 0x99..=0xb1 | 0xbf | 0xc2..=0xc3 | 0xc6..=0xc9)
 }
 
+fn loads_this(op: &Instruction) -> bool {
+    matches!((op.opcode, &op.operand), (0x19, Operand::Local(0)) | (0x2a, _))
+}
+
 fn initializer_local_access(op: &Instruction, mode: Mode) -> bool {
-    match (op.opcode, &op.operand) {
-        (0x19, Operand::Local(0)) | (0x2a, _) => mode == Mode::Instance,
-        (0x15..=0x2d, _) => false,
+    match op.opcode {
+        0x15..=0x2d => mode == Mode::Instance && loads_this(op),
         _ => true,
     }
 }
