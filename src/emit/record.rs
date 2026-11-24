@@ -2,7 +2,7 @@
 use super::{DecompileError, FINAL, PRIVATE, PUBLIC, STATIC, VARARGS, VISIBILITY, Writer, parse};
 use crate::{
     bytecode::{Instruction, Operand},
-    classfile::{ClassError, ClassFile, Constant, Member, RecordComponent},
+    classfile::{Annotation, ClassError, ClassFile, Constant, Member, RecordComponent, TypeTarget},
     descriptor::{FieldSignature, Primitive, Type},
 };
 
@@ -31,63 +31,84 @@ impl<'a> Writer<'a, '_> {
         Ok(false)
     }
 
-    pub(super) fn record_header(
+    pub(super) fn record_components_source(
         &self,
-        out: &mut String,
         components: &[RecordComponent<'a>],
-    ) -> Result<(), DecompileError> {
+    ) -> Result<Vec<String>, DecompileError> {
         let pool = &self.class.pool;
-        let mut varargs = false;
-        if !components.is_empty() {
-            for m in &self.class.methods {
-                if m.access_flags & VARARGS != 0
-                    && pool.utf8(m.name_index)? == "<init>"
-                    && is_canonical(self.class, components, pool.utf8(m.descriptor_index)?)?
+        let mut canonical = None;
+        for method in &self.class.methods {
+            if pool.utf8(method.name_index)? == "<init>"
+                && is_canonical(self.class, components, pool.utf8(method.descriptor_index)?)?
+            {
+                canonical = Some(method);
+                break;
+            }
+        }
+        let varargs = canonical.is_some_and(|method| method.access_flags & VARARGS != 0);
+        let mut params = [Vec::new(), Vec::new()];
+        if let Some(canonical) = canonical {
+            for (index, visible) in [true, false].into_iter().enumerate() {
+                params[index] = canonical.parameter_annotations(pool, visible)?;
+            }
+        }
+        let mut rendered = Vec::with_capacity(components.len());
+        for (index, component) in components.iter().enumerate() {
+            let mut out = String::new();
+            let mut declarations = Vec::new();
+            let name = pool.utf8(component.name_index)?;
+            let descriptor = pool.utf8(component.descriptor_index)?;
+            for visible in [true, false] {
+                extend_unique(&mut declarations, component.annotations(pool, visible)?);
+            }
+            for method in &self.class.methods {
+                if pool.utf8(method.name_index)? == name
+                    && pool.utf8(method.descriptor_index)?.strip_prefix("()") == Some(descriptor)
                 {
-                    varargs = true;
+                    for visible in [true, false] {
+                        extend_unique(&mut declarations, method.annotations(pool, visible)?);
+                    }
                     break;
                 }
             }
-        }
-        out.push('(');
-        for (index, component) in components.iter().enumerate() {
-            if index != 0 {
-                out.push_str(", ");
-            }
-            for visible in [true, false] {
-                for annotation in component.annotations(pool, visible)? {
-                    out.push_str(&self.annotation(&annotation)?);
-                    out.push(' ');
+            for group in &params {
+                if let Some(annotations) = group.get(index) {
+                    extend_unique(&mut declarations, annotations.iter().cloned());
                 }
             }
-            let descriptor = pool.utf8(component.descriptor_index)?;
-            let map_name = |name: &str| self.names.render(name);
+            for annotation in &declarations {
+                out.push_str(&self.annotation(annotation)?);
+                out.push(' ');
+            }
+            let mut annotations = component.type_annotations(pool, true)?;
+            annotations.extend(component.type_annotations(pool, false)?);
             let sig = if self.options.decompile_generics {
                 component.signature(pool)?
             } else {
                 None
             };
+            let varargs = varargs && index + 1 == components.len();
             let ty = if let Some(sig) = sig {
-                parse(sig, FieldSignature::parse)?
-                    .field_type
-                    .render(map_name)
+                let ty = parse(sig, FieldSignature::parse)?;
+                self.render_type_target(&ty.field_type, &annotations, TypeTarget::Field, &declarations, varargs)?
             } else {
-                parse(descriptor, Type::parse)?.render(map_name)
+                let ty = parse(descriptor, Type::parse)?;
+                self.render_type_target(&ty, &annotations, TypeTarget::Field, &declarations, varargs)?
             };
-            if varargs
-                && index + 1 == components.len()
-                && let Some(element) = ty.strip_suffix("[]")
-            {
-                out.push_str(element);
-                out.push_str("...");
-            } else {
-                out.push_str(&ty);
-            }
+            out.push_str(&ty);
             out.push(' ');
-            out.push_str(pool.utf8(component.name_index)?);
+            out.push_str(name);
+            rendered.push(out);
         }
-        out.push(')');
-        Ok(())
+        Ok(rendered)
+    }
+}
+
+fn extend_unique(queue: &mut Vec<Annotation>, additions: impl IntoIterator<Item = Annotation>) {
+    for annotation in additions {
+        if !queue.contains(&annotation) {
+            queue.push(annotation);
+        }
     }
 }
 
@@ -101,13 +122,13 @@ pub(super) fn is_generated(
 ) -> Result<bool, DecompileError> {
     let pool = &class.pool;
     let owner = pool.class_name(class.this_class)?;
-    if !method.annotations(pool, true)?.is_empty()
-        || !method.annotations(pool, false)?.is_empty()
-        || !method.exceptions(pool)?.is_empty()
-    {
+    let annotated = !method.annotations(pool, true)?.is_empty()
+        || !method.annotations(pool, false)?.is_empty();
+    if !method.exceptions(pool)?.is_empty() {
         return Ok(false);
     }
     if name == "<init>"
+        && !annotated
         && method.access_flags & VISIBILITY == class.access_flags & VISIBILITY
         && is_canonical(class, components, desc)?
     {
@@ -152,6 +173,9 @@ pub(super) fn is_generated(
                 return Ok(ret.opcode == load_opcode(&parse(returns, Type::parse)?) - 0x15 + 0xac);
             }
         }
+    }
+    if annotated {
+        return Ok(false);
     }
     let (call, returns) = match (name, desc, insns) {
         ("toString", "()Ljava/lang/String;", [a, call, ret])

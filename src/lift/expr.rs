@@ -49,8 +49,11 @@ pub(super) enum Source {
     Integer(i32),
     Null,
     This,
+    OuterThis,
     New(u32),
     Comparison(Box<Comparison>),
+    StringBuilder(std::sync::Arc<Vec<super::concat::Operand>>),
+    StringConversion(Box<Expr>),
 }
 
 #[derive(Clone)]
@@ -411,6 +414,16 @@ impl Machine<'_, '_> {
         ty: Type,
         effect: bool,
     ) -> Result<Expr, LiftError> {
+        self.reference_cast_with_name(expr, ty, effect, None)
+    }
+
+    pub(super) fn reference_cast_with_name(
+        &self,
+        expr: Expr,
+        ty: Type,
+        effect: bool,
+        name: Option<String>,
+    ) -> Result<Expr, LiftError> {
         let object = Type::Object("java/lang/Object".into());
         let expr = if !matches!(expr.source, Source::Null)
             && !self.known_assignable(&expr.ty, &ty)
@@ -423,7 +436,12 @@ impl Machine<'_, '_> {
         } else {
             expr
         };
-        self.cast(expr, ty, effect)
+        if let Some(name) = name {
+            let text = format!("({name}){}", expr.at(UNARY));
+            self.expression(ty, text, UNARY, [&expr], effect)
+        } else {
+            self.cast(expr, ty, effect)
+        }
     }
 }
 

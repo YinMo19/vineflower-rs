@@ -1,18 +1,23 @@
 // Copyright 2000-2020 JetBrains s.r.o. Use of this source code is governed by the Apache 2.0 license that can be found in the LICENSE file.
 
-use std::collections::VecDeque;
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use crate::bytecode::Instruction;
+use crate::bytecode::{Instruction, Operand};
 use crate::cfg::ControlFlowGraph;
 use crate::lift::Machine;
 
 use super::StructureError;
+use super::protected::ArmId;
 
 #[derive(Clone, Copy)]
 pub(super) struct Region<'r, 'a, 'c> {
     pub(super) stop: Option<usize>,
     pub(super) loop_header: Option<usize>,
     pub(super) protected: Option<&'r Machine<'a, 'c>>,
+    pub(super) exception_arm: Option<ArmId>,
+    pub(super) switch_depth: usize,
+    loop_scope: Option<&'r LoopScope<'a, 'c>>,
     outer: Option<&'r Region<'r, 'a, 'c>>,
 }
 
@@ -21,6 +26,9 @@ impl<'r, 'a, 'c> Region<'r, 'a, 'c> {
         stop: None,
         loop_header: None,
         protected: None,
+        exception_arm: None,
+        switch_depth: 0,
+        loop_scope: None,
         outer: None,
     };
 
@@ -32,18 +40,45 @@ impl<'r, 'a, 'c> Region<'r, 'a, 'c> {
         }
     }
 
-    pub(super) fn loop_body(&'r self, header: usize) -> Self {
+    pub(super) fn loop_body(&'r self, scope: &'r LoopScope<'a, 'c>) -> Self {
         Self {
-            stop: Some(header),
-            loop_header: Some(header),
+            stop: Some(scope.header),
+            loop_header: Some(scope.header),
+            loop_scope: Some(scope),
             outer: Some(self),
             ..*self
         }
     }
 
-    pub(super) fn try_body(&'r self, stop: Option<usize>, baseline: &'r Machine<'a, 'c>) -> Self {
+    pub(super) fn switch_body(&'r self, stop: Option<usize>) -> Self {
+        Self { switch_depth: self.switch_depth + 1, ..self.branch(stop) }
+    }
+
+    pub(super) fn loop_transfer(&self, block: usize) -> Option<(&'r LoopScope<'a, 'c>, Transfer)> {
+        let mut current = Some(self);
+        while let Some(region) = current {
+            if let Some(scope) = region.loop_scope {
+                if block == scope.header {
+                    return Some((scope, Transfer::Continue));
+                }
+                if Some(block) == scope.exit {
+                    return Some((scope, Transfer::Break));
+                }
+            }
+            current = region.outer;
+        }
+        None
+    }
+
+    pub(super) fn exception(
+        &'r self,
+        stop: Option<usize>,
+        arm: ArmId,
+        protected: Option<&'r Machine<'a, 'c>>,
+    ) -> Self {
         Self {
-            protected: Some(baseline),
+            protected: protected.or(self.protected),
+            exception_arm: Some(arm),
             ..self.branch(stop)
         }
     }
@@ -60,17 +95,40 @@ impl<'r, 'a, 'c> Region<'r, 'a, 'c> {
     }
 }
 
+pub(super) struct LoopScope<'a, 'c> {
+    pub(super) header: usize,
+    pub(super) exit: Option<usize>,
+    pub(super) entry: Machine<'a, 'c>,
+    pub(super) breaks: RefCell<Vec<Machine<'a, 'c>>>,
+    pub(super) labeled: Cell<bool>,
+    pub(super) switch_depth: usize,
+    pub(super) exception_arm: Option<ArmId>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Transfer {
+    Break,
+    Continue,
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct While {
     pub(super) body: usize,
     pub(super) exit: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct Loop {
+    pub(super) test: Option<While>,
+    pub(super) exit: Option<usize>,
     parent: Option<usize>,
 }
 
 pub(super) struct Layout {
-    pub(super) loops: Vec<Option<While>>,
+    pub(super) loops: Vec<Option<Loop>>,
     level: Vec<Option<usize>>,
     postdominators: PostDominators,
+    locals: Option<LocalLiveness>,
 }
 
 impl Layout {
@@ -81,52 +139,101 @@ impl Layout {
         let mut natural_loops = graph.natural_loops();
         natural_loops
             .sort_unstable_by_key(|natural_loop| std::cmp::Reverse(natural_loop.blocks.len()));
-        let mut loops = vec![None; graph.blocks.len()];
-        let mut level = vec![None; graph.blocks.len()];
+        let mut loops: Vec<Option<Loop>> = vec![None; graph.blocks.len()];
+        let mut level: Vec<Option<usize>> = vec![None; graph.blocks.len()];
+        let postdominators = PostDominators::new(graph.immediate_postdominators());
+        let mut dominators = None;
+        let mut loop_headers = vec![false; graph.blocks.len()];
+        for shape in &natural_loops {
+            loop_headers[shape.header] = true;
+        }
+        let mut seen_tail = vec![usize::MAX; graph.blocks.len()];
+        let mut pending = Vec::new();
         for natural_loop in natural_loops {
             let header = natural_loop.header;
             let unsupported = || StructureError::Flow {
                 offset: instructions[graph.blocks[header].instructions.start].offset,
             };
             let inside = |block: usize| natural_loop.blocks.binary_search(&block).is_ok();
-            let [first, second] = graph.blocks[header].successors.as_slice() else {
-                return Err(unsupported());
-            };
-            let (body, exit) = match (inside(*first), inside(*second)) {
-                (true, false) => (*first, *second),
-                (false, true) => (*second, *first),
-                _ => return Err(unsupported()),
-            };
-
-            // Recognize single-entry, header-tested loops, not arbitrary SCCs.
-            // A nested loop header remains a node in its parent's region.
             let parent = level[header];
-            for &block in &natural_loop.blocks {
-                if level[block] != parent {
-                    return Err(unsupported());
+            if natural_loop.blocks.iter().any(|&block| level[block] != parent) {
+                return Err(unsupported());
+            }
+            let outer_transfer = |block| {
+                let mut enclosing = parent;
+                while let Some(head) = enclosing {
+                    let shape: Loop = loops[head].expect("outer loops are classified first");
+                    if block == head || Some(block) == shape.exit {
+                        return true;
+                    }
+                    enclosing = shape.parent;
                 }
-                if block != header
-                    && graph.blocks[block]
-                        .successors
-                        .iter()
-                        .any(|&next| !inside(next))
+                false
+            };
+            let exits: BTreeSet<_> = natural_loop.blocks.iter()
+                .flat_map(|&block| graph.blocks[block].successors.iter().copied())
+                .filter(|&next| !inside(next) && !outer_transfer(next))
+                .collect();
+            let test = match graph.blocks[header].successors.as_slice() {
+                [first, second] => match (inside(*first), inside(*second)) {
+                    (true, false) if !outer_transfer(*second) => Some(While { body: *first, exit: *second }),
+                    (false, true) if !outer_transfer(*first) => Some(While { body: *second, exit: *first }),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let mut exit = exits.first().copied().filter(|_| exits.len() == 1)
+                .or_else(|| test.map(|test| test.exit))
+                .or_else(|| {
+                    let mut targets = exits.iter().copied();
+                    let first = targets.next()?;
+                    let common = targets.try_fold(first, |a, b| postdominators.common(a, b))?;
+                    (!inside(common) && !outer_transfer(common) && level[common] == parent).then_some(common)
+                });
+            let simple = test.is_some() && natural_loop.blocks.iter().copied().filter(|&block| block != header)
+                .all(|block| graph.blocks[block].successors.iter().copied().all(inside));
+
+            // A natural loop contains only blocks that can return to its
+            // header. Include dominated exit-only tails in the same source
+            // loop, stopping at its continuation or an enclosing transfer.
+            let tail_start = |target| Some(target) != exit;
+            pending.extend(exits.iter().copied().filter(|&target| tail_start(target)));
+            let mut tails = Vec::new();
+            while let Some(block) = pending.pop() {
+                if Some(block) == exit || inside(block) || outer_transfer(block)
+                    || std::mem::replace(&mut seen_tail[block], header) == header
                 {
-                    return Err(unsupported());
+                    continue;
                 }
+                let dominates = dominators.get_or_insert_with(|| PostDominators::new(graph.immediate_dominators()));
+                if level[block] != parent || loop_headers[block] || !dominates.contains(header, block) {
+                    if level[block] != parent || exit.is_some() {
+                        return Err(unsupported());
+                    }
+                    exit = Some(block);
+                    continue;
+                }
+                tails.push(block);
+                pending.extend_from_slice(&graph.blocks[block].successors);
+            }
+            if exit.is_some_and(|block| level[block] != parent) {
+                return Err(unsupported());
+            }
+            for block in natural_loop.blocks.into_iter().chain(tails) {
                 level[block] = Some(header);
             }
-            loops[header] = Some(While { body, exit, parent });
+            loops[header] = Some(Loop { test: test.filter(|_| simple), exit, parent });
         }
         for (header, shape) in loops.iter().enumerate() {
             if let Some(loop_shape) = shape {
                 level[header] = loop_shape.parent;
             }
         }
-        let postdominators = PostDominators::new(graph.immediate_postdominators());
         Ok(Self {
             loops,
             level,
             postdominators,
+            locals: None,
         })
     }
 
@@ -183,7 +290,7 @@ impl Layout {
                 }
                 seen[block] = start;
                 let successors = match &self.loops[block] {
-                    Some(loop_shape) => std::slice::from_ref(&loop_shape.exit),
+                    Some(loop_shape) => loop_shape.exit.as_slice(),
                     None => &graph.blocks[block].successors,
                 };
                 queue.extend(successors.iter().copied().filter(|&next| {
@@ -192,6 +299,86 @@ impl Layout {
             }
         }
         None
+    }
+
+    pub(super) fn local_is_live(
+        &mut self,
+        graph: &ControlFlowGraph,
+        instructions: &[Instruction],
+        block: usize,
+        slot: u16,
+    ) -> bool {
+        self.locals
+            .get_or_insert_with(|| LocalLiveness::new(graph, instructions))
+            .is_live(graph, block, slot)
+    }
+}
+
+/// Used only for slots whose incoming bindings differ. A local is live at a
+/// join if some path reads it before the next write. Exception edges see the
+/// incoming state conservatively: a throwable instruction can precede a store
+/// in the same block.
+struct LocalLiveness {
+    accesses: Vec<Vec<(u16, bool)>>,
+    seen: Vec<usize>,
+    pending: Vec<usize>,
+    generation: usize,
+}
+
+impl LocalLiveness {
+    fn new(graph: &ControlFlowGraph, instructions: &[Instruction]) -> Self {
+        let accesses = graph.blocks.iter().map(|block| {
+            let mut first = BTreeMap::new();
+            for instruction in &instructions[block.instructions.clone()] {
+                let (slot, read, wide) = match (instruction.opcode, &instruction.operand) {
+                    (0x15..=0x19, Operand::Local(slot)) => (*slot, true, false),
+                    (op @ 0x1a..=0x2d, _) => (u16::from((op - 0x1a) % 4), true, false),
+                    (op @ 0x36..=0x3a, Operand::Local(slot)) => (*slot, false, matches!(op, 0x37 | 0x39)),
+                    (op @ 0x3b..=0x4e, _) => (
+                        u16::from((op - 0x3b) % 4),
+                        false,
+                        matches!((op - 0x3b) / 4, 1 | 3),
+                    ),
+                    (0x84, Operand::Increment { index, .. }) => (*index, true, false),
+                    _ => continue,
+                };
+                first.entry(slot).or_insert(read);
+                if !read && wide && let Some(high) = slot.checked_add(1) {
+                    first.entry(high).or_insert(false);
+                }
+            }
+            first.into_iter().collect()
+        }).collect();
+        Self {
+            accesses,
+            seen: vec![0; graph.blocks.len()],
+            pending: Vec::new(),
+            generation: 0,
+        }
+    }
+
+    fn is_live(&mut self, graph: &ControlFlowGraph, block: usize, slot: u16) -> bool {
+        if self.generation == usize::MAX {
+            self.seen.fill(0);
+            self.generation = 0;
+        }
+        self.generation += 1;
+        self.pending.clear();
+        self.pending.push(block);
+        while let Some(block) = self.pending.pop() {
+            if std::mem::replace(&mut self.seen[block], self.generation) == self.generation {
+                continue;
+            }
+            let node = &graph.blocks[block];
+            let accesses = &self.accesses[block];
+            match accesses.binary_search_by_key(&slot, |&(slot, _)| slot) {
+                Ok(index) if accesses[index].1 => return true,
+                Ok(_) => {}
+                Err(_) => self.pending.extend_from_slice(&node.successors),
+            }
+            self.pending.extend_from_slice(&node.exception_successors);
+        }
+        false
     }
 }
 
@@ -232,5 +419,14 @@ impl PostDominators {
     fn contains(&self, parent: usize, node: usize) -> bool {
         let (start, end) = self.intervals[parent];
         (start..end).contains(&self.intervals[node].0)
+    }
+
+    fn common(&self, mut a: usize, b: usize) -> Option<usize> {
+        loop {
+            if self.contains(a, b) {
+                return Some(a);
+            }
+            a = self.parent[a]?;
+        }
     }
 }

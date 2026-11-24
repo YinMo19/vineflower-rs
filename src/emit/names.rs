@@ -6,74 +6,81 @@ use std::{
 };
 
 use crate::{
-    classfile::{ClassError, ClassFile},
+    context::{ClassGroup, NestedKind},
     descriptor::Type,
+    naming::MemberRenames,
 };
 
-pub(super) struct Names<'a> {
-    owner: &'a str,
-    package: &'a str,
+pub(super) struct Names<'a, 'c> {
+    owner: &'c str,
+    package: &'c str,
     imports: RefCell<BTreeSet<String>>,
     bindings: RefCell<HashMap<String, String>>,
-    members: HashMap<&'a str, (&'a str, &'a str)>,
+    group: &'c ClassGroup<'a>,
+    renames: &'c MemberRenames,
     qualify: bool,
 }
 
-impl<'a> Names<'a> {
+impl<'a, 'c> Names<'a, 'c> {
     pub(super) fn new(
-        class: &'a ClassFile<'_>,
-        name: &'a str,
+        group: &'c ClassGroup<'a>,
+        name: &'c str,
         qualify: bool,
-    ) -> Result<Self, ClassError> {
-        let package = name.rsplit_once('/').map_or("", |(package, _)| package);
-        let members = class
-            .inner_classes()?
-            .into_iter()
-            .filter(|inner| {
-                inner.outer_class != 0 && inner.inner_name != 0 && inner.inner_class != 0
-            })
-            .map(|inner| {
-                Ok((
-                    class.pool.class_name(inner.inner_class)?,
-                    (
-                        class.pool.class_name(inner.outer_class)?,
-                        class.pool.utf8(inner.inner_name)?,
-                    ),
-                ))
-            })
-            .collect::<Result<_, ClassError>>()?;
+        renames: &'c MemberRenames,
+    ) -> Self {
+        let effective = renames.class_name(name);
+        let package = effective.rsplit_once('/').map_or("", |(package, _)| package);
         let mut bindings = HashMap::new();
-        bindings.insert(simple(name).into(), name.into());
-        Ok(Self {
+        bindings.insert(simple(effective).into(), effective.into());
+        Self {
             owner: name,
             package,
             imports: RefCell::new(BTreeSet::new()),
             bindings: RefCell::new(bindings),
-            members,
+            group,
+            renames,
             qualify,
-        })
+        }
+    }
+
+    pub(super) fn renames(&self) -> &'c MemberRenames {
+        self.renames
     }
 
     pub(super) fn render(&self, name: &str) -> String {
         if name == self.owner {
-            return simple(name).into();
+            return simple(self.renames.class_name(name)).into();
         }
         if name.starts_with('[')
             && let Ok(ty) = Type::parse(name)
         {
             return ty.render(|name| self.render(name));
         }
+        if self.group.is_attached(name)
+            && let Some(class) = self.group.nested_class(name)
+            && let NestedKind::Local(simple) = &class.kind
+        {
+            return self.renames.simple_class_alias(name).unwrap_or(simple).into();
+        }
         let mut base = name;
         let mut chain = Vec::new();
-        while let Some(&(outer, inner)) = self.members.get(base) {
-            // InnerClasses is not required to form a valid ownership tree.
-            if chain.len() == self.members.len() || outer == base {
-                return name.replace('/', ".");
+        while let Some(member) = self.group.member_class(base) {
+            chain.push(self.renames.simple_class_alias(base).unwrap_or(member.simple_name));
+            base = member.outer;
+            if base == self.owner {
+                break;
             }
-            chain.push(inner);
-            base = outer;
+            if self.group.is_attached(base)
+                && let Some(class) = self.group.nested_class(base)
+                && let NestedKind::Local(simple) = &class.kind
+            {
+                let mut result = self.renames.simple_class_alias(base).unwrap_or(simple).to_owned();
+                append_members(&mut result, chain);
+                return result;
+            }
         }
 
+        let base = self.renames.class_name(base);
         let (package, leaf) = base.rsplit_once('/').unwrap_or(("", base));
         let mut bindings = self.bindings.borrow_mut();
         let same_package = package == self.package || package.is_empty();
@@ -90,10 +97,7 @@ impl<'a> Names<'a> {
         } else {
             base.replace('/', ".")
         };
-        for member in chain.into_iter().rev() {
-            result.push('.');
-            result.push_str(member);
-        }
+        append_members(&mut result, chain);
         result
     }
 
@@ -101,6 +105,13 @@ impl<'a> Names<'a> {
         for import in self.imports.borrow().iter() {
             let _ = writeln!(output, "import {import};");
         }
+    }
+}
+
+fn append_members(result: &mut String, chain: Vec<&str>) {
+    for member in chain.into_iter().rev() {
+        result.push('.');
+        result.push_str(member);
     }
 }
 

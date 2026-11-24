@@ -1,16 +1,16 @@
 // Based on Vineflower annotation attributes and AnnotationExprent (Apache-2.0).
-use super::{DecompileError, Writer, parse};
+use super::{DecompileError, Document, Writer, parse};
 use crate::{
     classfile::{Annotation, ElementValue, Member},
     descriptor::{Primitive, Type},
-    lift::{constant_literal, string_literal},
+    lift::{constant_literal_with_options, string_literal},
 };
 
 impl<'a> Writer<'a, '_> {
     pub(super) fn class_annotations(&mut self, depth: usize) -> Result<(), DecompileError> {
         for visible in [true, false] {
             for annotation in self.class.annotations(visible)? {
-                self.line(depth, &self.annotation(&annotation)?);
+                self.write_annotation(depth, &annotation)?;
             }
         }
         Ok(())
@@ -19,47 +19,43 @@ impl<'a> Writer<'a, '_> {
     pub(super) fn annotations_of(
         &self,
         member: &Member<'a>,
-    ) -> Result<Vec<String>, DecompileError> {
-        let mut result = Vec::new();
-        for visible in [true, false] {
-            for annotation in member.annotations(&self.class.pool, visible)? {
-                result.push(self.annotation(&annotation)?);
-            }
-        }
+    ) -> Result<Vec<Annotation>, DecompileError> {
+        let mut result = member.annotations(&self.class.pool, true)?;
+        result.extend(member.annotations(&self.class.pool, false)?);
         Ok(result)
     }
 
-    pub(super) fn member_annotations(
-        &mut self,
-        depth: usize,
-        member: &Member<'a>,
-    ) -> Result<(), DecompileError> {
-        for annotation in self.annotations_of(member)? {
-            self.line(depth, &annotation);
-        }
+    pub(super) fn write_annotation(&mut self, depth: usize, annotation: &Annotation) -> Result<(), DecompileError> {
+        let doc = self.annotation_document(annotation, Some(self.depth + depth))?;
+        self.document_line(depth, &doc);
         Ok(())
     }
 
     pub(super) fn annotation(&self, annotation: &Annotation) -> Result<String, DecompileError> {
+        Ok(self.annotation_document(annotation, None)?.into_flat())
+    }
+
+    pub(super) fn annotation_document(&self, annotation: &Annotation, depth: Option<usize>) -> Result<Document, DecompileError> {
         let pool = &self.class.pool;
-        let mut result = String::from("@");
-        result.push_str(&self.annotation_type(pool.utf8(annotation.type_index)?)?);
-        if !annotation.elements.is_empty() {
-            result.push('(');
-            for (index, (name, value)) in annotation.elements.iter().enumerate() {
-                if index != 0 {
-                    result.push_str(", ");
-                }
-                let name = pool.utf8(*name)?;
-                if annotation.elements.len() != 1 || name != "value" {
-                    result.push_str(name);
-                    result.push_str(" = ");
-                }
-                result.push_str(&self.annotation_value(value)?);
+        let name = self.annotation_type(pool.utf8(annotation.type_index)?)?;
+        let mut elements = Vec::with_capacity(annotation.elements.len());
+        for (member, value) in &annotation.elements {
+            let member = pool.utf8(*member)?;
+            let mut doc = Document::new();
+            if annotation.elements.len() != 1 || member != "value" {
+                doc.push_str(member);
+                doc.push_str(" = ");
             }
-            result.push(')');
+            match value {
+                ElementValue::Annotation(nested) => doc.append(self.annotation_document(nested, None)?),
+                _ => doc.push_str(&self.annotation_value(value)?),
+            }
+            elements.push(doc);
         }
-        Ok(result)
+        Ok(match depth {
+            Some(depth) => Document::annotation(depth, &name, elements),
+            None => Document::inline_annotation(&name, elements),
+        })
     }
 
     pub(super) fn annotation_value(&self, value: &ElementValue) -> Result<String, DecompileError> {
@@ -81,12 +77,7 @@ impl<'a> Writer<'a, '_> {
                     b'Z' => Primitive::Boolean,
                     _ => return Err(DecompileError::InvalidAttribute("annotation constant")),
                 };
-                constant_literal(
-                    pool,
-                    *index,
-                    Some(&Type::Primitive(primitive)),
-                    self.options.ascii_strings,
-                )
+                constant_literal_with_options(pool, *index, Some(&Type::Primitive(primitive)), self.options, |name| self.names.render(name))
                 .map_err(|source| DecompileError::Render {
                     context: "annotation constant",
                     source: Box::new(source),

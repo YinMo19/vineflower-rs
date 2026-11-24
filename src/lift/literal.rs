@@ -3,6 +3,7 @@
 use std::fmt::Write;
 
 use crate::{
+    Options,
     classfile::{Constant, ConstantPool},
     descriptor::{Primitive, Type},
 };
@@ -24,6 +25,19 @@ pub(crate) fn constant_literal(
         Constant::Utf8(text) => string_literal(&text.utf16(), ascii),
         _ => return Err(LiftError::UnrepresentableConstant(index)),
     })
+}
+
+pub(crate) fn constant_literal_with_options(
+    pool: &ConstantPool<'_>,
+    index: u16,
+    expected: Option<&Type>,
+    options: &Options,
+    name: impl Fn(&str) -> String,
+) -> Result<String, LiftError> {
+    if !options.keep_literals && let Some(symbolic) = super::numeric::named(pool.get(index)?, expected, name) {
+        return Ok(symbolic.text);
+    }
+    constant_literal(pool, index, expected, options.ascii_strings)
 }
 
 pub(super) fn integer_literal(value: i32, expected: Option<&Type>, ascii: bool) -> String {

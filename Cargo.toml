@@ -8,6 +8,10 @@ description = "Native Rust JVM decompiler based on Vineflower"
 [dependencies]
 cesu8 = "1.1"
 clap = { version = "4.6", features = ["derive"] }
+jimage-rs = "0.0.5"
+num-integer = "0.1"
+prost = "0.14"
 tempfile = "3"
 thiserror = "2"
+unicode-general-category = "1"
 zip = { version = "2.6.1", default-features = false, features = ["deflate"] }

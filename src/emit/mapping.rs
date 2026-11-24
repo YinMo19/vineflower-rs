@@ -8,7 +8,7 @@ use std::{
 /// Mapping from original bytecode and debug lines to emitted source lines.
 #[derive(Debug, Default)]
 pub struct SourceMap {
-    /// Methods in class-file order. Source lines are zero-based.
+    /// Mapped methods. Source lines are zero-based.
     pub methods: Vec<MethodMap>,
     /// Original and decompiled source lines, both one-based.
     pub original_lines: BTreeMap<u16, usize>,
@@ -17,13 +17,15 @@ pub struct SourceMap {
 
 #[derive(Debug)]
 pub struct MethodMap {
+    /// Internal JVM name of the class declaring this method.
+    pub class_name: String,
     pub name: String,
     pub descriptor: String,
     pub offsets: BTreeMap<u32, usize>,
 }
 
 impl SourceMap {
-    pub(super) fn add(&mut self, map: MethodMap, mut lines: Vec<(u16, u16)>) {
+    pub(crate) fn add(&mut self, map: MethodMap, mut lines: Vec<(u16, u16)>) {
         lines.sort_by_key(|&(offset, _)| offset);
         let mut mapped = BTreeMap::new();
         let mut unmapped = BTreeSet::new();
@@ -60,6 +62,13 @@ impl SourceMap {
         }
     }
 
+    pub(super) fn append(&mut self, mut other: Self, lines: usize) {
+        other.shift(lines);
+        self.methods.append(&mut other.methods);
+        self.original_lines.append(&mut other.original_lines);
+        self.unmapped_lines.append(&mut other.unmapped_lines);
+    }
+
     pub(super) fn annotate(&self, source: &str, output: &mut String) {
         let mut by_source: BTreeMap<usize, Vec<u16>> = BTreeMap::new();
         for (&original, &source) in &self.original_lines {
@@ -80,26 +89,35 @@ impl SourceMap {
         }
     }
 
-    pub(super) fn dump(&self, class: &str, indent: &str, output: &mut String) {
+    pub(super) fn dump(&self, root: &str, indent: &str, output: &mut String) {
         if self.methods.is_empty() && self.original_lines.is_empty() {
             return;
         }
-        let _ = writeln!(output, "\nclass '{class}' {{");
-        for (index, method) in self.methods.iter().enumerate() {
-            if index != 0 {
-                output.push('\n');
-            }
-            let _ = writeln!(
-                output,
-                "{indent}method '{} {}' {{",
-                method.name, method.descriptor
-            );
-            for (&offset, &line) in &method.offsets {
-                let _ = writeln!(output, "{indent}{indent}{offset:x}{indent}{indent}{line}");
-            }
-            let _ = writeln!(output, "{indent}}}");
+        let mut classes: BTreeMap<&str, Vec<&MethodMap>> = BTreeMap::new();
+        for method in &self.methods {
+            classes.entry(&method.class_name).or_default().push(method);
         }
-        output.push_str("}\n\nLines mapping:\n");
+        let first = classes.remove_entry(root);
+        output.push('\n');
+        for (class, methods) in first.into_iter().chain(classes) {
+            let _ = writeln!(output, "class '{class}' {{");
+            for (index, method) in methods.into_iter().enumerate() {
+                if index != 0 {
+                    output.push('\n');
+                }
+                let _ = writeln!(
+                    output,
+                    "{indent}method '{} {}' {{",
+                    method.name, method.descriptor
+                );
+                for (&offset, &line) in &method.offsets {
+                    let _ = writeln!(output, "{indent}{indent}{offset:x}{indent}{indent}{line}");
+                }
+                let _ = writeln!(output, "{indent}}}");
+            }
+            output.push_str("}\n\n");
+        }
+        output.push_str("Lines mapping:\n");
         for (original, source) in &self.original_lines {
             let _ = writeln!(output, "{original} <-> {source}");
         }

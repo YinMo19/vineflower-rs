@@ -1,11 +1,16 @@
 // Copyright 2000-2017 JetBrains s.r.o. Use of this source code is governed by the Apache 2.0 license that can be found in the LICENSE file.
 
-use std::{cell::RefCell, collections::HashSet, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    rc::Rc,
+};
 
 use crate::{
     bytecode::Instruction,
     classfile::{ClassFile, Code, Constant, LocalVariable, Member},
-    descriptor::{MethodDescriptor, Type},
+    descriptor::{FieldSignature, GenericType, MethodDescriptor, Type},
+    naming::{VariableNamer, VariableRenamer, is_valid_local_identifier},
     options::Options,
 };
 
@@ -13,6 +18,11 @@ use super::{
     Effect, LiftError, Machine,
     expr::{Category, Expr, INT, Order, Source},
 };
+
+#[path = "joins.rs"]
+mod joins;
+#[path = "lambda_locals.rs"]
+mod lambda_locals;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Local {
@@ -26,12 +36,26 @@ struct Local {
 struct Names {
     used: HashSet<String>,
     suffix: u32,
+    version: u16,
+    namer: Option<VariableNamer>,
 }
 
 impl Names {
     fn fresh(&mut self, name: &str) -> String {
-        if self.used.insert(name.to_owned()) {
-            return name.to_owned();
+        self.fresh_owned(name.into())
+    }
+
+    fn fresh_owned(&mut self, mut name: String) -> String {
+        if !self.used.contains(&name) {
+            self.used.insert(name.clone());
+            return name;
+        }
+        if self.namer.is_some() {
+            while self.used.contains(&name) {
+                name.push('x');
+            }
+            self.used.insert(name.clone());
+            return name;
         }
         loop {
             self.suffix += 1;
@@ -41,12 +65,48 @@ impl Names {
             }
         }
     }
+
+    fn binding(
+        &mut self,
+        parameter: bool,
+        index: u16,
+        ty: &Type,
+        debug_names: [Option<&str>; 2],
+        cast_name: impl FnOnce() -> Option<String>,
+        fallback: impl FnOnce() -> String,
+    ) -> String {
+        let proposed = self.namer.as_mut().and_then(|namer| {
+            if parameter {
+                if !namer.renames_parameters() {
+                    return None;
+                }
+                namer.rename_parameter(index, ty, cast_name().as_deref())
+            } else {
+                namer.rename_local(ty, cast_name().as_deref())
+            }
+        });
+        let name = proposed
+            .filter(|name| is_valid_local_identifier(name, self.version))
+            .or_else(|| {
+                debug_names
+                    .into_iter()
+                    .flatten()
+                    .find(|name| is_valid_local_identifier(name, self.version))
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(fallback);
+        self.fresh_owned(name)
+    }
 }
+
+type GenericSignatures<'a> = HashMap<(u16, u16, u16), &'a str>;
 
 #[derive(Clone)]
 pub(super) struct Locals<'a> {
     slots: Vec<Option<Local>>,
     debug: Rc<[LocalVariable<'a>]>,
+    generic: Option<Rc<GenericSignatures<'a>>>,
+    use_debug_names: bool,
     names: Rc<RefCell<Names>>,
     parameter_names: Rc<[String]>,
 }
@@ -60,7 +120,23 @@ impl<'a> Locals<'a> {
         options: &Options,
         owner: &str,
     ) -> Result<Self, LiftError> {
-        let mut names = Names::default();
+        let namer = VariableRenamer::select(
+            options.variable_renaming.as_deref(),
+            options.jad_style_variable_naming,
+        )
+        .map(|renamer| {
+            renamer.for_method(
+                options.rename_parameters,
+                options.jad_style_parameter_naming,
+                class.major_version,
+            )
+        });
+        let custom_names = namer.is_some();
+        let mut names = Names {
+            version: class.major_version,
+            namer,
+            ..Names::default()
+        };
         for constant in class.pool.iter() {
             if let Constant::Class(index) = constant {
                 let name = class.pool.utf8(*index)?;
@@ -81,18 +157,33 @@ impl<'a> Locals<'a> {
             }
         }
         for field in &class.fields {
-            if field.access_flags & 0x0018 == 0x0018 {
+            if custom_names || field.access_flags & 0x0018 == 0x0018 {
                 names.used.insert(class.pool.utf8(field.name_index)?.into());
             }
         }
-        let debug = if options.use_debug_names {
+        let debug = if options.use_debug_names || custom_names {
             code.local_variables(&class.pool)?
         } else {
             Vec::new()
         };
+        let generic = if custom_names && !debug.is_empty() {
+            let entries = code.local_variable_types(&class.pool)?;
+            (!entries.is_empty()).then(|| {
+                Rc::new(
+                    entries
+                        .into_iter()
+                        .map(|entry| ((entry.index, entry.start_pc, entry.length), entry.descriptor))
+                        .collect(),
+                )
+            })
+        } else {
+            None
+        };
         let mut result = Self {
             slots: vec![None; usize::from(code.max_locals)],
             debug: debug.into(),
+            generic,
+            use_debug_names: options.use_debug_names,
             names: Rc::new(RefCell::new(names)),
             parameter_names: Rc::default(),
         };
@@ -137,16 +228,13 @@ impl<'a> Locals<'a> {
                 }
                 _ => None,
             };
-            let fallback = format!("param{ordinal}");
-            let name = result.names.borrow_mut().fresh(
-                marked_name
-                    .filter(|name| identifier(name))
-                    .or_else(|| {
-                        debug
-                            .map(|entry| entry.name)
-                            .filter(|name| identifier(name))
-                    })
-                    .unwrap_or(&fallback),
+            let name = result.names.borrow_mut().binding(
+                true,
+                index,
+                ty,
+                [marked_name, result.debug_name(debug)],
+                || result.generic_cast(debug),
+                || format!("var{index}"),
             );
             let debug_range = debug.map(|entry| (entry.start_pc, entry.length));
             parameter_names.push(name.clone());
@@ -188,7 +276,7 @@ impl<'a> Locals<'a> {
     }
 
     pub(super) fn temporary(&self, offset: u32) -> String {
-        self.names.borrow_mut().fresh(&format!("stack{offset}"))
+        self.names.borrow_mut().fresh_owned(format!("stack{offset}"))
     }
 
     fn debug_at(&self, index: u16, offset: u32) -> Option<&LocalVariable<'a>> {
@@ -200,9 +288,83 @@ impl<'a> Locals<'a> {
             })
             .max_by_key(|entry| entry.start_pc)
     }
+
+    fn debug_name(&self, debug: Option<&LocalVariable<'a>>) -> Option<&'a str> {
+        self.use_debug_names.then_some(debug?.name)
+    }
+
+    fn generic_cast(&self, debug: Option<&LocalVariable<'a>>) -> Option<String> {
+        let entry = debug?;
+        let signature = self.generic.as_ref()?.get(&(entry.index, entry.start_pc, entry.length))?;
+        let signature = FieldSignature::parse(signature).ok()?;
+        Some(generic_cast_name(signature.field_type))
+    }
+
+    fn local_name(&self, index: u16, ty: &Type, debug: Option<&LocalVariable<'a>>) -> String {
+        self.names.borrow_mut().binding(
+            false,
+            index,
+            ty,
+            [self.debug_name(debug), None],
+            || self.generic_cast(debug),
+            || format!("var{index}"),
+        )
+    }
+}
+
+// Both providers discard the type arguments before looking for the leaf name.
+// Avoid rendering generic arguments that do not contribute to the name.
+fn generic_cast_name(ty: GenericType) -> String {
+    let (element, array) = match ty {
+        GenericType::Array { element, .. } => (*element, true),
+        _ => (ty, false),
+    };
+    let (mut name, has_arguments) = match element {
+        GenericType::Class(class) => {
+            let mut leaf = class.internal_name;
+            let mut has_arguments = !class.arguments.is_empty();
+            for nested in class.nested {
+                if has_arguments {
+                    break;
+                }
+                leaf = nested.name;
+                has_arguments = !nested.arguments.is_empty();
+            }
+            if let Some(index) = leaf.rfind('/') {
+                leaf.drain(..=index);
+            }
+            (leaf, has_arguments)
+        }
+        GenericType::Variable(name) => (name, false),
+        GenericType::Primitive(primitive) => (primitive.java_name().into(), false),
+        GenericType::Void | GenericType::Array { .. } => {
+            unreachable!("parsed field signatures have one array node and no void")
+        }
+    };
+    if array && !has_arguments {
+        name.push_str("[]");
+    }
+    name
 }
 
 impl Machine<'_, '_> {
+    pub(crate) fn resource_local(&self, index: u16) -> Option<(String, &str)> {
+        let local = self.locals.slots.get(usize::from(index))?.as_ref()?;
+        let Type::Object(class) = &local.ty else {
+            return None;
+        };
+        if local.receiver || !self.is_auto_closeable(class) {
+            return None;
+        }
+        Some((self.render_type(&local.ty), &local.name))
+    }
+
+    pub(crate) fn forget_resource_local(&mut self, index: u16) {
+        if let Some(local) = self.locals.slots.get_mut(usize::from(index)) {
+            *local = None;
+        }
+    }
+
     pub(crate) fn bind_caught_exception(
         &mut self,
         catch_type: u16,
@@ -241,15 +403,13 @@ impl Machine<'_, '_> {
         {
             return Err(self.unsupported("catch declaration overlaps an existing local"));
         }
-        let debug = self.locals.debug_at(index, store.offset + store.len);
+        let end = self.debug_offset(store.offset + store.len - 1) + 1;
+        let debug = self
+            .locals
+            .debug_at(index, end)
+            .or_else(|| self.locals.debug_at(index, self.debug_offset(store.offset)));
         let range = debug.map(|entry| (entry.start_pc, entry.length));
-        let fallback = format!("var{index}");
-        let name = self.locals.names.borrow_mut().fresh(
-            debug
-                .map(|entry| entry.name)
-                .filter(|name| identifier(name))
-                .unwrap_or(&fallback),
-        );
+        let name = self.locals.local_name(index, &ty, debug);
         let display_type = self.render_type(&ty);
         self.locals.slots[slot] = Some(Local {
             name: name.clone(),
@@ -272,6 +432,9 @@ impl Machine<'_, '_> {
                 self.invalid_local(index, "load opcode does not match the bound slot's type")
             );
         }
+        if let Some(expr) = self.lexical_parameter(index) {
+            return self.push(expr);
+        }
         let mut expr = Expr::atom(local.ty.clone(), local.name.clone());
         if local.receiver {
             expr.source = Source::This;
@@ -293,10 +456,11 @@ impl Machine<'_, '_> {
         if slot + width > self.locals.slots.len() {
             return Err(self.invalid_local(index, "store exceeds max_locals"));
         }
+        let end = self.debug_offset(op.offset + op.len - 1) + 1;
         let debug = self
             .locals
-            .debug_at(index, op.offset + op.len)
-            .or_else(|| self.locals.debug_at(index, op.offset));
+            .debug_at(index, end)
+            .or_else(|| self.locals.debug_at(index, self.debug_offset(op.offset)));
         let debug_ty = debug
             .and_then(|entry| Type::parse(entry.descriptor).ok())
             .filter(|ty| {
@@ -323,13 +487,7 @@ impl Machine<'_, '_> {
             (local.ty.clone(), local.name.clone(), String::new())
         } else {
             let ty = debug_ty.unwrap_or_else(|| value.ty.clone());
-            let fallback = format!("var{index}");
-            let name = self.locals.names.borrow_mut().fresh(
-                debug
-                    .map(|entry| entry.name)
-                    .filter(|name| identifier(name))
-                    .unwrap_or(&fallback),
-            );
+            let name = self.locals.local_name(index, &ty, debug);
             let prefix = format!("{} ", self.render_type(&ty));
             (ty, name, prefix)
         };
@@ -379,72 +537,74 @@ impl Machine<'_, '_> {
     }
 }
 
-fn identifier(name: &str) -> bool {
-    let mut chars = name.chars();
-    chars
-        .next()
-        .is_some_and(|ch| ch.is_alphabetic() || matches!(ch, '$' | '_'))
-        && chars.all(|ch| ch.is_alphanumeric() || matches!(ch, '$' | '_'))
-        && !matches!(
-            name,
-            "abstract"
-                | "assert"
-                | "boolean"
-                | "break"
-                | "byte"
-                | "case"
-                | "catch"
-                | "char"
-                | "class"
-                | "const"
-                | "continue"
-                | "default"
-                | "do"
-                | "double"
-                | "else"
-                | "enum"
-                | "extends"
-                | "false"
-                | "final"
-                | "finally"
-                | "float"
-                | "for"
-                | "goto"
-                | "if"
-                | "implements"
-                | "import"
-                | "instanceof"
-                | "int"
-                | "interface"
-                | "long"
-                | "native"
-                | "new"
-                | "null"
-                | "package"
-                | "permits"
-                | "private"
-                | "protected"
-                | "public"
-                | "record"
-                | "return"
-                | "sealed"
-                | "short"
-                | "static"
-                | "strictfp"
-                | "super"
-                | "switch"
-                | "synchronized"
-                | "this"
-                | "throw"
-                | "throws"
-                | "transient"
-                | "true"
-                | "try"
-                | "var"
-                | "void"
-                | "volatile"
-                | "while"
-                | "yield"
-                | "_"
-        )
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{bytecode::decode, classfile::Attribute};
+
+    #[test]
+    fn plugin_names_keep_debug_parameters_and_avoid_generated_name_collisions() {
+        const CLASS: &[u8] = b"\xca\xfe\xba\xbe\0\0\0\x34\0\x0b\
+            \x01\0\x09Collision\x07\0\x01\x01\0\x10java/lang/Object\x07\0\x03\
+            \x01\0\x04test\x01\0\x04(I)I\x01\0\x12LocalVariableTable\
+            \x01\0\x01i\x01\0\x07ignored\x01\0\x01I\
+            \0\x21\0\x02\0\x04\0\0\0\0\0\0\0\0";
+        const BYTES: &[u8] = &[0x04, 0x3c, 0x1a, 0x1b, 0x60, 0xac];
+        let class = ClassFile::parse(CLASS).unwrap();
+        let method = Member {
+            access_flags: 0x0008,
+            name_index: 5,
+            descriptor_index: 6,
+            attributes: Vec::new(),
+        };
+        let code = Code {
+            max_stack: 2,
+            max_locals: 2,
+            bytes: BYTES,
+            exceptions: Vec::new(),
+            attributes: vec![Attribute {
+                name_index: 7,
+                data: b"\0\x02\0\0\0\x06\0\x08\0\x0a\0\0\0\x02\0\x04\0\x09\0\x0a\0\x01",
+            }],
+        };
+        let descriptor = MethodDescriptor::parse("(I)I").unwrap();
+        let instructions = decode(BYTES).unwrap();
+        for (rename_parameters, expected) in [(false, "ix"), (true, "j")] {
+            let mut options = Options::default();
+            options.variable_renaming = Some("jad".into());
+            options.rename_parameters = rename_parameters;
+            let mut machine =
+                Machine::new(&class, &method, &code, &descriptor, &options, &str::to_owned)
+                    .unwrap();
+            assert_eq!(machine.parameter_names(), ["i"]);
+            machine.step(&instructions[0]).unwrap();
+            match machine.step(&instructions[1]).unwrap() {
+                Effect::Statement(text) => assert_eq!(text, format!("int {expected} = 1;")),
+                _ => panic!("expected local declaration"),
+            }
+            for instruction in &instructions[2..5] {
+                machine.step(instruction).unwrap();
+            }
+            match machine.step(&instructions[5]).unwrap() {
+                Effect::Return(Some(text)) => assert_eq!(text, format!("i + {expected}")),
+                _ => panic!("expected value return"),
+            }
+            let ty = Type::Object("pkg/Stack10".into());
+            assert_eq!(machine.locals.temporary(10), "stack10");
+            assert_eq!(machine.locals.local_name(1, &ty, None), "stack10x");
+            assert_eq!(machine.locals.temporary(10), "stack10xx");
+        }
+    }
+
+    #[test]
+    fn local_generic_cast_stops_at_first_type_argument_list() {
+        for (signature, name) in [
+            ("[[TT;", "T[]"),
+            ("[Lpkg/Outer<TT;>.Inner<TT;>;", "Outer"),
+            ("Lpkg/Outer.Inner<TT;>;", "Inner"),
+        ] {
+            let ty = FieldSignature::parse(signature).unwrap().field_type;
+            assert_eq!(generic_cast_name(ty), name);
+        }
+    }
 }

@@ -4,6 +4,7 @@ use std::fmt::Write;
 
 use crate::{
     bytecode::{Instruction, Operand},
+    classfile::{OffsetTarget, TypeArgumentTarget, TypeTarget},
     descriptor::{Primitive, Type},
 };
 
@@ -411,7 +412,13 @@ impl Machine<'_, '_> {
         let ty = self.class_type(self.constant_index(op)?)?;
         let value = self.pop_category(Category::Ref)?;
         if op.opcode == 0xc0 {
-            let value = self.reference_cast(value, ty, true)?;
+            let annotated = u16::try_from(self.debug_offset(op.offset)).ok().map(|offset| {
+                self.render_code_type(&ty, TypeTarget::TypeArgument { kind: TypeArgumentTarget::Cast, offset, argument: 0 })
+            }).transpose()?.flatten();
+            if annotated.is_none() && value.ty == ty && !matches!(value.source, Source::Null) {
+                return self.push(value);
+            }
+            let value = self.reference_cast_with_name(value, ty, true, annotated)?;
             self.push(value)
         } else {
             let value = if !matches!(value.source, Source::Null)
@@ -422,10 +429,13 @@ impl Machine<'_, '_> {
             } else {
                 value
             };
+            let name = u16::try_from(self.debug_offset(op.offset)).ok().map(|offset| {
+                self.render_code_type(&ty, TypeTarget::Offset { kind: OffsetTarget::InstanceOf, offset })
+            }).transpose()?.flatten().unwrap_or_else(|| self.render_type(&ty));
             let text = format!(
                 "{} instanceof {}",
                 value.at(RELATIONAL),
-                self.render_type(&ty)
+                name
             );
             self.push(self.expression(BOOLEAN, text, RELATIONAL, [&value], true)?)
         }

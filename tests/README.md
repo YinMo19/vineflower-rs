@@ -31,20 +31,34 @@ Point `VINEFLOWER_RS_CLASS_ROOT` at that checkout. Prebuilt outputs are also nee
 
 ### Native scope
 
-The Rust runtime does not require a JVM. `cargo run -- input.class` writes Java
-to stdout; `cargo run -- input.jar output-dir` or `cargo run -- input.jar
-output.jar` writes Java and resources. Use `cargo run -- --help` for the
-supported options. Library callers can use `vineflower_rs::decompile(bytes,
-&Options::default())` to obtain the source and optional bytecode line map.
+The Rust runtime does not require a JVM. `cargo run -- input.class` writes source
+to stdout; supplying an output directory or archive writes the recovered
+compilation units and resources. Use `cargo run -- --help` for options.
+Library callers can use `vineflower_rs::decompile(bytes, &Options::default())`
+or register companion and library inputs in a `ClassGroupBuilder`.
+`ClassPath` accepts directories, archives, JDK images and lazy providers.
 
-The implementation separates class-file and signature decoding, JVM
-instructions, CFG analysis, operand-stack lifting, region recovery, and Java
-rendering. Recovery is not yet equivalent to Vineflower: stack/local joins,
-complex exception regions, inners and shared classpath context, non-concat
-`invokedynamic`, and the language plugins account for many remaining failures.
+The implementation separates class-file decoding, JVM instructions, CFG
+analysis, operand-stack lifting, region recovery, and source rendering.
+Native passes recover stack/local joins, exception regions, declared member
+classes, typed lambdas and selected dynamic constants. Kotlin reconstruction
+and Java compiler idiom recovery are incomplete; a parseable input can still
+produce an explicit unsupported error or source that differs from upstream.
 
-Baseline with all upstream fixture bytecode and required JDKs available:
-37 of 697 cases match, 537 report unsupported behavior, and 123 differ from
-the expected source. All eight upstream CLI and bulk cases match.
+Exact upstream comparison with all fixture bytecode and required JDKs:
 
-The manifest preserves explicit companions and registration metadata; the runner also discovers sibling `$*.class` files and resolves Kotlin file facades. Cases that need multiple source classes, plugin rendering, or an active classpath provider are unsupported until those native APIs exist. Fixture diagnostic and validation flags, and a documented set of baseline upstream algorithm settings in `upstream_parity.rs`, are projected to native behavior so reachable cases still attempt the exact goldens. Overrides such as literal resugaring, Javadoc callbacks or member renaming are not silently dropped. Archive comparisons check paths and entry contents, not container serialization or timestamps.
+| Snapshot | Exact | Unsupported | Different | Missing or execution errors |
+| --- | ---: | ---: | ---: | ---: |
+| Initial native pipeline | 37 | 537 | 123 | 0 |
+| Class groups and structured recovery | 73 | 254 | 370 | 0 |
+
+All eight upstream CLI and bulk cases match. The full test remains failing
+until all 697 comparisons match.
+
+The runner preserves explicit companions, discovers sibling `$*.class` files
+and resolves Kotlin file facades. It installs the upstream fixture's selected
+plugins and runtime classpath where applicable, and checks the lazy-library
+case against the native provider callback. Fixture diagnostics and validation
+flags that do not affect source generation are handled separately from source
+options. Archive comparisons check entry names and contents, not container
+serialization or timestamps.

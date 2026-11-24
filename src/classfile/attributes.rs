@@ -248,7 +248,24 @@ impl<'a> Code<'a> {
         &self,
         pool: &'p ConstantPool<'a>,
     ) -> Result<Vec<LocalVariable<'p>>, ClassError> {
-        decode_repeated_tables(&self.attributes, pool, "LocalVariableTable", 10, |reader| {
+        self.local_variable_table(pool, "LocalVariableTable")
+    }
+
+    /// Generic signatures for debug locals, indexed by the same slot and
+    /// lifetime as [`Self::local_variables`]. `descriptor` holds a signature.
+    pub fn local_variable_types<'p>(
+        &self,
+        pool: &'p ConstantPool<'a>,
+    ) -> Result<Vec<LocalVariable<'p>>, ClassError> {
+        self.local_variable_table(pool, "LocalVariableTypeTable")
+    }
+
+    fn local_variable_table<'p>(
+        &self,
+        pool: &'p ConstantPool<'a>,
+        attribute: &'static str,
+    ) -> Result<Vec<LocalVariable<'p>>, ClassError> {
+        decode_repeated_tables(&self.attributes, pool, attribute, 10, |reader| {
             let start_pc = reader.u16()?;
             let length = reader.u16()?;
             let name = pool.utf8(reader.u16()?)?;
@@ -318,7 +335,7 @@ fn parse_annotations(
     reader.table(4, |reader| read_annotation(reader, pool, 0))
 }
 
-fn read_annotation(
+pub(super) fn read_annotation(
     reader: &mut Reader<'_>,
     pool: &ConstantPool<'_>,
     depth: usize,

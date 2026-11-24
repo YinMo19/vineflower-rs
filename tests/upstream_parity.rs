@@ -14,8 +14,11 @@ use std::fmt::Display;
 use std::fs;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use vineflower_rs::{DecompileError, OptionError, Options, bytecode, classfile, decompile};
+use vineflower_rs::{ClassGroupBuilder, DecompileError, Javadoc, JavadocProvider, JavadocStyle, JavadocTarget, OptionError, Options, bytecode, classfile, decompile};
+use vineflower_rs::classpath::{ClassDataProvider, ClassPath};
 
 use inputs::{Inputs, fixture_root, require_file, suite_data};
 use manifest::{Case, Manifest, Version};
@@ -205,6 +208,16 @@ fn upstream_source_goldens_without_jdk() {
             false,
         ),
         (
+            "TestRecordAnno",
+            include_bytes!("smoke/java16/TestRecordAnno.class"),
+            false,
+        ),
+        (
+            "TestConstantUninlining",
+            include_bytes!("smoke/java8/TestConstantUninlining.class"),
+            false,
+        ),
+        (
             "TestEnumStaticField",
             include_bytes!("smoke/jasm/TestEnumStaticField.class"),
             false,
@@ -224,6 +237,43 @@ fn upstream_source_goldens_without_jdk() {
             "{name}"
         );
     }
+}
+
+#[test]
+fn upstream_javadoc_and_selected_nested_method() {
+    let goldens = fixture_root().join("testData/results/pkg");
+    let mut options = Options::default();
+    for (name, bytes, style) in [
+        ("TestJavadoc", include_bytes!("smoke/java8/TestJavadoc.class").as_slice(), JavadocStyle::Html),
+        ("TestMarkdownJavadoc", include_bytes!("smoke/java8/TestMarkdownJavadoc.class").as_slice(), JavadocStyle::Markdown),
+    ] {
+        options.javadoc = Some(Arc::new(FixtureJavadoc(style)));
+        let source = decompile(bytes, &options).unwrap();
+        assert_eq!(normalized(source.text.as_bytes(), false), read_normalized(&goldens.join(format!("{name}.dec"))).unwrap());
+    }
+    options.javadoc = None;
+    options.include_line_mappings = true;
+    options.dump_original_lines = true;
+    options.unit_test_mode = true;
+    options.method_to_decompile = "pkg/TestSingleMethodInInnerClass$Inner.test()V".into();
+    let source = vineflower_rs::decompile_group(
+        include_bytes!("smoke/java8/TestSingleMethodInInnerClass.class"),
+        [include_bytes!("smoke/java8/TestSingleMethodInInnerClass$Inner.class").as_slice()],
+        &options,
+    ).unwrap();
+    let expected = read_normalized(&goldens.join("TestSingleMethodInInnerClass.dec")).unwrap();
+    assert_eq!(normalized(source.text.as_bytes(), false), expected);
+}
+
+#[test]
+fn upstream_lazy_library_golden() {
+    let root = fixture_root();
+    let expected = read_normalized(&root.join("testData/lazyLibrary/TestLibraryIsOnClasspath.java")).unwrap();
+    lazy_library_case(
+        include_bytes!("smoke/java8/TestLibraryIsOnClasspath.class"),
+        Arc::from(include_bytes!("smoke/java8/TestLibrary.class").as_slice()),
+        &expected,
+    ).unwrap();
 }
 
 #[test]
@@ -279,32 +329,16 @@ fn run_single(case: &Case, inputs: &mut Inputs) -> Result<(), Failure> {
         _ => None,
     };
 
-    if !companions.is_empty() {
-        let paths: Vec<_> = companions
-            .iter()
-            .map(|path| path.file_name().unwrap())
-            .collect();
-        let scala = if case.version.name == "SCALA" {
-            " and Scala companion output"
-        } else {
-            ""
-        };
-        return Err(Failure::Unsupported(format!(
-            "multi-class context{scala}: {paths:?}"
-        )));
-    }
-    match case.suite {
-        "kotlin" => {
-            return Err(Failure::Unsupported(
-                "Kotlin plugin (.kt source rendering)".into(),
-            ));
-        }
-        "idea-not-null" => return Err(Failure::Unsupported("IDEA not-null plugin".into())),
-        _ => {}
-    }
     let mut options = Options::default();
+    options.decompile_kotlin = case.suite == "kotlin";
+    options.idea_notnull = case.suite == "idea-not-null";
     let mut unsupported = Vec::new();
     for (&name, &registered_value) in &case.options {
+        if let ("fabric:javadoc", "javadoc" | "markdown") = (name, registered_value) {
+            let style = if registered_value == "markdown" { JavadocStyle::Markdown } else { JavadocStyle::Html };
+            options.javadoc = Some(Arc::new(FixtureJavadoc(style)));
+            continue;
+        }
         let value = match (name, &runtime) {
             ("include-runtime", Some(home)) => home.to_str().ok_or_else(|| {
                 Failure::Execution(format!("non-UTF-8 JDK path {}", home.display()))
@@ -325,13 +359,11 @@ fn run_single(case: &Case, inputs: &mut Inputs) -> Result<(), Failure> {
                         | ("dump-exception-on-error", "0")
                         | ("include-runtime", "")
                         | ("include-classpath", "0")
-                        | ("decompile-inner", "1")
+                        | ("include-classpath", "1") // The runner supplies the registered class group.
                         | ("verify-pre-post-merges", "1")
                         | ("verify-anonymous-classes", "1")
                         | ("ternary-in-if", "1")
-                        | ("force-jsr-inline", "1")
                         | ("ignore-invalid-bytecode", "1")
-                        | ("keep-literals", "1")
                 ) => {}
             Err(OptionError::Unsupported(_)) => unsupported.push(format!("{name}={value}")),
             Err(error) => return Err(Failure::Execution(error.to_string())),
@@ -344,17 +376,24 @@ fn run_single(case: &Case, inputs: &mut Inputs) -> Result<(), Failure> {
         )));
     }
 
-    let bytes = fs::read(&class).map_err(|e| Failure::io(&class, e))?;
-    let source = decompile(&bytes, &options).map_err(|error| {
-        let failure = format!("{}: {error}", class.display());
+    let load = |path: &Path| fs::read(path).map_err(|e| Failure::io(path, e));
+    let bytes = load(&class)?;
+    let companion_bytes = companions.iter().map(|path| load(path)).collect::<Result<Vec<_>, _>>()?;
+    let as_failure = |path: &Path, error: DecompileError| {
+        let failure = format!("{}: {error}", path.display());
         match error {
-            DecompileError::Unsupported { .. } | DecompileError::Method { .. } => {
-                Failure::Unsupported(failure)
-            }
+            DecompileError::Unsupported { .. } | DecompileError::Method { .. } | DecompileError::Kotlin(_) => Failure::Unsupported(failure),
             _ => Failure::Execution(failure),
         }
-    })?;
-    let actual_name = format!("{}.java", source.class_name.rsplit('/').next().unwrap());
+    };
+    let mut builder = ClassGroupBuilder::new();
+    let primary = builder.add(&bytes).map_err(|error| as_failure(&class, error.into()))?;
+    for (path, bytes) in companions.iter().zip(&companion_bytes) {
+        builder.add(bytes).map_err(|error| as_failure(path, error.into()))?;
+    }
+    let group = builder.build().map_err(|error| as_failure(&class, error.into()))?;
+    let source = group.decompile(&primary, &options).map_err(|error| as_failure(&class, error))?;
+    let actual_name = format!("{}.{}", source.class_name.rsplit('/').next().unwrap(), source.file_extension);
     let stem = class
         .file_stem()
         .and_then(|s| s.to_str())
@@ -371,7 +410,14 @@ fn run_single(case: &Case, inputs: &mut Inputs) -> Result<(), Failure> {
             "expected output {expected_name}, generated {actual_name}"
         )));
     }
-    let actual = normalized(source.text.as_bytes(), false);
+    let mut actual = normalized(source.text.as_bytes(), false);
+    if case.version.name == "SCALA" {
+        for companion in &case.companions {
+            let source = group.decompile(companion, &options).map_err(|error| as_failure(&class, error))?;
+            use std::fmt::Write;
+            let _ = write!(actual, "\n\n// Decompiled companion from {companion}\n{}", normalized(source.text.as_bytes(), false));
+        }
+    }
     let expected = read_normalized(&reference)?;
     if actual == expected {
         return Ok(());
@@ -399,19 +445,55 @@ fn run_single(case: &Case, inputs: &mut Inputs) -> Result<(), Failure> {
     )))
 }
 
+struct FixtureJavadoc(JavadocStyle);
+
+impl JavadocProvider for FixtureJavadoc {
+    fn javadoc(&self, target: JavadocTarget<'_, '_>) -> Option<Javadoc> {
+        let (kind, name) = match target {
+            JavadocTarget::Class(class) => ("Class", class.pool.class_name(class.this_class).unwrap()),
+            JavadocTarget::Field(class, field) => ("Field", class.pool.utf8(field.name_index).unwrap()),
+            JavadocTarget::Method(class, method) => ("Method", class.pool.utf8(method.name_index).unwrap()),
+        };
+        Some(Javadoc { style: self.0, text: format!("{kind} javadoc for '{name}'") })
+    }
+}
+
 fn run_lazy_library(inputs: &mut Inputs) -> Result<(), Failure> {
     let java8 = Version::java8();
-    require_file(
-        inputs
-            .data("core")
-            .join("lazyLibrary/TestLibraryIsOnClasspath.java"),
+    let expected = read_normalized(&require_file(
+        inputs.data("core").join("lazyLibrary/TestLibraryIsOnClasspath.java"),
         "lazy-library golden",
-    )?;
-    inputs.class_file("core", java8, "pkg/TestLibraryIsOnClasspath")?;
-    inputs.class_file("core", java8, "ext/TestLibrary")?;
-    Err(Failure::Unsupported(
-        "lazy classpath provider (IContextSource)".into(),
-    ))
+    )?)?;
+    let primary = inputs.class_file("core", java8, "pkg/TestLibraryIsOnClasspath")?;
+    let library = inputs.class_file("core", java8, "ext/TestLibrary")?;
+    let bytes = fs::read(&primary).map_err(|error| Failure::io(&primary, error))?;
+    let library_bytes = fs::read(&library).map_err(|error| Failure::io(&library, error))?;
+    lazy_library_case(&bytes, Arc::from(library_bytes), &expected)
+}
+
+fn lazy_library_case(bytes: &[u8], library: Arc<[u8]>, expected: &str) -> Result<(), Failure> {
+    #[derive(Debug)]
+    struct FixtureLibrary { bytes: Arc<[u8]>, reads: Arc<AtomicUsize> }
+    impl ClassDataProvider for FixtureLibrary {
+        fn load(&self, name: &str) -> std::io::Result<Option<Arc<[u8]>>> {
+            Ok((name == "ext/TestLibrary").then(|| {
+                self.reads.fetch_add(1, Ordering::Relaxed);
+                Arc::clone(&self.bytes)
+            }))
+        }
+    }
+    let reads = Arc::new(AtomicUsize::new(0));
+    let mut classpath = ClassPath::new();
+    classpath.add_provider(FixtureLibrary { bytes: library, reads: Arc::clone(&reads) });
+    let mut options = Options::default();
+    options.library_classpath = Some(Arc::new(classpath));
+    let output = decompile(bytes, &options).map_err(|error| Failure::Execution(error.to_string()))?;
+    let actual = normalized(output.text.as_bytes(), false);
+    if actual != expected { return Err(Failure::Mismatch(difference(expected, &actual))); }
+    if reads.load(Ordering::Relaxed) != 1 {
+        return Err(Failure::Execution("expected one lazy class read, including cached lookups".into()));
+    }
+    Ok(())
 }
 
 fn read_normalized(path: &Path) -> Result<String, Failure> {

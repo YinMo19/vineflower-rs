@@ -5,6 +5,8 @@
 
 mod attributes;
 mod pool;
+mod stack_map;
+mod type_annotations;
 #[cfg(test)]
 mod tests;
 
@@ -12,6 +14,8 @@ pub use attributes::{
     Annotation, BootstrapMethod, ElementValue, InnerClass, MethodParameter, RecordComponent,
 };
 pub use pool::{Constant, ConstantPool, ModifiedUtf8};
+pub use stack_map::{StackMapError, StackMapFrame, VerificationType, initial_stack_map_locals};
+pub use type_annotations::{LocalTypeRange, OffsetTarget, Supertype, TypeAnnotation, TypeArgumentTarget, TypePathStep, TypeTarget};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClassError {
@@ -62,6 +66,8 @@ pub enum ClassError {
     InvalidElementTag(u8),
     #[error("annotation nesting exceeds the supported depth of {0}")]
     AnnotationNestingLimit(usize),
+    #[error("invalid type annotation at attribute byte {offset}: {reason}")]
+    InvalidTypeAnnotation { offset: usize, reason: &'static str },
 }
 
 #[derive(Debug)]

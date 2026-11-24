@@ -3,21 +3,37 @@
 //! Lowers JVM values into Java expressions, materializing stack values when
 //! the JVM's evaluation schedule cannot otherwise be represented in Java.
 
+mod anonymous;
+mod concat;
+mod dynamic;
 mod expr;
+mod generics;
 mod literal;
 mod locals;
 mod members;
+mod nested;
+mod numeric;
 mod operations;
 
-pub(crate) use literal::{constant_literal, string_literal};
+pub(crate) use anonymous::{AnonymousSite, AnonymousSites};
+pub(crate) use literal::{constant_literal, constant_literal_with_options, string_literal};
+pub(crate) use dynamic::source_method_name;
 
 #[cfg(test)]
 mod tests;
 
+use std::{cell::RefCell, collections::BTreeSet, rc::Rc};
+
 use crate::{
+    ClassGroup,
     bytecode::{Instruction, Operand},
-    classfile::{BootstrapMethod, ClassError, ClassFile, Code, Constant, Member},
+    classfile::{
+        BootstrapMethod, ClassError, ClassFile, Code, Constant, Member, StackMapError,
+        TypeTarget, VerificationType, initial_stack_map_locals,
+    },
     descriptor::{DescriptorError, MethodDescriptor, Primitive, Type},
+    legacy::NormalizedCode,
+    naming::MemberRenames,
     options::Options,
 };
 
@@ -32,6 +48,10 @@ pub(crate) enum LiftError {
     Class(#[from] ClassError),
     #[error(transparent)]
     Descriptor(#[from] DescriptorError),
+    #[error(transparent)]
+    StackMap(#[from] StackMapError),
+    #[error("cannot render bytecode type annotation: {0}")]
+    TypeAnnotation(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("unsupported opcode {opcode:#04x} at bytecode offset {offset}: {reason}")]
     Unsupported {
         offset: u32,
@@ -72,9 +92,18 @@ pub(crate) enum Effect {
     },
 }
 
+pub(crate) type DynamicHelpers = Rc<RefCell<BTreeSet<(u16, u16)>>>;
+type CodeTypeRenderer<'c> = dyn Fn(&Type, TypeTarget) -> Result<Option<String>, LiftError> + 'c;
+
+
 #[derive(Clone)]
 pub(crate) struct Machine<'a, 'c> {
     class: &'c ClassFile<'a>,
+    group: Option<&'c ClassGroup<'a>>,
+    renames: Option<&'c MemberRenames>,
+    normalized: Option<&'c NormalizedCode>,
+    method: &'c Member<'a>,
+    code: &'c Code<'a>,
     descriptor: &'c MethodDescriptor,
     options: &'c Options,
     class_name: &'c dyn Fn(&str) -> String,
@@ -87,6 +116,10 @@ pub(crate) struct Machine<'a, 'c> {
     stack: Vec<Expr>,
     prelude: Vec<String>,
     bootstrap: Option<std::rc::Rc<[BootstrapMethod]>>,
+    dynamic_helpers: Option<DynamicHelpers>,
+    anonymous_sites: Option<AnonymousSites>,
+    code_type_renderer: Option<&'c CodeTypeRenderer<'c>>,
+    lambda_depth: u8,
     initialized_this: bool,
     opcode: u8,
     offset: u32,
@@ -109,6 +142,11 @@ impl<'a, 'c> Machine<'a, 'c> {
         let locals = Locals::new(class, method, code, descriptor, options, owner)?;
         Ok(Self {
             class,
+            group: None,
+            renames: None,
+            normalized: None,
+            method,
+            code,
             descriptor,
             options,
             class_name,
@@ -121,10 +159,73 @@ impl<'a, 'c> Machine<'a, 'c> {
             stack: Vec::new(),
             prelude: Vec::new(),
             bootstrap: None,
+            dynamic_helpers: None,
+            anonymous_sites: None,
+            code_type_renderer: None,
+            lambda_depth: 0,
             initialized_this: method_name != "<init>" || super_class.is_none(),
             opcode: 0,
             offset: 0,
         })
+    }
+
+    pub(crate) fn with_group(mut self, group: &'c ClassGroup<'a>) -> Self {
+        self.group = Some(group);
+        self
+    }
+
+    pub(crate) fn set_code_type_renderer(&mut self, renderer: &'c CodeTypeRenderer<'c>) {
+        self.code_type_renderer = Some(renderer);
+    }
+
+    pub(crate) fn set_member_renames(&mut self, renames: &'c MemberRenames) {
+        self.renames = Some(renames);
+    }
+
+    fn source_field_name<'n>(&'n self, owner: &str, name: &'n str, descriptor: &str) -> &'n str {
+        self.renames.map_or(name, |plan| plan.field_name(owner, name, descriptor))
+    }
+
+    pub(crate) fn with_normalized_offsets(mut self, normalized: &'c NormalizedCode) -> Self {
+        self.normalized = Some(normalized);
+        self
+    }
+
+    fn debug_offset(&self, offset: u32) -> u32 {
+        self.normalized.and_then(|code| code.source_offset(offset)).unwrap_or(offset)
+    }
+
+    pub(crate) fn set_dynamic_helpers(&mut self, helpers: DynamicHelpers) {
+        self.dynamic_helpers = Some(helpers);
+    }
+
+    pub(crate) fn render_catch_type(&self, catch_type: u16) -> Result<String, LiftError> {
+        Ok((self.class_name)(self.class.pool.class_name(catch_type)?))
+    }
+
+    pub(crate) fn exception_class(&self, index: u16) -> Result<&str, LiftError> {
+        Ok(self.class.pool.class_name(index)?)
+    }
+
+    pub(crate) fn exception_member(&self, index: u16) -> Result<(&str, &str, &str), LiftError> {
+        Ok(self.class.pool.member_ref(index)?)
+    }
+
+    pub(crate) fn is_auto_closeable(&self, owner: &str) -> bool {
+        crate::hierarchy::is_assignable(self.group, self.options, owner, "java/lang/AutoCloseable")
+    }
+
+    pub(crate) fn caught_exception_stack_type(&self, handler_offset: u32) -> Result<Option<u16>, LiftError> {
+        let initial = initial_stack_map_locals(self.class, self.method, self.descriptor)?;
+        let mut caught = None;
+        self.code.visit_stack_map_frames(&self.class.pool, &initial, None, |frame| {
+            if u32::from(frame.offset) == handler_offset
+                && let [VerificationType::Object(index)] = frame.stack
+            {
+                caught = Some(*index);
+            }
+        })?;
+        Ok(caught)
     }
 
     pub(crate) fn parameter_names(&self) -> &[String] {
@@ -156,6 +257,22 @@ impl<'a, 'c> Machine<'a, 'c> {
 
     pub(crate) fn take_prelude(&mut self) -> Vec<String> {
         std::mem::take(&mut self.prelude)
+    }
+
+    pub(crate) fn take_monitor_lock(&mut self, op: &Instruction) -> Result<String, LiftError> {
+        self.offset = op.offset;
+        self.opcode = op.opcode;
+        self.lower_pending_comparison()?;
+        let lock = self.pop_category(Category::Ref)?;
+        if !self.stack_is_empty() {
+            return Err(self.unsupported("pending operand across synchronized entry"));
+        }
+        self.before_statement(lock.order)?;
+        Ok(if matches!(lock.source, Source::Null) {
+            format!("(Object){}", lock.text)
+        } else {
+            lock.text
+        })
     }
 
     pub(crate) fn step(&mut self, op: &Instruction) -> Result<Effect, LiftError> {
@@ -277,12 +394,24 @@ impl<'a, 'c> Machine<'a, 'c> {
 
     fn load_constant(&mut self, op: &Instruction) -> Result<(), LiftError> {
         let index = self.constant_index(op)?;
-        let value = match self.class.pool.get(index)? {
-            Constant::Integer(value) => Expr::integer(*value),
-            Constant::Long(_) => Expr::literal(
-                Type::Primitive(Primitive::Long),
-                constant_literal(&self.class.pool, index, None, self.options.ascii_strings)?,
-            ),
+        let constant = self.class.pool.get(index)?;
+        let named = || {
+            (!self.options.keep_literals)
+                .then(|| numeric::named(constant, None, self.class_name)).flatten()
+        };
+        let value = match constant {
+            Constant::Integer(value) => {
+                if let Some(named) = named() {
+                    Expr {
+                        source: Source::Integer(*value),
+                        precedence: named.precedence,
+                        ..Expr::literal(expr::INT, named.text)
+                    }
+                } else {
+                    Expr::integer(*value)
+                }
+            }
+            Constant::Long(value) => numeric::expression(Primitive::Long, named(), || format!("{value}L")),
             Constant::Float(value) if value.is_nan() && value.to_bits() != f32::NAN.to_bits() => {
                 let class = (self.class_name)("java/lang/Float");
                 Expr {
@@ -309,14 +438,8 @@ impl<'a, 'c> Machine<'a, 'c> {
                     )?
                 }
             }
-            Constant::Float(value) => Expr::literal(
-                Type::Primitive(Primitive::Float),
-                literal::float_literal(*value),
-            ),
-            Constant::Double(value) => Expr::literal(
-                Type::Primitive(Primitive::Double),
-                literal::double_literal(*value),
-            ),
+            Constant::Float(value) => numeric::expression(Primitive::Float, named(), || literal::float_literal(*value)),
+            Constant::Double(value) => numeric::expression(Primitive::Double, named(), || literal::double_literal(*value)),
             Constant::String(_) => Expr::literal(
                 Type::Object("java/lang/String".into()),
                 constant_literal(&self.class.pool, index, None, self.options.ascii_strings)?,
@@ -331,7 +454,7 @@ impl<'a, 'c> Machine<'a, 'c> {
                     true,
                 )?
             }
-            Constant::Dynamic { .. } => return Err(self.unsupported("dynamic constant bootstrap")),
+            Constant::Dynamic { .. } => self.dynamic_constant(index)?,
             Constant::MethodType(_) | Constant::MethodHandle { .. } => {
                 return Err(
                     self.unsupported("method handle/type constants have no direct Java expression")
@@ -472,7 +595,7 @@ impl<'a, 'c> Machine<'a, 'c> {
     }
 
     fn spill(&mut self, value: &mut Expr) {
-        let name = self.locals.temporary(self.offset);
+        let name = self.locals.temporary(self.debug_offset(self.offset));
         let ty = self.render_type(&value.ty);
         self.prelude.push(format!("{ty} {name} = {};", value.text));
         value.text = name;
@@ -535,8 +658,17 @@ impl<'a, 'c> Machine<'a, 'c> {
         ty.render(self.class_name)
     }
 
+    fn render_code_type(&self, ty: &Type, target: TypeTarget) -> Result<Option<String>, LiftError> {
+        self.code_type_renderer.map_or(Ok(None), |render| render(ty, target))
+    }
+
     fn known_assignable(&self, from: &Type, to: &Type) -> bool {
         if from == to {
+            return true;
+        }
+        if let (Type::Object(from), Type::Object(to)) = (from, to)
+            && crate::hierarchy::is_assignable(self.group, self.options, from, to)
+        {
             return true;
         }
         match (from, to) {

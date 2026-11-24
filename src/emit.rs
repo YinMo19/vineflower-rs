@@ -1,32 +1,39 @@
 // Based on Vineflower ClassWriter and ClassesProcessor (Apache-2.0).
 // Copyright 2000-2021 JetBrains s.r.o.
 mod annotation;
+mod anonymous;
 mod enumeration;
 mod initializers;
+mod layout;
 mod mapping;
 mod module;
 mod names;
+mod nested;
+mod options_support;
 mod record;
+mod type_annotations;
 
 pub use mapping::{MethodMap, SourceMap};
 
-use std::{collections::BTreeMap, fmt::Write};
+use std::{collections::BTreeMap, fmt::Write, rc::Rc};
 
 use thiserror::Error;
 
 use crate::{
     Options, bytecode,
     cfg::ControlFlowGraph,
-    classfile::{ClassError, ClassFile, Code, Member, RecordComponent, find_attribute},
-    descriptor::{
-        ClassSignature, DescriptorError, FieldSignature, MethodDescriptor, MethodSignature, Type,
-        render_type_parameters,
-    },
-    lift::{Machine, constant_literal},
+    classfile::{ClassError, ClassFile, Code, Member, RecordComponent, Supertype, TypeTarget, find_attribute},
+    context::{ClassGroup, ClassGroupBuilder},
+    descriptor::{ClassSignature, DescriptorError, FieldSignature, MethodDescriptor, MethodSignature, Type},
+    javadoc::JavadocTarget,
+    lift::{DynamicHelpers, Machine, constant_literal_with_options},
+    naming::MemberRenames,
     structure::{Line, structure_with_handlers},
 };
 use enumeration::Enumeration;
+use layout::Document;
 use names::{Names, simple};
+use type_annotations::TypeNesting;
 
 const PUBLIC: u16 = 0x0001;
 const PRIVATE: u16 = 0x0002;
@@ -51,8 +58,18 @@ const VISIBILITY: u16 = PUBLIC | PRIVATE | PROTECTED;
 pub struct Source {
     /// Original internal JVM name, e.g. `example/Counter`.
     pub class_name: String,
+    renamed_name: Option<String>,
     pub text: String,
+    /// Source filename extension without a leading dot.
+    pub file_extension: &'static str,
     pub map: Option<SourceMap>,
+}
+
+impl Source {
+    /// Internal binary name under which the emitted source should be saved.
+    pub fn output_class_name(&self) -> &str {
+        self.renamed_name.as_deref().unwrap_or(&self.class_name)
+    }
 }
 
 #[derive(Debug, Error)]
@@ -65,6 +82,10 @@ pub enum DecompileError {
         #[source]
         source: DescriptorError,
     },
+    #[error("source class {0:?} does not exist in the class group")]
+    MissingClass(String),
+    #[error(transparent)]
+    Kotlin(#[from] crate::kotlin::KotlinError),
     #[error("malformed {0} attribute")]
     InvalidAttribute(&'static str),
     #[error("unsupported Java recovery: {feature}")]
@@ -86,22 +107,64 @@ pub enum DecompileError {
 
 /// Recover a compilation unit without running a JVM or delegating to a Java decompiler.
 pub fn decompile(bytes: &[u8], options: &Options) -> Result<Source, DecompileError> {
-    let class = ClassFile::parse(bytes)?;
+    decompile_group(bytes, std::iter::empty(), options)
+}
+
+/// Recover the primary compilation unit with class metadata from companion files.
+pub fn decompile_group<'a>(
+    primary: &'a [u8],
+    companions: impl IntoIterator<Item = &'a [u8]>,
+    options: &Options,
+) -> Result<Source, DecompileError> {
+    let mut builder = ClassGroupBuilder::new();
+    let primary = builder.add(primary)?;
+    for bytes in companions {
+        builder.add(bytes)?;
+    }
+    builder.build()?.decompile(&primary, options)
+}
+
+pub(crate) fn decompile_class(
+    group: &ClassGroup<'_>,
+    class_name: &str,
+    options: &Options,
+    renames: &MemberRenames,
+) -> Result<Source, DecompileError> {
+    let class = group.get(class_name).expect("source class is registered");
     let class_name = class.pool.class_name(class.this_class)?;
-    let names = Names::new(&class, class_name, options.remove_imports)?;
+    if options.decompile_kotlin
+        && let Some(source) = crate::kotlin::decompile_class(class)?
+    {
+        let text = finish_source(class_name, options.banner.clone(), &source, None, options);
+        return Ok(Source {
+            class_name: class_name.into(),
+            renamed_name: None,
+            text,
+            file_extension: "kt",
+            map: None,
+        });
+    }
+    let source_name = renames.class_name(class_name);
+    let names = Names::new(group, class_name, options.remove_imports, renames);
     let mut writer = Writer {
-        class: &class,
+        class,
+        owner: class_name,
+        flags: class.access_flags,
+        depth: 0,
+        group,
+        dynamic_helpers: DynamicHelpers::default(),
         names: &names,
+        type_nesting: Rc::new(TypeNesting::new(class)?),
         options,
         body: String::new(),
         lines: 0,
         mapping: options.include_line_mappings.then(SourceMap::default),
     };
-    let package = class_name
+    let package = source_name
         .rsplit_once('/')
         .map(|(package, _)| package.replace('/', "."));
     let mut prefix = options.banner.clone();
-    match simple(class_name) {
+    match simple(source_name) {
         "module-info" if class.access_flags & MODULE != 0 => {
             writer.module()?;
             let import_start = prefix.len();
@@ -131,38 +194,53 @@ pub fn decompile(bytes: &[u8], options: &Options) -> Result<Source, DecompileErr
             }
         }
     }
-    if let Some(mapping) = &mut writer.mapping {
-        mapping.shift(prefix.bytes().filter(|&byte| byte == b'\n').count());
-    }
-    prefix.push_str(&writer.body);
-    let mut text = if let Some(mapping) = &writer.mapping
-        && options.dump_original_lines
-        && !mapping.original_lines.is_empty()
-    {
-        let mut annotated = String::with_capacity(prefix.len());
-        mapping.annotate(&prefix, &mut annotated);
-        annotated
-    } else {
-        prefix
-    };
-    if let Some(mapping) = &writer.mapping
-        && options.unit_test_mode
-    {
-        mapping.dump(class_name, &options.indent, &mut text);
-    }
-    if options.crlf {
-        text = text.replace('\n', "\r\n");
-    }
+    let text = finish_source(class_name, prefix, &writer.body, writer.mapping.as_mut(), options);
     Ok(Source {
         class_name: class_name.into(),
+        renamed_name: (source_name != class_name).then(|| source_name.into()),
         text,
+        file_extension: "java",
         map: writer.mapping,
     })
 }
 
+fn finish_source(
+    class_name: &str,
+    mut prefix: String,
+    body: &str,
+    mapping: Option<&mut SourceMap>,
+    options: &Options,
+) -> String {
+    if let Some(mapping) = mapping {
+        mapping.shift(prefix.bytes().filter(|&byte| byte == b'\n').count());
+        prefix.push_str(body);
+        if options.dump_original_lines && !mapping.original_lines.is_empty() {
+            let mut annotated = String::with_capacity(prefix.len());
+            mapping.annotate(&prefix, &mut annotated);
+            prefix = annotated;
+        }
+        if options.unit_test_mode {
+            mapping.dump(class_name, &options.indent, &mut prefix);
+        }
+    } else {
+        prefix.push_str(body);
+    }
+    if options.crlf {
+        prefix.replace('\n', "\r\n")
+    } else {
+        prefix
+    }
+}
+
 struct Writer<'a, 'c> {
     class: &'c ClassFile<'a>,
-    names: &'c Names<'c>,
+    group: &'c ClassGroup<'a>,
+    owner: &'c str,
+    flags: u16,
+    depth: usize,
+    names: &'c Names<'a, 'c>,
+    type_nesting: Rc<TypeNesting<'c>>,
+    dynamic_helpers: DynamicHelpers,
     options: &'c Options,
     body: String,
     lines: usize,
@@ -171,18 +249,31 @@ struct Writer<'a, 'c> {
 
 impl<'a, 'c> Writer<'a, 'c> {
     fn line(&mut self, depth: usize, text: &str) {
-        if !text.is_empty() {
-            for _ in 0..depth {
-                self.body.push_str(&self.options.indent);
+        for line in text.split('\n') {
+            if !line.is_empty() {
+                for _ in 0..self.depth + depth {
+                    self.body.push_str(&self.options.indent);
+                }
+                self.body.push_str(line);
             }
-            self.body.push_str(text);
+            self.body.push('\n');
+            self.lines += 1;
         }
+    }
+
+    fn document_line(&mut self, depth: usize, doc: &Document) {
+        for _ in 0..self.depth + depth {
+            self.body.push_str(&self.options.indent);
+        }
+        self.lines += doc.render_with_crlf(
+            &mut self.body, self.options.preferred_line_length, &self.options.indent, self.options.crlf,
+        );
         self.body.push('\n');
         self.lines += 1;
     }
 
     fn class(&mut self, name: &str) -> Result<(), DecompileError> {
-        let flags = self.class.access_flags;
+        let flags = self.flags;
         let is_enum = flags & ENUM != 0;
         let enumeration = is_enum
             .then(|| Enumeration::recover(self.class, self.options.ascii_strings))
@@ -191,16 +282,31 @@ impl<'a, 'c> Writer<'a, 'c> {
         let is_annotation = flags & ANNOTATION != 0;
         let components = self.class.record_components()?;
         let permitted = self.class.permitted_subclasses()?;
+        if self.depth == 0 && self.names.renames().simple_class_alias(self.owner).is_some() {
+            self.line(0, &format!("// $VF: renamed from: {}", self.owner.replace('/', ".")));
+        }
+        self.sourcefile_comment()?;
+        self.javadoc(0, JavadocTarget::Class(self.class));
         self.class_annotations(0)?;
 
         let mut head = String::new();
         visibility(&mut head, flags);
         if !is_enum && !is_interface && components.is_none() {
             modifier(&mut head, flags, ABSTRACT, "abstract ");
+        }
+        if self.depth != 0 && !is_enum && !is_interface && components.is_none() {
+            modifier(&mut head, flags, STATIC, "static ");
+        }
+        if !is_enum && !is_interface && components.is_none() {
             modifier(&mut head, flags, FINAL, "final ");
         }
+        modifier(&mut head, flags, STRICT, "strictfp ");
         if !is_enum && !permitted.is_empty() {
             head.push_str("sealed ");
+        } else if !is_enum && flags & FINAL == 0 && components.is_none()
+            && crate::hierarchy::is_permitted_subclass(self.group, self.options, self.class, self.owner)?
+        {
+            head.push_str("non-sealed ");
         }
         head.push_str(
             match (is_enum, is_annotation, is_interface, components.is_some()) {
@@ -220,25 +326,31 @@ impl<'a, 'c> Writer<'a, 'c> {
         } else {
             None
         };
-        let map_name = |name: &str| self.names.render(name);
+        let pool = &self.class.pool;
+        let mut annotations = self.class.type_annotations(true)?;
+        annotations.extend(self.class.type_annotations(false)?);
         if let Some(sig) = &sig {
-            head.push_str(&render_type_parameters(&sig.type_parameters, map_name));
+            self.type_parameters(&mut head, &sig.type_parameters, &annotations, TypeTarget::ClassTypeParameter)?;
         }
-        if let Some(components) = &components {
-            self.record_header(&mut head, components)?;
-        } else if !is_enum
+        let record_components = if let Some(components) = &components {
+            Some((head.len(), self.record_components_source(components)?))
+        } else {
+            None
+        };
+        if components.is_none() && !is_enum
             && !is_interface
             && self.class.super_class != 0
             && self.class.pool.class_name(self.class.super_class)? != "java/lang/Object"
         {
             head.push_str(" extends ");
-            if let Some(sig) = &sig {
-                head.push_str(&sig.superclass.render(map_name));
+            let target = TypeTarget::Supertype(Supertype::Superclass);
+            let ty = if let Some(sig) = &sig {
+                self.render_type_target(&sig.superclass, &annotations, target, &[], false)?
             } else {
-                head.push_str(&map_name(
-                    self.class.pool.class_name(self.class.super_class)?,
-                ));
-            }
+                let ty = Type::Object(pool.class_name(self.class.super_class)?.into());
+                self.render_type_target(&ty, &annotations, target, &[], false)?
+            };
+            head.push_str(&ty);
         }
         if !is_annotation && !self.class.interfaces.is_empty() {
             head.push_str(if is_interface {
@@ -246,24 +358,36 @@ impl<'a, 'c> Writer<'a, 'c> {
             } else {
                 " implements "
             });
-            if let Some(sig) = &sig {
-                comma_list(
-                    &mut head,
-                    sig.interfaces.iter().map(|iface| iface.render(map_name)),
-                );
-            } else {
-                push_class_list(&mut head, &self.class.interfaces, self.class, &map_name)?;
+            for (index, &interface) in self.class.interfaces.iter().enumerate() {
+                if index != 0 { head.push_str(", "); }
+                let target = TypeTarget::Supertype(Supertype::Interface(index as u16));
+                let ty = if let Some(interface) = sig.as_ref().and_then(|sig| sig.interfaces.get(index)) {
+                    self.render_type_target(interface, &annotations, target, &[], false)?
+                } else {
+                    let ty = Type::Object(pool.class_name(interface)?.into());
+                    self.render_type_target(&ty, &annotations, target, &[], false)?
+                };
+                head.push_str(&ty);
             }
         }
         if !is_enum && !permitted.is_empty() {
             head.push_str(" permits ");
-            push_class_list(&mut head, &permitted, self.class, &map_name)?;
+            push_class_list(&mut head, &permitted, self.class, &|name| self.names.render(name))?;
         }
         head.push_str(" {");
-        self.line(0, &head);
+        if let Some((at, components)) = record_components {
+            let suffix = head.split_off(at);
+            let mut doc = Document::from(head);
+            doc.append(Document::record(self.depth, components));
+            doc.push_str(&suffix);
+            self.document_line(0, &doc);
+        } else {
+            self.line(0, &head);
+        }
 
         let mut needs_gap = false;
-        if let Some(info) = &enumeration {
+        let emit_fields = self.options.method_to_decompile.is_empty();
+        if let Some(info) = enumeration.as_ref().filter(|_| emit_fields) {
             let declarations = info.declarations();
             for (index, declaration) in declarations.iter().enumerate() {
                 let separator = if index + 1 == declarations.len() {
@@ -279,11 +403,21 @@ impl<'a, 'c> Writer<'a, 'c> {
             needs_gap = true;
         }
         let mut wrote_field = false;
-        let mut interface_inits = is_interface
+        let mut interface_inits = (is_interface && emit_fields)
             .then(|| self.interface_initializers())
             .transpose()?;
         let mut interface_offsets = BTreeMap::new();
-        for field in &self.class.fields {
+        for field in self.class.fields.iter().filter(|_| emit_fields) {
+            let pool = &self.class.pool;
+            if self.has_lexical_owner()
+                && self.group.outer_field(
+                    self.owner,
+                    pool.utf8(field.name_index)?,
+                    pool.utf8(field.descriptor_index)?,
+                ).is_some()
+            {
+                continue;
+            }
             if let Some(info) = &enumeration {
                 let name = self.class.pool.utf8(field.name_index)?;
                 if info.hides_field(field, name) {
@@ -321,6 +455,7 @@ impl<'a, 'c> Writer<'a, 'c> {
             {
                 mapping.add(
                     MethodMap {
+                        class_name: self.owner.into(),
                         name: "<clinit>".into(),
                         descriptor: "()V".into(),
                         offsets: interface_offsets,
@@ -333,26 +468,8 @@ impl<'a, 'c> Writer<'a, 'c> {
         for method in &self.class.methods {
             constructors += usize::from(self.class.pool.utf8(method.name_index)? == "<init>");
         }
-        for method in &self.class.methods {
-            if is_interface && self.class.pool.utf8(method.name_index)? == "<clinit>" {
-                continue;
-            }
-            if self.hidden(method)?
-                || (self.options.remove_bridge && method.access_flags & BRIDGE != 0)
-            {
-                continue;
-            }
-            if self.method(
-                name,
-                method,
-                components.as_deref(),
-                enumeration.as_ref(),
-                constructors,
-                needs_gap,
-            )? {
-                needs_gap = true;
-            }
-        }
+        self.write_methods(name, components.as_deref(), enumeration.as_ref(), constructors, &mut needs_gap)?;
+        self.member_classes(needs_gap)?;
         self.line(0, "}");
         Ok(())
     }
@@ -382,17 +499,20 @@ impl<'a, 'c> Writer<'a, 'c> {
         }
         modifier(&mut out, flags, 0x0080, "transient ");
         modifier(&mut out, flags, 0x0040, "volatile ");
+        let mut annotations = field.field_type_annotations(pool, true)?;
+        annotations.extend(field.field_type_annotations(pool, false)?);
+        let mut declarations = field.annotations(pool, true)?;
+        declarations.extend(field.annotations(pool, false)?);
         if let Some(signature) = self.member_signature(field)? {
-            out.push_str(
-                &parse(signature, FieldSignature::parse)?
-                    .field_type
-                    .render(map_name),
-            );
+            let ty = parse(signature, FieldSignature::parse)?;
+            out.push_str(&self.render_type_target(&ty.field_type, &annotations, TypeTarget::Field, &declarations, false)?);
         } else {
-            out.push_str(&ty.render(map_name));
+            out.push_str(&self.render_type_target(&ty, &annotations, TypeTarget::Field, &declarations, false)?);
         }
         out.push(' ');
-        out.push_str(pool.utf8(field.name_index)?);
+        let name = pool.utf8(field.name_index)?;
+        let renamed = self.names.renames().field_alias(self.owner, name, descriptor);
+        out.push_str(renamed.unwrap_or(name));
         if let Some(value) = find_attribute(&field.attributes, pool, "ConstantValue")? {
             let index = u16::from_be_bytes(
                 value
@@ -401,7 +521,7 @@ impl<'a, 'c> Writer<'a, 'c> {
             );
             out.push_str(" = ");
             out.push_str(
-                &constant_literal(pool, index, Some(&ty), self.options.ascii_strings).map_err(
+                &constant_literal_with_options(pool, index, Some(&ty), self.options, map_name).map_err(
                     |source| DecompileError::Render {
                         context: "constant field initializer",
                         source: Box::new(source),
@@ -413,7 +533,14 @@ impl<'a, 'c> Writer<'a, 'c> {
             out.push_str(initializer);
         }
         out.push(';');
-        self.member_annotations(1, field)?;
+        if renamed.is_some() {
+            let ty = ty.render(|name| name.replace('/', "."));
+            self.line(1, &format!("// $VF: renamed from: {name} {ty}"));
+        }
+        self.javadoc(1, JavadocTarget::Field(self.class, field));
+        for annotation in &declarations {
+            self.write_annotation(1, annotation)?;
+        }
         let source_line = self.lines;
         self.line(1, &out);
         Ok(source_line)
@@ -450,13 +577,16 @@ impl<'a, 'c> Writer<'a, 'c> {
             return Ok(false);
         }
         let ty = parse(descriptor, MethodDescriptor::parse)?;
+        let renamed = self.names.renames().method_alias(self.owner, name, descriptor);
         let code = method.code(pool)?;
+        let anonymous_sites = code.as_ref().and_then(|_| self.anonymous_sites());
         let constructor = name == "<init>";
         let initializer = name == "<clinit>";
         let implicit_parameters = if constructor && enumeration.is_some() {
             2
         } else {
-            0
+            usize::from(constructor && self.has_lexical_owner()
+                && self.group.constructor_outer(self.owner, descriptor).is_some())
         };
         let names = self.names;
         let map_name = |name: &str| names.render(name);
@@ -475,7 +605,7 @@ impl<'a, 'c> Writer<'a, 'c> {
                     descriptor: descriptor.into(),
                     source,
                 };
-            let instructions =
+            let mut instructions =
                 bytecode::decode(code.bytes).map_err(|source| method_error(Box::new(source)))?;
             if let Some(components) = components
                 && record::is_generated(
@@ -493,18 +623,72 @@ impl<'a, 'c> Writer<'a, 'c> {
                 .map(|info| info.method_prefix(self.class, name, descriptor, &instructions))
                 .transpose()?
                 .unwrap_or(0);
-            let instructions = if initializer {
-                &instructions[prefix..]
+            if self.options.idea_notnull {
+                crate::idea_notnull::strip_guards(self.class, method, code, &ty, &mut instructions)?;
+            }
+            let uses_subroutines =
+                instructions[prefix..].iter().any(|op| matches!(op.opcode, 0xa8 | 0xa9 | 0xc9));
+            let normalized;
+            let (instructions, handlers) = if self.options.force_jsr_inline || uses_subroutines {
+                if prefix != 0 {
+                    instructions.drain(..prefix);
+                }
+                normalized = Some(
+                    crate::legacy::normalize(instructions, code.exceptions.clone(), pool)
+                        .map_err(|source| method_error(Box::new(source)))?,
+                );
+                let code = normalized.as_ref().expect("code was normalized");
+                (&code.instructions[..], &code.handlers[..])
             } else {
-                &instructions
+                normalized = None;
+                (&instructions[prefix..], &code.exceptions[..])
             };
-            let graph = ControlFlowGraph::build(instructions, &code.exceptions)
+            let graph = ControlFlowGraph::build(instructions, handlers)
                 .map_err(|source| method_error(Box::new(source)))?;
-            let machine = Machine::new(self.class, method, code, &ty, self.options, &map_name)
-                .map_err(|source| method_error(Box::new(source)))?;
+            let mut machine = Machine::new(self.class, method, code, &ty, self.options, &map_name)
+                .map_err(|source| method_error(Box::new(source)))?
+                .with_group(self.group);
+            if uses_subroutines && let Some(normalized) = &normalized {
+                machine = machine.with_normalized_offsets(normalized);
+            }
+            let mut code_annotations = code.type_annotations(pool, true)?;
+            code_annotations.extend(code.type_annotations(pool, false)?);
+            let render_code_annotation = |ty: &Type, target: TypeTarget| {
+                let mut matching = code_annotations.iter().filter(|entry| entry.target == target).peekable();
+                if matching.peek().is_none() {
+                    return Ok(None);
+                }
+                type_annotations::render(
+                    &self.type_nesting,
+                    ty,
+                    matching,
+                    |name| self.names.render(name),
+                    |annotation| self.annotation(annotation),
+                    false,
+                ).map(Some).map_err(|error| crate::lift::LiftError::TypeAnnotation(Box::new(error)))
+            };
+            if !code_annotations.is_empty() {
+                machine.set_code_type_renderer(&render_code_annotation);
+            }
+            machine.set_member_renames(self.names.renames());
+            machine.set_dynamic_helpers(Rc::clone(&self.dynamic_helpers));
+            if let Some(sites) = &anonymous_sites {
+                machine.set_anonymous_sites(Rc::clone(sites));
+            }
             let parameters = machine.parameter_names().to_vec();
-            let lines = structure_with_handlers(instructions, &graph, machine, &code.exceptions)
                 .map_err(|source| method_error(Box::new(source)))?;
+            if uses_subroutines && let Some(code) = normalized {
+                for line in &mut lines {
+                    line.offsets.retain_mut(|offset| {
+                        if let Some(source) = code.source_offset(*offset) {
+                            *offset = source;
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                }
+            }
             (parameters, lines)
         } else {
             if flags & (ABSTRACT | NATIVE) == 0 {
@@ -556,6 +740,7 @@ impl<'a, 'c> Writer<'a, 'c> {
         }
         let is_interface = self.class.access_flags & INTERFACE != 0;
         let mut head = String::new();
+        let mut arguments_at = None;
         if initializer {
             head.push_str("static");
         } else {
@@ -567,7 +752,7 @@ impl<'a, 'c> Writer<'a, 'c> {
                 && exceptions.is_empty()
                 && annotations.is_empty()
                 && (enumeration.is_some()
-                    || flags & VISIBILITY == self.class.access_flags & VISIBILITY)
+                    || flags & VISIBILITY == self.flags & VISIBILITY)
                 && lines.is_empty()
             {
                 return Ok(false);
@@ -575,8 +760,15 @@ impl<'a, 'c> Writer<'a, 'c> {
             if needs_gap {
                 self.line(0, "");
             }
-            for annotation in annotations {
-                self.line(1, &annotation);
+            if renamed.is_some() {
+                let java_name = |name: &str| name.replace('/', ".");
+                let args = ty.parameters.iter().map(|param| param.render(java_name)).collect::<Vec<_>>().join(", ");
+                let result = ty.return_type.render(java_name);
+                self.line(1, &format!("// $VF: renamed from: {name} ({args}) {result}"));
+            }
+            self.javadoc(1, JavadocTarget::Method(self.class, method));
+            for annotation in &annotations {
+                self.write_annotation(1, annotation)?;
             }
             if !is_interface || flags & PUBLIC == 0 {
                 visibility(&mut head, flags);
@@ -599,26 +791,39 @@ impl<'a, 'c> Writer<'a, 'c> {
                 sig.parameters.len() == parameters.len()
                     || sig.parameters.len() + implicit_parameters == parameters.len()
             });
+            let mut type_annotations = method.method_type_annotations(pool, true)?;
+            type_annotations.extend(method.method_type_annotations(pool, false)?);
             if let Some(sig) = signature
                 && !sig.type_parameters.is_empty()
             {
-                head.push_str(&render_type_parameters(&sig.type_parameters, map_name));
+                self.type_parameters(&mut head, &sig.type_parameters, &type_annotations, TypeTarget::MethodTypeParameter)?;
                 head.push(' ');
             }
             if constructor {
                 head.push_str(class_name);
             } else {
-                let result = signature.map_or_else(
-                    || ty.return_type.render(map_name),
-                    |sig| sig.return_type.render(map_name),
-                );
+                let declarations = &annotations;
+                let result = if let Some(sig) = signature {
+                    self.render_type_target(&sig.return_type, &type_annotations, TypeTarget::MethodReturn, declarations, false)?
+                } else {
+                    self.render_type_target(&ty.return_type, &type_annotations, TypeTarget::MethodReturn, declarations, false)?
+                };
                 head.push_str(&result);
                 head.push(' ');
-                head.push_str(name);
+                if let Some(renamed) = renamed {
+                    head.push_str(renamed);
+                } else {
+                    head.push_str(&crate::lift::source_method_name(self.class, name, descriptor));
+                }
             }
-            head.push('(');
+            let arguments_start = head.len();
+            let mut args = Vec::with_capacity(ty.parameters.len());
+            if let Some(receiver) = self.annotated_receiver(&type_annotations, constructor)? {
+                args.push(Document::from(receiver));
+            }
             let annot_visible = method.parameter_annotations(pool, true)?;
             let annot_invisible = method.parameter_annotations(pool, false)?;
+            let method_parameters = if self.options.use_method_parameters { method.method_parameters(pool)? } else { Vec::new() };
             for (index, (param, name)) in ty
                 .parameters
                 .iter()
@@ -626,50 +831,49 @@ impl<'a, 'c> Writer<'a, 'c> {
                 .enumerate()
                 .skip(implicit_parameters)
             {
-                if index != implicit_parameters {
-                    head.push_str(", ");
-                }
+                let mut parameter = Document::new();
+                let mut declarations = Vec::new();
                 for group in [&annot_visible, &annot_invisible] {
                     let skip = ty.parameters.len().saturating_sub(group.len());
                     if let Some(annotations) = index.checked_sub(skip).and_then(|i| group.get(i)) {
                         for annotation in annotations {
-                            head.push_str(&self.annotation(annotation)?);
-                            head.push(' ');
+                            parameter.append(self.annotation_document(annotation, None)?);
+                            parameter.push_str(" ");
+                            declarations.push(annotation.clone());
                         }
                     }
                 }
-                let rendered = signature.map_or_else(
-                    || param.render(map_name),
-                    |sig| {
-                        let skip = ty.parameters.len() - sig.parameters.len();
-                        sig.parameters[index - skip].render(map_name)
-                    },
-                );
-                if flags & VARARGS != 0
-                    && index + 1 == ty.parameters.len()
-                    && let Some(element) = rendered.strip_suffix("[]")
-                {
-                    head.push_str(element);
-                    head.push_str("...");
-                } else {
-                    head.push_str(&rendered);
+                if method_parameters.get(index).is_some_and(|entry| entry.access_flags & FINAL != 0) {
+                    parameter.push_str("final ");
                 }
-                head.push(' ');
-                head.push_str(&name);
+                let target = TypeTarget::MethodParameter((index - implicit_parameters) as u8);
+                let varargs = flags & VARARGS != 0 && index + 1 == ty.parameters.len();
+                let rendered = if let Some(sig) = signature {
+                    let skip = ty.parameters.len() - sig.parameters.len();
+                    self.render_type_target(&sig.parameters[index - skip], &type_annotations, target, &declarations, varargs)?
+                } else {
+                    self.render_type_target(param, &type_annotations, target, &declarations, varargs)?
+                };
+                parameter.push_str(&rendered);
+                parameter.push_str(" ");
+                parameter.push_str(&name);
+                args.push(parameter);
             }
-            head.push(')');
+            arguments_at = Some((arguments_start, args));
             let generic_throws = signature.filter(|sig| !sig.throws.is_empty());
             if generic_throws.is_some() || !exceptions.is_empty() {
                 head.push_str(" throws ");
-                if let Some(sig) = generic_throws {
-                    comma_list(
-                        &mut head,
-                        sig.throws
-                            .iter()
-                            .map(|exception| exception.render(map_name)),
-                    );
-                } else {
-                    push_class_list(&mut head, &exceptions, self.class, &map_name)?;
+                let count = generic_throws.map_or(exceptions.len(), |sig| sig.throws.len());
+                for index in 0..count {
+                    if index != 0 { head.push_str(", "); }
+                    let target = TypeTarget::Throws(index as u16);
+                    let rendered = if let Some(sig) = generic_throws {
+                        self.render_type_target(&sig.throws[index], &type_annotations, target, &[], false)?
+                    } else {
+                        let ty = Type::Object(pool.class_name(exceptions[index])?.into());
+                        self.render_type_target(&ty, &type_annotations, target, &[], false)?
+                    };
+                    head.push_str(&rendered);
                 }
             }
             if let Some(default) = method.annotation_default(pool)? {
@@ -677,16 +881,21 @@ impl<'a, 'c> Writer<'a, 'c> {
                 head.push_str(&self.annotation_value(&default)?);
             }
         }
-        if let Some(code) = &code {
-            if initializer && needs_gap {
-                self.line(0, "");
-            }
-            head.push_str(" {");
-            self.line(1, &head);
-            self.method_body(name, descriptor, code, lines, closing)?;
+        if code.is_some() && initializer && needs_gap {
+            self.line(0, "");
+        }
+        head.push_str(if code.is_some() { " {" } else { ";" });
+        if let Some((at, arguments)) = arguments_at {
+            let suffix = head.split_off(at);
+            let mut doc = Document::from(head);
+            doc.append(Document::delimited(self.depth + 1, arguments));
+            doc.push_str(&suffix);
+            self.document_line(1, &doc);
         } else {
-            head.push(';');
             self.line(1, &head);
+        }
+        if let Some(code) = &code {
+            self.method_body(name, descriptor, code, lines, closing, anonymous_sites.as_ref())?;
         }
         Ok(true)
     }
@@ -698,14 +907,19 @@ impl<'a, 'c> Writer<'a, 'c> {
         code: &Code<'a>,
         lines: Vec<Line>,
         closing: Option<Vec<u32>>,
-    ) -> Result<(), ClassError> {
+        anonymous_sites: Option<&crate::lift::AnonymousSites>,
+    ) -> Result<(), DecompileError> {
+        let line_count = lines.len();
+        let mut declarations = self.local_declarations(name, descriptor, code, &lines)?
+            .into_iter().peekable();
         let mapping = self.mapping.is_some();
         let mut offsets = BTreeMap::new();
         let mut closed_block = None;
-        for line in lines {
+        for (index, line) in lines.into_iter().enumerate() {
             if closed_block == Some(line.depth) && !line.text.starts_with('}') {
                 self.line(0, "");
             }
+            self.write_local_declarations(index, line.depth, true, &mut declarations)?;
             closed_block =
                 (line.text == "}" || line.text.starts_with("} while ")).then_some(line.depth);
             if mapping {
@@ -713,8 +927,9 @@ impl<'a, 'c> Writer<'a, 'c> {
                     offsets.entry(offset).or_insert(self.lines);
                 }
             }
-            self.line(2 + line.depth, &line.text);
+            self.line_with_anonymous(2 + line.depth, &line.text, anonymous_sites)?;
         }
+        self.write_local_declarations(line_count, 0, false, &mut declarations)?;
         if mapping && let Some(closing) = closing {
             for offset in closing {
                 offsets.entry(offset).or_insert(self.lines);
@@ -725,7 +940,8 @@ impl<'a, 'c> Writer<'a, 'c> {
             let original = code.line_numbers(&self.class.pool)?;
             mapping.add(
                 MethodMap {
-                    name: name.into(),
+                    class_name: self.owner.into(),
+                    name: self.names.renames().method_alias(self.owner, name, descriptor).unwrap_or(name).into(),
                     descriptor: descriptor.into(),
                     offsets,
                 },
@@ -785,15 +1001,6 @@ fn visibility(out: &mut String, flags: u16) {
 fn modifier(out: &mut String, flags: u16, mask: u16, text: &'static str) {
     if flags & mask != 0 {
         out.push_str(text);
-    }
-}
-
-fn comma_list(out: &mut String, items: impl IntoIterator<Item = String>) {
-    for (index, item) in items.into_iter().enumerate() {
-        if index != 0 {
-            out.push_str(", ");
-        }
-        out.push_str(&item);
     }
 }
 
