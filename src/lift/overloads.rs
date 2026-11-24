@@ -3,7 +3,7 @@ use std::{borrow::Cow, collections::HashSet, sync::Arc};
 use crate::{
     classfile::ClassFile,
     classpath::ClassMetadata,
-    descriptor::{GenericType, MethodDescriptor, MethodSignature, Type},
+    descriptor::{GenericType, MethodDescriptor, MethodSignature, Primitive, Type},
 };
 
 use super::{
@@ -52,6 +52,7 @@ struct Invocation<'a> {
     parameters: &'a [Type],
     arguments: ArgumentForm<'a>,
     opcode: u8,
+    enum_delegation: bool,
     found: bool,
 }
 
@@ -107,9 +108,15 @@ impl<'a, 'c> Machine<'a, 'c> {
         opcode: u8,
     ) -> bool {
         let constructor = name == "<init>";
+        let enum_delegation = constructor
+            && owner == self.owner
+            && self.class.access_flags & ENUM != 0
+            && !self.initialized_this
+            && self.stack.last().is_some_and(|receiver| matches!(receiver.source, Source::This))
+            && enum_constructor_formals(&method.parameters).is_some();
         if lookup_owner.starts_with('[')
             || arguments.len() != method.parameters.len()
-            || constructor && self.group.is_some_and(|group| group.is_attached(owner))
+            || constructor && !enum_delegation && self.group.is_some_and(|group| group.is_attached(owner))
             || !arguments
                 .iter()
                 .zip(&method.parameters)
@@ -128,6 +135,7 @@ impl<'a, 'c> Machine<'a, 'c> {
                 parameters: &method.parameters,
                 arguments: ArgumentForm::Fixed(arguments),
                 opcode,
+                enum_delegation,
                 found: false,
             },
         )
@@ -172,6 +180,7 @@ impl<'a, 'c> Machine<'a, 'c> {
                 parameters: &method.parameters,
                 arguments: ArgumentForm::Variable { prefix, elements },
                 opcode,
+                enum_delegation: false,
                 found: false,
             },
         )
@@ -232,7 +241,7 @@ impl<'a, 'c> Machine<'a, 'c> {
                 DeclarationClass::Input(class) => class.access_flags,
                 DeclarationClass::Library(class) => class.access_flags,
             };
-            if constructor && flags & ENUM != 0 {
+            if constructor && (flags & ENUM != 0) != call.enum_delegation {
                 return false;
             }
             let inherited_excluded = if inherited {
@@ -369,7 +378,9 @@ impl Invocation<'_> {
                 || variable
                     && flags & NATIVE != 0
                     && matches!(owner, "java/lang/invoke/MethodHandle" | "java/lang/invoke/VarHandle")
-                || !signature().is_some_and(|signature| erased_formals(signature, self.parameters))
+                || !source_parameters(self.enum_delegation, self.parameters).is_some_and(|types| {
+                    signature().is_some_and(|signature| erased_formals(signature, types))
+                })
             {
                 return false;
             }
@@ -397,12 +408,15 @@ impl Invocation<'_> {
                 );
             }
         };
+        let Some(formals) = source_parameters(self.enum_delegation, &candidate.parameters) else {
+            return false;
+        };
         if candidate.parameters.len() != self.parameters.len() {
             // With the selected declaration applicable in the strict phase,
             // variable-arity expansion (JLS 15.12.2.4) cannot beat it.
             return true;
         }
-        if !signature().is_some_and(|signature| erased_formals(signature, &candidate.parameters)) {
+        if !signature().is_some_and(|signature| erased_formals(signature, formals)) {
             // Type inference or specialization can change applicability and
             // specificity; don't use erasure to rule out a generic overload.
             return false;
@@ -612,6 +626,17 @@ fn potential_strict_conversion(machine: &Machine<'_, '_>, source: &Type, target:
             !machine.overload_final_class(source) || !machine.overload_final_class(target)
         }
         _ => true,
+    }
+}
+
+fn source_parameters(enum_delegation: bool, parameters: &[Type]) -> Option<&[Type]> {
+    if enum_delegation { enum_constructor_formals(parameters) } else { Some(parameters) }
+}
+
+fn enum_constructor_formals(parameters: &[Type]) -> Option<&[Type]> {
+    match parameters {
+        [Type::Object(label), Type::Primitive(Primitive::Int), visible @ ..] if label == STRING => Some(visible),
+        _ => None,
     }
 }
 

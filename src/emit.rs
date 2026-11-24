@@ -1084,7 +1084,8 @@ impl<'a, 'c> Writer<'a, 'c> {
             {
                 self.line(1, "@Override");
             }
-            if !is_interface || flags & PUBLIC == 0 {
+            let implicit_private = constructor && enumeration.is_some() && flags & VISIBILITY == PRIVATE;
+            if !implicit_private && (!is_interface || flags & PUBLIC == 0) {
                 visibility(&mut head, flags);
             }
             if !is_interface {

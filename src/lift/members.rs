@@ -97,8 +97,10 @@ impl Machine<'_, '_> {
             Document::new()
         } else if !write
             && self.is_lexical_member_owner(owner)
-            && !matches!(self.method_name, "<init>" | "<clinit>")
-            && self.own_static_field_is_unambiguous(name, descriptor, source_name)?
+            && self.method_name != "<init>"
+            && self.own_static_field_is_unambiguous(
+                name, descriptor, source_name, self.method_name == "<clinit>",
+            )?
             && !self
                 .anonymous_bindings
                 .as_deref()
@@ -154,6 +156,7 @@ impl Machine<'_, '_> {
         name: &str,
         descriptor: &str,
         source_name: &str,
+        enum_constant_only: bool,
     ) -> Result<bool, LiftError> {
         let pool = &self.class.pool;
         let mut found = false;
@@ -167,6 +170,7 @@ impl Machine<'_, '_> {
                 || field_name != name
                 || field_type != descriptor
                 || field.access_flags & 0x0008 == 0
+                || enum_constant_only && field.access_flags & 0x4000 == 0
             {
                 return Ok(false);
             }
