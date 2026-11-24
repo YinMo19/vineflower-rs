@@ -22,7 +22,7 @@ struct Resource {
     exit: ResourceExit,
     skipped: Vec<usize>,
     redirects: Vec<(usize, ExceptionRedirect)>,
-    fulfilled_return: Option<usize>,
+    fulfilled_returns: Vec<usize>,
     epilogue: Option<(usize, u32)>,
 }
 
@@ -53,7 +53,7 @@ struct NormalExits {
     exit: ResourceExit,
     redirects: Vec<(usize, ExceptionRedirect)>,
     terminal_blocks: Vec<usize>,
-    fulfilled_return: Option<usize>,
+    fulfilled_returns: Vec<usize>,
 }
 
 struct ClosePattern {
@@ -488,7 +488,7 @@ impl Emitter<'_> {
                 exit,
                 skipped,
                 redirects: Vec::new(),
-                fulfilled_return: None,
+                fulfilled_returns: Vec::new(),
                 epilogue: None,
             },
             region,
@@ -564,7 +564,7 @@ impl Emitter<'_> {
         machine: &mut Machine<'a, 'c>,
         depth: usize,
     ) -> Result<Option<usize>, StructureError> {
-        if let Some(landing) = resource.fulfilled_return {
+        for landing in resource.fulfilled_returns {
             if !matches!(
                 self.exception_redirects.remove(&landing),
                 Some(ExceptionRedirect::Return { .. })
@@ -598,10 +598,13 @@ impl Emitter<'_> {
                     machine,
                     depth + 1,
                 );
-                for (entry, _) in resource.redirects {
-                    self.exception_redirects.remove(&entry);
+                let mut unfulfilled = false;
+                for (entry, redirect) in resource.redirects {
+                    let remaining = self.exception_redirects.remove(&entry);
+                    unfulfilled |= matches!(redirect, ExceptionRedirect::Return { .. })
+                        && remaining.is_some();
                 }
-                if reaches_stop? != next.is_some() {
+                if reaches_stop? != next.is_some() || unfulfilled {
                     return Err(self.unstructured(shape.start));
                 }
                 next
@@ -842,7 +845,7 @@ impl Emitter<'_> {
         let Some(normal) = (if shape.split_resource_exits.is_empty() {
             self.prove_single_resource_exit(id, shape, machine, primary.start, pattern, &mut skipped)?
         } else {
-            self.prove_split_resource_exits(shape, region, machine, primary.start, pattern, &mut skipped)?
+            self.prove_split_resource_exits(id, region, machine, primary.start, pattern, &mut skipped)?
         }) else {
             return Ok(None);
         };
@@ -899,7 +902,7 @@ impl Emitter<'_> {
             exit: normal.exit,
             skipped,
             redirects: normal.redirects,
-            fulfilled_return: normal.fulfilled_return,
+            fulfilled_returns: normal.fulfilled_returns,
             epilogue: self.resource_epilogue_jump(shape, region, normal_close, normal.exit, nullable),
         }))
     }
@@ -1001,7 +1004,7 @@ impl Emitter<'_> {
             exit,
             redirects: Vec::new(),
             terminal_blocks,
-            fulfilled_return,
+            fulfilled_returns: fulfilled_return.into_iter().collect(),
         }))
     }
 
@@ -1050,27 +1053,24 @@ impl Emitter<'_> {
         // close edges account for every normal predecessor of this landing.
         let mut children = self.exceptions.children_of(shape.body).filter(|&id| {
             let child = self.exceptions.region(id);
-            let Some(entry) = child.join else { return false };
-            if child.catches.len() != 1
-                || !child.split_resource_exits.is_empty()
-                || entry == landing
-                || !self.exceptions.contains(Some(shape.body), entry)
-            {
-                return false;
-            }
-            match self.graph.blocks[entry].successors.as_slice() {
-                &[next] => next == landing && predecessors == [entry],
-                &[next, close] => {
-                    next == landing
-                        && self.exceptions.contains(Some(shape.body), close)
-                        && self.graph.blocks[close].predecessors == [entry]
-                        && self.graph.blocks[close].successors == [landing]
-                        && predecessors.len() == 2
-                        && predecessors.contains(&entry)
-                        && predecessors.contains(&close)
-                }
-                _ => false,
-            }
+            child.catches.len() == 1
+                && child.join.into_iter().chain(child.split_resource_exits.iter().copied()).any(|entry| {
+                    entry != landing
+                        && self.exceptions.contains(Some(shape.body), entry)
+                        && match self.graph.blocks[entry].successors.as_slice() {
+                            &[next] => next == landing && predecessors == [entry],
+                            &[next, close] => {
+                                next == landing
+                                    && self.exceptions.contains(Some(shape.body), close)
+                                    && self.graph.blocks[close].predecessors == [entry]
+                                    && self.graph.blocks[close].successors == [landing]
+                                    && predecessors.len() == 2
+                                    && predecessors.contains(&entry)
+                                    && predecessors.contains(&close)
+                            }
+                            _ => false,
+                        }
+                })
         });
         let recipient = children.next()?;
         children.next().is_none().then_some(ResourceExit::DelegateReturn { recipient, value })

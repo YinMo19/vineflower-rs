@@ -3,8 +3,8 @@
 use crate::lift::Machine;
 
 use super::{
-    CloseExit, ClosePattern, Emitter, ExceptionRedirect, NormalExits, ProtectedRegion, Region,
-    ResourceExit, StructureError,
+    CloseExit, ClosePattern, Emitter, ExceptionId, ExceptionRedirect, NormalExits, Region,
+    ResourceExit, ReturnValue, StructureError,
 };
 
 impl Emitter<'_> {
@@ -13,18 +13,20 @@ impl Emitter<'_> {
     // reload. Never redirect a copied close into a differently protected arm.
     pub(super) fn prove_split_resource_exits(
         &mut self,
-        shape: &ProtectedRegion,
+        id: ExceptionId,
         region: Region<'_, '_, '_>,
         machine: &Machine<'_, '_>,
         primary: usize,
         pattern: ClosePattern,
         skipped: &mut Vec<usize>,
     ) -> Result<Option<NormalExits>, StructureError> {
+        let shape = self.exceptions.region(id);
         let mut ambient = None;
         let mut continuation = None;
         let mut enclosing_terminal = None;
         let mut redirects = Vec::new();
         let mut terminal_blocks = Vec::new();
+        let mut fulfilled_returns = Vec::new();
         for entry in shape.join.into_iter().chain(shape.split_resource_exits.iter().copied()) {
             let Some((close, exit)) = self.match_normal_resource_close(
                 entry, pattern.slot, pattern.nullable, pattern.member, machine,
@@ -51,30 +53,34 @@ impl Emitter<'_> {
             }
             skipped.push(close);
 
-            let edge = match exit {
+            let returned = match exit {
                 CloseExit::Continue(target) => {
-                    let enclosing = self.exceptions.enclosing_terminal_copy(region.exception_arm, target);
-                    let target = enclosing.unwrap_or(target);
-                    if (enclosing.is_some() && region.stop != enclosing)
-                        || enclosing_terminal.is_some_and(|previous| previous != enclosing)
+                    if let Some(&ExceptionRedirect::Return { recipient, value }) =
+                        self.exception_redirects.get(&target)
                     {
-                        return Ok(None);
+                        if recipient != id || fulfilled_returns.contains(&target)
+                            || self.layout.local_is_live(self.graph, self.instructions, target, pattern.slot)
+                        {
+                            return Ok(None);
+                        }
+                        fulfilled_returns.push(target);
+                        value
+                    } else {
+                        let enclosing = self.exceptions.enclosing_terminal_copy(region.exception_arm, target);
+                        let target = enclosing.unwrap_or(target);
+                        if (enclosing.is_some() && region.stop != enclosing)
+                            || enclosing_terminal.is_some_and(|previous| previous != enclosing)
+                            || continuation.is_some_and(|previous| previous != target)
+                        {
+                            return Ok(None);
+                        }
+                        enclosing_terminal = Some(enclosing);
+                        continuation = Some(target);
+                        redirects.push((entry, ExceptionRedirect::Continue { target, arm: shape.body }));
+                        continue;
                     }
-                    enclosing_terminal = Some(enclosing);
-                    if continuation.is_some_and(|previous| previous != target) {
-                        return Ok(None);
-                    }
-                    continuation = Some(target);
-                    ExceptionRedirect::Continue { target, arm: shape.body }
                 }
                 CloseExit::Return { block, transfer, local } => {
-                    let Some((spill, store)) = self.exclusive_resource_spill(shape, entry, local)
-                    else {
-                        return Ok(None);
-                    };
-                    if self.protected_resource_slot_overlap(local, close, primary) {
-                        return Ok(None);
-                    }
                     if block != close {
                         if skipped.contains(&block)
                             || self.graph.blocks[block].predecessors.iter().any(|&pred| {
@@ -86,9 +92,23 @@ impl Emitter<'_> {
                         skipped.push(block);
                         terminal_blocks.push(block);
                     }
+                    ReturnValue { transfer, local }
+                }
+            };
+            let Some(return_site) = self.resource_body_return(shape, entry, close, primary, returned)
+            else {
+                return Ok(None);
+            };
+            let edge = match return_site {
+                ResourceExit::Return { spill, transfer } => {
+                    let store = self.graph.blocks[spill].instructions.end - 1;
                     redirects.push((spill, ExceptionRedirect::ReturnSpill { store, arm: shape.body }));
                     ExceptionRedirect::ReturnAtEdge { transfer, arm: shape.body }
                 }
+                ResourceExit::DelegateReturn { recipient, value } => {
+                    ExceptionRedirect::Return { recipient, value }
+                }
+                ResourceExit::Continue(_) => return Ok(None),
             };
             redirects.push((entry, edge));
         }
@@ -112,7 +132,7 @@ impl Emitter<'_> {
             exit: ResourceExit::Continue(continuation),
             redirects,
             terminal_blocks,
-            fulfilled_return: None,
+            fulfilled_returns,
         }))
     }
 }

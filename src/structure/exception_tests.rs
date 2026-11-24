@@ -820,6 +820,60 @@ fn split_normal_resource_copies_must_rejoin_at_the_same_continuation() {
 }
 
 #[test]
+fn nested_split_resources_delegate_each_return_to_its_own_spill() {
+    let mut bytes = [
+        0x2a, 0x4d, // 0: acquire outer resource
+        0x2a, 0x4e, // 2: acquire inner resource
+        0x1b, 0x99, 0, 29, // 4: select between two terminal paths
+        0x08, 0x36, 4, // 8: first return spill
+        0x2d, 0xc6, 0, 9, // 11: test inner resource
+        0x2d, 0xb9, 0, 13, 1, 0, // 15: close inner resource
+        0x2c, 0xc6, 0, 9, // 21: test outer resource
+        0x2c, 0xb9, 0, 13, 1, 0, // 25: close outer resource
+        0x15, 4, 0xac, // 31: first return
+        0x06, 0x36, 4, // 34: second return spill (reuses local slot)
+        0x2d, 0xc6, 0, 9, // 37: test inner resource
+        0x2d, 0xb9, 0, 13, 1, 0, // 41: close inner resource
+        0x2c, 0xc6, 0, 9, // 47: test outer resource
+        0x2c, 0xb9, 0, 13, 1, 0, // 51: close outer resource
+        0x15, 4, 0xac, // 57: second return
+        0x3a, 4, 0x2d, 0xc6, 0, 21, // 60: inner primary exception
+        0x2d, 0xb9, 0, 13, 1, 0, // 66: inner exceptional close
+        0xa7, 0, 12, // 72: go to inner rethrow
+        0x3a, 5, 0x19, 4, 0x19, 5, 0xb6, 0, 19, // 75: add suppressed
+        0x19, 4, 0xbf, // 84: inner rethrow
+        0x3a, 4, 0x2c, 0xc6, 0, 21, // 87: outer primary exception
+        0x2c, 0xb9, 0, 13, 1, 0, // 93: outer exceptional close
+        0xa7, 0, 12, // 99: go to outer rethrow
+        0x3a, 5, 0x19, 4, 0x19, 5, 0xb6, 0, 19, // 102: add suppressed
+        0x19, 4, 0xbf, // 111: outer rethrow
+    ];
+    let handlers = [
+        handler(4, 11, 60, 15),
+        handler(34, 37, 60, 15),
+        handler(66, 72, 75, 15),
+        handler(2, 21, 87, 15),
+        handler(34, 47, 87, 15),
+        handler(60, 87, 87, 15),
+        handler(93, 99, 102, 15),
+    ];
+    let descriptor = "(Ljava/lang/AutoCloseable;Z)I";
+    let lines = test_method_with_descriptor(&bytes, &handlers, &[], descriptor).unwrap();
+    assert!(lines[1].text.as_flat().contains("var2 = var0"));
+    assert!(lines[2].text.as_flat().contains("var3 = var0"));
+    for (value, spill, transfer) in [("return 5;", 8, 33), ("return 3;", 34, 59)] {
+        let mut matches = lines.iter().filter(|line| line.text == value);
+        let line = matches.next().unwrap();
+        assert!(matches.next().is_none());
+        assert!(line.offsets.contains(&spill));
+        assert!(line.offsets.contains(&transfer));
+    }
+
+    bytes[51] = 0x2d; // Closing a different resource on one path is observable.
+    assert!(test_method_with_descriptor(&bytes, &handlers, &[], descriptor).is_err());
+}
+
+#[test]
 fn legacy_resource_proves_the_primary_exception_and_both_closes() {
     let mut bytes = [
         0x2a, 0x4c, 0x01, 0x4d, // 0: resource store; primary = null
