@@ -39,6 +39,23 @@ pub enum Operand {
     },
 }
 
+impl Instruction {
+    /// Slots touched by a load, store, or increment, and whether the instruction
+    /// reads the incoming value. An increment reads before writing its slot.
+    pub(crate) fn local_access(&self) -> Option<(std::ops::Range<u32>, bool)> {
+        let (slot, kind, read) = match (self.opcode, &self.operand) {
+            (code @ 0x15..=0x19, Operand::Local(slot)) => (*slot, code - 0x15, true),
+            (code @ 0x1a..=0x2d, _) => (u16::from((code - 0x1a) % 4), (code - 0x1a) / 4, true),
+            (code @ 0x36..=0x3a, Operand::Local(slot)) => (*slot, code - 0x36, false),
+            (code @ 0x3b..=0x4e, _) => (u16::from((code - 0x3b) % 4), (code - 0x3b) / 4, false),
+            (0x84, Operand::Increment { index, .. }) => (*index, 0, true),
+            _ => return None,
+        };
+        let slot = u32::from(slot);
+        Some((slot..slot + if matches!(kind, 1 | 3) { 2 } else { 1 }, read))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum BytecodeError {
     #[error("bytecode exceeds the representable size")]

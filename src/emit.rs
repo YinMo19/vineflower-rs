@@ -1303,18 +1303,27 @@ impl<'a, 'c> Writer<'a, 'c> {
         let mut offsets = BTreeMap::new();
         let mut closed_block = None;
         let mut previous_depth = None;
+        let mut scope_end = None;
         for (index, line) in lines.into_iter().enumerate() {
             if (closed_block == Some(line.depth) && !line.text.starts_with('}'))
                 || (line.sequence_boundary && previous_depth == Some(line.depth))
             {
                 self.line(0, "");
             }
-            self.write_local_declarations(index, line.depth, true, &mut declarations)?;
+            if let Some(end) = declarations
+                .peek()
+                .and_then(|declaration| declaration.scope_at(index))
+            {
+                self.line(2 + line.depth, "{");
+                scope_end = Some(end);
+            }
+            let depth = line.depth + usize::from(scope_end.is_some());
+            self.write_local_declarations(index, depth, true, &mut declarations)?;
             closed_block =
                 (line.text == "}" || line.text.starts_with("} while ")).then_some(line.depth);
             previous_depth = Some(line.depth);
             let start = self.lines;
-            let depth = 2 + line.depth;
+            let depth = 2 + depth;
             if line.text.contains('\0') {
                 self.line_with_anonymous(depth, &line.text, anonymous_sites)?;
             } else {
@@ -1333,6 +1342,11 @@ impl<'a, 'c> Writer<'a, 'c> {
                 for offset in line.text.omitted_bytecode().flatten() {
                     offsets.remove(&offset);
                 }
+            }
+            if scope_end == Some(index + 1) {
+                self.line(2 + line.depth, "}");
+                closed_block = Some(line.depth);
+                scope_end = None;
             }
         }
         self.write_local_declarations(line_count, 0, false, &mut declarations)?;

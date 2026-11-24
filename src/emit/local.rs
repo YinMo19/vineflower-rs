@@ -8,7 +8,7 @@ use std::{
 
 use crate::{
     bytecode::{self, Instruction, Operand},
-    classfile::{BootstrapMethod, ClassError, ClassFile, Code, Constant},
+    classfile::{BootstrapMethod, ClassError, ClassFile, Code, Constant, LocalVariable},
     context::{NestedClass, NestedKind},
     lift::{AnonymousBindings, AnonymousSites},
     structure::Line,
@@ -43,7 +43,9 @@ impl<'a, 'c> Writer<'a, 'c> {
                         node,
                         simple,
                         uses: None,
+                        references: None,
                         insertion: 0,
+                        scope_end: None,
                         captures: BTreeSet::new(),
                         bindings: None,
                     },
@@ -130,17 +132,19 @@ impl<'a, 'c> Writer<'a, 'c> {
         }
         let mut bootstraps = None;
         for op in &instructions {
-            let Some(&line) = locations.get(&op.offset) else {
-                continue;
-            };
+            let line = locations.get(&op.offset).copied();
             if let Some(class) = referenced_class(self.class, op)?
                 && let Some(declaration) = declarations.get_mut(class)
             {
-                declaration.add_use(line);
+                let (first, _) = declaration.references.unwrap_or((op.offset, op.offset));
+                declaration.references = Some((first, op.offset));
+                if let Some(line) = line {
+                    declaration.add_use(line);
+                }
             }
-            if op.opcode != 0xba {
+            let Some(line) = line.filter(|_| op.opcode == 0xba) else {
                 continue;
-            }
+            };
             let bootstraps = match &mut bootstraps {
                 Some(bootstraps) => bootstraps,
                 place @ None => place.insert(self.class.bootstrap_methods()?),
@@ -175,7 +179,8 @@ impl<'a, 'c> Writer<'a, 'c> {
                 }
             }
         }
-        for local in code.local_variables(pool)? {
+        let locals = code.local_variables(pool)?;
+        for local in &locals {
             let Some(class) = array_or_object_class(local.descriptor) else {
                 continue;
             };
@@ -220,6 +225,12 @@ impl<'a, 'c> Writer<'a, 'c> {
         }
         order.reverse();
         order.sort_by_key(|declaration| declaration.insertion);
+        if code.exceptions.is_empty() {
+            for index in 0..order.len() {
+                order[index].scope_end =
+                    isolated_scope(index, &order, lines, &instructions, &locations, &locals);
+            }
+        }
         Ok(order)
     }
 
@@ -304,12 +315,18 @@ pub(in crate::emit) struct LocalDeclaration<'a> {
     node: &'a NestedClass,
     simple: &'a str,
     uses: Option<(usize, usize)>,
+    references: Option<(u32, u32)>,
     insertion: usize,
+    scope_end: Option<usize>,
     captures: BTreeSet<usize>,
     bindings: Option<AnonymousBindings>,
 }
 
 impl LocalDeclaration<'_> {
+    pub(in crate::emit) fn scope_at(&self, index: usize) -> Option<usize> {
+        self.scope_end.filter(|_| self.insertion == index)
+    }
+
     fn add_use(&mut self, index: usize) {
         self.uses = Some(self.uses.map_or((index, index), |(first, last)| {
             (first.min(index), last.max(index))
@@ -361,6 +378,148 @@ impl LocalDeclaration<'_> {
             insertion = 1;
         }
         self.insertion = insertion;
+    }
+}
+
+/// Recover a lost block only for a straight-line run with a fresh, dead binding.
+/// Other scopes already present in the structured lines keep their ownership.
+fn isolated_scope(
+    index: usize,
+    declarations: &[LocalDeclaration<'_>],
+    lines: &[Line],
+    instructions: &[Instruction],
+    locations: &BTreeMap<u32, usize>,
+    locals: &[LocalVariable<'_>],
+) -> Option<usize> {
+    let declaration = &declarations[index];
+    let (_, last) = declaration.uses?;
+    let start = declaration.insertion;
+    let depth = lines.get(start)?.depth;
+    let end = last + 1;
+    let body = lines.get(start..end)?;
+    if body.is_empty()
+        || body
+            .iter()
+            .any(|line| line.depth != depth || line.offsets.is_empty())
+        || !declarations[index + 1..].iter().any(|later| {
+            later.simple == declaration.simple
+                && lines
+                    .get(start..later.insertion)
+                    .is_some_and(|between| between.iter().all(|line| line.depth >= depth))
+                && lines.get(later.insertion).map_or(0, |line| line.depth) >= depth
+        })
+        || declarations.iter().enumerate().any(|(other, sibling)| {
+            other != index
+                && ((start..end).contains(&sibling.insertion)
+                    || sibling.captures.range(start..end).next().is_some())
+        })
+    {
+        return None;
+    }
+
+    let first_mapped = body.iter().flat_map(|line| &line.offsets).min().copied()?;
+    let last_mapped = body.iter().flat_map(|line| &line.offsets).max().copied()?;
+    let (first_ref, last_ref) = declaration.references?;
+    // Allocation and constructor instructions can be unanchored.
+    let first_offset = first_mapped.min(first_ref);
+    let cut = last_mapped.checked_add(1)?;
+    let enter = instructions
+        .binary_search_by_key(&first_offset, |op| op.offset)
+        .ok()?;
+    let exit = instructions
+        .binary_search_by_key(&cut, |op| op.offset)
+        .ok()?;
+    if last_ref >= cut
+        || (first_ref < first_mapped && instructions[enter].opcode != 0xbb)
+        || locations
+            .range(first_offset..cut)
+            .any(|(_, line)| !(start..end).contains(line))
+        || instructions.iter().any(|op| {
+            let inside = |target| (first_offset + 1..cut).contains(&target);
+            match &op.operand {
+                Operand::Branch(target) => inside(*target),
+                Operand::Switch { default, cases } => {
+                    inside(*default) || cases.iter().any(|&(_, target)| inside(target))
+                }
+                _ => op.opcode == 0xa9,
+            }
+        })
+    {
+        return None;
+    }
+
+    let mut binding = None;
+    for op in &instructions[enter..exit] {
+        if transfers_control(op) {
+            return None;
+        }
+        // Do not absorb an earlier unmapped construction statement into this binding.
+        if binding.is_none()
+            && first_ref < first_mapped
+            && op.offset != first_ref
+            && matches!(op.opcode, 0x57 | 0x58 | 0xbb)
+        {
+            return None;
+        }
+        let Some((slots, false)) = op.local_access() else {
+            continue;
+        };
+        if binding.is_some()
+            || !matches!(op.opcode, 0x3a | 0x4b..=0x4e)
+            || locations.get(&op.offset) != Some(&start)
+        {
+            return None;
+        }
+        binding = Some((slots.start, op.offset + op.len));
+    }
+    let (slot, initialized) = binding?;
+    let mut has_binding = false;
+    for local in locals
+        .iter()
+        .filter(|local| array_or_object_class(local.descriptor) == Some(declaration.child))
+    {
+        let start_pc = u32::from(local.start_pc);
+        if start_pc < first_offset || start_pc + u32::from(local.length) > cut {
+            return None;
+        }
+        has_binding |= u32::from(local.index) == slot && start_pc == initialized;
+    }
+    // The debug lifetime can end before the actual JVM value is dead.
+    (has_binding && dead_in_straight_line(&instructions[exit..], slot)).then_some(end)
+}
+
+fn transfers_control(op: &Instruction) -> bool {
+    matches!(op.operand, Operand::Branch(_) | Operand::Switch { .. })
+        || matches!(op.opcode, 0xa9 | 0xac..=0xb1 | 0xbf)
+}
+
+fn dead_in_straight_line(instructions: &[Instruction], slot: u32) -> bool {
+    for op in instructions {
+        if let Some((slots, read)) = op.local_access()
+            && slots.contains(&slot)
+        {
+            return !read;
+        }
+        if transfers_control(op) {
+            return matches!(op.opcode, 0xac..=0xb1 | 0xbf);
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bytecode, dead_in_straight_line};
+
+    #[test]
+    fn slot_read_before_redefinition_prevents_a_scope_cut() {
+        let instructions = bytecode::decode(&[
+            0x2c, 0x57, // aload_2; pop
+            0x01, 0x4d, 0xb1, // aconst_null; astore_2; return
+        ])
+        .unwrap();
+        assert!(!dead_in_straight_line(&instructions, 2));
+        assert!(dead_in_straight_line(&instructions[2..], 2));
     }
 }
 
