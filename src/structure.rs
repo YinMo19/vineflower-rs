@@ -7,6 +7,7 @@ mod exception_tests;
 mod flow;
 #[cfg(test)]
 mod join_tests;
+mod pattern_switch;
 mod protected;
 mod string_switch;
 mod switch_expression;
@@ -249,6 +250,13 @@ impl Emitter<'_> {
                     return Ok(false);
                 };
                 block = exit;
+                continue;
+            }
+            if let Some(next) =
+                self.try_emit_pattern_switch(block, region, machine, depth, pending)?
+            {
+                let Some(next) = next else { return Ok(false) };
+                block = next;
                 continue;
             }
             if let Some(next) =

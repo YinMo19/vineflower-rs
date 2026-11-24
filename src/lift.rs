@@ -18,6 +18,7 @@ mod nested;
 mod numeric;
 mod operations;
 mod overloads;
+pub(crate) mod pattern_dispatch;
 mod switch_expression;
 
 pub(crate) use anonymous::{AnonymousBindings, AnonymousSite, AnonymousSites};
