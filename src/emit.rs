@@ -228,7 +228,7 @@ fn decompile_java<'a>(
         "module-info" if class.access_flags & MODULE != 0 => {
             writer.module()?;
             let import_start = prefix.len();
-            names.imports(&mut prefix);
+            names.imports(&mut prefix, &writer.body);
             if prefix.len() != import_start {
                 prefix.push('\n');
             }
@@ -237,11 +237,11 @@ fn decompile_java<'a>(
             writer.class_annotations(0)?;
             token_prefix = Some(prefix.len());
             prefix.push_str(&writer.body);
-            writer.body.clear();
             if let Some(package) = &package {
                 let _ = writeln!(prefix, "package {package};\n");
             }
-            names.imports(&mut prefix);
+            names.imports(&mut prefix, &writer.body);
+            writer.body.clear();
         }
         simple_name => {
             writer.class(simple_name)?;
@@ -249,7 +249,7 @@ fn decompile_java<'a>(
                 let _ = writeln!(prefix, "package {package};\n");
             }
             let import_start = prefix.len();
-            names.imports(&mut prefix);
+            names.imports(&mut prefix, &writer.body);
             if prefix.len() != import_start {
                 prefix.push('\n');
             }

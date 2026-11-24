@@ -1,4 +1,6 @@
 // Based on Vineflower ImportCollector (Apache-2.0).
+mod import_usage;
+
 use std::{
     cell::RefCell,
     collections::{BTreeSet, HashMap},
@@ -126,9 +128,24 @@ impl<'a, 'c> Names<'a, 'c> {
         result
     }
 
-    pub(super) fn imports(&self, output: &mut String) {
-        for import in self.imports.borrow().iter() {
-            let _ = writeln!(output, "import {import};");
+    pub(super) fn imports(&self, output: &mut String, body: &str) {
+        let imports = self.imports.borrow();
+        if imports.is_empty() {
+            return;
+        }
+        // Lifting and constructor/loop/lambda rewrites can ask for a type
+        // name before proving whether that expression survives. Keep the
+        // spelling chosen during recovery, but write only imports still
+        // needed by the final compilation unit.
+        let mut names: HashMap<_, _> = imports
+            .iter()
+            .map(|name| (import_leaf(name), false))
+            .collect();
+        let complete = import_usage::mark_used(body, &mut names);
+        for import in imports.iter() {
+            if !complete || names[import_leaf(import)] {
+                let _ = writeln!(output, "import {import};");
+            }
         }
     }
 }
@@ -138,6 +155,10 @@ fn append_members(result: &mut String, chain: Vec<&str>) {
         result.push('.');
         result.push_str(member);
     }
+}
+
+fn import_leaf(name: &str) -> &str {
+    name.rsplit_once('.').map_or(name, |(_, leaf)| leaf)
 }
 
 pub(super) fn simple(name: &str) -> &str {
