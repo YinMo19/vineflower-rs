@@ -1062,6 +1062,88 @@ fn synchronized_handler_may_protect_only_its_exception_store() {
 }
 
 #[test]
+fn synchronized_split_departure_preserves_the_enclosing_try_tail() {
+    let mut bytes = [
+        0x2a, 0x59, 0x4d, 0xc2, // 0: acquire monitor
+        0x1b, 0x9e, 0, 8, // 4: if var1 <= 0, goto 13
+        0x2c, 0xc3, // 8: unlock to leave the entire try
+        0xa7, 0, 27, // 10: goto 37
+        0xb8, 0, 22, // 13: work while holding the monitor
+        0x2c, 0xc3, // 16: unlock to continue the try
+        0xa7, 0, 8, // 18: goto 26
+        0x4e, 0x2c, 0xc3, // 21: release on exception
+        0x2d, 0xbf, // 24: rethrow
+        0xb8, 0, 22, // 26: work after releasing the monitor
+        0xa7, 0, 8, // 29: goto 37
+        0x3a, 4, // 32: catch Exception
+        0xb8, 0, 22, // 34: work in the catch
+        0xb1, // 37: return
+    ];
+    let monitor_rows = [
+        handler(4, 10, 21, 0),
+        handler(13, 18, 21, 0),
+        handler(21, 24, 21, 0),
+    ];
+    let descriptor = "(Ljava/lang/Object;I)V";
+    for jump_via_stub in [false, true] {
+        let mut handlers = monitor_rows.to_vec();
+        if jump_via_stub {
+            bytes[12] = 19; // goto 29; the label still ends at 37
+            handlers.push(handler(0, 29, 32, 28));
+        } else {
+            handlers.extend([handler(0, 10, 32, 28), handler(13, 29, 32, 28)]);
+        }
+        let lines = test_method_with_descriptor(&bytes, &handlers, &[], descriptor).unwrap();
+        assert_eq!(lines[0].text, "try {");
+        assert_eq!(lines[1].text, "label37: {");
+        assert_eq!(lines[2].text, "synchronized (var0) {");
+        assert!(lines.iter().any(|line| line.depth == 4 && line.text == "break label37;"));
+        let work_depths: Vec<_> = lines
+            .iter()
+            .filter(|line| line.text == "work();")
+            .map(|line| line.depth)
+            .collect();
+        assert!(matches!(work_depths.as_slice(), [3 | 4, 2, 1]));
+
+        bytes[8] = 0x01; // aconst_null on only the abrupt unlock
+        assert!(matches!(classify(&bytes, &handlers).1, Err(StructureError::ExceptionHandlers)));
+        bytes[8] = 0x2c;
+    }
+}
+
+#[test]
+fn synchronized_inner_catch_stops_at_the_normal_unlock() {
+    let bytes = [
+        0x2a, 0x59, 0x4d, 0xc2, // 0: acquire monitor
+        0x00, // 4: enter the monitor scope before the typed try
+        0x2b, 0xc7, 0, 6, // 5: if var1 != null, goto 12
+        0x2c, 0xc3, 0xb1, // 9: release and return
+        0x2c, 0xc3, 0xb1, // 12: release and return
+        0x4e, 0x2c, 0xc3, // 15: catch Exception; release the monitor
+        0xa7, 0, 10, // 18: goto 28
+        0x3a, 4, 0x2c, 0xc3, // 21: release on uncaught exception
+        0x19, 4, 0xbf, // 25: rethrow
+        0xb8, 0, 22, // 28: work outside synchronized and outside the catch
+        0xb1, // 31: return
+    ];
+    let handlers = [
+        handler(5, 9, 15, 28),
+        handler(4, 11, 21, 0),
+        handler(12, 14, 21, 0),
+        handler(15, 18, 21, 0),
+        handler(21, 25, 21, 0),
+    ];
+    let descriptor = "(Ljava/lang/Object;Ljava/lang/Object;)V";
+    let lines = test_method_with_descriptor(&bytes, &handlers, &[], descriptor).unwrap();
+    assert_eq!(lines[0].text, "synchronized (var0) {");
+    assert!(lines.iter().any(|line| {
+        line.depth == 1 && line.text.as_flat().starts_with("} catch (java.lang.Exception ")
+    }));
+    let work = lines.iter().find(|line| line.text == "work();").unwrap();
+    assert_eq!(work.depth, 0);
+}
+
+#[test]
 fn monitor_head_cannot_be_entered_without_acquisition() {
     let bytes = [
         0x03, // 0: iconst_0

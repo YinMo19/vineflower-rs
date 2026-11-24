@@ -2,7 +2,10 @@ use std::{cell::RefCell, collections::BTreeSet, mem, ops::RangeInclusive};
 
 use crate::{bytecode::Operand, lift::Machine, source_text::Document};
 
-use super::{Arm, Condition, Emitter, Line, Region, StructureError, instanceof_patterns, protected::ArmId};
+use super::{
+    Arm, Condition, Emitter, Line, Region, StructureError, instanceof_patterns,
+    protected::{ArmId, MonitorDeparture, ProtectedRegion},
+};
 
 mod resource_switch;
 
@@ -28,7 +31,15 @@ pub(super) enum EdgeLine {
 
 impl Scope<'_, '_> {
     pub(super) fn head_tail(&self, block: usize) -> Option<usize> {
-        (self.head == block).then_some(self.tail)
+        (self.head == block && !matches!(&self.edges, Edges::Monitor { .. })).then_some(self.tail)
+    }
+
+    pub(super) fn owns_monitor_departure(&self, arm: ArmId, departure: MonitorDeparture) -> bool {
+        matches!(
+            &self.edges,
+            Edges::Monitor { arm: owner, source, target }
+                if *owner == arm && *source == departure.source && *target == departure.target
+        )
     }
 }
 
@@ -42,6 +53,7 @@ struct Plan {
 enum Edges {
     Explicit,
     Resource { arm: ArmId, abrupt_entries: BTreeSet<usize> },
+    Monitor { arm: ArmId, source: usize, target: usize },
 }
 
 enum Head {
@@ -262,6 +274,72 @@ impl Emitter<'_> {
         Ok(Some(plan.join))
     }
 
+    pub(super) fn emit_try_with_monitor_departure<'a, 'c>(
+        &mut self,
+        shape: &ProtectedRegion,
+        region: Region<'_, 'a, 'c>,
+        machine: &Machine<'a, 'c>,
+        depth: usize,
+    ) -> Result<Option<bool>, StructureError> {
+        if shape.catches.is_empty() || region.label_scope().is_some() || region.loop_header.is_some()
+        {
+            return Ok(None);
+        }
+        let mut departures = self.exceptions.children_of(shape.body).filter_map(|child| {
+            let child = self.exceptions.region(child);
+            let departure = child.monitor.as_ref()?.departure?;
+            Some((child.body, departure))
+        });
+        let Some((arm, departure)) = departures.next() else {
+            return Ok(None);
+        };
+        let join = shape.join.ok_or(StructureError::ExceptionHandlers)?;
+        if departures.next().is_some() {
+            return Err(self.unstructured(departure.source));
+        }
+        // The source break skips the rest of the try, so the bytecode must
+        // reach its join with no other work or exception transfer.
+        let mut target = departure.target;
+        while target != join {
+            let block = &self.graph.blocks[target];
+            let &[next] = block.successors.as_slice() else {
+                return Err(self.unstructured(target));
+            };
+            if next <= target
+                || next > join
+                || !self.labeled_region_block(target, region.exception(Some(join), shape.body, None))
+                || block.instructions.len() != 1
+                || self.explicit_jump(target, next).is_none()
+            {
+                return Err(self.unstructured(target));
+            }
+            target = next;
+        }
+        let scope = Scope {
+            head: shape.start,
+            tail: join,
+            join,
+            name: format!("label{}", self.offset(join)),
+            edges: Edges::Monitor { arm, source: departure.source, target: departure.target },
+            exits: RefCell::new(Vec::with_capacity(1)),
+        };
+        self.syntax(depth, &format!("{}: {{", scope.name));
+        let body = region.exception(Some(join), shape.body, Some(machine));
+        if !self.scoped_arm(shape.start, body.label_body(&scope, Some(join)), machine, depth + 1)? {
+            return Err(self.unstructured(departure.source));
+        }
+        let mut exits = scope.exits.into_inner().into_iter();
+        let Some(Exit { state, .. }) = exits.next() else {
+            return Err(self.unstructured(departure.source));
+        };
+        if exits.next().is_some() {
+            return Err(self.unstructured(departure.source));
+        }
+        Self::check_scope(state, machine, self.offset(join))?;
+        self.syntax(depth, "}");
+        Ok(Some(true))
+    }
+
     pub(super) fn record_labeled_break<'a, 'c>(
         &mut self,
         block: usize,
@@ -283,6 +361,15 @@ impl Emitter<'_> {
                 && abrupt_entries.contains(&to) && self.labeled_region_block(block, region) =>
             {
                 self.explicit_jump(block, to)
+            }
+            Edges::Monitor { arm, source, target }
+                if region.exception_arm == Some(*arm) && (*source, *target) == (block, to) =>
+            {
+                let jump = self.explicit_jump(block, to).ok_or_else(|| self.unstructured(block))?;
+                scope.exits.borrow_mut().push(Exit { block, state: machine.clone() });
+                offsets.push(jump);
+                self.push(depth, format!("break {};", scope.name), mem::take(offsets));
+                return Ok(true);
             }
             _ => return Ok(false),
         };

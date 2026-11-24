@@ -204,12 +204,19 @@ impl Emitter<'_> {
         };
         let body_lines = self.lines.len();
         self.syntax(depth, "try {");
-        let mut reaches_join = self.scoped_arm(
-            clauses.start,
-            scope.exception(clauses.join, clauses.body, Some(machine)),
-            machine,
-            depth + 1,
-        )?;
+        let mut reaches_join = if shape.finally.is_none()
+            && let Some(reaches) =
+                self.emit_try_with_monitor_departure(clauses, scope, machine, depth + 1)?
+        {
+            reaches
+        } else {
+            self.scoped_arm(
+                clauses.start,
+                scope.exception(clauses.join, clauses.body, Some(machine)),
+                machine,
+                depth + 1,
+            )?
+        };
         // If the entire protected body is one verified resource statement,
         // the surrounding catch/finally clauses are its Java clauses. The
         // acquisition and both close paths remain inside that same scope.
@@ -394,6 +401,13 @@ impl Emitter<'_> {
         depth: usize,
         pending: &mut Vec<u32>,
     ) -> Result<Option<usize>, StructureError> {
+        if let Some(departure) = monitor.departure
+            && !region
+                .label_scope()
+                .is_some_and(|scope| scope.owns_monitor_departure(shape.body, departure))
+        {
+            return Err(self.unstructured(departure.source));
+        }
         let enter = &self.instructions[monitor.plan.enter_index()];
         let mut lock = machine.take_monitor_lock(enter)?;
         let mut offsets = mem::take(pending);

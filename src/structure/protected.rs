@@ -71,6 +71,67 @@ pub(super) struct Finally {
 pub(super) struct Monitor {
     arm: ArmId,
     pub(super) plan: MonitorPlan,
+    pub(super) departure: Option<MonitorDeparture>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct MonitorDeparture {
+    pub(super) source: usize,
+    pub(super) target: usize,
+}
+
+impl MonitorDeparture {
+    fn prove(
+        instructions: &[Instruction],
+        graph: &ControlFlowGraph,
+        body: &BTreeSet<usize>,
+        exits: &BTreeSet<usize>,
+        monitor: &MonitorPlan,
+    ) -> Option<Self> {
+        if exits.len() != 2 {
+            return None;
+        }
+        let normal = *exits.first()?;
+        let target = *exits.last()?;
+        // One unlock skips a forward tail of the enclosing statement. The
+        // ordinary unlock reaches that same destination through the tail.
+        let mut block = normal;
+        while block != target {
+            let &[next] = graph.blocks[block].successors.as_slice() else {
+                return None;
+            };
+            if next <= block || next > target || body.contains(&next) {
+                return None;
+            }
+            block = next;
+        }
+        let mut incoming = graph.blocks[target]
+            .predecessors
+            .iter()
+            .copied()
+            .filter(|source| body.contains(source));
+        let source = incoming.next()?;
+        let edge = &graph.blocks[source];
+        if incoming.next().is_some()
+            || source >= normal
+            || edge.successors != [target]
+            || !matches!(instructions[edge.instructions.end - 1].opcode, 0xa7 | 0xc8)
+        {
+            return None;
+        }
+        if monitor.release_index(source).is_none()
+            && (edge.instructions.len() != 1
+                || !edge.exception_predecessors.is_empty()
+                || edge.predecessors.is_empty()
+                || edge
+                    .predecessors
+                    .iter()
+                    .any(|&pred| monitor.release_index(pred).is_none()))
+        {
+            return None;
+        }
+        Some(Self { source, target })
+    }
 }
 
 pub(super) struct Legacy {
@@ -178,7 +239,7 @@ impl Exceptions {
             if Some(route) != routes.last() {
                 return Err(unsupported());
             }
-            let Some(handler) = table.monitor_handlers.remove(&route.handler) else {
+            let Some(handler) = table.monitor_handlers.get(&route.handler).copied() else {
                 continue;
             };
             if routes.len() != 1 {
@@ -233,7 +294,16 @@ impl Exceptions {
                 .into_iter()
                 .map(|(handler, plan)| (handler, CleanupPlan::Monitor(plan))),
         );
-        for (covered, routes) in &table.by_range {
+        // Give inner catches the already-proven boundary of their enclosing
+        // monitor, including catches that are the only normal way out.
+        let is_monitor = |routes: &[Route]| {
+            routes.last().is_some_and(|route| {
+                route.catch_type == 0 && table.monitor_handlers.contains_key(&route.handler)
+            })
+        };
+        let monitor_ranges = table.by_range.iter().filter(|(_, routes)| is_monitor(routes));
+        let ordinary_ranges = table.by_range.iter().filter(|(_, routes)| !is_monitor(routes));
+        for (covered, routes) in monitor_ranges.chain(ordinary_ranges) {
             result.classify(
                 instructions,
                 graph,
@@ -466,7 +536,11 @@ impl Exceptions {
                 CleanupPlan::Monitor(plan) => {
                     body.extend(plan.releases.keys().copied());
                     let arm = self.add_arm(id, plan.handler_blocks().collect());
-                    monitor = Some(Monitor { arm, plan });
+                    monitor = Some(Monitor {
+                        arm,
+                        plan,
+                        departure: None,
+                    });
                 }
             }
         }
@@ -518,6 +592,14 @@ impl Exceptions {
                 start: route.handler,
                 alternatives: vec![route.catch_type],
             });
+        }
+        if let Some(monitor) = &mut monitor
+            && exits.len() > 1
+        {
+            let departure = MonitorDeparture::prove(instructions, graph, &body, &exits, &monitor.plan)
+                .ok_or_else(unsupported)?;
+            exits.remove(&departure.target);
+            monitor.departure = Some(departure);
         }
         if exits.len() > 1 {
             // An ordinary try has one normal continuation. Leave separate
@@ -1092,10 +1174,20 @@ fn catch_blocks(
     handler: usize,
     exceptions: &Exceptions,
 ) -> Result<BTreeSet<usize>, StructureError> {
+    let monitor_body = exceptions
+        .regions
+        .iter()
+        .filter(|region| region.monitor.is_some())
+        .map(|region| &exceptions.arms[region.body.0].blocks)
+        .filter(|blocks| blocks.contains(&handler) && body.is_subset(blocks))
+        .min_by_key(|blocks| blocks.len());
     let mut blocks = BTreeSet::new();
     let mut pending = vec![handler];
     while let Some(block) = pending.pop() {
-        if !dominance.contains(handler, block) || !blocks.insert(block) {
+        if !dominance.contains(handler, block)
+            || monitor_body.is_some_and(|limit| !limit.contains(&block))
+            || !blocks.insert(block)
+        {
             continue;
         }
         if body.contains(&block) {

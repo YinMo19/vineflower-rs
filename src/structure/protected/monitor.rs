@@ -8,6 +8,7 @@ use crate::cfg::ControlFlowGraph;
 
 use super::{local_touches, reference_load, reference_store};
 
+#[derive(Clone, Copy)]
 pub(super) struct MonitorHandler {
     pub(super) start: usize,
     release: usize,
