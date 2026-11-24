@@ -23,6 +23,7 @@ use super::{
     CodeTypeSite, Effect, LiftError, Machine,
     assignment_expr::LocalWrite,
     expr::{AnonymousOrigin, Category, Expr, INT, IntFits, Order, Source},
+    nested::OuterAlias,
 };
 
 #[path = "instanceof_locals.rs"]
@@ -170,6 +171,8 @@ fn local_key<'a>(entry: &LocalVariable<'a>) -> LocalKey<'a> {
 #[derive(Clone)]
 pub(super) struct Locals<'a> {
     slots: Vec<Option<Local>>,
+    // The hidden binding is consumed within its proved straight-line sequence.
+    outer_alias: Option<OuterAlias>,
     debug: Rc<[LocalVariable<'a>]>,
     generic: Option<Rc<GenericSignatures<'a>>>,
     decompile_generics: bool,
@@ -241,6 +244,7 @@ impl<'a> Locals<'a> {
             .map_or((None, None), |(locals, signature)| (Some(Rc::new(locals)), signature));
         let mut result = Self {
             slots: vec![None; usize::from(code.max_locals)],
+            outer_alias: None,
             debug: debug.into(),
             decompile_generics: options.decompile_generics,
             generic,
@@ -766,6 +770,20 @@ impl<'c> Machine<'_, 'c> {
     }
 
     pub(super) fn load(&mut self, op: &Instruction, index: u16, category: Category) -> Result<(), LiftError> {
+        if let Some(alias) = self.locals.outer_alias
+            && alias.slot == index
+            && alias.reload == op.offset
+            && category == Category::Ref
+            && let Some(value) = self.lexical_parameter(1)
+            && matches!(value.source, Source::OuterThis)
+        {
+            self.locals.outer_alias = alias.discard.map(|reload| OuterAlias {
+                reload,
+                discard: None,
+                ..alias
+            });
+            return self.push(value);
+        }
         let local = self
             .locals
             .slots
@@ -804,6 +822,19 @@ impl<'c> Machine<'_, 'c> {
         let target = LocalWrite { index, category };
         let (ty, debug, same) = self.resolve_local_store(op, target, &value)?;
         let slot = usize::from(index);
+        if matches!(value.source, Source::OuterThis)
+            && value.order.is_none()
+            && !value.observable
+            && slot >= 2
+            && self.locals.outer_alias.is_none()
+            && self.locals.slots[slot].is_none()
+            && !self.locals.slots[slot - 1].as_ref().is_some_and(|local| local.ty.slots() == 2)
+            && !self.locals.debug.iter().any(|entry| entry.index == index)
+            && let Some(alias) = self.dead_outer_parameter_copy(op, index, &value)
+        {
+            self.locals.outer_alias = Some(alias);
+            return Ok(Effect::None);
+        }
         let generic = if same { None } else { self.locals.declaration_signature(&ty, debug.as_ref()) };
         let signature = if same {
             self.locals.slots[slot].as_ref().and_then(|local| local.generic.as_deref())

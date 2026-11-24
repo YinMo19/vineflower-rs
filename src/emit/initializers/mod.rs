@@ -10,7 +10,7 @@ use crate::{
     classfile::{Code, Member, find_attribute},
     context::NestedKind,
     descriptor::MethodDescriptor,
-    lift::{DynamicHelpers, Effect, Machine},
+    lift::{DynamicHelper, DynamicHelpers, Effect, Machine},
     source_text::Document,
 };
 
@@ -54,7 +54,7 @@ struct Assignment {
     instructions: Range<usize>,
     materialization: Option<Range<u32>>,
     expression: Document,
-    helpers: BTreeSet<(u16, u16)>,
+    helpers: BTreeSet<DynamicHelper>,
 }
 
 struct Prefix<'c> {

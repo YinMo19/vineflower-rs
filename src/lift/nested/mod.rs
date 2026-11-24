@@ -15,6 +15,39 @@ use super::{
     expr::{Category, Expr, PRIMARY, Source},
 };
 
+#[derive(Clone, Copy)]
+pub(super) struct OuterAlias {
+    pub(super) slot: u16,
+    pub(super) reload: u32,
+    pub(super) discard: Option<u32>,
+}
+
+struct OuterCopy {
+    reload: usize,
+    write: usize,
+}
+
+impl OuterCopy {
+    fn at_store(instructions: &[Instruction], store: usize, slot: u16, ty: &Type) -> Option<Self> {
+        let source = instructions.get(store.checked_sub(1)?)?;
+        let [save, left, right, next, ..] = instructions.get(store..)? else {
+            return None;
+        };
+        let (receiver, reload, write) = if next.opcode == 0x5f {
+            (right, store + 1, store + 4)
+        } else {
+            (left, store + 2, store + 3)
+        };
+        (parameter_load_slot(source, ty) == Some(1)
+            && matches!(save.opcode, 0x3a | 0x4b..=0x4e)
+            && save.local_access().is_some_and(|(slots, _)| slots.start == u32::from(slot))
+            && parameter_load_slot(receiver, ty) == Some(0)
+            && parameter_load_slot(&instructions[reload], ty) == Some(slot)
+            && instructions.get(write)?.opcode == 0xb5)
+            .then_some(Self { reload, write })
+    }
+}
+
 impl<'a, 'c> Machine<'a, 'c> {
     pub(super) fn lexical_parameter(&self, index: u16) -> Option<Expr> {
         if let Some(capture) = self.captured_parameter(index) {
@@ -67,8 +100,10 @@ impl<'a, 'c> Machine<'a, 'c> {
         if let Some(value) = value {
             if self.method_name != "<init>"
                 || !matches!(receiver.source, Source::This)
-                || !matches!(value.source, Source::OuterThis)
                 || !matches!(&value.ty, Type::Object(name) if name == outer)
+                || !(matches!(value.source, Source::OuterThis)
+                    || matches!(value.source, Source::Local(slot)
+                        if self.proves_outer_parameter_copy(slot, &value.ty)))
             {
                 return Err(self.unsupported("noninitial synthetic enclosing-instance field write"));
             }
@@ -76,6 +111,90 @@ impl<'a, 'c> Machine<'a, 'c> {
             self.push(self.outer_this(outer))?;
         }
         Ok(Some(Effect::None))
+    }
+
+    fn may_copy_outer_parameter(&self, slot: u16, ty: &Type) -> bool {
+        slot >= 2
+            && self.method_name == "<init>"
+            && !self.initialized_this
+            && self.normalized.is_none()
+            && self.descriptor.parameters.first() == Some(ty)
+    }
+
+    /// A real source local may also hold the outer parameter. Prove the
+    /// store/reload, not just the local's declared type.
+    fn proves_outer_parameter_copy(&self, slot: u16, ty: &Type) -> bool {
+        let prove = || {
+            if !self.may_copy_outer_parameter(slot, ty) {
+                return None;
+            }
+            let instructions = bytecode::decode(self.code.bytes).ok()?;
+            let write = instructions.binary_search_by_key(&self.offset, |op| op.offset).ok()?;
+            let swapped = instructions.get(write.checked_sub(1)?)?.opcode == 0x5f;
+            let store = write.checked_sub(if swapped { 4 } else { 3 })?;
+            let copy = OuterCopy::at_store(&instructions, store, slot, ty)?;
+            Some(copy.write == write
+                && self.proves_outer_copy_path(&instructions, store, write))
+        };
+        prove() == Some(true)
+    }
+
+    /// Elide only a compiler temporary whose entire lifetime is the copy into
+    /// the hidden field and, optionally, reloading and discarding its value.
+    pub(super) fn dead_outer_parameter_copy(
+        &self, op: &Instruction, slot: u16, value: &Expr,
+    ) -> Option<OuterAlias> {
+        if !self.may_copy_outer_parameter(slot, &value.ty) || !self.code.exceptions.is_empty() {
+            return None;
+        }
+        let group = self.group.filter(|group| self.options.decompile_inner && group.is_attached(self.owner))?;
+        let instructions = bytecode::decode(self.code.bytes).ok()?;
+        let store = instructions.binary_search_by_key(&op.offset, |op| op.offset).ok()?;
+        let copy = OuterCopy::at_store(&instructions, store, slot, &value.ty)?;
+        let Operand::Constant(index) = instructions[copy.write].operand else {
+            return None;
+        };
+        let (owner, name, descriptor) = self.class.pool.member_ref(index).ok()?;
+        if owner != self.owner || group.outer_field(owner, name, descriptor).is_none() {
+            return None;
+        }
+        let discard = match &instructions[copy.write + 1..] {
+            [load, pop, ..] if pop.opcode == 0x57 && parameter_load_slot(load, &value.ty) == Some(slot) =>
+                Some(copy.write + 1),
+            _ => None,
+        };
+        let end = discard.map_or(copy.write, |load| load + 1);
+        if !self.proves_outer_copy_path(&instructions, store, end)
+            || instructions.iter().enumerate().any(|(i, op)| {
+                i != store && i != copy.reload && discard != Some(i)
+                    && op.local_access().is_some_and(|(slots, _)| slots.contains(&u32::from(slot)))
+            })
+        {
+            return None;
+        }
+        Some(OuterAlias {
+            slot,
+            reload: instructions[copy.reload].offset,
+            discard: discard.map(|i| instructions[i].offset),
+        })
+    }
+
+    fn proves_outer_copy_path(&self, instructions: &[Instruction], store: usize, end: usize) -> bool {
+        let enters_copy = |target| (instructions[store].offset..=instructions[end].offset).contains(&target);
+        !self.code.exceptions.iter().any(|handler| enters_copy(u32::from(handler.handler_pc)))
+            && !instructions.iter().any(|op| {
+                // A branch can run even a later write to slot one before the
+                // copy, so require the input parameter to retain its value.
+                op.local_access().is_some_and(|(slots, read)| {
+                    slots.contains(&1) && (!read || op.opcode == 0x84)
+                }) || match &op.operand {
+                    Operand::Branch(target) => enters_copy(*target),
+                    Operand::Switch { default, cases } => {
+                        enters_copy(*default) || cases.iter().any(|&(_, target)| enters_copy(target))
+                    }
+                    _ => false,
+                }
+            })
     }
 
     /// Return the Java constructor head and the JVM arguments that remain

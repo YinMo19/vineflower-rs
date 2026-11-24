@@ -547,7 +547,7 @@ impl<'a, 'c> Machine<'a, 'c> {
         if let Some(helpers) = &self.dynamic_helpers {
             helpers
                 .borrow_mut()
-                .insert((helper.name_index, helper.descriptor_index));
+                .insert(super::DynamicHelper::Synthetic(helper.name_index, helper.descriptor_index));
         }
     }
 

@@ -351,6 +351,11 @@ impl Machine<'_, '_> {
         {
             return Ok(effect);
         }
+        let bridge = if expanded.is_none() {
+            self.groovy_dispatch(index, member, op.opcode)?
+        } else {
+            None
+        };
         // With a declaration in the current class, a simple invocation
         // searches the same overload set as the written class qualifier.
         // A symbolic owner alone is insufficient: it may resolve upstairs.
@@ -358,7 +363,7 @@ impl Machine<'_, '_> {
             || op.opcode == 0xb8
                 && self.is_lexical_member_owner(owner)
                 && self.own_method_is_static(name, method_type)?;
-        let (mut text, chain) = if unqualified {
+        let (mut text, chain) = if unqualified || bridge.is_some() {
             (Document::new(), false)
         } else if let Some(receiver) = &receiver {
             let mut text = receiver.at(PRIMARY).into_owned();
@@ -378,15 +383,26 @@ impl Machine<'_, '_> {
         };
         self.record_synthetic_invocation(owner, name, method_type);
         let source_name = self.source_invocation_name(owner, name, method_type);
-        if enclosing_receiver && self.current_member_named(&source_name, true)? {
+        if bridge.is_none() && enclosing_receiver && self.current_member_named(&source_name, true)? {
             return Err(self.unsupported("an unnameable enclosing method is shadowed"));
         }
-        if !unqualified {
+        if !unqualified && bridge.is_none() {
             text.push('.');
         }
         self.anchor_member(&mut text, op);
-        self.append_method_reference(&mut text, &source_name, owner, name, method_type);
-        if let Some(elements) = &expanded {
+        self.append_method_reference(
+            &mut text,
+            bridge.as_ref().map_or(source_name.as_ref(), |bridge| bridge.name.as_str()),
+            owner,
+            name,
+            method_type,
+        );
+        if let Some(bridge) = bridge {
+            text.append_relative_arguments(
+                receiver.iter().chain(&args).map(|argument| &argument.text),
+            );
+            self.record_groovy_dispatch(bridge);
+        } else if let Some(elements) = &expanded {
             let prefix = &args[..args.len() - 1];
             text.append_relative_arguments(
                 prefix.iter().map(|argument| &argument.text)
@@ -575,7 +591,7 @@ impl Machine<'_, '_> {
         }
     }
 
-    fn current_member_named(&self, source_name: &str, method: bool) -> Result<bool, LiftError> {
+    pub(super) fn current_member_named(&self, source_name: &str, method: bool) -> Result<bool, LiftError> {
         let pool = &self.class.pool;
         let members = if method {
             &self.class.methods

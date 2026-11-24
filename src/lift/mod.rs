@@ -16,6 +16,7 @@ mod enum_constants;
 pub(crate) mod enum_switch;
 mod expr;
 mod generics;
+pub(crate) mod invoke_groovy;
 mod java_templates;
 mod literal;
 mod locals;
@@ -107,7 +108,13 @@ pub(crate) enum Effect {
     },
 }
 
-pub(crate) type DynamicHelpers = Rc<RefCell<BTreeSet<(u16, u16)>>>;
+#[derive(Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum DynamicHelper {
+    Synthetic(u16, u16),
+    GroovyDispatch(invoke_groovy::GroovyDispatch),
+}
+
+pub(crate) type DynamicHelpers = Rc<RefCell<BTreeSet<DynamicHelper>>>;
 type CodeTypeRenderer<'c> =
     dyn Fn(RenderType<'_>, CodeTypeSite) -> Result<Option<Document>, LiftError> + 'c;
 

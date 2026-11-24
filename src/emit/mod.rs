@@ -10,6 +10,7 @@ mod names;
 mod nested;
 mod options_support;
 mod record;
+mod source_helpers;
 pub(crate) mod symbols;
 pub(crate) mod synthetic_marks;
 pub(crate) mod type_annotations;

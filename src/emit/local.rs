@@ -169,7 +169,9 @@ impl<'a, 'c> Writer<'a, 'c> {
                             if self
                                 .dynamic_helpers
                                 .borrow()
-                                .contains(&(method.name_index, method.descriptor_index))
+                                .contains(&crate::lift::DynamicHelper::Synthetic(
+                                    method.name_index, method.descriptor_index,
+                                ))
                             {
                                 return Err(DecompileError::Unsupported {
                                     feature: "local class escaping to a synthetic lambda helper",

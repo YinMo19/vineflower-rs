@@ -5,6 +5,7 @@ use std::{mem, rc::Rc};
 use crate::{
     classfile::{Constant, Member, RecordComponent, find_attribute},
     context::{NestedClass, NestedKind},
+    lift::DynamicHelper,
 };
 
 use super::initializers::FieldInitializers;
@@ -154,7 +155,7 @@ impl<'a, 'c> Writer<'a, 'c> {
                     *needs_gap = true;
                 }
             }
-            return Ok(());
+            return self.write_source_helpers(needs_gap);
         }
 
         let mut staged: Vec<Option<MethodOutput>> =
@@ -223,7 +224,7 @@ impl<'a, 'c> Writer<'a, 'c> {
             self.lines += output.lines;
             *needs_gap = true;
         }
-        Ok(())
+        self.write_source_helpers(needs_gap)
     }
 
     fn should_write_method(
@@ -256,7 +257,7 @@ impl<'a, 'c> Writer<'a, 'c> {
             || self
                 .dynamic_helpers
                 .borrow()
-                .contains(&(method.name_index, method.descriptor_index)))
+                .contains(&DynamicHelper::Synthetic(method.name_index, method.descriptor_index)))
     }
 }
 
