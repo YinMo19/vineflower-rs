@@ -1,7 +1,7 @@
 // Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Method stages of `MethodProcessor.codeToJava` leading up to its main loop.
+//! Method stages of `MethodProcessor.codeToJava`.
 //!
 //! The language-independent stages end immediately before upstream dispatches
 //! to a language's CFG passes. Java then prepares exception regions for
@@ -251,6 +251,30 @@ pub struct ExpressionMethod {
 }
 
 impl ExpressionMethod {
+    /// Refreshes explicit jumps and their enclosing statements at main-loop entry.
+    pub fn clean_up_edges(&mut self, cx: &mut Cx) {
+        crate::decompiler::labels::clean_up_edges(&mut cx.ir, self.root);
+    }
+
+    /// One pass of redundant-loop elimination. A change restarts the merge loop.
+    pub fn eliminate_loops(&mut self, cx: &mut Cx, class: &StructClass) -> io::Result<bool> {
+        let crate::decompiler::stats::StatementKind::Root { content_flags, .. } =
+            cx.ir[self.root].kind
+        else {
+            unreachable!("Expected a method root")
+        };
+        if content_flags.has_loops {
+            crate::decompiler::loops::eliminate::eliminate(
+                cx,
+                &mut self.flow.counters,
+                self.root,
+                class,
+            )
+        } else {
+            Ok(false)
+        }
+    }
+
     pub fn simplify_string_concat(&mut self, cx: &mut Cx, class: &StructClass) -> io::Result<()> {
         if class.version.has_indy_string_concat() {
             crate::decompiler::concat::simplify(cx, &mut self.flow.counters, self.root)?;
@@ -357,6 +381,8 @@ pub fn expression_method(
 }
 
 /// Processes a method with code up to the Java BEFORE_MAIN pass location.
+/// For a compilation unit, [`super::class_processor::prepare_class`] establishes
+/// the root's imports, lambda nodes and wrapper order before method processing.
 pub fn pre_main_method(
     cx: &mut Cx,
     class: &StructClass,

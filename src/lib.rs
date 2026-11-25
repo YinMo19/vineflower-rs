@@ -1,10 +1,10 @@
 //! A Rust port of the Vineflower Java decompiler (upstream 1.12.0).
 //!
 //! The port follows upstream's algorithms, iteration orders and method-local
-//! counters. [`engine::method_processor::structured_statement_graph`] reconstructs
-//! method structure through the first upstream `DomHelper.parseGraph` call.
-//! [`engine::method_processor::StructuredMethod::process_expressions`] lifts
-//! bytecode on that tree for expression and variable analysis.
+//! counters. [`engine::method_processor::pre_main_method`] processes a method
+//! through finally recovery, expression lifting, type inference and the Java
+//! passes preceding `BEFORE_MAIN`. [`engine::method_processor::ExpressionMethod`]
+//! exposes the tree and the first main-loop rewrites.
 //!
 //! # Where things are
 //!
@@ -41,10 +41,10 @@
 //!   module documents tree-bin limits. Linked and identity-keyed maps that
 //!   require stable iteration use `indexmap`, sorted keys use `BTreeMap`,
 //!   and lookup-only maps can use `rustc_hash`.
-//! - **Exceptions.** A Java exception that ends the decompilation of a
-//!   method is a panic, caught where upstream catches it; `IOException`s of
-//!   class loading are `io::Result`s; a parser that upstream lets throw on
-//!   malformed input returns `Option`.
+//! - **Exceptions.** Class loading and method processing use `io::Result`.
+//!   An explicit rejection of an input method returns `InvalidData` at the
+//!   pass that detects it. Internal graph invariants are checked in place.
+//!   Optional metadata parsers can indicate absence with `Option`.
 //! - **Strings.** Names and descriptors are shared `ArcStr`s. Generated text
 //!   is kept in UTF-16 ([`util::text_buffer`]) and [`util::java_str`] has
 //!   the `String` operations whose results differ from Rust's.

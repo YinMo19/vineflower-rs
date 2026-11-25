@@ -1,6 +1,6 @@
 # Testing the current port
 
-The active method pipeline runs through finally recovery, expression lifting, stack-variable simplification, variable type inference, increment recovery, string concatenation and assertions. Intermediate entry points expose statement decomposition and the SSA and SSAU passes used during finally recovery and inlining. Run the checks against the checked-in class files with
+The active method stages cover finally recovery, expression lifting, stack-variable simplification, variable type inference, increment recovery, string concatenation, assertions and the first main-loop rewrites. Intermediate entry points expose statement decomposition and the SSA and SSAU passes used during finally recovery and inlining. Run the checks against the checked-in class files with
 
 ```sh
 cargo test --locked --test control_flow --test structured_flow
@@ -31,6 +31,8 @@ The stack comparison prepares the owning classes with the inputs from their comp
 The variable comparison checks the first assignment of source variable indices and the fixed point after increment recovery. It compares the lower and upper type bounds, explicit null upper bounds, finality, original slot provenance, expression IDs, effective types and counters. The three profiles exercise default behavior, disabled debug variable names and disabled integer treatment of boolean constants. A JDK-free check also queries two constructors sharing an IR arena and slot zero.
 
 The pre-main comparison runs the full increment fixed point, then checks the method after string concatenation and again after assertion recovery. It compares the tree, expressions, variable state, root flags and comments, hidden class members and the return value of assertion recovery. The two profiles use default options and disabled assertions. A checked-in Java 19 class also exercises the public method entry point and the operand order of dynamic string concatenation without a JDK.
+
+The loop-entry comparison checks the result of edge cleanup and every call to redundant-loop elimination through its first false return. It compares both ordered adjacency lists, closure membership, edge flags, expressions, counters and variables. A JDK-free test uses the upstream Java 8 nested-loop class to check that one elimination preserves the surrounding loops.
 
 ## End-to-end source and CLI suite
 

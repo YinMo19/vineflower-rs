@@ -8,6 +8,8 @@ mod effectively_final;
 mod inline;
 mod simplify_list;
 
+use std::io;
+
 use rustc_hash::FxHashSet;
 
 use crate::decompiler::decompose::{finish::condense_sequences, if_helper::merge_ifs};
@@ -68,17 +70,44 @@ pub fn simplify_statement(
     class: &StructClass,
     first: bool,
 ) -> bool {
+    simplify_statement_with_optional_ssa(cx, counters, stat, reordered, Some(ssa), class, first)
+        .expect("SSA is available to simplify stack variables")
+}
+
+pub(crate) fn simplify_statement_without_ssa(
+    cx: &mut Cx,
+    counters: &mut CounterContainer,
+    stat: StatId,
+    reordered: &mut FxHashSet<i32>,
+    class: &StructClass,
+) -> io::Result<bool> {
+    simplify_statement_with_optional_ssa(cx, counters, stat, reordered, None, class, false)
+}
+
+fn simplify_statement_with_optional_ssa(
+    cx: &mut Cx,
+    counters: &mut CounterContainer,
+    stat: StatId,
+    reordered: &mut FxHashSet<i32>,
+    ssa: Option<&SsaResult>,
+    class: &StructClass,
+    first: bool,
+) -> io::Result<bool> {
     if let Some(list) = cx.ir[stat].exprents {
-        return simplify_list::simplify_list(cx, counters, stat, list, ssa, class, first);
+        return Ok(simplify_list::simplify_list(
+            cx, counters, stat, list, ssa, class, first,
+        ));
     }
     let mut found = false;
     loop {
         let mut changed = false;
         for i in 0..cx.ir[stat].stats.len() {
             let child = cx.ir[stat].stats[i];
-            found |= simplify_statement(cx, counters, child, reordered, ssa, class, first);
+            found |= simplify_statement_with_optional_ssa(
+                cx, counters, child, reordered, ssa, class, first,
+            )?;
             changed = merge_ifs(cx, counters, child, reordered, class)
-                || conditionals::build_iff(cx, counters, child, ssa)
+                || conditionals::build_iff(cx, counters, child, ssa)?
                 || cx.options.decompile_java4
                     && conditionals::collapse_class_literal(cx, counters, child, class);
             if changed {
@@ -91,7 +120,7 @@ pub fn simplify_statement(
             }
         }
         if !changed {
-            return found;
+            return Ok(found);
         }
         found = true;
     }

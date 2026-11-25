@@ -3,7 +3,10 @@
 
 //! Conditional rewrites interleaved with stack-expression simplification.
 
-use std::sync::{Arc, LazyLock};
+use std::{
+    io,
+    sync::{Arc, LazyLock},
+};
 
 use crate::decompiler::decompose::finish::destroy_and_flatten_statement;
 use crate::decompiler::exps::{ExitType, Expr, ExprKind, FunctionType};
@@ -30,23 +33,23 @@ pub(super) fn build_iff(
     cx: &mut Cx,
     counters: &mut CounterContainer,
     stat: StatId,
-    ssa: &SsaResult,
-) -> bool {
+    ssa: Option<&SsaResult>,
+) -> io::Result<bool> {
     let ir = &mut cx.ir;
     let StatementKind::If(branch) = ir[stat].kind else {
-        return false;
+        return Ok(false);
     };
     if ir[stat].exprents.is_some() || !branch.has_else {
-        return false;
+        return Ok(false);
     }
     let Some((then_expr, exit)) = single_branch(ir, branch.if_stat) else {
-        return false;
+        return Ok(false);
     };
     let Some((else_expr, else_exit)) = single_branch(ir, branch.else_stat) else {
-        return false;
+        return Ok(false);
     };
     if ir[exit].destination != ir[else_exit].destination {
-        return false;
+        return Ok(false);
     }
 
     let (yes, no, result) = match (&ir[then_expr].kind, &ir[else_expr].kind) {
@@ -61,17 +64,21 @@ pub(super) fn build_iff(
             let (ExprKind::Variable(a), ExprKind::Variable(b)) =
                 (&ir[*left].kind, &ir[*other].kind)
             else {
-                return false;
+                return Ok(false);
             };
-            if !a.stack
-                || a.index != b.index
-                || !ssa.versions.phi.iter().any(|(key, versions)| {
-                    key.var == a.index
-                        && versions.contains(&a.version)
-                        && versions.contains(&b.version)
-                })
-            {
-                return false;
+            if !a.stack || a.index != b.index {
+                return Ok(false);
+            }
+            let ssa = ssa.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Trying to make ternary but have no SSA-Form! How is this possible?",
+                )
+            })?;
+            if !ssa.versions.phi.iter().any(|(key, versions)| {
+                key.var == a.index && versions.contains(&a.version) && versions.contains(&b.version)
+            }) {
+                return Ok(false);
             }
             (*right, *alternate, ResultKind::Assignment(*left))
         }
@@ -97,7 +104,7 @@ pub(super) fn build_iff(
                     }
                 )
             }) {
-                return false;
+                return Ok(false);
             }
             (
                 *yes,
@@ -105,7 +112,7 @@ pub(super) fn build_iff(
                 ResultKind::Return(return_type.clone(), Arc::clone(method_descriptor)),
             )
         }
-        _ => return false,
+        _ => return Ok(false),
     };
     let head = ir[branch.head_exprents.unwrap()][0];
     let ExprKind::If { condition } = ir[head].kind else {
@@ -154,7 +161,7 @@ pub(super) fn build_iff(
         }
     }
     destroy_and_flatten_statement(cx, counters, parent, stat);
-    true
+    Ok(true)
 }
 
 fn single_branch(ir: &Ir, branch: Option<StatId>) -> Option<(ExprId, EdgeId)> {

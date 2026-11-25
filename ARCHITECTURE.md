@@ -85,9 +85,13 @@ CFG、语句图和 DirectGraph 具有不同的边契约。
 
 `ExpressionMethod::process_increments` 按上游顺序运行栈简化、类型推断和自增识别。识别成功时，下一轮把新编号经上一轮的映射追溯到原始槽。稳定后才尝试将块末的前缀自增移入后继 if 的条件。
 
-[`pre_main_method`](src/engine/method_processor.rs) 接着按 class 版本处理字符串拼接，再恢复断言，到达 `BEFORE_MAIN`。拼接识别器从调用和 bootstrap recipe 收集有序操作数，按 UTF-16 单元保留常量片段，再构建左结合的字符串表达式。断言恢复根据类初始化字节码记录的字段识别保护条件，保留条件与消息的求值位置。接口可引用同一根类下已初始化 wrapper 的合成持有类。方法主循环、类级写出和 CLI 的端到端验证仍待接入。[字符串拼接](src/decompiler/concat.rs) · [断言恢复](src/decompiler/assertions.rs)
+[`pre_main_method`](src/engine/method_processor.rs) 接着按 class 版本处理字符串拼接，再恢复断言，到达 `BEFORE_MAIN`。拼接识别器从调用和 bootstrap recipe 收集有序操作数，按 UTF-16 单元保留常量片段，再构建左结合的字符串表达式。断言恢复根据类初始化字节码记录的字段识别保护条件，保留条件与消息的求值位置。接口可引用同一根类下已初始化 wrapper 的合成持有类。[字符串拼接](src/decompiler/concat.rs) · [断言恢复](src/decompiler/assertions.rs)
+
+方法主循环的第一步通过 `ExpressionMethod::clean_up_edges` 重置边标志、删除不能直接跳出的 break/continue，并重新确定跳转归属的语句。随后 `eliminate_loops` 按后序查找与外层循环共享基本块入口的无限循环。只有在 break 标签数量和 continue 目标允许时才移除一层，随后压缩 sequence，并按上游在无 SSA 的上下文中重新简化语句。一次调用至多消除一个循环，成功后从合并循环的起点重新遍历。下一阶段是 `MergeHelper.enhanceLoops`，类级写出与 CLI 仍待接入。[边清理](src/decompiler/labels.rs) · [冗余循环](src/decompiler/loops/eliminate.rs)
 
 同步区扩展有一处有意的终止条件。当共享后继的首个前驱来自另一保护区，上游可能反复向已覆盖的区间追加同一块。如果本轮既不会新增覆盖关系、也不会增加异常边或移动指令，Rust 跳过这个候选，继续检查其他区间。
+
+断言 IR 允许顶层条件为空，用来表达 `assert false`。上游递归剥离断言字段时还可能把空引用写进 `&&` 的操作数。Rust 的二元表达式要求两个有效操作数，遇到后一种形状会在断言恢复阶段返回方法级错误。当前真实 class 对照尚未触发这条路径。
 
 ## 核对实现
 

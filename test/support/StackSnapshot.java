@@ -12,7 +12,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
-import java.util.function.BiFunction;
+import java.util.StringJoiner;
 import java.util.stream.Collectors;
 
 import org.jetbrains.java.decompiler.code.CodeConstants;
@@ -33,8 +33,10 @@ import org.jetbrains.java.decompiler.modules.code.MethodPropertiesProcessor;
 import org.jetbrains.java.decompiler.modules.decompiler.AssertProcessor;
 import org.jetbrains.java.decompiler.modules.decompiler.ClearStructHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.ConcatenationHelper;
+import org.jetbrains.java.decompiler.modules.decompiler.EliminateLoopsHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.ExprProcessor;
 import org.jetbrains.java.decompiler.modules.decompiler.FinallyProcessor;
+import org.jetbrains.java.decompiler.modules.decompiler.LabelHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.PPandMMHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.SequenceHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.SimplifyExprentsHelper;
@@ -50,7 +52,7 @@ import org.jetbrains.java.decompiler.struct.gen.MethodDescriptor;
 import org.jetbrains.java.decompiler.util.InterpreterUtil;
 
 class StackSnapshot {
-  enum Check { STACK, INCREMENTS, PRE_MAIN }
+  enum Check { STACK, INCREMENTS, PRE_MAIN, LOOP_ELIMINATION }
 
   record Options(int group, boolean simplify, boolean ternary, boolean lvt, boolean booleanAsInt, boolean assertions) {}
   private record RootScope(ImportCollector imports, List<ClassNode> wrapperOrder, String error) {}
@@ -137,8 +139,7 @@ class StackSnapshot {
     }
 
     String run(DataInputStream input, Options options, String classname,
-               String name, String descriptor,
-               BiFunction<RootStatement, CounterContainer, String> tree) throws IOException {
+               String name, String descriptor) throws IOException {
       select(options);
       var node = Objects.requireNonNull(DecompilerContext.getClassProcessor().getMapRootClasses().get(classname));
       var owner = node;
@@ -164,13 +165,13 @@ class StackSnapshot {
         }
         var hidden = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_CLASS_WRAPPER).getHiddenMembers();
         var initialHidden = Set.copyOf(hidden);
-        String first = stage(firstGraph, scope.imports(), cl, method, tree, initialHidden, true, check);
+        String first = stage(firstGraph, scope.imports(), cl, method, initialHidden, true, check);
         hidden.clear();
         hidden.addAll(initialHidden);
         if ("rejected=parsing failure!".equals(first)) {
           return first;
         }
-        return first + "\t" + stage(settledGraph, scope.imports(), cl, method, tree, initialHidden, false, check);
+        return first + "\t" + stage(settledGraph, scope.imports(), cl, method, initialHidden, false, check);
       } finally {
         method.releaseResources();
       }
@@ -238,8 +239,7 @@ class StackSnapshot {
   }
 
   private static String stage(ControlFlowGraph graph, ImportCollector imports, StructClass cl, StructMethod method,
-                              BiFunction<RootStatement, CounterContainer, String> tree, Set<String> initialHidden,
-                              boolean first, Check check) {
+                              Set<String> initialHidden, boolean first, Check check) {
     DecompilerContext.startClass(new ImportCollector(imports));
     var descriptor = MethodDescriptor.parseDescriptor(method, null);
     var vars = new VarProcessor(method, descriptor);
@@ -285,12 +285,12 @@ class StackSnapshot {
           operation = "inline-increments";
           PPandMMHelper.inlinePPIandMMIIf(root);
         }
-        if (check == Check.PRE_MAIN) {
+        if (check == Check.PRE_MAIN || check == Check.LOOP_ELIMINATION) {
           operation = "simplify-concat";
           if (cl.getVersion().hasIndyStringConcat()) {
             ConcatenationHelper.simplifyStringConcat(root);
           }
-          if (!first) {
+          if (!first || check == Check.LOOP_ELIMINATION) {
             operation = "build-assertions";
             AssertProcessor.buildAssertions(root);
           }
@@ -303,24 +303,45 @@ class StackSnapshot {
       } else {
         StackVarsProcessor.simplifyStackVars(root, method, cl);
       }
-      var hidden = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_CLASS_WRAPPER).getHiddenMembers();
-      String allMembers = hidden.stream().sorted().map(ExpressionSnapshot::text).collect(Collectors.joining(","));
-      String added = hidden.stream().filter(member -> !initialHidden.contains(member)).sorted()
-        .map(ExpressionSnapshot::text).collect(Collectors.joining(","));
-      operation = "snapshot";
-      String content = check == Check.PRE_MAIN
-        ? ";content=" + root.hasTryCatch() + "," + root.hasLoops() + "," + root.hasSwitch() : "";
-      String snapshot = tree.apply(root, counters) + content + ";hidden=" + allMembers + ";hidden-added=" + added
-        + "\t" + ExpressionSnapshot.snapshot(root, counters);
-      if (check != Check.STACK) {
-        snapshot += "\t" + VariableSnapshot.snapshot(vars);
-        if (check == Check.INCREMENTS && first) {
-          operation = "find-increments";
-          snapshot += ";repeat=" + new PPandMMHelper(vars).findPPandMM(root);
-        } else if (check == Check.PRE_MAIN && first) {
-          operation = "build-assertions";
-          snapshot += ";assert-changed=" + AssertProcessor.buildAssertions(root);
+      if (check == Check.LOOP_ELIMINATION) {
+        operation = "snapshot";
+        var originalEdges = first ? StructureReference.edgeStates(root) : Map.of();
+        operation = "clean-up-edges";
+        LabelHelper.cleanUpEdges(root);
+        operation = "snapshot";
+        if (first) {
+          var cleanedEdges = StructureReference.edgeStates(root);
+          long removed = originalEdges.keySet().stream().filter(edge -> !cleanedEdges.containsKey(edge)).count();
+          long rewritten = originalEdges.entrySet().stream().filter(entry -> cleanedEdges.containsKey(entry.getKey())
+            && !entry.getValue().equals(cleanedEdges.get(entry.getKey()))).count();
+          return snapshot(root, counters, vars, initialHidden, check,
+            ";cleanup-removed=" + removed + ";cleanup-rewritten=" + rewritten);
         }
+
+        List<String> states = new ArrayList<>();
+        states.add(snapshot(root, counters, vars, initialHidden, check, ""));
+        var iterations = new StringJoiner(",");
+        if (root.hasLoops()) {
+          boolean repeat;
+          do {
+            operation = "eliminate-loops";
+            repeat = EliminateLoopsHelper.eliminateLoops(root, cl);
+            iterations.add(Boolean.toString(repeat));
+            operation = "snapshot";
+            states.add(snapshot(root, counters, vars, initialHidden, check, ""));
+          } while (repeat);
+        }
+        return "iterations=" + iterations + "\t" + String.join("\t", states);
+      }
+
+      operation = "snapshot";
+      String snapshot = snapshot(root, counters, vars, initialHidden, check, "");
+      if (check == Check.INCREMENTS && first) {
+        operation = "find-increments";
+        snapshot += ";repeat=" + new PPandMMHelper(vars).findPPandMM(root);
+      } else if (check == Check.PRE_MAIN && first) {
+        operation = "build-assertions";
+        snapshot += ";assert-changed=" + AssertProcessor.buildAssertions(root);
       }
       return snapshot;
     } catch (RuntimeException | AssertionError | StackOverflowError error) {
@@ -331,8 +352,23 @@ class StackSnapshot {
         case STACK -> "stack-";
         case INCREMENTS -> "increments-" + operation + "-";
         case PRE_MAIN -> "pre-main-" + operation + "-";
+        case LOOP_ELIMINATION -> "loop-elimination-" + operation + "-";
       };
       return failure + StructureReference.failureSnapshot(error);
     }
+  }
+
+  private static String snapshot(RootStatement root, CounterContainer counters, VarProcessor vars,
+                                 Set<String> initialHidden, Check check, String details) {
+    var hidden = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_CLASS_WRAPPER).getHiddenMembers();
+    String allMembers = hidden.stream().sorted().map(ExpressionSnapshot::text).collect(Collectors.joining(","));
+    String added = hidden.stream().filter(member -> !initialHidden.contains(member)).sorted()
+      .map(ExpressionSnapshot::text).collect(Collectors.joining(","));
+    String content = check == Check.PRE_MAIN || check == Check.LOOP_ELIMINATION
+      ? ";content=" + root.hasTryCatch() + "," + root.hasLoops() + "," + root.hasSwitch() : "";
+    String snapshot = StructureReference.snapshot(root, counters, check == Check.LOOP_ELIMINATION)
+      + content + ";hidden=" + allMembers + ";hidden-added=" + added + details
+      + "\t" + ExpressionSnapshot.snapshot(root, counters);
+    return check == Check.STACK ? snapshot : snapshot + "\t" + VariableSnapshot.snapshot(vars);
   }
 }

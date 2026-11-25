@@ -20,7 +20,7 @@ pub(super) fn simplify_list(
     counters: &mut CounterContainer,
     stat: StatId,
     list: ExprListId,
-    ssa: &SsaResult,
+    ssa: Option<&SsaResult>,
     class: &StructClass,
     first_invocation: bool,
 ) -> bool {
@@ -62,9 +62,9 @@ pub(super) fn simplify_list(
                     || stack_assignment(cx, current, next)
                 {
                     cx.ir[list].remove(index + 1);
-                } else if constructors::inline_method_reference_assignment(
-                    cx, ssa, class, current, next,
-                ) {
+                } else if ssa.is_some_and(|ssa| {
+                    constructors::inline_method_reference_assignment(cx, ssa, class, current, next)
+                }) {
                     cx.ir[list].remove(index);
                 } else if !first_invocation && stack_assignment_two(cx, counters, current, next) {
                     cx.ir[list].remove(index + 1);

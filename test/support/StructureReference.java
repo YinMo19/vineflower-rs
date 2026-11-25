@@ -11,6 +11,7 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -37,6 +38,7 @@ import org.jetbrains.java.decompiler.modules.decompiler.exps.Exprent;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.VarExprent;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.CatchAllStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.CatchStatement;
+import org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.IfStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.RootStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.Statement;
@@ -61,6 +63,7 @@ class StructureReference {
         case 3 -> StackSnapshot.Check.STACK;
         case 4 -> StackSnapshot.Check.INCREMENTS;
         case 5 -> StackSnapshot.Check.PRE_MAIN;
+        case 6 -> StackSnapshot.Check.LOOP_ELIMINATION;
         default -> null;
       };
       StackSnapshot.Context stackContext = stackCheck == null ? null
@@ -81,7 +84,7 @@ class StructureReference {
           boolean assertions = input.readBoolean();
           String classname = readText(input);
           var stackOptions = new StackSnapshot.Options(group, simplify, ternary, options.useLvtNames(), booleanAsInt, assertions);
-          String snapshot = stackContext.run(input, stackOptions, classname, name, descriptor, StructureReference::snapshot);
+          String snapshot = stackContext.run(input, stackOptions, classname, name, descriptor);
           System.out.println(index + "\t" + snapshot);
           continue;
         }
@@ -315,6 +318,10 @@ class StructureReference {
   }
 
   private static String snapshot(RootStatement root, CounterContainer counters) {
+    return snapshot(root, counters, false);
+  }
+
+  static String snapshot(RootStatement root, CounterContainer counters, boolean loopStage) {
     List<String> fields = new ArrayList<>();
     fields.add("counters=" + counters.getCounter(CounterContainer.STATEMENT_COUNTER)
       + "," + counters.getCounter(CounterContainer.EXPRESSION_COUNTER)
@@ -322,11 +329,7 @@ class StructureReference {
     fields.add("error=" + root.addErrorComment);
     fields.add("comments=" + (root.commentLines == null ? "" : String.join("|", root.commentLines)));
 
-    Deque<Statement> pending = new ArrayDeque<>();
-    pending.add(root);
-    pending.add(root.getDummyExit());
-    while (!pending.isEmpty()) {
-      Statement statement = pending.removeFirst();
+    for (Statement statement : statements(root)) {
       fields.add("stat=" + statement.id + ":" + statement.type.name());
       fields.add("tree=" + statementId(statement.getParent()) + "/" + statementId(statement.getFirst())
         + "/" + statementId(statement.getPost()) + "/"
@@ -334,6 +337,9 @@ class StructureReference {
       fields.add("flags=" + statement.getLastBasicType().name() + "/" + statement.isMonitorEnter()
         + "/" + statement.containsMonitorExitOrAthrow() + "/" + statement.containsMonitorExit() + "/" + statement.isCopied());
       fields.add("out=" + edges(statement.getAllSuccessorEdges()));
+      if (loopStage) {
+        fields.add("in=" + edges(statement.getAllPredecessorEdges()));
+      }
       fields.add("labels=" + statement.getLabelEdges().stream().map(StructureReference::edgeId)
         .sorted().collect(Collectors.joining("|")));
 
@@ -356,13 +362,36 @@ class StructureReference {
           + "/" + expression(caught.getMonitor()) + "/" + expressions(caught.getVars()));
       } else if (statement instanceof SynchronizedStatement sync) {
         fields.add("monitor=" + statementId(sync.getBody()));
+      } else if (loopStage && statement instanceof DoStatement loop) {
+        fields.add("loop=" + loop.getLooptype());
       }
+    }
+    return String.join(";", fields);
+  }
 
+  private static List<Statement> statements(RootStatement root) {
+    List<Statement> result = new ArrayList<>();
+    Deque<Statement> pending = new ArrayDeque<>();
+    pending.add(root);
+    pending.add(root.getDummyExit());
+    while (!pending.isEmpty()) {
+      Statement statement = pending.removeFirst();
+      result.add(statement);
       for (int i = statement.getStats().size() - 1; i >= 0; i--) {
         pending.addFirst(statement.getStats().get(i));
       }
     }
-    return String.join(";", fields);
+    return result;
+  }
+
+  static Map<StatEdge, String> edgeStates(RootStatement root) {
+    Map<StatEdge, String> states = new IdentityHashMap<>();
+    for (Statement statement : statements(root)) {
+      for (StatEdge edge : statement.getAllSuccessorEdges()) {
+        states.put(edge, edgeId(edge));
+      }
+    }
+    return states;
   }
 
   private static String statementId(Statement statement) {

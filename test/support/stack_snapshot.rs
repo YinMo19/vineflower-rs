@@ -11,22 +11,26 @@ use std::sync::Arc;
 
 use itertools::Itertools;
 use rustc_hash::FxHashSet;
+use vineflower_rs::decompiler::ir::{EdgeId, Ir, StatId};
 use vineflower_rs::decompiler::sforms::split_ssa;
 use vineflower_rs::decompiler::stack::simplify_statement;
-use vineflower_rs::decompiler::stats::StatementKind;
+use vineflower_rs::decompiler::stats::{ContentFlags, STATEDGE_ALL, StatementKind};
 use vineflower_rs::decompiler::vars::versions::{FinalType, VarVersions};
 use vineflower_rs::engine::class_nodes::{ClassNodeId, load_classes};
 use vineflower_rs::engine::class_processor::prepare_class;
 use vineflower_rs::engine::import_collector::ImportCollector;
-use vineflower_rs::engine::method_processor::{InitialMethod, initial_statement_graph};
+use vineflower_rs::engine::method_processor::{
+    ExpressionMethod, InitialMethod, initial_statement_graph,
+};
 use vineflower_rs::engine::{Cx, Options};
 use vineflower_rs::structs::single_file_context_source::SingleFileContextSource;
 use vineflower_rs::structs::{StructClass, StructContext, StructMethod};
 
 use super::upstream_reference::Corpus;
 use super::{
-    REFERENCE_HELPERS, compare_snapshots, expression_snapshot, one_line, panic_text, parse_class,
-    structure_snapshot, write_cfg, write_count, write_flag, write_int, write_text,
+    REFERENCE_HELPERS, compare_snapshots, edge_id, expression_snapshot, one_line, panic_text,
+    parse_class, structure_snapshot_with_edges, structure_statements, write_cfg, write_count,
+    write_flag, write_int, write_text,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -35,6 +39,7 @@ pub(super) enum Check {
     Stack = 3,
     Increments = 4,
     PreMain = 5,
+    LoopElimination = 6,
 }
 
 #[derive(Clone, Copy)]
@@ -111,12 +116,52 @@ const PRE_MAIN_STAGES: &[(&str, &str)] = &[
     ("Before main variable versions", "versions="),
 ];
 
+const LOOP_ELIMINATION_STAGES: &[(&str, &str)] = &[
+    ("Edge cleanup structure", "counters="),
+    ("Edge cleanup expressions", "counters="),
+    ("Edge cleanup variable versions", "versions="),
+    ("Loop elimination results", "iterations="),
+    ("Loop elimination input structure", "counters="),
+    ("Loop elimination input expressions", "counters="),
+    ("Loop elimination input variable versions", "versions="),
+];
+
+const ELIMINATED_STAGES: &[(&str, &str)] = &[
+    ("After removing a loop, structure", "counters="),
+    ("After removing a loop, expressions", "counters="),
+    ("After removing a loop, variable versions", "versions="),
+];
+
+const TERMINAL_LOOP_STAGES: &[(&str, &str)] = &[
+    (
+        "After loop elimination returns false, structure",
+        "counters=",
+    ),
+    (
+        "After loop elimination returns false, expressions",
+        "counters=",
+    ),
+    (
+        "After loop elimination returns false, variable versions",
+        "versions=",
+    ),
+];
+
+fn loop_iterations(row: &str) -> impl Iterator<Item = &str> {
+    row.split('\t')
+        .nth(3)
+        .and_then(|field| field.strip_prefix("iterations="))
+        .into_iter()
+        .flat_map(|trace| trace.split(',').filter(|result| !result.is_empty()))
+}
+
 impl Check {
     fn profiles(self) -> &'static [Profile] {
         match self {
             Self::Stack => STACK_PROFILES,
             Self::Increments => INCREMENT_PROFILES,
             Self::PreMain => PRE_MAIN_PROFILES,
+            Self::LoopElimination => &[DEFAULT],
         }
     }
 
@@ -125,6 +170,7 @@ impl Check {
             Self::Stack => STACK_STAGES,
             Self::Increments => INCREMENT_STAGES,
             Self::PreMain => PRE_MAIN_STAGES,
+            Self::LoopElimination => LOOP_ELIMINATION_STAGES,
         }
     }
 
@@ -133,8 +179,65 @@ impl Check {
             Self::Stack => "stack",
             Self::Increments => "increments",
             Self::PreMain => "pre-main",
+            Self::LoopElimination => "loop-elimination",
         }
     }
+}
+
+#[derive(Default)]
+struct LoopCoverage {
+    removed_edges: usize,
+    rewritten_edges: usize,
+    successful_calls: usize,
+    removed_loops: usize,
+    terminal_calls: usize,
+    terminal_changes: usize,
+}
+
+impl LoopCoverage {
+    fn record(&mut self, row: &str) {
+        let cleanup = row.split('\t').next().unwrap();
+        for field in cleanup.split(';') {
+            if let Some(removed) = field.strip_prefix("cleanup-removed=") {
+                self.removed_edges += removed.parse::<usize>().unwrap();
+            }
+            if let Some(rewritten) = field.strip_prefix("cleanup-rewritten=") {
+                self.rewritten_edges += rewritten.parse::<usize>().unwrap();
+            }
+        }
+
+        let mut snapshots = row.split('\t').skip(4).tuples::<(_, _, _)>();
+        let mut previous = snapshots.next().unwrap();
+        for (repeat, current) in loop_iterations(row).zip(snapshots) {
+            if repeat == "true" {
+                self.successful_calls += 1;
+                self.removed_loops += loop_ids(previous.0)
+                    .difference(&loop_ids(current.0))
+                    .count();
+            } else {
+                self.terminal_calls += 1;
+                self.terminal_changes += usize::from(previous != current);
+            }
+            previous = current;
+        }
+    }
+
+    fn report(&self) {
+        eprintln!(
+            "Edge cleanup removed {} edges and rewrote {} retained edges",
+            self.removed_edges, self.rewritten_edges,
+        );
+        eprintln!(
+            "{} successful calls removed {} loop statements; {} terminal false calls changed {} method snapshots",
+            self.successful_calls, self.removed_loops, self.terminal_calls, self.terminal_changes,
+        );
+    }
+}
+
+fn loop_ids(tree: &str) -> FxHashSet<&str> {
+    tree.split(';')
+        .filter_map(|field| field.strip_prefix("stat=")?.strip_suffix(":DO"))
+        .collect()
 }
 
 struct Fixture {
@@ -209,6 +312,7 @@ pub(super) fn check(corpus: &Corpus, check: Check) {
     let mut changed_original = 0;
     let mut concats = 0;
     let mut assertion_changes = 0;
+    let mut loop_coverage = LoopCoverage::default();
     for (index, method) in methods.iter().enumerate() {
         let row = java_rows
             .next()
@@ -220,17 +324,29 @@ pub(super) fn check(corpus: &Corpus, check: Check) {
             .expect("missing Rust stack snapshot")
             .unwrap();
         assert_eq!(id.parse::<usize>().unwrap(), index);
+        let mut loop_stages;
+        let stages = if check == Check::LoopElimination {
+            loop_stages = check.stages().to_vec();
+            for repeat in loop_iterations(&rust) {
+                loop_stages.extend_from_slice(if repeat == "true" {
+                    ELIMINATED_STAGES
+                } else {
+                    TERMINAL_LOOP_STAGES
+                });
+            }
+            &loop_stages
+        } else {
+            check.stages()
+        };
         if java == rust && (java.starts_with("rejected=") || java.starts_with("class-rejected=")) {
             rejected += 1;
-        } else if let Err(diff) = compare_snapshots(java, &rust, check.stages()) {
+        } else if let Err(diff) = compare_snapshots(java, &rust, stages) {
             errors.push(format!("{method}\n  {diff}"));
         } else {
-            let stage_size = check.stages().len() / 2;
-            for (tree, changes) in rust
-                .split('\t')
-                .step_by(stage_size)
-                .zip(&mut hidden_changes)
-            {
+            let stage_size = if check == Check::Stack { 2 } else { 3 };
+            let first = rust.split('\t').next().unwrap();
+            let settled = rust.rsplit('\t').nth(stage_size - 1).unwrap();
+            for (tree, changes) in [first, settled].into_iter().zip(&mut hidden_changes) {
                 if tree.split(';').any(|field| {
                     field
                         .strip_prefix("hidden-added=")
@@ -259,6 +375,9 @@ pub(super) fn check(corpus: &Corpus, check: Check) {
                 concats += usize::from(first.next().unwrap().contains("|STR_CONCAT|"));
                 assertion_changes +=
                     usize::from(first.next().unwrap().ends_with(";assert-changed=true"));
+            }
+            if check == Check::LoopElimination {
+                loop_coverage.record(&rust);
             }
         }
     }
@@ -293,6 +412,9 @@ pub(super) fn check(corpus: &Corpus, check: Check) {
         eprintln!(
             "{concats} concat checkpoints contain string concatenation; {assertion_changes} assertion passes changed their tree"
         );
+    }
+    if check == Check::LoopElimination {
+        loop_coverage.report();
     }
 }
 
@@ -447,6 +569,73 @@ fn stage(
                 operation.set("prepare-main-loop");
                 method.prepare_main_loop(cx, class)?;
             }
+            (Check::LoopElimination, _) => {
+                loop {
+                    operation.set("simplify-stack");
+                    method.simplify_stack_vars(cx, class);
+                    operation.set("set-var-versions");
+                    method.set_var_versions(cx, class)?;
+                    operation.set("find-increments");
+                    if !method.find_increments(cx) {
+                        break;
+                    }
+                }
+                operation.set("inline-increments");
+                method.inline_increments_in_conditions(cx);
+                operation.set("simplify-concat");
+                method.simplify_string_concat(cx, class)?;
+                operation.set("build-assertions");
+                method.build_assertions(cx, class)?;
+
+                operation.set("snapshot");
+                let original_edges = first.then(|| edge_states(&cx.ir, method.root));
+                operation.set("clean-up-edges");
+                method.clean_up_edges(cx);
+                operation.set("snapshot");
+                if let Some(original_edges) = original_edges {
+                    let cleaned_edges = edge_states(&cx.ir, method.root);
+                    let removed = original_edges
+                        .keys()
+                        .filter(|edge| !cleaned_edges.contains_key(edge))
+                        .count();
+                    let rewritten = original_edges
+                        .iter()
+                        .filter(|(edge, old)| {
+                            cleaned_edges.get(edge).is_some_and(|new| *old != new)
+                        })
+                        .count();
+                    let details =
+                        format!(";cleanup-removed={removed};cleanup-rewritten={rewritten}");
+                    return Ok(snapshot(
+                        cx,
+                        owner,
+                        &method,
+                        initial_hidden,
+                        check,
+                        &details,
+                    ));
+                }
+
+                let mut states = vec![snapshot(cx, owner, &method, initial_hidden, check, "")];
+                let mut iterations = Vec::new();
+                if root_content_flags(cx, method.root).has_loops {
+                    loop {
+                        operation.set("eliminate-loops");
+                        let repeat = method.eliminate_loops(cx, class)?;
+                        iterations.push(repeat);
+                        operation.set("snapshot");
+                        states.push(snapshot(cx, owner, &method, initial_hidden, check, ""));
+                        if !repeat {
+                            break;
+                        }
+                    }
+                }
+                return Ok(format!(
+                    "iterations={}\t{}",
+                    iterations.iter().join(","),
+                    states.join("\t")
+                ));
+            }
             (Check::Stack, true) => {
                 let owner = Arc::clone(method.root.method(&cx.ir));
                 let ssa = split_ssa(&mut cx.ir, method.root, &owner);
@@ -464,39 +653,18 @@ fn stage(
             (Check::Stack, false) => method.simplify_stack_vars(cx, class),
         }
         operation.set("snapshot");
-        let mut tree = structure_snapshot(cx, method.root, &method.flow.counters);
-        if check == Check::PreMain {
-            let StatementKind::Root { content_flags, .. } = &cx.ir[method.root].kind else {
-                unreachable!()
-            };
+        let mut snapshot = snapshot(cx, owner, &method, initial_hidden, check, "");
+        if check == Check::Increments && first {
+            operation.set("find-increments");
+            write!(snapshot, ";repeat={}", method.find_increments(cx)).unwrap();
+        } else if check == Check::PreMain && first {
+            operation.set("build-assertions");
             write!(
-                tree,
-                ";content={},{},{}",
-                content_flags.has_try_catch, content_flags.has_loops, content_flags.has_switch,
+                snapshot,
+                ";assert-changed={}",
+                method.build_assertions(cx, class)?
             )
             .unwrap();
-        }
-        let hidden = &cx.class_nodes[owner].hidden_members;
-        let all_members = hidden_members(hidden.iter());
-        let added = hidden_members(hidden.difference(initial_hidden));
-        let expressions = expression_snapshot::snapshot(cx, method.root, &method.flow.counters);
-        let mut snapshot =
-            format!("{tree};hidden={all_members};hidden-added={added}\t{expressions}");
-        if check != Check::Stack {
-            let versions = variable_snapshot(&cx.ir[method.flow.variables]);
-            write!(snapshot, "\t{versions}").unwrap();
-            if check == Check::Increments && first {
-                operation.set("find-increments");
-                write!(snapshot, ";repeat={}", method.find_increments(cx)).unwrap();
-            } else if check == Check::PreMain && first {
-                operation.set("build-assertions");
-                write!(
-                    snapshot,
-                    ";assert-changed={}",
-                    method.build_assertions(cx, class)?
-                )
-                .unwrap();
-            }
         }
         Ok::<_, io::Error>(snapshot)
     }));
@@ -516,6 +684,56 @@ fn stage(
         ),
         Err(error) => stage_error(check, operation.get(), "panic", &panic_text(&*error)),
     }
+}
+
+fn snapshot(
+    cx: &Cx,
+    owner: ClassNodeId,
+    method: &ExpressionMethod,
+    initial_hidden: &FxHashSet<String>,
+    check: Check,
+    details: &str,
+) -> String {
+    let mut tree = structure_snapshot_with_edges(
+        cx,
+        method.root,
+        &method.flow.counters,
+        check == Check::LoopElimination,
+    );
+    if matches!(check, Check::PreMain | Check::LoopElimination) {
+        let content = root_content_flags(cx, method.root);
+        write!(
+            tree,
+            ";content={},{},{}",
+            content.has_try_catch, content.has_loops, content.has_switch,
+        )
+        .unwrap();
+    }
+    let hidden = &cx.class_nodes[owner].hidden_members;
+    let all_members = hidden_members(hidden.iter());
+    let added = hidden_members(hidden.difference(initial_hidden));
+    let expressions = expression_snapshot::snapshot(cx, method.root, &method.flow.counters);
+    let mut snapshot =
+        format!("{tree};hidden={all_members};hidden-added={added}{details}\t{expressions}");
+    if check != Check::Stack {
+        let versions = variable_snapshot(&cx.ir[method.flow.variables]);
+        write!(snapshot, "\t{versions}").unwrap();
+    }
+    snapshot
+}
+
+fn root_content_flags(cx: &Cx, root: StatId) -> ContentFlags {
+    let StatementKind::Root { content_flags, .. } = cx.ir[root].kind else {
+        unreachable!()
+    };
+    content_flags
+}
+
+fn edge_states(ir: &Ir, root: StatId) -> HashMap<EdgeId, String> {
+    structure_statements(ir, root)
+        .flat_map(|stat| stat.get_successor_edges(ir, STATEDGE_ALL))
+        .map(|edge| (edge, edge_id(ir, Some(edge))))
+        .collect()
 }
 
 fn stage_error(check: Check, operation: &str, kind: &str, message: &str) -> String {

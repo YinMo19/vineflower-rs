@@ -5,14 +5,12 @@
 
 use rustc_hash::FxHashSet;
 
-use super::finish::first_successor;
 use crate::decompiler::assertions::assertion_field;
 use crate::decompiler::exps::{Expr, ExprKind, FunctionType};
 use crate::decompiler::ir::{EdgeId, ExprId, Ir, StatId};
+use crate::decompiler::labels::is_direct_path;
 use crate::decompiler::stats::stat_edge::{EdgeType, StatEdge};
-use crate::decompiler::stats::{
-    IfStatement, STATEDGE_ALL, STATEDGE_DIRECT_ALL, Statement, StatementKind,
-};
+use crate::decompiler::stats::{IfStatement, STATEDGE_ALL, Statement, StatementKind};
 use crate::engine::{Cx, counter_container::CounterContainer};
 use crate::structs::StructClass;
 
@@ -146,7 +144,9 @@ impl SubNode {
                 target: ir[branches.if_edge.unwrap()].destination,
             });
         }
-        node.successor = first_successor(ir, statement).map(|edge| ir[edge].destination);
+        node.successor = ir[statement]
+            .first_successor()
+            .map(|edge| ir[edge].destination);
         node
     }
 }
@@ -202,7 +202,7 @@ fn collapse_if_if(
         branches.if_stat = Some(inner.target);
         add_child(ir, parent, inner.target);
 
-        if let Some(edge) = first_successor(ir, inner.target)
+        if let Some(edge) = ir[inner.target].first_successor()
             && ir[edge].closure == Some(child)
         {
             ir[edge].closure = Some(parent);
@@ -403,7 +403,7 @@ fn collapse_ternary(cx: &mut Cx, counters: &mut CounterContainer, root: &IfNode)
     if_data_mut(ir, main).if_edge = Some(jump);
     jump.change_source(ir, main_head);
 
-    if let Some(edge) = first_successor(ir, main) {
+    if let Some(edge) = ir[main].first_successor() {
         edge.remove(ir);
     }
     let next = outgoing(ir, second);
@@ -468,8 +468,9 @@ fn if_else_chain_denesting(cx: &mut Cx, counters: &mut CounterContainer, root: &
         return false;
     }
 
-    let Some(next) =
-        first_successor(ir, outer).filter(|&edge| ir[edge].edge_type == EdgeType::Regular)
+    let Some(next) = ir[outer]
+        .first_successor()
+        .filter(|&edge| ir[edge].edge_type == EdgeType::Regular)
     else {
         return false;
     };
@@ -653,37 +654,6 @@ fn has_direct_end_edge(ir: &Ir, stat: StatId, from: StatId) -> bool {
     }
 }
 
-/// The destination reached after a statement finishes, as in MergeHelper.isDirectPath.
-fn is_direct_path(ir: &Ir, mut stat: StatId, end: StatId) -> bool {
-    loop {
-        let edges = stat.get_successor_edges(ir, STATEDGE_DIRECT_ALL);
-        if !edges.is_empty() {
-            return edges.into_iter().any(|edge| ir[edge].destination == end);
-        }
-
-        let Some(parent) = ir[stat].parent else {
-            return matches!(ir[end].kind, StatementKind::DummyExit);
-        };
-        match &ir[parent].kind {
-            StatementKind::Root { .. } => return matches!(ir[end].kind, StatementKind::DummyExit),
-            StatementKind::Do => return end == parent,
-            StatementKind::Switch(switch) => {
-                for cases in switch.cases.windows(2) {
-                    if cases[0].statement == stat {
-                        let mut next = cases[1].statement;
-                        if ir[next].exprents.is_some_and(|list| ir[list].is_empty()) {
-                            next = ir[outgoing(ir, next)].destination;
-                        }
-                        return end == next;
-                    }
-                }
-            }
-            _ => {}
-        }
-        stat = parent;
-    }
-}
-
 fn get_next_statement(ir: &Ir, mut stat: StatId) -> StatId {
     loop {
         let parent = ir[stat].parent.expect("Statement has no enclosing root");
@@ -739,11 +709,14 @@ fn empty_if_head(ir: &Ir, stat: StatId) -> bool {
 }
 
 fn has_finally_exit(ir: &Ir, stat: StatId) -> bool {
-    first_successor(ir, stat).is_some_and(|edge| ir[edge].edge_type == EdgeType::FinallyExit)
+    ir[stat]
+        .first_successor()
+        .is_some_and(|edge| ir[edge].edge_type == EdgeType::FinallyExit)
 }
 
 fn outgoing(ir: &Ir, stat: StatId) -> EdgeId {
-    first_successor(ir, stat)
+    ir[stat]
+        .first_successor()
         .unwrap_or_else(|| panic!("Statement {} has no successors", ir[stat].id))
 }
 

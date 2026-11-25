@@ -304,6 +304,18 @@ impl Statement {
             .map_or(&[], Vec::as_slice)
     }
 
+    pub fn all_successors(&self) -> &[EdgeId] {
+        self.edge_view(EdgeDirection::Forward, STATEDGE_ALL)
+    }
+
+    pub fn direct_successors(&self) -> &[EdgeId] {
+        self.edge_view(EdgeDirection::Forward, STATEDGE_DIRECT_ALL)
+    }
+
+    pub fn first_successor(&self) -> Option<EdgeId> {
+        self.all_successors().first().copied()
+    }
+
     pub(super) fn add_edge_to_index(&mut self, direction: EdgeDirection, mask: u32, edge: EdgeId) {
         self.edge_index_mut(direction)
             .entry(mask)

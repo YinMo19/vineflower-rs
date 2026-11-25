@@ -318,6 +318,33 @@ fn pre_main_recovers_the_order_of_dynamic_string_concatenation() {
 }
 
 #[test]
+fn redundant_loop_elimination_keeps_the_enclosing_loops() {
+    use vineflower_rs::engine::method_processor::pre_main_method;
+
+    let options = Arc::new(Options::default());
+    let class = parse_class(
+        include_bytes!("smoke/java8/TestNestedLoops.class"),
+        &options,
+    )
+    .unwrap();
+    let mut cx = make_context(&options);
+    let method = class.get_method("decomp", "()V").unwrap();
+    let mut result = pre_main_method(&mut cx, &class, method).unwrap().unwrap();
+    result.clean_up_edges(&mut cx);
+    let root = result.root;
+    let loop_count = |ir: &Ir| {
+        structure_statements(ir, root)
+            .filter(|&stat| matches!(ir[stat].kind, StatementKind::Do))
+            .count()
+    };
+    let before = loop_count(&cx.ir);
+    assert!(result.eliminate_loops(&mut cx, &class).unwrap());
+    assert_eq!(loop_count(&cx.ir), before - 1);
+    assert!(before > 2);
+    assert!(!result.eliminate_loops(&mut cx, &class).unwrap());
+}
+
+#[test]
 fn expression_method_recovers_finally_around_a_synchronized_body() {
     use vineflower_rs::engine::method_processor::expression_method;
 
@@ -405,6 +432,15 @@ fn pre_main_matches_upstream() {
     stack_snapshot::check(
         &upstream_reference::Corpus::discover(),
         stack_snapshot::Check::PreMain,
+    );
+}
+
+#[test]
+#[ignore = "requires the upstream +local.jar and JDK 17 or later"]
+fn edge_cleanup_and_loop_elimination_match_upstream() {
+    stack_snapshot::check(
+        &upstream_reference::Corpus::discover(),
+        stack_snapshot::Check::LoopElimination,
     );
 }
 
@@ -835,9 +871,17 @@ fn write_text(out: &mut impl Write, text: &str) -> io::Result<()> {
 }
 
 fn structure_snapshot(cx: &Cx, root: StatId, counters: &CounterContainer) -> String {
+    structure_snapshot_with_edges(cx, root, counters, false)
+}
+
+fn structure_snapshot_with_edges(
+    cx: &Cx,
+    root: StatId,
+    counters: &CounterContainer,
+    loop_stage: bool,
+) -> String {
     let ir = &cx.ir;
     let StatementKind::Root {
-        dummy_exit,
         comment_lines,
         add_error_comment,
         ..
@@ -855,8 +899,7 @@ fn structure_snapshot(cx: &Cx, root: StatId, counters: &CounterContainer) -> Str
         format!("error={add_error_comment}"),
         format!("comments={}", comment_lines.iter().flatten().join("|")),
     ];
-    let mut pending = vec![*dummy_exit, root];
-    while let Some(stat) = pending.pop() {
+    for stat in structure_statements(ir, root) {
         let node = &ir[stat];
         let id = |stat| statement_id(ir, stat);
         let edge = |edge| edge_id(ir, edge);
@@ -887,6 +930,15 @@ fn structure_snapshot(cx: &Cx, root: StatId, counters: &CounterContainer) -> Str
                 .map(|&e| edge(Some(e)))
                 .join("|")
         ));
+        if loop_stage {
+            fields.push(format!(
+                "in={}",
+                stat.get_predecessor_edges(ir, STATEDGE_ALL)
+                    .iter()
+                    .map(|&e| edge(Some(e)))
+                    .join("|")
+            ));
+        }
         fields.push(format!(
             "labels={}",
             node.label_edges
@@ -951,11 +1003,23 @@ fn structure_snapshot(cx: &Cx, root: StatId, counters: &CounterContainer) -> Str
             StatementKind::Synchronized { body, .. } => {
                 fields.push(format!("monitor={}", ir[*body].id))
             }
+            StatementKind::Do if loop_stage => fields.push("loop=INFINITE".to_owned()),
             _ => {}
         }
-        pending.extend(node.stats.iter().rev().copied());
     }
     fields.join(";")
+}
+
+fn structure_statements(ir: &Ir, root: StatId) -> impl Iterator<Item = StatId> + '_ {
+    let StatementKind::Root { dummy_exit, .. } = ir[root].kind else {
+        unreachable!();
+    };
+    let mut pending = vec![dummy_exit, root];
+    std::iter::from_fn(move || {
+        let stat = pending.pop()?;
+        pending.extend(ir[stat].stats.iter().rev().copied());
+        Some(stat)
+    })
 }
 
 fn kind_name(kind: &StatementKind) -> &'static str {

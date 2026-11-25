@@ -12,6 +12,8 @@ pub mod finally;
 pub mod flow;
 pub(crate) mod increments;
 pub mod ir;
+pub(crate) mod labels;
+pub(crate) mod loops;
 pub mod sforms;
 pub mod stack;
 pub mod stats;

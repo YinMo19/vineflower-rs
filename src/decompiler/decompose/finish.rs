@@ -5,18 +5,18 @@
 
 use std::collections::VecDeque;
 
-use indexmap::IndexSet;
 use rustc_hash::FxHashSet;
 
 use crate::code::code_constants::OPC_MONITOREXIT;
-use crate::decompiler::ir::{EdgeId, Expr, ExprListId, Ir, StatId};
+use crate::decompiler::ir::{Expr, ExprListId, Ir, StatId};
+use crate::decompiler::labels::low_continue_labels;
 use crate::decompiler::stats::stat_edge::{EdgeType, StatEdge};
 use crate::decompiler::stats::{STATEDGE_ALL, STATEDGE_DIRECT_ALL, Statement, StatementKind};
 use crate::engine::Cx;
 use crate::engine::counter_container::CounterContainer;
 
 pub fn finish(cx: &mut Cx, counters: &mut CounterContainer, root: StatId) {
-    low_continue_labels(&mut cx.ir, root, &mut IndexSet::new());
+    low_continue_labels(&mut cx.ir, root);
     condense_sequences(cx, counters, root);
     root.build_monitor_flags(&mut cx.ir);
     build_synchronized(&mut cx.ir, counters, root);
@@ -34,27 +34,6 @@ pub fn prepare_expressions(cx: &mut Cx, counters: &mut CounterContainer, root: S
     while let Some(stat) = pending.pop_front() {
         cx.ir[stat].clear_temp_information();
         pending.extend(cx.ir[stat].stats.iter().copied());
-    }
-}
-
-fn low_continue_labels(ir: &mut Ir, stat: StatId, edges: &mut IndexSet<EdgeId>) {
-    edges.extend(stat.get_predecessor_edges(ir, EdgeType::Continue.mask()));
-    // At this stage all Do statements still have the initial infinite loop type.
-    if matches!(ir[stat].kind, StatementKind::Do) {
-        for &edge in edges.iter() {
-            if stat.contains_statement_strict(ir, ir[edge].source) {
-                edge.change_destination(ir, stat);
-                stat.add_labeled_edge(ir, edge);
-            }
-        }
-    }
-    for index in 0..ir[stat].stats.len() {
-        let child = ir[stat].stats[index];
-        if Some(child) == ir[stat].first {
-            low_continue_labels(ir, child, edges);
-        } else {
-            low_continue_labels(ir, child, &mut IndexSet::new());
-        }
     }
 }
 
@@ -88,8 +67,8 @@ pub(crate) fn condense_sequences(cx: &mut Cx, counters: &mut CounterContainer, m
         remove_empty_statements(ir, stat);
         if ir[stat].stats.len() == 1 {
             let child = ir[stat].first.unwrap();
-            let child_edge = first_successor(ir, child);
-            let parent_edge = first_successor(ir, stat);
+            let child_edge = ir[child].first_successor();
+            let parent_edge = ir[stat].first_successor();
             let can_disband = match (child_edge, parent_edge) {
                 (Some(edge), Some(outer)) => {
                     if ir[edge].destination == ir[outer].destination {
@@ -121,13 +100,11 @@ pub(crate) fn condense_sequences(cx: &mut Cx, counters: &mut CounterContainer, m
     }
 }
 
-pub(super) fn first_successor(ir: &Ir, stat: StatId) -> Option<EdgeId> {
-    stat.get_successor_edges(ir, STATEDGE_ALL).first().copied()
-}
-
 fn is_sequence_disbandable(ir: &Ir, stat: StatId, next: StatId) -> bool {
     let last = *ir[stat].stats.get_last();
-    first_successor(ir, last).is_none_or(|edge| ir[edge].destination == next)
+    ir[last]
+        .first_successor()
+        .is_none_or(|edge| ir[edge].destination == next)
         && next
             .get_predecessor_edges(ir, EdgeType::Break.mask())
             .into_iter()
@@ -215,7 +192,7 @@ fn remove_empty_statements(ir: &mut Ir, sequence: StatId) {
 }
 
 fn remove_empty_statement(ir: &mut Ir, stat: StatId) -> bool {
-    let Some(outgoing) = first_successor(ir, stat) else {
+    let Some(outgoing) = ir[stat].first_successor() else {
         if !stat
             .get_predecessor_edges(ir, EdgeType::Break.mask())
             .is_empty()
