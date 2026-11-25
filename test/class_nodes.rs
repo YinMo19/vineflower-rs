@@ -10,6 +10,8 @@ mod nested_classes;
 mod nested_member_access;
 #[path = "support/lambda_nodes.rs"]
 mod lambda_nodes;
+#[path = "support/oddities.rs"]
+mod oddities;
 #[path = "support/upstream_reference.rs"]
 mod upstream_reference;
 
