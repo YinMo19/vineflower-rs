@@ -17,12 +17,17 @@ use crate::decompiler::decompose::{
     dom_helper::{graph_to_statement, process_statement},
     finish::finish as finish_statement_graph,
 };
-use crate::decompiler::ir::{Ir, StatId};
+use crate::decompiler::{
+    expr_processor,
+    ir::{Ir, StatId},
+    stats::StatementKind,
+};
 use crate::engine::{
     Cx, Options,
     counter_container::{CounterContainer, VAR_COUNTER},
 };
 use crate::structs::{StructClass, StructMethod};
+use crate::types::MethodDescriptor;
 
 /// Per-method state. Graph handles belong to the enclosing root class's IR.
 /// The counters follow the method when another method becomes current.
@@ -141,6 +146,29 @@ pub struct StructuredMethod {
     pub root: StatId,
 }
 
+impl StructuredMethod {
+    /// Runs the expression pass on the current statement tree. Finally analysis
+    /// calls this before assigning versions, and may later rebuild the tree.
+    pub fn process_expressions(&mut self, cx: &mut Cx, class: &StructClass) -> io::Result<()> {
+        let StatementKind::Root { method, .. } = &cx.ir[self.root].kind else {
+            unreachable!("StructuredMethod owns a root statement")
+        };
+        let method = Arc::clone(method);
+        let mut descriptor = MethodDescriptor::parse_descriptor(&method.descriptor);
+        if let Some(signature) = method.shared_signature() {
+            descriptor.add_generic_descriptor(Arc::clone(signature));
+        }
+        expr_processor::process_statement(
+            cx,
+            &mut self.flow.counters,
+            self.root,
+            class,
+            &method,
+            &Arc::new(descriptor),
+        )
+    }
+}
+
 impl InitialMethod {
     pub fn structure(mut self, cx: &mut Cx) -> io::Result<StructuredMethod> {
         if !process_statement(
@@ -154,7 +182,7 @@ impl InitialMethod {
                 "parsing failure!",
             ));
         }
-        finish_statement_graph(&mut cx.ir, &mut self.flow.counters, self.root);
+        finish_statement_graph(cx, &mut self.flow.counters, self.root);
         Ok(StructuredMethod {
             flow: self.flow,
             root: self.root,

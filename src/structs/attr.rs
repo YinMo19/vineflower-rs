@@ -12,6 +12,7 @@
 use std::cmp::Ordering;
 use std::fmt;
 use std::io;
+use std::sync::Arc;
 
 use arcstr::ArcStr;
 
@@ -41,10 +42,7 @@ fn optional_string_at(pool: &ConstantPool, index: i32) -> Option<ArcStr> {
     (index != 0).then(|| string_at(pool, index))
 }
 
-fn read_list<T>(
-    count: i32,
-    mut read: impl FnMut() -> io::Result<T>,
-) -> io::Result<Vec<T>> {
+fn read_list<T>(count: i32, mut read: impl FnMut() -> io::Result<T>) -> io::Result<Vec<T>> {
     (0..count).map(|_| read()).collect()
 }
 
@@ -129,7 +127,7 @@ impl StructCodeAttribute {
 */
 #[derive(Clone, Debug, Default)]
 pub struct StructLocalVariableTableAttribute {
-    local_variables: Vec<LocalVariable>,
+    local_variables: Vec<Arc<LocalVariable>>,
 }
 
 impl StructLocalVariableTableAttribute {
@@ -141,15 +139,15 @@ impl StructLocalVariableTableAttribute {
             let name_index = data.read_unsigned_short()?;
             let descriptor_index = data.read_unsigned_short()?;
             let var_index = data.read_unsigned_short()?;
-            Ok(LocalVariable::new(
+            Ok(Arc::new(LocalVariable::new(
                 start_pc,
                 length,
                 string_at(pool, name_index),
                 string_at(pool, descriptor_index),
                 var_index,
-            ))
+            )))
         })?;
-        local_variables.sort_by(LocalVariable::compare_to);
+        local_variables.sort_by(|left, right| left.compare_to(right));
         version_variables(&mut local_variables);
 
         Ok(Self { local_variables })
@@ -179,7 +177,7 @@ impl StructLocalVariableTableAttribute {
         index: i32,
         visible_offset: i32,
     ) -> impl Iterator<Item = &LocalVariable> {
-        self.local_variables.iter().filter(move |var| {
+        self.get_variables().filter(move |var| {
             var.index == index
                 && visible_offset >= var.start_pc
                 && visible_offset < var.start_pc + var.length
@@ -188,14 +186,11 @@ impl StructLocalVariableTableAttribute {
 
     /// `matchingVars(index)`.
     pub fn matching_vars(&self, index: i32) -> impl Iterator<Item = &LocalVariable> {
-        self.local_variables
-            .iter()
-            .filter(move |var| var.index == index)
+        self.get_variables().filter(move |var| var.index == index)
     }
 
     pub fn get_range(&self, start: i32, end: i32) -> impl Iterator<Item = &LocalVariable> {
-        self.local_variables
-            .iter()
+        self.get_variables()
             .filter(move |var| var.get_start() >= start && var.get_end() <= end)
     }
 
@@ -212,7 +207,15 @@ impl StructLocalVariableTableAttribute {
     }
 
     pub fn get_variables(&self) -> impl Iterator<Item = &LocalVariable> {
-        self.local_variables.iter()
+        self.local_variables.iter().map(Arc::as_ref)
+    }
+
+    /// The local whose debug scope begins at this instruction boundary.
+    pub fn get_variable_at_start(&self, index: i32, start: i32) -> Option<Arc<LocalVariable>> {
+        self.local_variables
+            .iter()
+            .find(|var| var.version.var == index && var.start_pc == start)
+            .cloned()
     }
 
     pub fn merge_signatures(&mut self, lvtt: &StructLocalVariableTypeTableAttribute) {
@@ -222,7 +225,7 @@ impl StructLocalVariableTableAttribute {
                 .iter_mut()
                 .find(|var| var.compare_to(ty) == Ordering::Equal)
             {
-                var.signature = Some(ty.descriptor.clone());
+                Arc::make_mut(var).signature = Some(ty.descriptor.clone());
             }
         }
     }
@@ -230,8 +233,9 @@ impl StructLocalVariableTableAttribute {
 
 /// Upstream means to number the variables of each slot, but its counter
 /// never advances, so every variable is version one of its slot.
-fn version_variables(vars: &mut [LocalVariable]) {
+fn version_variables(vars: &mut [Arc<LocalVariable>]) {
     for var in vars {
+        let var = Arc::make_mut(var);
         var.version = VarVersionPair::new(var.index, 1);
     }
 }
@@ -656,7 +660,10 @@ pub enum ElementValue {
     Array(Vec<ElementValue>),
     Annotation(AnnotationData),
     /// `new ConstExprent(type, value, null)`.
-    Const { ty: VarType, value: ConstantValue },
+    Const {
+        ty: VarType,
+        value: ConstantValue,
+    },
 }
 
 impl AnnotationData {

@@ -22,6 +22,10 @@ path = "test/control_flow.rs"
 name = "structured_flow"
 path = "test/structured_flow.rs"
 
+[[test]]
+name = "class_nodes"
+path = "test/class_nodes.rs"
+
 [dependencies]
 arcstr = "1.2.0"
 bit-set = "0.11.1"

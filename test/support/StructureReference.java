@@ -22,9 +22,11 @@ import org.jetbrains.java.decompiler.code.Instruction;
 import org.jetbrains.java.decompiler.code.cfg.BasicBlock;
 import org.jetbrains.java.decompiler.code.cfg.ControlFlowGraph;
 import org.jetbrains.java.decompiler.code.cfg.ExceptionRangeCFG;
+import org.jetbrains.java.decompiler.main.ClassesProcessor.ClassNode;
 import org.jetbrains.java.decompiler.main.DecompilerContext;
 import org.jetbrains.java.decompiler.main.Fernflower;
 import org.jetbrains.java.decompiler.main.collectors.CounterContainer;
+import org.jetbrains.java.decompiler.main.collectors.ImportCollector;
 import org.jetbrains.java.decompiler.main.extern.IFernflowerLogger;
 import org.jetbrains.java.decompiler.main.extern.IFernflowerPreferences;
 import org.jetbrains.java.decompiler.modules.decompiler.StatEdge;
@@ -39,30 +41,41 @@ import org.jetbrains.java.decompiler.modules.decompiler.stats.RootStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.Statement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.SwitchStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.SynchronizedStatement;
+import org.jetbrains.java.decompiler.modules.decompiler.vars.VarProcessor;
 import org.jetbrains.java.decompiler.struct.StructClass;
 import org.jetbrains.java.decompiler.struct.StructMethod;
+import org.jetbrains.java.decompiler.struct.gen.MethodDescriptor;
 import org.jetbrains.java.decompiler.util.DataInputFullStream;
 
 class StructureReference {
+  private record Options(boolean forceJsr, boolean useLvtNames, boolean complexCondy) { }
+
   public static void main(String[] args) throws IOException {
     new Fernflower(null, Map.of(IFernflowerPreferences.INCLUDE_JAVA_RUNTIME, "0"), IFernflowerLogger.NO_OP);
     try (var input = new DataInputStream(new BufferedInputStream(Files.newInputStream(Path.of(args[0]))))) {
       Path previousPath = null;
+      Options previousOptions = null;
       StructClass currentClass = null;
       for (int index = input.readInt(); index >= 0; index = input.readInt()) {
         Path classPath = Path.of(readText(input));
         String name = readText(input);
         String descriptor = readText(input);
-        boolean forceJsr = input.readBoolean();
-        if (!classPath.equals(previousPath)) {
+        Options options = new Options(input.readBoolean(), input.readBoolean(), input.readBoolean());
+        if (!classPath.equals(previousPath) || !options.equals(previousOptions)) {
+          DecompilerContext.setProperty(IFernflowerPreferences.FORCE_JSR_INLINE, flag(options.forceJsr()));
+          DecompilerContext.setProperty(IFernflowerPreferences.USE_DEBUG_VAR_NAMES, flag(options.useLvtNames()));
+          DecompilerContext.setProperty(IFernflowerPreferences.DECOMPILE_COMPLEX_CONDYS, flag(options.complexCondy()));
           currentClass = StructClass.create(new DataInputFullStream(Files.readAllBytes(classPath)), true);
           DecompilerContext.setProperty(DecompilerContext.CURRENT_CLASS, currentClass);
+          DecompilerContext.startClass(new ImportCollector(new ClassNode(ClassNode.Type.ROOT, currentClass)));
           previousPath = classPath;
+          previousOptions = options;
         }
 
         StructMethod method = Objects.requireNonNull(currentClass.getMethod(name, descriptor));
-        DecompilerContext.setProperty(IFernflowerPreferences.FORCE_JSR_INLINE, forceJsr ? "1" : "0");
-        DecompilerContext.startMethod(null);
+        MethodDescriptor methodDescriptor = MethodDescriptor.parseDescriptor(method, null);
+        VarProcessor varProcessor = new VarProcessor(method, methodDescriptor);
+        DecompilerContext.startMethod(varProcessor);
         method.expandData(currentClass);
         try {
           CounterContainer counters = DecompilerContext.getCounterContainer();
@@ -71,7 +84,8 @@ class StructureReference {
           String snapshot;
           try {
             RootStatement root = DomHelper.parseGraph(graph, method, 0);
-            snapshot = snapshot(root, counters) + "\t" + directSnapshot(root);
+            snapshot = snapshot(root, counters) + "\t" + directSnapshot(root)
+              + "\t" + ExpressionSnapshot.lift(root, currentClass, methodDescriptor, varProcessor, counters);
           } catch (RuntimeException | AssertionError | StackOverflowError failure) {
             if (failure.getClass() == RuntimeException.class && "parsing failure!".equals(failure.getMessage())) {
               snapshot = "rejected=parsing failure!";
@@ -85,6 +99,10 @@ class StructureReference {
         }
       }
     }
+  }
+
+  private static String flag(boolean value) {
+    return value ? "1" : "0";
   }
 
   private static String directSnapshot(RootStatement root) {

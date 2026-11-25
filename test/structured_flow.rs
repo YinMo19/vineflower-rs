@@ -17,15 +17,18 @@ use vineflower_rs::decompiler::stats::{LastBasicType, STATEDGE_ALL, StatementKin
 use vineflower_rs::engine::counter_container::{
     EXPRESSION_COUNTER, STATEMENT_COUNTER, VAR_COUNTER,
 };
+use vineflower_rs::engine::import_collector::ImportCollector;
 use vineflower_rs::engine::method_processor::{
     StructuredMethod, initial_statement_graph, structured_statement_graph,
 };
 use vineflower_rs::engine::{Cx, Options};
-use vineflower_rs::structs::{StructClass, StructContext};
+use vineflower_rs::structs::{StructClass, StructContext, consts::ConstantValue};
 use vineflower_rs::util::data_input::DataInputFullStream;
 
 #[path = "support/direct_graph_snapshot.rs"]
 mod direct_graph_snapshot;
+#[path = "support/expression_snapshot.rs"]
+mod expression_snapshot;
 
 #[test]
 fn structure_retains_statement_and_edge_links() {
@@ -106,6 +109,47 @@ fn structure_retains_statement_and_edge_links() {
 }
 
 #[test]
+fn structured_method_lifts_switch_expressions() {
+    let options = Arc::new(Options::default());
+    let mut cx = make_context(&options);
+    let class = parse_class(
+        include_bytes!("smoke/java8/TestClassSwitch.class"),
+        &options,
+    )
+    .unwrap();
+    let method = class.get_method("testCaseOrder", "(I)V").unwrap();
+    let mut structured = structured_statement_graph(&mut cx, &class, method)
+        .unwrap()
+        .unwrap();
+    let initial_count = structured.flow.counters.get_counter(EXPRESSION_COUNTER);
+
+    structured.process_expressions(&mut cx, &class).unwrap();
+
+    assert!(structured.flow.counters.get_counter(EXPRESSION_COUNTER) > initial_count);
+    let ir = &cx.ir;
+    let mut pending = vec![structured.root];
+    while let Some(stat) = pending.pop() {
+        let statement = &ir[stat];
+        if let StatementKind::Switch(branch) = &statement.kind {
+            let head = ir[branch.head_exprents.expect("switch header")][0];
+            let ExprKind::SwitchHead { value, .. } = &ir[head].kind else {
+                panic!("expected a switch head expression");
+            };
+            assert!(matches!(&ir[*value].kind, ExprKind::Variable(var) if var.stack));
+            let body = ir[statement.first.unwrap()].exprents.unwrap();
+            assert!(
+                ir[body]
+                    .iter()
+                    .any(|&expr| { matches!(&ir[expr].kind, ExprKind::Assignment { .. }) })
+            );
+            return;
+        }
+        pending.extend(statement.stats.iter().copied());
+    }
+    panic!("fixture contains no switch");
+}
+
+#[test]
 #[ignore = "requires the upstream +local.jar and JDK 17 or later"]
 fn structured_flow_matches_upstream() {
     let corpus = upstream_reference::Corpus::discover();
@@ -116,12 +160,20 @@ fn structured_flow_matches_upstream() {
         let mut transfer = BufWriter::new(transfer.as_file_mut());
         for path in paths {
             let bytes = fs::read(path).unwrap();
-            for force_jsr_inline in [false, true] {
+            for (force_jsr_inline, use_lvt_names, decompile_complex_constant_dynamic) in [
+                (false, true, false),
+                (true, true, false),
+                (false, false, false),
+                (false, true, true),
+            ] {
                 let mut options = Options::default();
                 options.force_jsr_inline = force_jsr_inline;
+                options.use_lvt_names = use_lvt_names;
+                options.decompile_complex_constant_dynamic = decompile_complex_constant_dynamic;
                 let options = Arc::new(options);
                 let class = parse_class(&bytes, &options).unwrap();
                 let mut cx = make_context(&options);
+                cx.imports = ImportCollector::for_class(&cx.struct_context, &class);
                 for method in &class.methods {
                     if !method.contains_code() {
                         continue;
@@ -135,31 +187,55 @@ fn structured_flow_matches_upstream() {
                     write_text(&mut transfer, &method.name).unwrap();
                     write_text(&mut transfer, &method.descriptor).unwrap();
                     write_flag(&mut transfer, force_jsr_inline).unwrap();
+                    write_flag(&mut transfer, use_lvt_names).unwrap();
+                    write_flag(&mut transfer, decompile_complex_constant_dynamic).unwrap();
                     write_cfg(&mut transfer, &cx.ir, &initial.flow.graph).unwrap();
 
                     let result = catch_unwind(AssertUnwindSafe(|| initial.structure(&mut cx)));
-                    let (snapshot, direct) = match result {
-                        Ok(Ok(method)) => {
-                            let statement = structure_snapshot(&cx.ir, &method);
+                    let (snapshot, direct, expressions) = match result {
+                        Ok(Ok(mut structured)) => {
+                            let statement = structure_snapshot(&cx.ir, &structured);
                             let direct = catch_unwind(AssertUnwindSafe(|| {
-                                direct_graph_snapshot::snapshot(&mut cx.ir, method.root)
+                                direct_graph_snapshot::snapshot(&mut cx.ir, structured.root)
                             }))
                             .unwrap_or_else(|error| format!("panic={}", panic_text(&*error)));
-                            (statement, Some(direct))
+                            let lifted = catch_unwind(AssertUnwindSafe(|| {
+                                structured.process_expressions(&mut cx, &class)
+                            }));
+                            let expressions = match lifted {
+                                Ok(Ok(())) => catch_unwind(AssertUnwindSafe(|| {
+                                    expression_snapshot::snapshot(
+                                        &cx,
+                                        structured.root,
+                                        &structured.flow.counters,
+                                    )
+                                }))
+                                .unwrap_or_else(|error| {
+                                    format!("snapshot-error={}", panic_text(&*error))
+                                }),
+                                Ok(Err(error)) => format!("lift-error={error}"),
+                                Err(error) => format!("lift-panic={}", panic_text(&*error)),
+                            };
+                            (statement, Some(direct), Some(expressions))
                         }
                         Ok(Err(error))
                             if error.kind() == io::ErrorKind::InvalidData
                                 && error.to_string() == "parsing failure!" =>
                         {
-                            ("rejected=parsing failure!".to_owned(), None)
+                            ("rejected=parsing failure!".to_owned(), None, None)
                         }
-                        Ok(Err(error)) => (format!("error={error}"), None),
-                        Err(error) => (format!("panic={}", panic_text(&*error)), None),
+                        Ok(Err(error)) => (format!("error={error}"), None, None),
+                        Err(error) => (format!("panic={}", panic_text(&*error)), None, None),
                     };
                     snapshots.push((
-                        format!("{} {method} force-jsr={force_jsr_inline}", path.display()),
+                        format!(
+                            "{} {method} force-jsr={force_jsr_inline} lvt={use_lvt_names} \
+                             complex-condy={decompile_complex_constant_dynamic}",
+                            path.display()
+                        ),
                         snapshot,
                         direct,
+                        expressions,
                     ));
                 }
             }
@@ -170,36 +246,48 @@ fn structured_flow_matches_upstream() {
 
     let reference = corpus.run(
         "StructureReference",
-        &["DirectGraphSnapshot"],
+        &["DirectGraphSnapshot", "ExpressionSnapshot"],
         transfer.path(),
     );
     let mut mismatches = Vec::new();
     let mut rejected = 0;
     let mut rows = reference.lines();
-    for (index, (method, rust, rust_direct)) in snapshots.iter().enumerate() {
+    for (index, (method, rust, rust_direct, rust_expr)) in snapshots.iter().enumerate() {
         let (row_id, java) = rows
             .next()
             .expect("missing Java result")
             .split_once('\t')
             .unwrap();
         assert_eq!(row_id.parse::<usize>().unwrap(), index);
-        let (java, java_direct) = match java.split_once('\t') {
-            Some((statement, direct)) => (statement, Some(direct)),
-            None => (java, None),
-        };
+        let mut columns = java.split('\t');
+        let java = columns.next().unwrap();
+        let java_direct = columns.next();
+        let java_expr = columns.next();
+        assert!(columns.next().is_none(), "unexpected extra Java columns");
         if java == "rejected=parsing failure!" && java == rust {
+            assert!(java_direct.is_none() && java_expr.is_none());
             rejected += 1;
         } else if java != rust || java.starts_with("error=") {
             mismatches.push(format!("{method}\n  Structure {}", difference(java, rust)));
-        } else if let (Some(java_direct), Some(rust_direct)) = (java_direct, rust_direct) {
-            if java_direct != rust_direct || java_direct.starts_with("error=") {
-                mismatches.push(format!(
-                    "{method}\n  Direct graph {}",
-                    difference(java_direct, rust_direct)
-                ));
-            }
         } else {
-            mismatches.push(format!("{method}\n  Missing direct graph"));
+            let mut differences = Vec::new();
+            match (java_direct, rust_direct) {
+                (Some(java), Some(rust)) if java != rust || java.starts_with("error=") => {
+                    differences.push(format!("Direct graph {}", difference(java, rust)));
+                }
+                (None, _) | (_, None) => differences.push("Missing direct graph".into()),
+                _ => {}
+            }
+            match (java_expr, rust_expr) {
+                (Some(java), Some(rust)) if java != rust || !java.starts_with("counters=") => {
+                    differences.push(format!("Expression lifting {}", difference(java, rust)));
+                }
+                (None, _) | (_, None) => differences.push("Missing expression graph".into()),
+                _ => {}
+            }
+            if !differences.is_empty() {
+                mismatches.push(format!("{method}\n  {}", differences.join("\n  ")));
+            }
         }
     }
     assert!(rows.next().is_none(), "unexpected extra Java results");
@@ -211,7 +299,7 @@ fn structured_flow_matches_upstream() {
         mismatches.iter().take(30).join("\n")
     );
     eprintln!(
-        "{} exact statement trees and direct graphs, and {rejected} matching decomposition rejections from {} class files",
+        "{} exact statement trees, direct graphs and expression snapshots, and {rejected} matching decomposition rejections from {} class files",
         snapshots.len() - rejected,
         paths.len()
     );
@@ -488,13 +576,18 @@ fn expression(ir: &Ir, expr: Option<ExprId>) -> String {
         || "-".to_owned(),
         |expr| {
             let expr = &ir[expr];
-            match expr.kind {
-                ExprKind::IntConstant { value, .. } => format!("{}={value}", expr.id),
-                ExprKind::Variable { index } => format!(
-                    "{}={index}:{}",
+            match &expr.kind {
+                ExprKind::Constant {
+                    value: ConstantValue::Integer(value),
+                    ..
+                } => format!("{}={value}", expr.id),
+                ExprKind::Variable(var) => format!(
+                    "{}={}:{}",
                     expr.id,
-                    expr.var_type.value.as_deref().unwrap_or("*")
+                    var.index,
+                    var.var_type.value.as_deref().unwrap_or("*")
                 ),
+                _ => panic!("unexpected expression before lifting: {:?}", expr.kind),
             }
         },
     )

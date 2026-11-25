@@ -65,7 +65,11 @@ CFG、语句图和 DirectGraph 具有不同的边契约。
 
 [DirectGraph](src/decompiler/flow/flatten.rs) 可从这一阶段的结构化语句树建立数据流视图。构图时登记语句对应的普通与 continue 目标，全部直接节点分配完成后连边。try 作用域收集内部节点的异常边；case 节点保留对应分支的表达式。该阶段产生的循环均为初始无限循环类型。不可达的非出口直接节点依照确定的创建顺序前置；上游使用含 JVM 对象身份散列的集合，这一小段遍历顺序可能随运行变化。
 
-后续方法主线从 `FinallyProcessor.iterateGraph` 继续。它在识别 handler 时已经需要 `ExprProcessor.processStatement`、SSA/SSAU 和直接图。表达式构建在实现顺序上因此先于 finally 整体接入。当前源码输出、类级 passes 和插件分派的端到端验证仍待这些依赖接入。
+[`StructuredMethod::process_expressions`](src/engine/method_processor.rs) 在当前语句树上运行 [`ExprProcessor`](src/decompiler/expr_processor/driver.rs)。沿直接图的普通边传播操作数栈时，首次到达后继就复制其中的变量表达式；处理 catch 入口时从对应的异常变量重新建立栈。基本块把结果写入表达式列表，随后 if、switch 和 synchronized 从首块取回各自的头表达式。switch 头引用语句持有的分支标签。表达式的 Java 编号按构造和复制的先后顺序分配，与 arena 句柄分开。
+
+[类节点](src/engine/class_nodes/load.rs) 根据已登记类的 InnerClasses 和 EnclosingMethod 建立父子关系。类节点保存匿名类的实际父类型，表达式构造 `new` 时通过同一份节点表查询。根类的 [ImportCollector](src/engine/import_collector.rs) 结合类路径、继承层次和当前类决定短名，动态常量展开和泛型类型名都经过这个入口。方法阶段差分直接使用同一 CFG，类节点与导入的差分另用已登记文件组成的类路径。
+
+后续方法主线从 `FinallyProcessor.iterateGraph` 继续。它在识别 handler 时会调用上述表达式构建，随后执行 SSA、变量重编号和 SSAU。当前完整 finally 循环、类级重写、源码输出与 CLI 的端到端验证仍待这些阶段接入。
 
 同步区扩展有一处有意的终止条件。当共享后继的首个前驱来自另一保护区，上游可能反复向已覆盖的区间追加同一块。如果本轮既不会新增覆盖关系、也不会增加异常边或移动指令，Rust 跳过这个候选，继续检查其他区间。
 

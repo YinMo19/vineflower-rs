@@ -96,6 +96,10 @@ impl MethodDescriptor {
         self.generic_info = Some(desc);
     }
 
+    pub fn as_str(&self) -> &str {
+        &self.descriptor
+    }
+
     pub fn build_new_descriptor(&self, builder: &dyn NewClassNameBuilder) -> Option<String> {
         let new_params: Vec<Option<VarType>> = self
             .params

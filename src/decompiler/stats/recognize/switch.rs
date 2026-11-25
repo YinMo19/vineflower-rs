@@ -13,6 +13,7 @@ use crate::decompiler::stats::{
     LastBasicType, STATEDGE_DIRECT_ALL, Statement, StatementKind, SwitchCase, SwitchStatement,
 };
 use crate::engine::counter_container::CounterContainer;
+use crate::types::CodeType;
 
 pub(super) fn detect_switch(
     ir: &mut Ir,
@@ -68,8 +69,11 @@ pub(super) fn sort_edges_and_nodes(ir: &mut Ir, counters: &mut CounterContainer,
         .iter()
         .flat_map(|case| &case.values)
         .any(|value| {
-            value.is_none_or(|expr| !matches!(ir[expr].kind, ExprKind::IntConstant { .. }))
+            value.is_none_or(|expr| {
+                !matches!(&ir[expr].kind, ExprKind::Constant { var_type, .. } if var_type.ty != CodeType::Null)
+            })
         })
+        || data.case_guards.iter().any(Option::is_some)
     {
         return;
     }

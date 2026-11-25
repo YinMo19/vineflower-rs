@@ -4,6 +4,7 @@
 //! context and the class-level processors.
 
 pub mod bytecode_mapping_tracer;
+pub mod class_nodes;
 pub mod context;
 pub mod context_source;
 pub mod counter_container;

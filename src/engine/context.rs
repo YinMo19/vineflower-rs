@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use super::class_nodes::ClassNodes;
 use super::import_collector::ImportCollector;
 use super::options::Options;
 use crate::decompiler::ir::Ir;
@@ -23,6 +24,10 @@ pub struct Cx {
     pub pool_interceptor: Option<Arc<PoolInterceptor>>,
     /// Object identities shared by methods and nested classes in this root class.
     pub ir: Ir,
+    /// ClassesProcessor.mapRootClasses in this root-class worker.
+    pub class_nodes: ClassNodes,
+    /// ClassNode currently used for import shadowing.
+    pub current_class_node: Option<arcstr::ArcStr>,
     /// `DecompilerContext.getImportCollector()`.
     pub imports: ImportCollector,
 }
@@ -34,6 +39,8 @@ impl Cx {
             options: Arc::clone(struct_context.options()),
             pool_interceptor: struct_context.pool_interceptor().cloned(),
             struct_context,
+            class_nodes: ClassNodes::default(),
+            current_class_node: None,
             imports: ImportCollector::default(),
             ir: Ir::default(),
         }

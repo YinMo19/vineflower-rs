@@ -4,6 +4,7 @@ use itertools::Itertools;
 use vineflower_rs::decompiler::flow::flatten::build_direct_graph;
 use vineflower_rs::decompiler::flow::{DirectEdgeType, DirectGraph, DirectId};
 use vineflower_rs::decompiler::ir::{ExprId, ExprKind, Ir, StatId};
+use vineflower_rs::structs::consts::ConstantValue;
 
 pub fn snapshot(ir: &mut Ir, root: StatId) -> String {
     let graph = build_direct_graph(ir, root);
@@ -59,14 +60,16 @@ fn node(ir: &Ir, graph: &DirectGraph, id: DirectId) -> String {
 
 fn exprent(ir: &Ir, expr: ExprId) -> String {
     let expr = &ir[expr];
-    let kind = match expr.kind {
-        ExprKind::IntConstant {
-            value,
+    let (kind, ty) = match &expr.kind {
+        ExprKind::Constant {
+            value: ConstantValue::Integer(value),
             bool_permitted,
-        } => format!("const={value}:{bool_permitted}"),
-        ExprKind::Variable { index } => format!("var={index}"),
+            var_type,
+            ..
+        } => (format!("const={value}:{bool_permitted}"), var_type),
+        ExprKind::Variable(variable) => (format!("var={}", variable.index), &variable.var_type),
+        _ => unreachable!("Direct graph snapshot runs before expression lifting"),
     };
-    let ty = &expr.var_type;
     format!(
         "{}:{}:{}:{}:{kind}",
         expr.id,

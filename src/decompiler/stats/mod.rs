@@ -92,6 +92,8 @@ pub struct IfStatement {
 pub struct SwitchStatement {
     pub default_edge: Option<EdgeId>,
     pub cases: Vec<SwitchCase>,
+    /// Indexed by case. Cases beyond the end of the list have no guard.
+    pub case_guards: Vec<Option<ExprId>>,
     pub head_exprents: Option<ExprListId>,
 }
 

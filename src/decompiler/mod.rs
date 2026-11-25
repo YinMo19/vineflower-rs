@@ -5,6 +5,7 @@
 
 pub mod decompose;
 pub mod expr_processor;
+pub mod exps;
 pub mod flow;
 pub mod ir;
 pub mod stats;

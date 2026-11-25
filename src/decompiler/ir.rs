@@ -19,10 +19,9 @@ use std::ops::{Index, IndexMut};
 
 use index_vec::{IndexVec, define_index_type};
 
+pub use super::exps::{Expr, ExprKind};
 use super::stats::{Statement, stat_edge::StatEdge};
 use crate::code::cfg::basic_block::BasicBlock;
-use crate::engine::counter_container::{CounterContainer, EXPRESSION_COUNTER, VAR_COUNTER};
-use crate::types::VarType;
 
 define_index_type! {
     /// A reference to a `Statement`.
@@ -48,56 +47,6 @@ define_index_type! {
 define_index_type! {
     /// A reference to a `BasicBlock`.
     pub struct BlockId = u32;
-}
-
-/// The expressions created when structuring catch handlers and switch cases.
-#[derive(Clone, Debug)]
-pub struct Expr {
-    pub id: i32,
-    pub kind: ExprKind,
-    pub var_type: VarType,
-}
-
-#[derive(Clone, Debug)]
-pub enum ExprKind {
-    IntConstant { value: i32, bool_permitted: bool },
-    Variable { index: i32 },
-}
-
-impl Expr {
-    pub fn new_int_constant(
-        ir: &mut Ir,
-        counters: &mut CounterContainer,
-        value: i32,
-        bool_permitted: bool,
-    ) -> ExprId {
-        let var_type = match value {
-            0 | 1 if bool_permitted => VarType::VARTYPE_BOOLEAN,
-            0..=127 => VarType::VARTYPE_BYTECHAR,
-            -128..=-1 => VarType::VARTYPE_BYTE,
-            128..=32767 => VarType::VARTYPE_SHORTCHAR,
-            -32768..=-129 => VarType::VARTYPE_SHORT,
-            32768..=65535 => VarType::VARTYPE_CHAR,
-            _ => VarType::VARTYPE_INT,
-        };
-        ir.exprs.push(Self {
-            id: counters.get_counter_and_increment(EXPRESSION_COUNTER),
-            kind: ExprKind::IntConstant {
-                value,
-                bool_permitted,
-            },
-            var_type,
-        })
-    }
-
-    pub fn new_variable(ir: &mut Ir, counters: &mut CounterContainer, var_type: VarType) -> ExprId {
-        let index = counters.get_counter_and_increment(VAR_COUNTER);
-        ir.exprs.push(Self {
-            id: counters.get_counter_and_increment(EXPRESSION_COUNTER),
-            kind: ExprKind::Variable { index },
-            var_type,
-        })
-    }
 }
 
 #[derive(Default)]

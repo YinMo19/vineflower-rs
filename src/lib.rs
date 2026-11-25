@@ -3,6 +3,8 @@
 //! The port follows upstream's algorithms, iteration orders and method-local
 //! counters. [`engine::method_processor::structured_statement_graph`] reconstructs
 //! method structure through the first upstream `DomHelper.parseGraph` call.
+//! [`engine::method_processor::StructuredMethod::process_expressions`] lifts
+//! bytecode on that tree for expression and variable analysis.
 //!
 //! # Where things are
 //!

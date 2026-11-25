@@ -7,16 +7,17 @@ use indexmap::IndexSet;
 use rustc_hash::FxHashSet;
 
 use crate::code::code_constants::OPC_MONITOREXIT;
-use crate::decompiler::ir::{EdgeId, ExprListId, Ir, StatId};
+use crate::decompiler::ir::{EdgeId, Expr, ExprListId, Ir, StatId};
 use crate::decompiler::stats::stat_edge::{EdgeType, StatEdge};
 use crate::decompiler::stats::{STATEDGE_ALL, STATEDGE_DIRECT_ALL, Statement, StatementKind};
-use crate::engine::counter_container::{CounterContainer, EXPRESSION_COUNTER};
+use crate::engine::Cx;
+use crate::engine::counter_container::CounterContainer;
 
-pub fn finish(ir: &mut Ir, counters: &mut CounterContainer, root: StatId) {
-    low_continue_labels(ir, root, &mut IndexSet::new());
-    condense_sequences(ir, counters, root);
-    root.build_monitor_flags(ir);
-    build_synchronized(ir, counters, root);
+pub fn finish(cx: &mut Cx, counters: &mut CounterContainer, root: StatId) {
+    low_continue_labels(&mut cx.ir, root, &mut IndexSet::new());
+    condense_sequences(cx, counters, root);
+    root.build_monitor_flags(&mut cx.ir);
+    build_synchronized(&mut cx.ir, counters, root);
 }
 
 fn low_continue_labels(ir: &mut Ir, stat: StatId, edges: &mut IndexSet<EdgeId>) {
@@ -40,7 +41,8 @@ fn low_continue_labels(ir: &mut Ir, stat: StatId, edges: &mut IndexSet<EdgeId>) 
     }
 }
 
-fn condense_sequences(ir: &mut Ir, counters: &mut CounterContainer, mut stat: StatId) {
+fn condense_sequences(cx: &mut Cx, counters: &mut CounterContainer, mut stat: StatId) {
+    let ir = &mut cx.ir;
     if matches!(ir[stat].kind, StatementKind::Sequence) {
         let mut children = ir[stat].stats.to_vec();
         let mut index = 0;
@@ -90,15 +92,15 @@ fn condense_sequences(ir: &mut Ir, counters: &mut CounterContainer, mut stat: St
         }
     }
 
-    while let Some(child) = ir[stat].stats.iter().copied().find(|&child| {
-        (ir[child].stats.is_empty() || ir[child].exprents.is_some())
-            && !matches!(ir[child].kind, StatementKind::BasicBlock { .. })
+    while let Some(child) = cx.ir[stat].stats.iter().copied().find(|&child| {
+        (cx.ir[child].stats.is_empty() || cx.ir[child].exprents.is_some())
+            && !matches!(cx.ir[child].kind, StatementKind::BasicBlock { .. })
     }) {
-        destroy_and_flatten_statement(ir, counters, stat, child);
+        destroy_and_flatten_statement(cx, counters, stat, child);
     }
-    for index in 0..ir[stat].stats.len() {
-        let child = ir[stat].stats[index];
-        condense_sequences(ir, counters, child);
+    for index in 0..cx.ir[stat].stats.len() {
+        let child = cx.ir[stat].stats[index];
+        condense_sequences(cx, counters, child);
     }
 }
 
@@ -274,23 +276,22 @@ fn first_expression_list(ir: &Ir, mut stat: StatId) -> Option<ExprListId> {
 }
 
 fn destroy_and_flatten_statement(
-    ir: &mut Ir,
+    cx: &mut Cx,
     counters: &mut CounterContainer,
     parent: StatId,
     stat: StatId,
 ) {
-    destroy_statement_content(ir, stat, false);
-    let replacement = Statement::new_empty_basic_block(ir, counters);
-    let expressions = ir[replacement].exprents.unwrap();
-    if let Some(list) = ir[stat].exprents {
-        for index in 0..ir[list].len() {
-            let mut expression = ir[ir[list][index]].clone();
-            expression.id = counters.get_counter_and_increment(EXPRESSION_COUNTER);
-            let copied = ir.exprs.push(expression);
-            ir[expressions].push(copied);
+    destroy_statement_content(&mut cx.ir, stat, false);
+    let replacement = Statement::new_empty_basic_block(&mut cx.ir, counters);
+    let expressions = cx.ir[replacement].exprents.unwrap();
+    if let Some(list) = cx.ir[stat].exprents {
+        for index in 0..cx.ir[list].len() {
+            let expr = cx.ir[list][index];
+            let copied = Expr::copy(cx, counters, expr);
+            cx.ir[expressions].push(copied);
         }
     }
-    parent.replace_statement(ir, stat, replacement);
+    parent.replace_statement(&mut cx.ir, stat, replacement);
 }
 
 fn destroy_statement_content(ir: &mut Ir, stat: StatId, remove_self: bool) {

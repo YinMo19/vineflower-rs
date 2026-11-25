@@ -17,3 +17,5 @@ pub use struct_context::StructContext;
 pub use struct_field::{StructField, StructRecordComponent};
 pub use struct_member::{Attributes, StructMember};
 pub use struct_method::StructMethod;
+
+pub mod single_file_context_source;
