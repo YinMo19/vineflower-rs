@@ -50,6 +50,8 @@ The switch-entry comparison restarts at edge cleanup after each successful `inst
 
 The switch-pass comparison runs pattern and expression recovery in order on the same method. It checks both return values, counters between the passes and after both, shared case values and edges, case guards, phantom statements, and switch expressions with their backing statements and yields. The try-entry comparison also runs the outer restart after any successful switch pass and compares the settled method immediately before try processing.
 
+The resource comparison checks one try-with-resources recovery pass, including the return value, resource order, catches and their variables, jumps, and return expressions. The single-block comparison restarts the main loop after try recovery until it reaches the inlining pass, then checks that pass's result and the same method state. The graph captures when a try node shares its resource expression list with the statement.
+
 ## End-to-end source and CLI suite
 
 The retained `upstream_parity` target covers final source and CLI behavior. It currently requires library and binary entry points that still await migration. Use the explicit stage targets above to test the active implementation. The commands below document the end-to-end gate once those entry points are available.

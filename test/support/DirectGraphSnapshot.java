@@ -14,6 +14,7 @@ import org.jetbrains.java.decompiler.modules.decompiler.flow.DirectEdgeType;
 import org.jetbrains.java.decompiler.modules.decompiler.flow.DirectGraph;
 import org.jetbrains.java.decompiler.modules.decompiler.flow.DirectNode;
 import org.jetbrains.java.decompiler.modules.decompiler.flow.FlattenStatementsHelper;
+import org.jetbrains.java.decompiler.modules.decompiler.stats.CatchStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.RootStatement;
 import org.jetbrains.java.decompiler.struct.gen.VarType;
@@ -90,6 +91,9 @@ class DirectGraphSnapshot {
         if (node.exprents == loop.getIncExprentList()) {
           aliases.add("increment");
         }
+      }
+      if (node.statement instanceof CatchStatement caught && node.exprents == caught.getResources()) {
+        aliases.add("resources");
       }
       fields.add(String.join(",", aliases));
     }

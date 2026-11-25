@@ -105,6 +105,11 @@ fn node(ir: &Ir, graph: &DirectGraph, id: DirectId, list: Option<&str>) -> Strin
                 }
             }
         }
+        if let StatementKind::Catch { resources, .. } = ir[node.stat].kind
+            && resources == Some(node.exprents)
+        {
+            aliases.push("resources");
+        }
         snapshot.push_str(&format!("/{list}/{}", aliases.join(",")));
     }
     snapshot

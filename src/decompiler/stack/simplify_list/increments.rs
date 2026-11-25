@@ -3,7 +3,7 @@
 
 //! Recognize or relocate increment and decrement expressions.
 
-use super::{assignment, set_assignment_right, variable};
+use super::{set_assignment_right, variable};
 use crate::decompiler::exps::{Expr, ExprKind, FunctionType, delta_by_one, increment};
 use crate::decompiler::ir::{ExprId, Ir};
 use crate::engine::Cx;
@@ -15,7 +15,7 @@ pub(super) fn prefix(
     counters: &mut CounterContainer,
     first: ExprId,
 ) -> Option<ExprId> {
-    let (left, function) = assignment(&cx.ir, first)?;
+    let (left, function) = cx.ir[first].as_assignment()?;
     let (operand, add) = delta_by_one(&cx.ir, function)?;
     if variable(&cx.ir, left).is_some() || !Expr::equals(cx, left, operand) {
         return None;
@@ -30,7 +30,7 @@ pub(super) fn prefix(
 }
 
 pub(super) fn postfix(cx: &mut Cx, first: ExprId, second: ExprId) -> bool {
-    let Some((_, right)) = assignment(&cx.ir, first) else {
+    let Some((_, right)) = cx.ir[first].as_assignment() else {
         return false;
     };
     let ExprKind::Function { op, operands, .. } = &cx.ir[second].kind else {
@@ -59,7 +59,7 @@ pub(super) fn postfix_assignment(
     second: ExprId,
 ) -> bool {
     let (Some((left, right)), Some((target, function))) =
-        (assignment(&cx.ir, first), assignment(&cx.ir, second))
+        (cx.ir[first].as_assignment(), cx.ir[second].as_assignment())
     else {
         return false;
     };

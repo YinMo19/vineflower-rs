@@ -60,7 +60,7 @@ struct CaseGroup {
 
 /// Sort switch cases and turn direct exits into case bodies. The graph's
 /// successor order defines bytecode label indices, with the default moved last.
-pub(super) fn sort_edges_and_nodes(ir: &mut Ir, counters: &mut CounterContainer, switch: StatId) {
+pub(crate) fn sort_edges_and_nodes(ir: &mut Ir, counters: &mut CounterContainer, switch: StatId) {
     let StatementKind::Switch(data) = &ir[switch].kind else {
         unreachable!();
     };

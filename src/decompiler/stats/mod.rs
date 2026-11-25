@@ -554,9 +554,20 @@ impl StatId {
         destination.add_edge_internal(ir, EdgeDirection::Backward, edge);
     }
 
+    /// Detach the predecessor entry while discarding an entire source subtree.
+    pub(crate) fn remove_predecessor(self, ir: &mut Ir, edge: EdgeId) {
+        debug_assert_eq!(self, ir[edge].destination);
+        self.remove_edge_internal(ir, EdgeDirection::Backward, edge);
+    }
+
     pub fn remove_successor(self, ir: &mut Ir, edge: EdgeId) {
-        debug_assert_eq!(self, ir[edge].source);
-        edge.remove(ir);
+        // Java removes from the receiver's forward index. During rewrites the
+        // receiver can already have replaced a detached source statement.
+        self.remove_edge_internal(ir, EdgeDirection::Forward, edge);
+        if let Some(closure) = ir[edge].closure {
+            ir[closure].label_edges.shift_remove(&edge);
+        }
+        ir[edge].destination.remove_predecessor(ir, edge);
     }
 
     pub fn add_labeled_edge(self, ir: &mut Ir, edge: EdgeId) {

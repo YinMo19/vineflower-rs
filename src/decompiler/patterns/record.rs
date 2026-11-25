@@ -270,12 +270,12 @@ impl Record {
             .expect("Record stack block has no expressions");
         let exprs = &ir[list];
         let [ex_assign, real_assign] = [exprs[0], exprs[1]];
-        let (ex_var, initial) = assignment(ir, ex_assign)?;
+        let (ex_var, initial) = ir[ex_assign].as_assignment()?;
         Expr::variable(ir, ex_var)?;
         if !Expr::equals(cx, initial, found) {
             return None;
         }
-        let (real_var, source) = assignment(ir, real_assign)?;
+        let (real_var, source) = ir[real_assign].as_assignment()?;
         Expr::variable(ir, real_var)?;
         if !Expr::equals(cx, ex_var, source)
             || Expr::is_var_referenced_in_stat(ir, ex_var, branch, &[source])
@@ -283,7 +283,7 @@ impl Record {
             return None;
         }
         if exprs.len() == 3
-            && let Some((_, third)) = assignment(ir, exprs[2])
+            && let Some((_, third)) = ir[exprs[2]].as_assignment()
             && Expr::equals(cx, third, self.store)
         {
             edits.destroy.push(head);
@@ -325,7 +325,7 @@ fn accessor_destination(
         return None;
     }
     let expr = single_basic_expr(ir, *body)?;
-    let (left, right) = assignment(ir, expr)?;
+    let (left, right) = ir[expr].as_assignment()?;
     if !Expr::variable(ir, left)?.stack {
         return None;
     }
@@ -502,15 +502,8 @@ fn single_basic_expr(ir: &Ir, stat: StatId) -> Option<ExprId> {
     Some(*expr)
 }
 
-fn assignment(ir: &Ir, expr: ExprId) -> Option<(ExprId, ExprId)> {
-    match ir[expr].kind {
-        ExprKind::Assignment { left, right, .. } => Some((left, right)),
-        _ => None,
-    }
-}
-
 fn var_assignment(ir: &Ir, expr: ExprId) -> Option<ExprId> {
-    let (left, right) = assignment(ir, expr)?;
+    let (left, right) = ir[expr].as_assignment()?;
     Expr::variable(ir, left)?;
     Expr::variable(ir, right)?;
     Some(left)

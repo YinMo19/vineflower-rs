@@ -115,7 +115,7 @@ fn removable_monitor_exit(ir: &Ir, current: ExprId) -> bool {
 }
 
 fn trivial_stack_assignment(ir: &Ir, current: ExprId) -> bool {
-    let Some((left, right)) = assignment(ir, current) else {
+    let Some((left, right)) = ir[current].as_assignment() else {
         return false;
     };
     matches!((variable(ir, left), variable(ir, right)), (Some(left), Some(right)) if left.stack && left.index == right.index)
@@ -203,10 +203,10 @@ fn if_condition(ir: &Ir, head: Option<ExprListId>) -> Option<ExprId> {
 }
 
 fn stack_assignment(cx: &mut Cx, mut first: ExprId, second: ExprId) -> bool {
-    let Some((target, rhs)) = assignment(&cx.ir, second) else {
+    let Some((target, rhs)) = cx.ir[second].as_assignment() else {
         return false;
     };
-    while let Some((left, right)) = assignment(&cx.ir, first) {
+    while let Some((left, right)) = cx.ir[first].as_assignment() {
         if Expr::equals(cx, right, rhs)
             && is_stack_variable(&cx.ir, left)
             && !is_stack_variable(&cx.ir, target)
@@ -227,7 +227,7 @@ fn stack_assignment_two(
     second: ExprId,
 ) -> bool {
     let (Some((left, right)), Some((target, rhs))) =
-        (assignment(&cx.ir, first), assignment(&cx.ir, second))
+        (cx.ir[first].as_assignment(), cx.ir[second].as_assignment())
     else {
         return false;
     };
@@ -250,13 +250,6 @@ fn stack_assignment_two(
     );
     set_assignment_right(&mut cx.ir, first, combined);
     true
-}
-
-fn assignment(ir: &Ir, expr: ExprId) -> Option<(ExprId, ExprId)> {
-    match ir[expr].kind {
-        ExprKind::Assignment { left, right, .. } => Some((left, right)),
-        _ => None,
-    }
 }
 
 fn set_assignment_right(ir: &mut Ir, expr: ExprId, value: ExprId) {

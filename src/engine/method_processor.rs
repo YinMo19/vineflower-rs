@@ -256,6 +256,8 @@ enum MainLoopStage {
     IfPatterns,
     Switches,
     Try,
+    InlineBlocks,
+    LateLoops,
 }
 
 impl ExpressionMethod {
@@ -379,6 +381,23 @@ impl ExpressionMethod {
         self.run_until(cx, class, MainLoopStage::Try)
     }
 
+    pub fn enhance_try(&mut self, cx: &mut Cx, class: &StructClass) -> bool {
+        self.content_flags(&cx.ir).has_try_catch
+            && crate::decompiler::resources::enhance(cx, &mut self.flow.counters, self.root, class)
+    }
+
+    pub fn prepare_inline(&mut self, cx: &mut Cx, class: &StructClass) -> io::Result<()> {
+        self.run_until(cx, class, MainLoopStage::InlineBlocks)
+    }
+
+    pub fn inline_single_blocks(&mut self, cx: &mut Cx) -> io::Result<bool> {
+        crate::decompiler::inline_blocks::inline(cx, &mut self.flow.counters, self.root)
+    }
+
+    pub fn prepare_late_loops(&mut self, cx: &mut Cx, class: &StructClass) -> io::Result<()> {
+        self.run_until(cx, class, MainLoopStage::LateLoops)
+    }
+
     /// Execute the Java method loop up to the specified stage in a stable iteration.
     fn run_until(
         &mut self,
@@ -408,7 +427,19 @@ impl ExpressionMethod {
             }
             let patterns = self.process_switch_patterns(cx)?;
             let expressions = self.process_switch_expressions(cx)?;
-            if !patterns && !expressions {
+            if patterns || expressions {
+                continue;
+            }
+            if stage == MainLoopStage::Try {
+                return Ok(());
+            }
+            if self.enhance_try(cx, class) {
+                continue;
+            }
+            if stage == MainLoopStage::InlineBlocks {
+                return Ok(());
+            }
+            if !self.inline_single_blocks(cx)? {
                 return Ok(());
             }
         }

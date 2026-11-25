@@ -38,6 +38,7 @@ import org.jetbrains.java.decompiler.modules.decompiler.ExprProcessor;
 import org.jetbrains.java.decompiler.modules.decompiler.FinallyProcessor;
 import org.jetbrains.java.decompiler.modules.decompiler.IfHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.IfPatternMatchProcessor;
+import org.jetbrains.java.decompiler.modules.decompiler.InlineSingleBlockHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.IntersectionCastProcessor;
 import org.jetbrains.java.decompiler.modules.decompiler.LabelHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.LoopExtractHelper;
@@ -49,6 +50,7 @@ import org.jetbrains.java.decompiler.modules.decompiler.SimplifyExprentsHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.StackVarsProcessor;
 import org.jetbrains.java.decompiler.modules.decompiler.SwitchExpressionHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.SwitchPatternMatchProcessor;
+import org.jetbrains.java.decompiler.modules.decompiler.TryHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.decompose.DomHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.sforms.SSAConstructorSparseEx;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.RootStatement;
@@ -62,7 +64,8 @@ import org.jetbrains.java.decompiler.util.InterpreterUtil;
 class StackSnapshot {
   enum Check {
     STACK, INCREMENTS, PRE_MAIN, LOOP_ELIMINATION, LOOP_ENHANCEMENT, LOOP_MERGE, MAIN_LOOP_LABELS,
-    SECONDARY_FUNCTIONS, PATTERN_MATCHING_ENTRY, IF_PATTERNS, SWITCH_ENTRY, SWITCH_PASSES, TRY_ENTRY;
+    SECONDARY_FUNCTIONS, PATTERN_MATCHING_ENTRY, IF_PATTERNS, SWITCH_ENTRY, SWITCH_PASSES, TRY_ENTRY,
+    TRY_RESOURCES, INLINE_BLOCKS;
 
     boolean usesLoopHeaders() {
       return this == LOOP_ENHANCEMENT || this == LOOP_MERGE || identifiesLabels();
@@ -81,12 +84,17 @@ class StackSnapshot {
     }
 
     boolean recoversSwitches() {
-      return this == SWITCH_PASSES || this == TRY_ENTRY;
+      return this == SWITCH_PASSES || this == TRY_ENTRY || recoversResources();
+    }
+
+    boolean recoversResources() {
+      return this == TRY_RESOURCES || this == INLINE_BLOCKS;
     }
 
     ExpressionSnapshot.Detail expressionDetail() {
       return switch (this) {
         case SWITCH_PASSES, TRY_ENTRY -> ExpressionSnapshot.Detail.SWITCHES;
+        case TRY_RESOURCES, INLINE_BLOCKS -> ExpressionSnapshot.Detail.RESOURCES;
         case PATTERN_MATCHING_ENTRY, IF_PATTERNS, SWITCH_ENTRY -> ExpressionSnapshot.Detail.INTERSECTION_CASTS;
         case SECONDARY_FUNCTIONS -> ExpressionSnapshot.Detail.SECONDARY_FUNCTIONS;
         default -> usesLoopHeaders() ? ExpressionSnapshot.Detail.LOOP_HEADERS : ExpressionSnapshot.Detail.BASE;
@@ -432,6 +440,19 @@ class StackSnapshot {
               continue;
             }
           }
+          if (check.recoversResources()) {
+            operation = "enhance-try";
+            boolean changed = root.hasTryCatch() && TryHelper.enhanceTryStats(root, cl);
+            if (check == Check.TRY_RESOURCES) {
+              details = ";try-resources=" + changed;
+            } else {
+              if (changed) {
+                continue;
+              }
+              operation = "inline-single-blocks";
+              details = ";inline-blocks=" + InlineSingleBlockHelper.inlineSingleBlocks(root);
+            }
+          }
           break;
         }
         operation = "snapshot";
@@ -496,6 +517,8 @@ class StackSnapshot {
         case SWITCH_ENTRY -> "switch-entry-" + operation + "-";
         case SWITCH_PASSES -> "switch-passes-" + operation + "-";
         case TRY_ENTRY -> "try-entry-" + operation + "-";
+        case TRY_RESOURCES -> "try-resources-" + operation + "-";
+        case INLINE_BLOCKS -> "inline-blocks-" + operation + "-";
       };
       return failure + StructureReference.failureSnapshot(error);
     }

@@ -25,7 +25,7 @@ import org.jetbrains.java.decompiler.struct.gen.generics.GenericMethodDescriptor
 import org.jetbrains.java.decompiler.struct.gen.generics.GenericType;
 
 class ExpressionSnapshot {
-  enum Detail { BASE, LOOP_HEADERS, SECONDARY_FUNCTIONS, INTERSECTION_CASTS, SWITCHES }
+  enum Detail { BASE, LOOP_HEADERS, SECONDARY_FUNCTIONS, INTERSECTION_CASTS, SWITCHES, RESOURCES }
 
   private static final Field ARRAY_HARD_TYPE = field(ArrayExprent.class, "hardType");
   private static final Field VARIABLE_TYPE = field(VarExprent.class, "varType");
@@ -92,13 +92,16 @@ class ExpressionSnapshot {
         boolean linked = branch.getHeadexprent() instanceof SwitchHeadExprent head
           && head.getCaseValues() == branch.getCaseValues();
         fields.add("cases" + statement.id + "=" + cases(branch.getCaseValues()) + "|" + linked);
-        if (detail == Detail.SWITCHES) {
+        if (detail.ordinal() >= Detail.SWITCHES.ordinal()) {
           fields.add("guards" + statement.id + "=" + expressions(branch.getCaseGuards()));
         }
       } else if (statement instanceof SynchronizedStatement sync) {
         fields.add("head" + statement.id + "=" + expressions(sync.getHeadexprentList()));
       } else if (statement instanceof CatchStatement caught) {
         fields.add("catch" + statement.id + "=" + expressions(caught.getVars()));
+        if (detail == Detail.RESOURCES) {
+          fields.add("resources" + statement.id + "=" + expressions(caught.getResources()));
+        }
       } else if (statement instanceof CatchAllStatement caught) {
         fields.add("catch" + statement.id + "=" + expressions(caught.getVars()) + "|" + expression(caught.getMonitor()));
       }

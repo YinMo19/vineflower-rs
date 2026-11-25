@@ -5,7 +5,7 @@
 
 use rustc_hash::FxHashMap;
 
-use super::{assignment, variable};
+use super::variable;
 use crate::decompiler::exps::{ConstantValue, Expr, ExprKind};
 use crate::decompiler::ir::{ExprId, ExprListId, Ir};
 use crate::engine::Cx;
@@ -19,7 +19,7 @@ pub(super) fn initializer(
     index: usize,
     current: ExprId,
 ) -> usize {
-    let Some((array, allocation)) = assignment(&cx.ir, current) else {
+    let Some((array, allocation)) = cx.ir[current].as_assignment() else {
         return 0;
     };
     let Some(var) = variable(&cx.ir, array) else {
@@ -98,7 +98,7 @@ pub(super) fn add_element(
     first: ExprId,
     second: ExprId,
 ) -> bool {
-    let Some((array, allocation)) = assignment(&cx.ir, first) else {
+    let Some((array, allocation)) = cx.ir[first].as_assignment() else {
         return false;
     };
     let ExprKind::New {
@@ -151,7 +151,7 @@ pub(super) fn add_element(
 }
 
 fn array_write(cx: &Cx, expr: ExprId, target: ExprId) -> Option<(i32, ExprId)> {
-    let (left, value) = assignment(&cx.ir, expr)?;
+    let (left, value) = cx.ir[expr].as_assignment()?;
     let ExprKind::Array { array, index, .. } = cx.ir[left].kind else {
         return None;
     };

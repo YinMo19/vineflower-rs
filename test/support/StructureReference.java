@@ -73,6 +73,8 @@ class StructureReference {
         case 13 -> StackSnapshot.Check.SWITCH_ENTRY;
         case 14 -> StackSnapshot.Check.SWITCH_PASSES;
         case 15 -> StackSnapshot.Check.TRY_ENTRY;
+        case 16 -> StackSnapshot.Check.TRY_RESOURCES;
+        case 17 -> StackSnapshot.Check.INLINE_BLOCKS;
         default -> null;
       };
       StackSnapshot.Context stackContext = stackCheck == null ? null

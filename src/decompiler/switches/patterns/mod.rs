@@ -242,7 +242,7 @@ impl PatternSwitch {
         let Some(&first) = ir[list].first() else {
             return Ok(());
         };
-        let Some((binding, value)) = assignment(ir, first) else {
+        let Some((binding, value)) = ir[first].as_assignment() else {
             return Ok(());
         };
         if Expr::variable(ir, binding).is_none()
@@ -351,7 +351,7 @@ fn find_inline_selector(
         list = ir[ir[*edge].source].exprents?;
     }
     Expr::variable(ir, selector)?;
-    let (assigned, value) = assignment(ir, *ir[list].last()?)?;
+    let (assigned, value) = ir[*ir[list].last()?].as_assignment()?;
     Expr::variable(ir, assigned)?;
     if !Expr::equals(cx, selector, assigned) {
         return None;
@@ -440,7 +440,7 @@ fn identify_record(
     let Some(list) = ir[head].exprents else {
         return Ok(None);
     };
-    let Some((store, _)) = ir[list].first().and_then(|&expr| assignment(ir, expr)) else {
+    let Some((store, _)) = ir[list].first().and_then(|&expr| ir[expr].as_assignment()) else {
         return Ok(None);
     };
     if Expr::variable(ir, store).is_none() {
@@ -452,13 +452,6 @@ fn identify_record(
         cx.ir[list].remove(0);
     }
     Ok(pattern)
-}
-
-fn assignment(ir: &Ir, expr: ExprId) -> Option<(ExprId, ExprId)> {
-    match ir[expr].kind {
-        ExprKind::Assignment { left, right, .. } => Some((left, right)),
-        _ => None,
-    }
 }
 
 fn int_constant(ir: &Ir, expr: ExprId) -> Option<i32> {

@@ -5,7 +5,7 @@
 use std::collections::VecDeque;
 use std::io;
 
-use super::{assignment, identify_record, int_constant, invalid, switch};
+use super::{identify_record, int_constant, invalid, switch};
 use crate::decompiler::exps::{Expr, ExprKind, FunctionType};
 use crate::decompiler::ir::{EdgeId, ExprId, Ir, StatId};
 use crate::decompiler::stats::stat_edge::{EdgeType, StatEdge};
@@ -45,7 +45,7 @@ pub(super) fn recover(
     let Some((&initial, rest)) = refs.split_first() else {
         return Err(invalid("Pattern switch has no restart-index reference"));
     };
-    let Some((_, value)) = assignment(&cx.ir, initial.expr) else {
+    let Some((_, value)) = cx.ir[initial.expr].as_assignment() else {
         return Ok(None);
     };
 
@@ -111,7 +111,7 @@ fn eliminate(
     reference: Reference,
     simulate: bool,
 ) -> io::Result<bool> {
-    if assignment(&cx.ir, reference.expr).is_none() {
+    if cx.ir[reference.expr].as_assignment().is_none() {
         return Ok(false);
     }
     let assign_stat = reference.stat;

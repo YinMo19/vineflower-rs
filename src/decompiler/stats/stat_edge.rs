@@ -114,13 +114,7 @@ impl EdgeId {
     }
 
     pub fn remove(self, ir: &mut Ir) {
-        ir[self].source.remove_edge_internal(ir, Forward, self);
-        ir[self]
-            .destination
-            .remove_edge_internal(ir, Backward, self);
-        if let Some(closure) = ir[self].closure {
-            ir[closure].label_edges.shift_remove(&self);
-        }
+        ir[self].source.remove_successor(ir, self);
     }
 
     pub fn remove_closure(self, ir: &mut Ir) {

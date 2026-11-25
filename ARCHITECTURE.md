@@ -101,6 +101,8 @@ CFG、语句图和 DirectGraph 具有不同的边契约。
 
 同一轮主循环会先恢复由 `SwitchBootstraps` 编译的模式标签和守卫，再检查各个离开 switch 的分支是否向同一变量赋值。恢复出的 switch 表达式持有原语句的 arena 句柄，各分支上的赋值改为 `yield`。下一轮的变量分析继续遍历承载分支的语句。标签类型无法与选择器合并时，变量分析会返回带选择器类型的错误。[模式 switch](src/decompiler/switches/patterns/mod.rs) · [switch 表达式](src/decompiler/switches/expression.rs)
 
+资源恢复根据 class 版本检查 finally 清理或受抑制异常的 catch 结构，通过类路径确认 `close()V` 的声明类型实现了 `AutoCloseable`。正常出口的清理都通过检查以后，再将初始化表达式移到 try 头部。嵌套资源合并保留声明顺序。单块内联在资源恢复稳定后运行，只能跨过原版允许的保护区和标签作用域。[try-with-resources](src/decompiler/resources/mod.rs) · [单块内联](src/decompiler/inline_blocks.rs)
+
 `RuntimeImage::open` 将模块化 JDK 的每个模块作为独立库登记，按 JRT 的目录遍历和模块描述符顺序提供条目。普通镜像与 ZIP 压缩镜像可由现有 JImage 库读取；该库遇到 compact-cp 压缩时返回 Unsupported。[运行时类路径](src/engine/context_source/runtime.rs)
 
 `StructContext::add_file` 根据文件后缀和 ZIP 结束记录登记目录、归档或单文件。重新载入上下文时再次扫描目录及其子归档。ZIP 保留中央目录顺序和重复条目，按 Java 的规则解释多版本路径。单个 class 文件在预读内部名称和正式解析时使用同一上下文的注解表达式计数器。直接读取缺失资源或目录时，Rust 的 `ContextSource` 返回 `Ok(None)`。Java 的目录源打开这些路径时抛出 I/O 异常，ZIP 源读取缺失条目时抛出空引用异常，读取显式目录条目时返回空流。正常登记按已有条目读取类和资源。[文件登记](src/structs/struct_context.rs)

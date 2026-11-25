@@ -6,6 +6,8 @@
 mod dec_helper;
 mod switch;
 
+pub(crate) use switch::sort_edges_and_nodes as sort_switch_edges;
+
 use std::sync::Arc;
 
 use arcstr::ArcStr;
@@ -359,7 +361,7 @@ fn new_exception_var(
 
 pub(super) fn on_node_collapse(ir: &mut Ir, counters: &mut CounterContainer, stat: StatId) {
     if matches!(ir[stat].kind, StatementKind::Switch(_)) {
-        switch::sort_edges_and_nodes(ir, counters, stat);
+        sort_switch_edges(ir, counters, stat);
     }
 }
 
@@ -454,7 +456,7 @@ pub(crate) fn init_simple_copy(ir: &mut Ir, counters: &mut CounterContainer, sta
                 unreachable!()
             };
             switch.default_edge = default;
-            switch::sort_edges_and_nodes(ir, counters, stat);
+            sort_switch_edges(ir, counters, stat);
         }
         _ => {}
     }

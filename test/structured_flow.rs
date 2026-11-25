@@ -578,6 +578,24 @@ fn try_entry_matches_upstream() {
     );
 }
 
+#[test]
+#[ignore = "requires the upstream +local.jar and JDK 17 or later"]
+fn try_resources_match_upstream() {
+    stack_snapshot::check(
+        &upstream_reference::Corpus::discover(),
+        stack_snapshot::Check::TryResources,
+    );
+}
+
+#[test]
+#[ignore = "requires the upstream +local.jar and JDK 17 or later"]
+fn single_block_inlining_matches_upstream() {
+    stack_snapshot::check(
+        &upstream_reference::Corpus::discover(),
+        stack_snapshot::Check::InlineBlocks,
+    );
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 enum Check {

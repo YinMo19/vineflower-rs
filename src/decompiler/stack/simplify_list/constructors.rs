@@ -5,7 +5,7 @@
 
 use std::collections::VecDeque;
 
-use super::{assignment, set_assignment_right, variable};
+use super::{set_assignment_right, variable};
 use crate::decompiler::exps::{Expr, ExprKind, InvocationFunction, InvocationType};
 use crate::decompiler::ir::{ExprId, ExprListId, Ir};
 use crate::decompiler::sforms::SsaResult;
@@ -79,7 +79,7 @@ pub(super) fn swap(
 ) -> bool {
     let previous = ir[list][index - 1];
     let (Some((left, allocation)), Some((_, alias))) =
-        (assignment(ir, previous), assignment(ir, current))
+        (ir[previous].as_assignment(), ir[current].as_assignment())
     else {
         return false;
     };
@@ -114,7 +114,7 @@ pub(super) fn remote(
     index: usize,
     current: ExprId,
 ) -> bool {
-    let Some((left, allocation)) = assignment(&cx.ir, current) else {
+    let Some((left, allocation)) = cx.ir[current].as_assignment() else {
         return false;
     };
     let Some(var) = variable(&cx.ir, left) else {
@@ -227,7 +227,7 @@ pub(super) fn inline_method_reference_assignment(
     first: ExprId,
     second: ExprId,
 ) -> bool {
-    let Some((left, right)) = assignment(&cx.ir, first) else {
+    let Some((left, right)) = cx.ir[first].as_assignment() else {
         return false;
     };
     let Some(var) = variable(&cx.ir, left) else {

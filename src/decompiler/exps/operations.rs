@@ -10,6 +10,13 @@ use crate::engine::{Cx, counter_container::CounterContainer};
 use super::{Expr, ExprKind, FunctionType, Variable};
 
 impl Expr {
+    pub(crate) fn as_assignment(&self) -> Option<(ExprId, ExprId)> {
+        match self.kind {
+            ExprKind::Assignment { left, right, .. } => Some((left, right)),
+            _ => None,
+        }
+    }
+
     /// IfExprent.negateIf retains the wrapper and the condition's bytecode positions.
     pub(crate) fn negate_if(ir: &mut Ir, counters: &mut CounterContainer, head: ExprId) {
         let ExprKind::If { condition } = ir[head].kind else {

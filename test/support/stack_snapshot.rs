@@ -52,6 +52,8 @@ pub(super) enum Check {
     SwitchEntry = 13,
     SwitchPasses = 14,
     TryEntry = 15,
+    TryResources = 16,
+    InlineBlocks = 17,
 }
 
 #[derive(Clone, Copy)]
@@ -256,6 +258,26 @@ const TRY_ENTRY_STAGES: &[(&str, &str)] = &[
     ("Direct graph before try processing", "graph="),
 ];
 
+const TRY_RESOURCE_STAGES: &[(&str, &str)] = &[
+    ("Structure and return value after try recovery", "counters="),
+    ("Resources and expressions after try recovery", "counters="),
+    ("Variable versions after try recovery", "versions="),
+    ("Direct graph after try recovery", "graph="),
+];
+
+const INLINE_BLOCK_STAGES: &[(&str, &str)] = &[
+    (
+        "Structure and return value after single-block inlining",
+        "counters=",
+    ),
+    (
+        "Resources and expressions after single-block inlining",
+        "counters=",
+    ),
+    ("Variable versions after single-block inlining", "versions="),
+    ("Direct graph after single-block inlining", "graph="),
+];
+
 fn loop_iterations(row: &str) -> impl Iterator<Item = &str> {
     row.split('\t')
         .nth(3)
@@ -278,7 +300,9 @@ impl Check {
             | Self::IfPatterns
             | Self::SwitchEntry
             | Self::SwitchPasses
-            | Self::TryEntry => &[DEFAULT],
+            | Self::TryEntry
+            | Self::TryResources
+            | Self::InlineBlocks => &[DEFAULT],
             Self::SecondaryFunctions => SECONDARY_PROFILES,
         }
     }
@@ -298,6 +322,8 @@ impl Check {
             Self::SwitchEntry => SWITCH_ENTRY_STAGES,
             Self::SwitchPasses => SWITCH_PASS_STAGES,
             Self::TryEntry => TRY_ENTRY_STAGES,
+            Self::TryResources => TRY_RESOURCE_STAGES,
+            Self::InlineBlocks => INLINE_BLOCK_STAGES,
         }
     }
 
@@ -316,6 +342,8 @@ impl Check {
             Self::SwitchEntry => "switch-entry",
             Self::SwitchPasses => "switch-passes",
             Self::TryEntry => "try-entry",
+            Self::TryResources => "try-resources",
+            Self::InlineBlocks => "inline-blocks",
         }
     }
 
@@ -343,12 +371,17 @@ impl Check {
     }
 
     fn recovers_switches(self) -> bool {
-        matches!(self, Self::SwitchPasses | Self::TryEntry)
+        matches!(self, Self::SwitchPasses | Self::TryEntry) || self.recovers_resources()
+    }
+
+    fn recovers_resources(self) -> bool {
+        matches!(self, Self::TryResources | Self::InlineBlocks)
     }
 
     fn expression_detail(self) -> expression_snapshot::Detail {
         use expression_snapshot::Detail;
         match self {
+            _ if self.recovers_resources() => Detail::Resources,
             _ if self.recovers_switches() => Detail::Switches,
             _ if self.settles_pattern_entry() => Detail::IntersectionCasts,
             Self::SecondaryFunctions => Detail::SecondaryFunctions,
@@ -537,6 +570,46 @@ struct SwitchCoverage {
     guards: usize,
     switch_expressions: usize,
     yields: usize,
+}
+
+#[derive(Default)]
+struct ResourceCoverage {
+    changed_methods: usize,
+    methods_with_resources: usize,
+    resource_statements: usize,
+    resources: usize,
+}
+
+impl ResourceCoverage {
+    fn record(&mut self, row: &str) {
+        let mut snapshots = row.split('\t');
+        let tree = snapshots.next().unwrap();
+        self.changed_methods += usize::from(
+            tree.ends_with(";try-resources=true") || tree.ends_with(";inline-blocks=true"),
+        );
+        let mut method_has_resources = false;
+        for field in snapshots.next().unwrap().split(';') {
+            if let Some((key, list)) = field.split_once('=')
+                && key.starts_with("resources")
+                && !list.is_empty()
+            {
+                method_has_resources = true;
+                self.resource_statements += 1;
+                self.resources += list.split(',').count();
+            }
+        }
+        self.methods_with_resources += usize::from(method_has_resources);
+    }
+
+    fn report(&self) {
+        eprintln!(
+            "{} methods reported a change. {} methods contain {} resources across {} try statements.",
+            self.changed_methods,
+            self.methods_with_resources,
+            self.resources,
+            self.resource_statements
+        );
+    }
 }
 
 impl SwitchCoverage {
@@ -766,6 +839,7 @@ pub(super) fn check(corpus: &Corpus, check: Check) {
     let mut secondary_comparison = SecondaryComparison::default();
     let mut if_pattern_coverage = IfPatternCoverage::default();
     let mut switch_coverage = SwitchCoverage::default();
+    let mut resource_coverage = ResourceCoverage::default();
     let methods_per_profile = methods.len() / check.profiles().len();
     for (index, method) in methods.iter().enumerate() {
         let row = java_rows
@@ -815,6 +889,9 @@ pub(super) fn check(corpus: &Corpus, check: Check) {
             }
             if check.recovers_switches() {
                 switch_coverage.record(&rust);
+            }
+            if check.recovers_resources() {
+                resource_coverage.record(&rust);
             }
         } else {
             let stage_size = if check == Check::Stack { 2 } else { 3 };
@@ -893,6 +970,9 @@ pub(super) fn check(corpus: &Corpus, check: Check) {
         }
         if check.recovers_switches() {
             switch_coverage.report(check);
+        }
+        if check.recovers_resources() {
+            resource_coverage.report();
         }
         if check == Check::SecondaryFunctions {
             eprintln!("With ternary constant simplification enabled");
@@ -1093,7 +1173,9 @@ fn stage(
                 | Check::IfPatterns
                 | Check::SwitchEntry
                 | Check::SwitchPasses
-                | Check::TryEntry,
+                | Check::TryEntry
+                | Check::TryResources
+                | Check::InlineBlocks,
                 _,
             ) => {
                 loop {
@@ -1130,10 +1212,20 @@ fn stage(
                         operation.set("merge-loops");
                         method.merge_loops(cx, class)?;
                         String::new()
-                    } else if check == Check::TryEntry {
+                    } else if check == Check::InlineBlocks {
+                        operation.set("prepare-inline");
+                        method.prepare_inline(cx, class)?;
+                        operation.set("inline-single-blocks");
+                        format!(";inline-blocks={}", method.inline_single_blocks(cx)?)
+                    } else if matches!(check, Check::TryEntry | Check::TryResources) {
                         operation.set("prepare-try");
                         method.prepare_try(cx, class)?;
-                        String::new()
+                        if check == Check::TryResources {
+                            operation.set("enhance-try");
+                            format!(";try-resources={}", method.enhance_try(cx, class))
+                        } else {
+                            String::new()
+                        }
                     } else if matches!(check, Check::SwitchEntry | Check::SwitchPasses) {
                         operation.set("prepare-switches");
                         method.prepare_switches(cx, class)?;
@@ -1356,10 +1448,22 @@ fn stage_error(check: Check, operation: &str, kind: &str, message: &str) -> Stri
 }
 
 fn same_switch_case_rejection(check: Check, java: &str, rust: &str) -> bool {
-    if check != Check::TryEntry
-        || !java.starts_with("try-entry-set-var-versions-error=java.lang.IllegalStateException: Invalid switch case set:")
-        || !rust.starts_with("try-entry-prepare-try-invalid-data=Invalid switch case set")
-    {
+    let operation = match check {
+        Check::TryEntry | Check::TryResources => "prepare-try",
+        Check::InlineBlocks => "prepare-inline",
+        _ => return false,
+    };
+    let Some(java) = java.strip_prefix(check.name()) else {
+        return false;
+    };
+    let Some(rust) = rust.strip_prefix(check.name()) else {
+        return false;
+    };
+    if !java.starts_with(
+        "-set-var-versions-error=java.lang.IllegalStateException: Invalid switch case set:",
+    ) || !rust.starts_with(&format!(
+        "-{operation}-invalid-data=Invalid switch case set"
+    )) {
         return false;
     }
     let selector = " for selector of type ";

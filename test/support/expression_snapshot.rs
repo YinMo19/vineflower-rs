@@ -23,6 +23,7 @@ pub enum Detail {
     SecondaryFunctions,
     IntersectionCasts,
     Switches,
+    Resources,
 }
 
 pub fn snapshot(cx: &Cx, root: StatId, counters: &CounterContainer) -> String {
@@ -111,8 +112,14 @@ pub fn snapshot_details(
             StatementKind::Synchronized { head_exprents, .. } => {
                 fields.push(format!("head{id}={}", snapshot.list(*head_exprents)));
             }
-            StatementKind::Catch { vars, .. } => {
+            StatementKind::Catch {
+                vars, resources, ..
+            } => {
                 fields.push(format!("catch{id}={}", snapshot.expressions(vars)));
+                if detail >= Detail::Resources {
+                    let resources = resources.map_or(&[][..], |list| ir[list].as_slice());
+                    fields.push(format!("resources{id}={}", snapshot.expressions(resources)));
+                }
             }
             StatementKind::CatchAll { vars, monitor, .. } => {
                 fields.push(format!(
