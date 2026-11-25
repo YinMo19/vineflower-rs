@@ -38,18 +38,20 @@ class ExpressionSnapshot {
   // Record shared nodes once and keep references by the upstream expression ID.
   private final Map<Integer, Exprent> nodes = new TreeMap<>();
   private final boolean enhanced;
+  private final boolean secondary;
 
-  private ExpressionSnapshot(boolean enhanced) {
+  private ExpressionSnapshot(boolean enhanced, boolean secondary) {
     this.enhanced = enhanced;
+    this.secondary = secondary;
   }
 
   static String snapshot(RootStatement root, CounterContainer counters) {
-    return snapshot(root, counters, false);
+    return snapshot(root, counters, false, false);
   }
 
-  static String snapshot(RootStatement root, CounterContainer counters, boolean enhanced) {
+  static String snapshot(RootStatement root, CounterContainer counters, boolean enhanced, boolean secondary) {
     try {
-      return new ExpressionSnapshot(enhanced).describe(root, counters);
+      return new ExpressionSnapshot(enhanced, secondary).describe(root, counters);
     } catch (RuntimeException | AssertionError | StackOverflowError failure) {
       return "snapshot-error=" + text(failure.toString());
     }
@@ -153,17 +155,19 @@ class ExpressionSnapshot {
     }
     if (e instanceof InvocationExprent invocation) {
       List<PooledConstant> arguments = invocation.getBootstrapArguments();
-      return parts(invocation.getInvocationType().name(), invocation.getFunctype().name(),
+      String fields = parts(invocation.getInvocationType().name(), invocation.getFunctype().name(),
         text(invocation.getName()), text(invocation.getClassname()), invocation.isStatic(),
         expression(invocation.getInstance()), text(invocation.getStringDescriptor()),
         descriptor(invocation.getDescriptor()), text(invocation.getInvokeDynamicClassSuffix()),
         expressions(invocation.getLstParameters()), constant(invocation.getBootstrapMethod()),
         arguments == null ? "~" : arguments.stream().map(ExpressionSnapshot::constant).collect(Collectors.joining("/")),
         invocation.isSyntheticNullCheck(), read(INVOCATION_LAZY_CONDY, invocation));
+      return secondary ? fields + "|" + invocation.shouldForceBoxing() : fields;
     }
     if (e instanceof FunctionExprent function) {
-      return parts(function.getFuncType().name(), expressions(function.getLstOperands()),
+      String fields = parts(function.getFuncType().name(), expressions(function.getLstOperands()),
         type((VarType) read(FUNCTION_IMPLICIT_TYPE, function)));
+      return secondary ? fields + "|" + function.doesCast() : fields;
     }
     if (e instanceof NewExprent allocation) {
       return parts(type(allocation.getNewType()), expressions(allocation.getLstDims()),

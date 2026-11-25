@@ -30,7 +30,9 @@ enum Extraction {
 fn extract_recursive(ir: &mut Ir, counters: &mut CounterContainer, stat: StatId) -> Extraction {
     let mut result = Extraction::Unchanged;
     'rescan: loop {
-        for child in ir[stat].stats.to_vec() {
+        // Extracting a child may replace it in this parent's collection.
+        let children = ir[stat].stats.to_vec();
+        for child in children {
             match extract_recursive(ir, counters, child) {
                 Extraction::Unchanged => {}
                 Extraction::Descendant => result = Extraction::Descendant,

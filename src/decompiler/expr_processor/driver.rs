@@ -12,7 +12,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{ExpressionData, block};
 use crate::decompiler::exps::Variable;
-use crate::decompiler::exps::{Expr, ExprKind, FunctionType, STACK_BASE, SwitchCaseValues};
+use crate::decompiler::exps::{Expr, ExprKind, STACK_BASE, SwitchCaseValues};
 use crate::decompiler::flow::{DirectEdgeType, DirectGraph, flatten::build_direct_graph};
 use crate::decompiler::ir::{ExprId, Ir, StatId, VarProcessorId};
 use crate::decompiler::stats::StatementKind;
@@ -164,7 +164,9 @@ fn initialize_header(cx: &mut Cx, counters: &mut CounterContainer, stat: StatId)
                 ));
             };
             if negated {
-                negate_if_copy(cx, counters, head)
+                let copy = Expr::copy(cx, counters, head);
+                Expr::negate_if(&mut cx.ir, counters, copy);
+                copy
             } else {
                 head
             }
@@ -209,21 +211,4 @@ fn take_header(ir: &mut Ir, stat: StatId) -> io::Result<ExprId> {
                 format!("missing header expression for statement {}", ir[stat].id),
             )
         })
-}
-
-fn negate_if_copy(cx: &mut Cx, counters: &mut CounterContainer, head: ExprId) -> ExprId {
-    let copy = Expr::copy(cx, counters, head);
-    let ExprKind::If { condition } = cx.ir[copy].kind else {
-        unreachable!()
-    };
-    let bytecode = cx.ir[condition].bytecode.clone();
-    let condition = Expr::function(
-        &mut cx.ir,
-        counters,
-        FunctionType::BoolNot,
-        vec![condition],
-        bytecode,
-    );
-    cx.ir[copy].kind = ExprKind::If { condition };
-    copy
 }

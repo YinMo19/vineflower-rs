@@ -91,7 +91,9 @@ CFG、语句图和 DirectGraph 具有不同的边契约。
 
 循环增强按后序检查入口条件，再依次尝试迭代器、数组和计数循环。识别器检查变量槽、版本、使用位置和异常保护区，成功后将表达式移到循环头并转移字节码范围。迭代器子类型通过已登记的类路径解析。循环抽取移动可离开循环的分支，同时改写对应的边与闭包。抽取成功后，`ExpressionMethod::merge_loops` 回到循环消除；条件合并也会重启这一内层循环。Java 的后测试循环识别发生在外层主循环的后续阶段。[循环增强](src/decompiler/loops/enhance.rs) · [增强 for](src/decompiler/loops/foreach.rs) · [循环抽取](src/decompiler/loops/extract.rs)
 
-`ExpressionMethod::identify_main_loop_labels` 从每轮主循环的边清理开始，运行内层合并、重新简化栈变量并更新变量版本，再依据各分支的下一条语句确定哪些跳转需要显式标签。原版在同样大小的候选边组之间按 JVM 对象身份散列遍历来选择。Rust 对这种平局按发现顺序选择。接下来是次级表达式改写；类级写出与 CLI 仍待接入。[标签识别](src/decompiler/labels/identify.rs)
+`ExpressionMethod::identify_main_loop_labels` 从每轮主循环的边清理开始，运行内层合并、重新简化栈变量并更新变量版本，再依据各分支的下一条语句确定哪些跳转需要显式标签。原版在同样大小的候选边组之间按 JVM 对象身份散列遍历来选择。Rust 对这种平局按发现顺序选择。[标签识别](src/decompiler/labels/identify.rs)
+
+次级表达式改写在标签确定后运行。先尝试消除空 then 分支，再按原版的先后次序处理逻辑取反、浮点比较、三元式、复合赋值与装箱。某些改写只改变强制类型转换或装箱的写出标志；调用方是否重启由改写函数的返回值决定。[次级表达式](src/decompiler/secondary/mod.rs)
 
 `RuntimeImage::open` 将模块化 JDK 的每个模块作为独立库登记，按 JRT 的目录遍历和模块描述符顺序提供条目。普通镜像与 ZIP 压缩镜像可由现有 JImage 库读取；该库遇到 compact-cp 压缩时返回 Unsupported。[运行时类路径](src/engine/context_source/runtime.rs)
 

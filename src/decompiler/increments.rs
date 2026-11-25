@@ -82,26 +82,7 @@ impl Finder<'_> {
         let ExprKind::Function { op, operands, .. } = &ir[right].kind else {
             return None;
         };
-        // Numeric conversions are the FunctionType entries with a castType.
-        let midlayer = matches!(
-            op,
-            FunctionType::I2l
-                | FunctionType::I2f
-                | FunctionType::I2d
-                | FunctionType::L2i
-                | FunctionType::L2f
-                | FunctionType::L2d
-                | FunctionType::F2i
-                | FunctionType::F2l
-                | FunctionType::F2d
-                | FunctionType::D2i
-                | FunctionType::D2l
-                | FunctionType::D2f
-                | FunctionType::I2b
-                | FunctionType::I2c
-                | FunctionType::I2s
-        )
-        .then(|| Expr::expr_type(self.cx, right));
+        let midlayer = op.simple_cast_type();
         let arithmetic = if midlayer.is_some() {
             operands[0]
         } else {

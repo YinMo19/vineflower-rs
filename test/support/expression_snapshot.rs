@@ -17,14 +17,15 @@ use vineflower_rs::structs::consts::{ConstantValue, LinkConstant, PooledConstant
 use vineflower_rs::types::{MethodDescriptor, VarType};
 
 pub fn snapshot(cx: &Cx, root: StatId, counters: &CounterContainer) -> String {
-    snapshot_with_loops(cx, root, counters, false)
+    snapshot_details(cx, root, counters, false, false)
 }
 
-pub fn snapshot_with_loops(
+pub fn snapshot_details(
     cx: &Cx,
     root: StatId,
     counters: &CounterContainer,
     enhanced: bool,
+    secondary: bool,
 ) -> String {
     let ir = &cx.ir;
     let StatementKind::Root { dummy_exit, .. } = ir[root].kind else {
@@ -35,6 +36,7 @@ pub fn snapshot_with_loops(
         cx,
         nodes: BTreeMap::new(),
         enhanced,
+        secondary,
     };
     let mut fields = vec![format!(
         "counters={},{},{}",
@@ -115,6 +117,7 @@ struct Snapshot<'a> {
     cx: &'a Cx,
     nodes: BTreeMap<i32, (ExprId, String)>,
     enhanced: bool,
+    secondary: bool,
 }
 
 impl Snapshot<'_> {
@@ -232,9 +235,8 @@ impl Snapshot<'_> {
                     field.was_condy
                 ),
             ),
-            ExprKind::Invocation(invocation) => (
-                "INVOCATION",
-                format!(
+            ExprKind::Invocation(invocation) => {
+                let mut operands = format!(
                     "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
                     enum_name(invocation.kind),
                     enum_name(invocation.function),
@@ -256,21 +258,29 @@ impl Snapshot<'_> {
                     ),
                     invocation.synthetic_null_check,
                     invocation.was_lazy_condy
-                ),
-            ),
+                );
+                if self.secondary {
+                    write!(operands, "|{}", invocation.force_boxing).unwrap();
+                }
+                ("INVOCATION", operands)
+            }
             ExprKind::Function {
                 op,
                 operands,
                 implicit_type,
-            } => (
-                "FUNCTION",
-                format!(
+                needs_cast,
+            } => {
+                let mut operands = format!(
                     "{}|{}|{}",
                     function_name(*op),
                     self.expressions(operands),
                     var_type(implicit_type.as_deref()),
-                ),
-            ),
+                );
+                if self.secondary {
+                    write!(operands, "|{needs_cast}").unwrap();
+                }
+                ("FUNCTION", operands)
+            }
             ExprKind::New {
                 new_type,
                 dimensions,

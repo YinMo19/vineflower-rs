@@ -14,6 +14,7 @@ pub(crate) mod increments;
 pub mod ir;
 pub(crate) mod labels;
 pub(crate) mod loops;
+pub(crate) mod secondary;
 pub mod sforms;
 pub mod stack;
 pub mod stats;

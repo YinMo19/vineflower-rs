@@ -471,6 +471,15 @@ fn main_loop_label_identification_matches_upstream() {
     );
 }
 
+#[test]
+#[ignore = "requires the upstream +local.jar and JDK 17 or later"]
+fn secondary_functions_match_upstream() {
+    stack_snapshot::check(
+        &upstream_reference::Corpus::discover(),
+        stack_snapshot::Check::SecondaryFunctions,
+    );
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 enum Check {

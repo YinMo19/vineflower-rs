@@ -5,11 +5,27 @@
 
 use crate::decompiler::ir::{ExprId, Ir, StatId};
 use crate::decompiler::vars::var_version_pair::VarVersionPair;
-use crate::engine::Cx;
+use crate::engine::{Cx, counter_container::CounterContainer};
 
-use super::{Expr, ExprKind, Variable};
+use super::{Expr, ExprKind, FunctionType, Variable};
 
 impl Expr {
+    /// IfExprent.negateIf retains the wrapper and the condition's bytecode positions.
+    pub(crate) fn negate_if(ir: &mut Ir, counters: &mut CounterContainer, head: ExprId) {
+        let ExprKind::If { condition } = ir[head].kind else {
+            unreachable!("Conditional header must be an IfExprent");
+        };
+        let offsets = ir[condition].bytecode.clone();
+        let condition = Self::function(
+            ir,
+            counters,
+            FunctionType::BoolNot,
+            vec![condition],
+            offsets,
+        );
+        ir[head].kind = ExprKind::If { condition };
+    }
+
     pub const MULTIPLE_USES: u8 = 1;
     pub const SIDE_EFFECTS_FREE: u8 = 2;
 

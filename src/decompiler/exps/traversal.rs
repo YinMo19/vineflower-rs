@@ -95,7 +95,9 @@ impl StatId {
                     .collect(),
                 LoopType::ForEach => vec![
                     loop_stat.init(ir).expect("Foreach variable is missing"),
-                    loop_stat.increment(ir).expect("Foreach iterable is missing"),
+                    loop_stat
+                        .increment(ir)
+                        .expect("Foreach iterable is missing"),
                 ],
             },
             StatementKind::If(branch) => list(branch.head_exprents).to_vec(),
@@ -115,6 +117,42 @@ impl StatId {
                 )
                 .collect(),
             _ => Vec::new(),
+        }
+    }
+}
+
+impl StatId {
+    /// Statement.replaceExprent only replaces a header owned by its statement.
+    /// A switch searches guards by expression equality after checking its head.
+    pub(crate) fn replace_header(self, cx: &mut crate::engine::Cx, old: ExprId, new: ExprId) {
+        let slots = match &cx.ir[self].kind {
+            StatementKind::Do(header) => [header.init, header.condition, header.increment],
+            StatementKind::If(branch) => [branch.head_exprents, None, None],
+            StatementKind::Synchronized { head_exprents, .. } => [*head_exprents, None, None],
+            StatementKind::Switch(switch) => {
+                if switch
+                    .head_exprents
+                    .is_none_or(|slot| cx.ir[slot].first() != Some(&old))
+                {
+                    let index = switch
+                        .case_guards
+                        .iter()
+                        .position(|guard| guard.is_some_and(|expr| Expr::equals(cx, old, expr)));
+                    if let Some(index) = index
+                        && let StatementKind::Switch(switch) = &mut cx.ir[self].kind
+                    {
+                        switch.case_guards[index] = Some(new);
+                    }
+                    return;
+                }
+                [switch.head_exprents, None, None]
+            }
+            _ => return,
+        };
+        for slot in slots.into_iter().flatten() {
+            if cx.ir[slot].first() == Some(&old) {
+                cx.ir[slot][0] = new;
+            }
         }
     }
 }

@@ -41,6 +41,7 @@ import org.jetbrains.java.decompiler.modules.decompiler.LabelHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.LoopExtractHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.MergeHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.PPandMMHelper;
+import org.jetbrains.java.decompiler.modules.decompiler.SecondaryFunctionsHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.SequenceHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.SimplifyExprentsHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.StackVarsProcessor;
@@ -56,14 +57,20 @@ import org.jetbrains.java.decompiler.util.InterpreterUtil;
 
 class StackSnapshot {
   enum Check {
-    STACK, INCREMENTS, PRE_MAIN, LOOP_ELIMINATION, LOOP_ENHANCEMENT, LOOP_MERGE, MAIN_LOOP_LABELS;
+    STACK, INCREMENTS, PRE_MAIN, LOOP_ELIMINATION, LOOP_ENHANCEMENT, LOOP_MERGE, MAIN_LOOP_LABELS,
+    SECONDARY_FUNCTIONS;
 
     boolean usesLoopHeaders() {
-      return this == LOOP_ENHANCEMENT || this == LOOP_MERGE || this == MAIN_LOOP_LABELS;
+      return this == LOOP_ENHANCEMENT || this == LOOP_MERGE || identifiesLabels();
+    }
+
+    boolean identifiesLabels() {
+      return this == MAIN_LOOP_LABELS || this == SECONDARY_FUNCTIONS;
     }
   }
 
-  record Options(int group, boolean simplify, boolean ternary, boolean lvt, boolean booleanAsInt, boolean assertions) {}
+  record Options(int group, boolean simplify, boolean ternary, boolean lvt, boolean booleanAsInt,
+                 boolean assertions, boolean ternaryConstants) {}
   private record RootScope(ImportCollector imports, List<ClassNode> wrapperOrder, String error) {}
 
   static class Context {
@@ -99,7 +106,8 @@ class StackSnapshot {
         IFernflowerPreferences.TERNARY_CONDITIONS, next.ternary() ? "1" : "0",
         IFernflowerPreferences.USE_DEBUG_VAR_NAMES, next.lvt() ? "1" : "0",
         IFernflowerPreferences.BOOLEAN_TRUE_ONE, next.booleanAsInt() ? "1" : "0",
-        IFernflowerPreferences.DECOMPILE_ASSERTIONS, next.assertions() ? "1" : "0"
+        IFernflowerPreferences.DECOMPILE_ASSERTIONS, next.assertions() ? "1" : "0",
+        IFernflowerPreferences.TERNARY_CONSTANT_SIMPLIFICATION, next.ternaryConstants() ? "1" : "0"
       ), IFernflowerLogger.NO_OP);
       for (String path : groups.get(next.group())) {
         engine.addSource(Path.of(path).toFile());
@@ -343,13 +351,17 @@ class StackSnapshot {
             }
           }
         }
-        if (check == Check.MAIN_LOOP_LABELS) {
+        if (check.identifiesLabels()) {
           operation = "simplify-stack";
           StackVarsProcessor.simplifyStackVars(root, method, cl);
           operation = "set-var-versions";
           vars.setVarVersions(root);
           operation = "identify-labels";
           LabelHelper.identifyLabels(root);
+        }
+        if (check == Check.SECONDARY_FUNCTIONS) {
+          operation = "identify-secondary";
+          details = ";secondary=" + SecondaryFunctionsHelper.identifySecondaryFunctions(root, vars);
         }
         operation = "snapshot";
         return snapshot(root, counters, vars, initialHidden, check, details)
@@ -407,6 +419,7 @@ class StackSnapshot {
         case LOOP_ENHANCEMENT -> "loop-enhancement-" + operation + "-";
         case LOOP_MERGE -> "loop-merge-" + operation + "-";
         case MAIN_LOOP_LABELS -> "main-loop-labels-" + operation + "-";
+        case SECONDARY_FUNCTIONS -> "secondary-functions-" + operation + "-";
       };
       return failure + StructureReference.failureSnapshot(error);
     }
@@ -423,7 +436,8 @@ class StackSnapshot {
       ? ";content=" + root.hasTryCatch() + "," + root.hasLoops() + "," + root.hasSwitch() : "";
     String snapshot = StructureReference.snapshot(root, counters, loopStage)
       + content + ";hidden=" + allMembers + ";hidden-added=" + added + details
-      + "\t" + ExpressionSnapshot.snapshot(root, counters, check.usesLoopHeaders());
+      + "\t" + ExpressionSnapshot.snapshot(root, counters, check.usesLoopHeaders(),
+        check == Check.SECONDARY_FUNCTIONS);
     return check == Check.STACK ? snapshot : snapshot + "\t" + VariableSnapshot.snapshot(vars);
   }
 }

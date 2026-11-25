@@ -87,6 +87,7 @@ impl Expr {
                 op,
                 operands,
                 implicit_type,
+                ..
             } => {
                 function_bounds(cx, *op, operands, implicit_type.as_deref(), &mut bounds);
             }

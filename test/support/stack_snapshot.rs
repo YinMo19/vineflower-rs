@@ -44,12 +44,14 @@ pub(super) enum Check {
     LoopEnhancement = 7,
     LoopMerge = 8,
     MainLoopLabels = 9,
+    SecondaryFunctions = 10,
 }
 
 #[derive(Clone, Copy)]
 struct Profile {
     simplify: bool,
     ternary: bool,
+    ternary_constants: bool,
     lvt: bool,
     boolean_as_int: bool,
     assertions: bool,
@@ -58,6 +60,7 @@ struct Profile {
 const DEFAULT: Profile = Profile {
     simplify: true,
     ternary: true,
+    ternary_constants: false,
     lvt: true,
     boolean_as_int: true,
     assertions: true,
@@ -91,6 +94,14 @@ const PRE_MAIN_PROFILES: &[Profile] = &[
     DEFAULT,
     Profile {
         assertions: false,
+        ..DEFAULT
+    },
+];
+
+const SECONDARY_PROFILES: &[Profile] = &[
+    DEFAULT,
+    Profile {
+        ternary_constants: true,
         ..DEFAULT
     },
 ];
@@ -175,6 +186,19 @@ const MAIN_LOOP_LABEL_STAGES: &[(&str, &str)] = &[
     ("Direct graph after label identification", "graph="),
 ];
 
+const SECONDARY_FUNCTION_STAGES: &[(&str, &str)] = &[
+    (
+        "Structure and return value after secondary functions",
+        "counters=",
+    ),
+    (
+        "Expressions and cast/boxing flags after secondary functions",
+        "counters=",
+    ),
+    ("Variable versions after secondary functions", "versions="),
+    ("Direct graph after secondary functions", "graph="),
+];
+
 fn loop_iterations(row: &str) -> impl Iterator<Item = &str> {
     row.split('\t')
         .nth(3)
@@ -193,6 +217,7 @@ impl Check {
             | Self::LoopEnhancement
             | Self::LoopMerge
             | Self::MainLoopLabels => &[DEFAULT],
+            Self::SecondaryFunctions => SECONDARY_PROFILES,
         }
     }
 
@@ -205,6 +230,7 @@ impl Check {
             Self::LoopEnhancement => LOOP_ENHANCEMENT_STAGES,
             Self::LoopMerge => LOOP_MERGE_STAGES,
             Self::MainLoopLabels => MAIN_LOOP_LABEL_STAGES,
+            Self::SecondaryFunctions => SECONDARY_FUNCTION_STAGES,
         }
     }
 
@@ -217,14 +243,22 @@ impl Check {
             Self::LoopEnhancement => "loop-enhancement",
             Self::LoopMerge => "loop-merge",
             Self::MainLoopLabels => "main-loop-labels",
+            Self::SecondaryFunctions => "secondary-functions",
         }
     }
 
     fn uses_loop_headers(self) -> bool {
         matches!(
             self,
-            Self::LoopEnhancement | Self::LoopMerge | Self::MainLoopLabels
+            Self::LoopEnhancement
+                | Self::LoopMerge
+                | Self::MainLoopLabels
+                | Self::SecondaryFunctions
         )
+    }
+
+    fn identifies_labels(self) -> bool {
+        matches!(self, Self::MainLoopLabels | Self::SecondaryFunctions)
     }
 }
 
@@ -290,13 +324,16 @@ struct EnhancementCoverage {
     loops: BTreeMap<String, usize>,
     foreach_sources: BTreeMap<String, usize>,
     list_iterator: bool,
+    optional_casts: usize,
+    forced_boxing: usize,
 }
 
 impl EnhancementCoverage {
-    fn record(&mut self, method: &str, row: &str) {
+    fn record(&mut self, check: Check, method: &str, row: &str) {
         let mut snapshots = row.split('\t');
         let tree = snapshots.next().unwrap();
-        self.changed_methods += usize::from(tree.ends_with(";enhanced=true"));
+        self.changed_methods +=
+            usize::from(tree.ends_with(";enhanced=true") || tree.ends_with(";secondary=true"));
         for kind in tree
             .split(';')
             .filter_map(|field| field.strip_prefix("loop="))
@@ -312,6 +349,15 @@ impl EnhancementCoverage {
                 self.list_iterator |= kind == "iterator"
                     && method.contains("TestListIteratorHierarchy.class print (Ljava/util/List;)V");
             }
+            if check == Check::SecondaryFunctions
+                && field.starts_with('e')
+                && let Some((_, node)) = field.split_once('=')
+            {
+                self.optional_casts +=
+                    usize::from(node.starts_with("FUNCTION|") && node.ends_with("|false"));
+                self.forced_boxing +=
+                    usize::from(node.starts_with("INVOCATION|") && node.ends_with("|true"));
+            }
         }
     }
 
@@ -324,6 +370,15 @@ impl EnhancementCoverage {
             eprintln!(
                 "{} methods reported a change from loop enhancement",
                 self.changed_methods
+            );
+        } else if check == Check::SecondaryFunctions {
+            eprintln!(
+                "{} methods reported a change from secondary functions",
+                self.changed_methods
+            );
+            eprintln!(
+                "{} expressions omit casts and {} invocations retain explicit boxing",
+                self.optional_casts, self.forced_boxing
             );
         }
         for kind in ["INFINITE", "DO_WHILE", "WHILE", "FOR", "FOR_EACH"] {
@@ -338,6 +393,48 @@ impl EnhancementCoverage {
                 self.foreach_sources.get(source).copied().unwrap_or(0)
             );
         }
+    }
+}
+
+#[derive(Default)]
+struct SecondaryComparison {
+    baseline: Vec<String>,
+    return_changes: usize,
+    tree_changes: usize,
+    expression_changes: usize,
+    counter_changes: usize,
+}
+
+impl SecondaryComparison {
+    fn record_variant(&mut self, index: usize, variant: &str) {
+        let mut baseline = self.baseline[index].split('\t');
+        let mut variant = variant.split('\t');
+        let baseline_tree = baseline.next().unwrap();
+        let variant_tree = variant.next().unwrap();
+        let (baseline_tree, baseline_result) = baseline_tree
+            .rsplit_once(";secondary=")
+            .unwrap_or((baseline_tree, ""));
+        let (variant_tree, variant_result) = variant_tree
+            .rsplit_once(";secondary=")
+            .unwrap_or((variant_tree, ""));
+        let (baseline_counters, baseline_tree) = split_counters(baseline_tree);
+        let (variant_counters, variant_tree) = split_counters(variant_tree);
+        self.return_changes += usize::from(baseline_result != variant_result);
+        self.tree_changes += usize::from(baseline_tree != variant_tree);
+        self.counter_changes += usize::from(baseline_counters != variant_counters);
+        let expressions = |field| split_counters(field).1;
+        self.expression_changes +=
+            usize::from(baseline.next().map(expressions) != variant.next().map(expressions));
+    }
+}
+
+fn split_counters(snapshot: &str) -> (&str, &str) {
+    if snapshot.starts_with("counters=")
+        && let Some(fields) = snapshot.split_once(';')
+    {
+        fields
+    } else {
+        ("", snapshot)
     }
 }
 
@@ -432,6 +529,9 @@ pub(super) fn check(corpus: &Corpus, check: Check) {
     let mut assertion_changes = 0;
     let mut loop_coverage = LoopCoverage::default();
     let mut enhancement_coverage = EnhancementCoverage::default();
+    let mut secondary_coverage = EnhancementCoverage::default();
+    let mut secondary_comparison = SecondaryComparison::default();
+    let methods_per_profile = methods.len() / check.profiles().len();
     for (index, method) in methods.iter().enumerate() {
         let row = java_rows
             .next()
@@ -443,6 +543,14 @@ pub(super) fn check(corpus: &Corpus, check: Check) {
             .expect("missing Rust stack snapshot")
             .unwrap();
         assert_eq!(id.parse::<usize>().unwrap(), index);
+        let secondary_variant = check == Check::SecondaryFunctions && index >= methods_per_profile;
+        if check == Check::SecondaryFunctions {
+            if secondary_variant {
+                secondary_comparison.record_variant(index - methods_per_profile, &rust);
+            } else {
+                secondary_comparison.baseline.push(rust.clone());
+            }
+        }
         let mut loop_stages;
         let stages = if check == Check::LoopElimination {
             loop_stages = check.stages().to_vec();
@@ -461,8 +569,10 @@ pub(super) fn check(corpus: &Corpus, check: Check) {
             rejected += 1;
         } else if let Err(diff) = compare_snapshots(java, &rust, stages) {
             errors.push(format!("{method}\n  {diff}"));
+        } else if secondary_variant {
+            secondary_coverage.record(check, method, &rust);
         } else if check.uses_loop_headers() {
-            enhancement_coverage.record(method, &rust);
+            enhancement_coverage.record(check, method, &rust);
         } else {
             let stage_size = if check == Check::Stack { 2 } else { 3 };
             let first = rust.split('\t').next().unwrap();
@@ -528,7 +638,21 @@ pub(super) fn check(corpus: &Corpus, check: Check) {
         groups.iter().map(Vec::len).sum::<usize>()
     );
     if check.uses_loop_headers() {
+        if check == Check::SecondaryFunctions {
+            eprintln!("With default ternary constant simplification");
+        }
         enhancement_coverage.report(check);
+        if check == Check::SecondaryFunctions {
+            eprintln!("With ternary constant simplification enabled");
+            secondary_coverage.report(check);
+            eprintln!(
+                "Relative to the default, {} return values, {} trees, {} expression snapshots and {} method counters changed",
+                secondary_comparison.return_changes,
+                secondary_comparison.tree_changes,
+                secondary_comparison.expression_changes,
+                secondary_comparison.counter_changes
+            );
+        }
         return;
     }
     let [first, settled] = hidden_changes;
@@ -561,6 +685,7 @@ fn write_group(
     let mut options = Options::default();
     options.simplify_stack = profile.simplify;
     options.ternary_in_if = profile.ternary;
+    options.ternary_constant_simplification = profile.ternary_constants;
     options.use_lvt_names = profile.lvt;
     options.boolean_as_int = profile.boolean_as_int;
     options.decompile_assert = profile.assertions;
@@ -621,6 +746,9 @@ fn write_group(
             write_flag(input, profile.ternary).unwrap();
             write_flag(input, profile.boolean_as_int).unwrap();
             write_flag(input, profile.assertions).unwrap();
+            if check == Check::SecondaryFunctions {
+                write_flag(input, profile.ternary_constants).unwrap();
+            }
             write_text(input, &fixture.name).unwrap();
             write_cfg(input, &cx.ir, &initial.flow.graph).unwrap();
 
@@ -630,13 +758,14 @@ fn write_group(
             };
             writeln!(snapshots, "{snapshot}").unwrap();
             methods.push(format!(
-                "{} {method} simplify-stack={} ternary-in-if={} lvt={} boolean-as-int={} assertions={}",
+                "{} {method} simplify-stack={} ternary-in-if={} lvt={} boolean-as-int={} assertions={} ternary-constant-simplification={}",
                 fixture.path.display(),
                 profile.simplify,
                 profile.ternary,
                 profile.lvt,
                 profile.boolean_as_int,
                 profile.assertions,
+                profile.ternary_constants,
             ));
         }
     }
@@ -707,7 +836,8 @@ fn stage(
                 Check::LoopElimination
                 | Check::LoopEnhancement
                 | Check::LoopMerge
-                | Check::MainLoopLabels,
+                | Check::MainLoopLabels
+                | Check::SecondaryFunctions,
                 _,
             ) => {
                 loop {
@@ -730,7 +860,7 @@ fn stage(
                 operation.set("snapshot");
                 let original_edges = (first && check == Check::LoopElimination)
                     .then(|| edge_states(&cx.ir, method.root));
-                if check != Check::MainLoopLabels {
+                if !check.identifies_labels() {
                     operation.set("clean-up-edges");
                     method.clean_up_edges(cx);
                 }
@@ -747,7 +877,12 @@ fn stage(
                     } else {
                         operation.set("identify-main-loop-labels");
                         method.identify_main_loop_labels(cx, class)?;
-                        String::new()
+                        if check == Check::SecondaryFunctions {
+                            operation.set("identify-secondary");
+                            format!(";secondary={}", method.identify_secondary(cx)?)
+                        } else {
+                            String::new()
+                        }
                     };
                     operation.set("snapshot");
                     let result = snapshot(cx, owner, &method, initial_hidden, check, &details);
@@ -872,11 +1007,12 @@ fn snapshot(
     let hidden = &cx.class_nodes[owner].hidden_members;
     let all_members = hidden_members(hidden.iter());
     let added = hidden_members(hidden.difference(initial_hidden));
-    let expressions = expression_snapshot::snapshot_with_loops(
+    let expressions = expression_snapshot::snapshot_details(
         cx,
         method.root,
         &method.flow.counters,
         check.uses_loop_headers(),
+        check == Check::SecondaryFunctions,
     );
     let mut snapshot =
         format!("{tree};hidden={all_members};hidden-added={added}{details}\t{expressions}");

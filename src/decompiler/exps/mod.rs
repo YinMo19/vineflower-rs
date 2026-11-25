@@ -28,7 +28,7 @@ use crate::engine::class_nodes::ClassKind;
 use crate::engine::counter_container::{CounterContainer, EXPRESSION_COUNTER, VAR_COUNTER};
 use crate::structs::attr::LocalVariable;
 use crate::structs::consts::{LinkConstant, PooledConstant};
-use crate::types::{CodeType, FieldDescriptor, GenericType, MethodDescriptor, VarType};
+use crate::types::{CodeType, FieldDescriptor, GenericType, MethodDescriptor, TypeFamily, VarType};
 
 /// `VarExprent.STACK_BASE`.
 pub const STACK_BASE: i32 = 10_000;
@@ -70,6 +70,7 @@ pub enum ExprKind {
         op: FunctionType,
         operands: Vec<ExprId>,
         implicit_type: Option<Box<VarType>>,
+        needs_cast: bool,
     },
     New {
         new_type: VarType,
@@ -235,6 +236,7 @@ pub struct Invocation {
     pub bootstrap_arguments: Option<Arc<[Option<PooledConstant>]>>,
     pub synthetic_null_check: bool,
     pub was_lazy_condy: bool,
+    pub force_boxing: bool,
 }
 
 impl Invocation {
@@ -253,11 +255,45 @@ impl Invocation {
             bootstrap_arguments: None,
             synthetic_null_check: false,
             was_lazy_condy: false,
+            force_boxing: false,
         }
     }
 
     pub fn string_descriptor(&self) -> &str {
         self.descriptor.as_str()
+    }
+
+    /// `InvocationExprent.isBoxingCall`.
+    pub(crate) fn is_boxing_call(&self, cx: &Cx) -> bool {
+        let [parameter] = self.parameters.as_slice() else {
+            return false;
+        };
+        let Some(class) = self.classname.as_ref() else {
+            return false;
+        };
+        if !self.is_static || self.name != "valueOf" {
+            return false;
+        }
+        let ty = Expr::expr_type(cx, *parameter);
+        let Some(unboxed) = VarType::with_value(CodeType::Object, 0, class.clone()).unboxing_type()
+        else {
+            return false;
+        };
+
+        // Integer constants can have a narrower or ambiguous type.
+        if matches!(cx.ir[*parameter].kind, ExprKind::Constant { .. })
+            && (ty.type_family == TypeFamily::Integer && unboxed.ty == CodeType::Int
+                || matches!(ty.ty, CodeType::Bytechar | CodeType::Shortchar)
+                    && matches!(unboxed.ty, CodeType::Char | CodeType::Short))
+        {
+            return true;
+        }
+        let primitive = match ty.ty {
+            CodeType::Bytechar => CodeType::Byte,
+            CodeType::Shortchar => CodeType::Short,
+            primitive => primitive,
+        };
+        unboxed.ty == primitive
     }
 
     /// `InvocationExprent.isUnboxingCall`.
@@ -345,6 +381,7 @@ impl Expr {
                 op,
                 operands,
                 implicit_type: None,
+                needs_cast: true,
             },
             bytecode,
         )
@@ -498,6 +535,7 @@ impl Expr {
                 op,
                 operands,
                 implicit_type,
+                ..
             } => op.expr_type(cx, operands, implicit_type.as_deref()),
             ExprKind::New {
                 new_type,
@@ -563,6 +601,7 @@ impl Expr {
             }
             ExprKind::Invocation(invocation) => {
                 id = Some(counters.get_counter_and_increment(EXPRESSION_COUNTER));
+                invocation.force_boxing = false;
                 invocation.instance = invocation
                     .instance
                     .map(|expr| Self::copy(cx, counters, expr));
@@ -576,7 +615,12 @@ impl Expr {
                     invocation.instance = Some(first);
                 }
             }
-            ExprKind::Function { operands, .. } => copy_entries(cx, counters, operands),
+            ExprKind::Function {
+                operands, needs_cast, ..
+            } => {
+                copy_entries(cx, counters, operands);
+                *needs_cast = true;
+            }
             ExprKind::New {
                 new_type,
                 dimensions,

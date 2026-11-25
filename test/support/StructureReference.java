@@ -67,6 +67,7 @@ class StructureReference {
         case 7 -> StackSnapshot.Check.LOOP_ENHANCEMENT;
         case 8 -> StackSnapshot.Check.LOOP_MERGE;
         case 9 -> StackSnapshot.Check.MAIN_LOOP_LABELS;
+        case 10 -> StackSnapshot.Check.SECONDARY_FUNCTIONS;
         default -> null;
       };
       StackSnapshot.Context stackContext = stackCheck == null ? null
@@ -85,8 +86,10 @@ class StructureReference {
           boolean ternary = input.readBoolean();
           boolean booleanAsInt = input.readBoolean();
           boolean assertions = input.readBoolean();
+          boolean ternaryConstants = stackCheck == StackSnapshot.Check.SECONDARY_FUNCTIONS && input.readBoolean();
           String classname = readText(input);
-          var stackOptions = new StackSnapshot.Options(group, simplify, ternary, options.useLvtNames(), booleanAsInt, assertions);
+          var stackOptions = new StackSnapshot.Options(group, simplify, ternary, options.useLvtNames(),
+            booleanAsInt, assertions, ternaryConstants);
           String snapshot = stackContext.run(input, stackOptions, classname, name, descriptor);
           System.out.println(index + "\t" + snapshot);
           continue;

@@ -79,6 +79,20 @@ impl FunctionType {
         matches!(self, Self::Imm | Self::Mmi | Self::Ipp | Self::Ppi)
     }
 
+    pub(crate) fn simple_cast_type(self) -> Option<VarType> {
+        use FunctionType::*;
+        Some(match self {
+            L2i | F2i | D2i => VarType::VARTYPE_INT,
+            I2l | F2l | D2l => VarType::VARTYPE_LONG,
+            I2f | L2f | D2f => VarType::VARTYPE_FLOAT,
+            I2d | L2d | F2d => VarType::VARTYPE_DOUBLE,
+            I2b => VarType::VARTYPE_BYTE,
+            I2c => VarType::VARTYPE_CHAR,
+            I2s => VarType::VARTYPE_SHORT,
+            _ => return None,
+        })
+    }
+
     pub(super) fn expr_type(
         self,
         cx: &Cx,
@@ -89,13 +103,9 @@ impl FunctionType {
         let operand_type = |index: usize| Expr::expr_type(cx, operands[index]);
         match self {
             StrConcat => VarType::VARTYPE_STRING,
-            L2i | F2i | D2i | ArrayLength => VarType::VARTYPE_INT,
-            I2l | F2l | D2l => VarType::VARTYPE_LONG,
-            I2f | L2f | D2f => VarType::VARTYPE_FLOAT,
-            I2d | L2d | F2d => VarType::VARTYPE_DOUBLE,
-            I2b => VarType::VARTYPE_BYTE,
-            I2c => VarType::VARTYPE_CHAR,
-            I2s => VarType::VARTYPE_SHORT,
+            ArrayLength => VarType::VARTYPE_INT,
+            I2l | I2f | I2d | L2i | L2f | L2d | F2i | F2l | F2d | D2i | D2l | D2f
+            | I2b | I2c | I2s => self.simple_cast_type().unwrap(),
             // Vineflower's temporary compare operations have boolean expression
             // type even though the JVM comparison instructions produce an int.
             Lcmp | Fcmpl | Fcmpg | Dcmpl | Dcmpg | Eq | Ne | Lt | Ge | Gt | Le | InstanceOf

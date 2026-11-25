@@ -298,13 +298,28 @@ impl ExpressionMethod {
     }
 
     /// First part of each Java main-loop iteration, through IdentifyLabels.
-    pub fn identify_main_loop_labels(&mut self, cx: &mut Cx, class: &StructClass) -> io::Result<()> {
+    pub fn identify_main_loop_labels(
+        &mut self,
+        cx: &mut Cx,
+        class: &StructClass,
+    ) -> io::Result<()> {
         self.clean_up_edges(cx);
         self.merge_loops(cx, class)?;
         self.simplify_stack_vars(cx, class);
         self.set_var_versions(cx, class)?;
         crate::decompiler::labels::identify_labels(&mut cx.ir, self.root);
         Ok(())
+    }
+
+    /// Recover Java operators after IdentifyLabels. A change restarts the main loop.
+    pub fn identify_secondary(&mut self, cx: &mut Cx) -> io::Result<bool> {
+        crate::decompiler::secondary::identify(
+            cx,
+            &mut self.flow.counters,
+            self.root,
+            self.flow.variables,
+            false,
+        )
     }
 
     pub fn simplify_string_concat(&mut self, cx: &mut Cx, class: &StructClass) -> io::Result<()> {

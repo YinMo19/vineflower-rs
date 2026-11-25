@@ -8,7 +8,7 @@ use std::io;
 
 use super::{counted::match_for, foreach::match_for_each, inherit_offsets};
 use crate::decompiler::decompose::finish::{condense_sequences, destroy_and_flatten_statement};
-use crate::decompiler::exps::{Expr, FunctionType};
+use crate::decompiler::exps::Expr;
 use crate::decompiler::ir::{EdgeId, ExprId, ExprKind, Ir, StatId};
 use crate::decompiler::labels::{is_direct_path, low_closures};
 use crate::decompiler::stats::{
@@ -157,20 +157,12 @@ fn move_condition(
 ) {
     let copied = Expr::copy(cx, counters, head);
     let ir = &mut cx.ir;
-    let ExprKind::If { mut condition } = ir[copied].kind else {
+    if negate {
+        Expr::negate_if(ir, counters, copied);
+    }
+    let ExprKind::If { condition } = ir[copied].kind else {
         unreachable!()
     };
-    if negate {
-        let offsets = ir[condition].bytecode.clone();
-        condition = Expr::function(
-            ir,
-            counters,
-            FunctionType::BoolNot,
-            vec![condition],
-            offsets,
-        );
-        ir[copied].kind = ExprKind::If { condition };
-    }
     let StatementKind::Do(header) = ir[stat].kind else {
         unreachable!()
     };
