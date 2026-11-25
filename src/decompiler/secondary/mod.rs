@@ -7,8 +7,8 @@ mod expression;
 
 use std::io;
 
-use crate::decompiler::exps::Expr;
-use crate::decompiler::ir::{StatId, VarProcessorId};
+use crate::decompiler::exps::{Expr, ExprKind};
+use crate::decompiler::ir::{ExprId, Ir, StatId, VarProcessorId};
 use crate::decompiler::stats::StatementKind;
 use crate::engine::{Cx, counter_container::CounterContainer};
 
@@ -119,4 +119,52 @@ impl Rewrite<'_> {
         self.cx.ir[head][0] = copy;
         true
     }
+}
+
+/// After slot merging, a plain assignment can become a compound assignment
+/// even when its two original variable expressions carried different types.
+pub(crate) fn update_assignments(ir: &mut Ir, stat: StatId) -> bool {
+    let mut changed = false;
+    for index in 0..ir[stat].stats.len() {
+        changed |= update_assignments(ir, ir[stat].stats[index]);
+    }
+    let expressions = ir[stat]
+        .exprents
+        .map_or_else(|| stat.stat_exprents(ir), |list| ir[list].to_vec());
+    for expr in expressions {
+        changed |= update_assignment(ir, expr);
+    }
+    changed
+}
+
+fn update_assignment(ir: &mut Ir, expr: ExprId) -> bool {
+    let ExprKind::Assignment {
+        left,
+        right,
+        compound: None,
+    } = ir[expr].kind
+    else {
+        return false;
+    };
+    let Some(target) = Expr::variable(ir, left) else {
+        return false;
+    };
+    let ExprKind::Function { op, operands, .. } = &ir[right].kind else {
+        return false;
+    };
+    if !op.is_arithmetic_binary()
+        || Expr::variable(ir, operands[0]).is_none_or(|first| first.index != target.index)
+    {
+        return false;
+    }
+    let (op, value) = (*op, operands[1]);
+    let ExprKind::Assignment {
+        right, compound, ..
+    } = &mut ir[expr].kind
+    else {
+        unreachable!()
+    };
+    *right = value;
+    *compound = Some(op);
+    true
 }

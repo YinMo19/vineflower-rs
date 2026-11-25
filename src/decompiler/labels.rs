@@ -3,6 +3,7 @@
 
 //! Normalizes statement edges and their label closures.
 
+pub(crate) mod finish;
 mod identify;
 pub(crate) use identify::identify_labels;
 

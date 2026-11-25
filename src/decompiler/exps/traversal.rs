@@ -157,9 +157,9 @@ impl StatId {
             StatementKind::Switch(switch) => pattern_vars_in(
                 ir,
                 switch
-                    .cases
-                    .iter()
-                    .flat_map(|case| case.values.iter().flatten())
+                    .case_values()
+                    .flatten()
+                    .flatten()
                     .chain(switch.case_guards.iter().flatten())
                     .copied(),
             ),
@@ -217,12 +217,7 @@ impl StatId {
                 .iter()
                 .copied()
                 .chain(switch.case_guards.iter().flatten().copied())
-                .chain(
-                    switch
-                        .cases
-                        .iter()
-                        .flat_map(|case| case.values.iter().flatten().copied()),
-                )
+                .chain(switch.case_values().flatten().flatten().copied())
                 .collect(),
             _ => Vec::new(),
         }

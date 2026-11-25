@@ -270,16 +270,22 @@ impl<'a> Flatten<'a> {
         let StatementKind::Switch(switch) = &self.ir[stat].kind else {
             unreachable!();
         };
-        for index in 0..switch.cases.len() {
+        let case_count = switch.cases.len();
+        let default_edge = {
+            let mut trailing_values = switch.case_values().skip(case_count);
+            trailing_values.next().map(|values| {
+                assert!(
+                    values == [None] && trailing_values.next().is_none(),
+                    "Case edges and case values do not match"
+                );
+                switch.default_edge
+            })
+        };
+        for index in 0..case_count {
             let StatementKind::Switch(switch) = &self.ir[stat].kind else {
                 unreachable!();
             };
             let case = &switch.cases[index];
-            assert_eq!(
-                case.edges.len(),
-                case.values.len(),
-                "Case edges and case values do not match"
-            );
             let statement = case.statement;
             let edges = case.edges.clone();
             let values = case.values.iter().flatten().copied().collect();
@@ -287,6 +293,9 @@ impl<'a> Flatten<'a> {
             let case_node = self.create_node(statement, NodeType::Case, Some(expressions));
             self.graph.connect(out, case_node, DirectEdgeType::Regular);
             self.defer_edges(case_node, &edges);
+        }
+        if let Some(edge) = default_edge {
+            self.defer_edge(out, edge.expect("Missing switch default edge"));
         }
         first
     }

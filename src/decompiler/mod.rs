@@ -11,6 +11,7 @@ pub mod expr_processor;
 pub mod exps;
 pub mod finally;
 pub mod flow;
+pub(crate) mod generic_chains;
 pub(crate) mod increments;
 pub(crate) mod inline_blocks;
 pub(crate) mod intersection;

@@ -75,6 +75,11 @@ impl FunctionType {
         }
     }
 
+    pub(crate) const fn is_arithmetic_binary(self) -> bool {
+        use FunctionType::*;
+        matches!(self, Add | Sub | Mul | Div | And | Or | Xor | Rem | Shl | Shr | Ushr)
+    }
+
     pub const fn is_inc_dec(self) -> bool {
         matches!(self, Self::Imm | Self::Mmi | Self::Ipp | Self::Ppi)
     }

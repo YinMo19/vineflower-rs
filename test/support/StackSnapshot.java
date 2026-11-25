@@ -38,6 +38,7 @@ import org.jetbrains.java.decompiler.modules.decompiler.EliminateLoopsHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.ExitHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.ExprProcessor;
 import org.jetbrains.java.decompiler.modules.decompiler.FinallyProcessor;
+import org.jetbrains.java.decompiler.modules.decompiler.GenericsProcessor;
 import org.jetbrains.java.decompiler.modules.decompiler.IfHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.IfPatternMatchProcessor;
 import org.jetbrains.java.decompiler.modules.decompiler.InlineSingleBlockHelper;
@@ -73,7 +74,7 @@ class StackSnapshot {
     STACK, INCREMENTS, PRE_MAIN, LOOP_ELIMINATION, LOOP_ENHANCEMENT, LOOP_MERGE, MAIN_LOOP_LABELS,
     SECONDARY_FUNCTIONS, PATTERN_MATCHING_ENTRY, IF_PATTERNS, SWITCH_ENTRY, SWITCH_PASSES, TRY_ENTRY,
     TRY_RESOURCES, INLINE_BLOCKS, LATE_LOOP_PASSES, EXIT_ENTRY, EXIT_CONDENSATION, MAIN_LOOP_END, POST_SWITCHES,
-    AFTER_MAIN, VARIABLE_DEFINITIONS;
+    AFTER_MAIN, VARIABLE_DEFINITIONS, METHOD_END;
 
     boolean usesLoopHeaders() {
       return this == LOOP_ENHANCEMENT || this == LOOP_MERGE || identifiesLabels();
@@ -112,11 +113,16 @@ class StackSnapshot {
     }
 
     boolean finishesPostProcessing() {
-      return this == AFTER_MAIN || this == VARIABLE_DEFINITIONS;
+      return this == AFTER_MAIN || definesVariables();
+    }
+
+    boolean definesVariables() {
+      return this == VARIABLE_DEFINITIONS || this == METHOD_END;
     }
 
     ExpressionSnapshot.Detail expressionDetail() {
       return switch (this) {
+        case METHOD_END -> ExpressionSnapshot.Detail.METHOD_END;
         case VARIABLE_DEFINITIONS -> ExpressionSnapshot.Detail.VARIABLE_DEFINITIONS;
         case AFTER_MAIN -> ExpressionSnapshot.Detail.AFTER_MAIN;
         case SWITCH_PASSES, TRY_ENTRY -> ExpressionSnapshot.Detail.SWITCHES;
@@ -599,15 +605,44 @@ class StackSnapshot {
           operation = "insert-monitor-sinks";
           SynchronizedHelper.insertSink(root, vars, root);
         }
-        if (check == Check.VARIABLE_DEFINITIONS) {
+        if (check.definesVariables()) {
           operation = "set-var-definitions";
           vars.setVarDefinitions(root);
         }
-        operation = "snapshot";
-        var state = snapshot(root, counters, vars, initialHidden, check, details)
-          + "\t" + DirectGraphSnapshot.enhanced(root);
+        String state;
+        String atEndContinues = null;
+        if (check == Check.METHOD_END) {
+          operation = "update-assignments";
+          SecondaryFunctionsHelper.updateAssignments(root);
+          operation = "hide-default-switch-edges";
+          if (root.hasSwitch()) {
+            LabelHelper.hideDefaultSwitchEdges(root);
+          }
+          operation = "qualify-chains";
+          GenericsProcessor.qualifyChains(root);
+          operation = "canonicalize-casts";
+          ExprProcessor.canonicalizeCasts(root);
+          operation = "at-end-snapshot";
+          state = snapshot(root, counters, vars, initialHidden, check, details);
+          atEndContinues = movedContinues == null ? "" : continueMoves(root, movedContinues);
+
+          operation = "replace-continue-with-break";
+          LabelHelper.replaceContinueWithBreak(root);
+          operation = "mark-expr-oddities";
+          ExprProcessor.markExprOddities(root);
+          operation = "final-snapshot";
+          state += "\t" + snapshot(root, counters, vars, initialHidden, check, details)
+            + "\t" + phantomContinues(root);
+        } else {
+          operation = "snapshot";
+          state = snapshot(root, counters, vars, initialHidden, check, details)
+            + "\t" + DirectGraphSnapshot.enhanced(root);
+        }
         if (check.publishesWrappers()) {
           completeMethod(root, cl, method, vars, counters, null);
+        }
+        if (atEndContinues != null) {
+          state += "\tat-end-continue-moves=" + atEndContinues;
         }
         return movedContinues == null ? state : state + "\tcontinue-moves=" + continueMoves(root, movedContinues);
       } else if (check == Check.LOOP_ELIMINATION) {
@@ -681,6 +716,7 @@ class StackSnapshot {
         case POST_SWITCHES -> "post-switches-" + operation + "-";
         case AFTER_MAIN -> "after-main-" + operation + "-";
         case VARIABLE_DEFINITIONS -> "variable-definitions-" + operation + "-";
+        case METHOD_END -> "method-end-" + operation + "-";
       };
       return failure + StructureReference.failureSnapshot(error);
     }
@@ -751,6 +787,12 @@ class StackSnapshot {
     return groups.toString();
   }
 
+  private static String phantomContinues(RootStatement root) {
+    return StructureReference.statements(root).stream().flatMap(stat -> stat.getAllSuccessorEdges().stream())
+      .filter(edge -> edge.phantomContinue).map(StructureReference::edgeId)
+      .collect(Collectors.joining("|", "phantom-continues=", ""));
+  }
+
   private static String snapshot(RootStatement root, CounterContainer counters, VarProcessor vars,
                                  Set<String> initialHidden, Check check, String details) {
     var hidden = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_CLASS_WRAPPER).getHiddenMembers();
@@ -764,7 +806,7 @@ class StackSnapshot {
       + content + ";hidden=" + allMembers + ";hidden-added=" + added + details
       + "\t" + ExpressionSnapshot.snapshot(root, counters, check.expressionDetail());
     return check == Check.STACK ? snapshot
-      : snapshot + "\t" + VariableSnapshot.snapshot(vars, check == Check.VARIABLE_DEFINITIONS);
+      : snapshot + "\t" + VariableSnapshot.snapshot(vars, check.definesVariables());
   }
 
   private static String counterSnapshot(CounterContainer counters) {

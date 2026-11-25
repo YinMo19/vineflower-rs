@@ -2,6 +2,8 @@
 
 use std::{env, fmt::Display, fs, io::Write, path::Path, process::Command, sync::Arc};
 
+#[path = "support/generic_chains.rs"]
+mod generic_chains;
 #[path = "support/lambda_nodes.rs"]
 mod lambda_nodes;
 #[path = "support/upstream_reference.rs"]

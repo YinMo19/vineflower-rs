@@ -211,8 +211,8 @@ fn switch_bounds(
             let StatementKind::Switch(switch) = &cx.ir[*stat].kind else {
                 unreachable!("Switch header case values belong to a switch statement");
             };
-            for case in &switch.cases {
-                check_cases(&case.values)?;
+            for values in switch.case_values() {
+                check_cases(values)?;
             }
         }
         Some(SwitchCaseValues::Copied(cases)) => {

@@ -5,9 +5,11 @@ use std::fmt::Write;
 
 use itertools::Itertools;
 use vineflower_rs::code::instruction::Instruction;
-use vineflower_rs::decompiler::exps::{Expr, ExprKind, FunctionType, SwitchCaseValues};
+use vineflower_rs::decompiler::exps::{
+    Expr, ExprKind, FunctionType, InvocationGenerics, SwitchCaseValues,
+};
 use vineflower_rs::decompiler::ir::{ExprId, ExprListId, StatId};
-use vineflower_rs::decompiler::stats::{LoopType, StatementKind, SwitchCase};
+use vineflower_rs::decompiler::stats::{LoopType, StatementKind};
 use vineflower_rs::engine::Cx;
 use vineflower_rs::engine::counter_container::{
     CounterContainer, EXPRESSION_COUNTER, STATEMENT_COUNTER, VAR_COUNTER,
@@ -26,6 +28,7 @@ pub enum Detail {
     Resources,
     AfterMain,
     VariableDefinitions,
+    MethodEnd,
 }
 
 pub fn snapshot(cx: &Cx, root: StatId, counters: &CounterContainer) -> String {
@@ -100,7 +103,7 @@ pub fn snapshot_details(
                     });
                 fields.push(format!(
                     "cases{id}={}|{linked}",
-                    snapshot.cases(&branch.cases)
+                    snapshot.case_values(branch.case_values())
                 ));
                 if detail >= Detail::Switches {
                     let guards = branch
@@ -110,7 +113,7 @@ pub fn snapshot_details(
                         .join(",");
                     fields.push(format!("guards{id}={guards}"));
                 }
-                if detail == Detail::VariableDefinitions {
+                if detail >= Detail::VariableDefinitions {
                     let scoped = branch
                         .scoped_case_statements
                         .iter()
@@ -173,10 +176,6 @@ impl Snapshot<'_> {
             .join(",")
     }
 
-    fn cases(&mut self, cases: &[SwitchCase]) -> String {
-        self.case_values(cases.iter().map(|case| case.values.as_slice()))
-    }
-
     fn case_values<'a>(&mut self, cases: impl IntoIterator<Item = &'a [Option<ExprId>]>) -> String {
         let rows = cases
             .into_iter()
@@ -228,7 +227,7 @@ impl Snapshot<'_> {
                 if self.detail >= Detail::IntersectionCasts {
                     write!(operands, "|{}", var.intersection_type).unwrap();
                 }
-                if self.detail == Detail::VariableDefinitions {
+                if self.detail >= Detail::VariableDefinitions {
                     write!(operands, "|{}", var.definition).unwrap();
                 }
                 ("VAR", operands)
@@ -311,6 +310,14 @@ impl Snapshot<'_> {
                 if self.detail >= Detail::AfterMain {
                     write!(operands, "|{}", invocation.can_ignore_boxing).unwrap();
                 }
+                if self.detail == Detail::MethodEnd {
+                    write!(
+                        operands,
+                        "|{}",
+                        invocation_generics(invocation.generics.as_deref())
+                    )
+                    .unwrap();
+                }
                 ("INVOCATION", operands)
             }
             ExprKind::Function {
@@ -366,16 +373,23 @@ impl Snapshot<'_> {
                 lambda,
                 method_reference,
                 direct_array_init,
-            } => (
-                "NEW",
-                format!(
+                generics,
+            } => {
+                let mut operands = format!(
                     "{}|{}|{}|{}|{anonymous}|{lambda}|{method_reference}|{direct_array_init}",
                     var_type(Some(new_type)),
                     self.expressions(dimensions),
                     self.expression(*constructor),
                     self.expressions(array_elements)
-                ),
-            ),
+                );
+                if self.detail == Detail::MethodEnd {
+                    let generics = generics.as_deref();
+                    let arguments = generics.map_or(&[][..], |data| data.arguments.as_slice());
+                    let lambda_type = generics.and_then(|data| data.inferred_lambda_type.as_ref());
+                    write!(operands, "|{}|{}", types(arguments), var_type(lambda_type)).unwrap();
+                }
+                ("NEW", operands)
+            }
             ExprKind::Exit {
                 kind,
                 value,
@@ -419,7 +433,7 @@ impl Snapshot<'_> {
                         let StatementKind::Switch(branch) = &ir[*stat].kind else {
                             panic!("switch expression has a non-switch owner");
                         };
-                        self.cases(&branch.cases)
+                        self.case_values(branch.case_values())
                     }
                     Some(SwitchCaseValues::Copied(cases)) => {
                         self.case_values(cases.iter().map(Vec::as_slice))
@@ -510,6 +524,38 @@ fn descriptor(descriptor: &MethodDescriptor) -> String {
         text(Some(&descriptor.to_string())),
         var_type(Some(&descriptor.ret)),
         types(&descriptor.params),
+    )
+}
+
+fn invocation_generics(generics: Option<&InvocationGenerics>) -> String {
+    let resolved = generics
+        .and_then(|data| data.resolved_method.as_ref())
+        .map_or_else(
+            || "~".into(),
+            |method| {
+                format!(
+                    "{},{},{}",
+                    text(Some(&method.class_qualified_name)),
+                    text(Some(&method.name)),
+                    text(Some(&method.descriptor)),
+                )
+            },
+        );
+    let arguments = generics.map_or(&[][..], |data| data.arguments.as_slice());
+    let mappings = generics
+        .into_iter()
+        .flat_map(|data| data.mappings.iter())
+        .map(|(from, to)| format!("{}={}", var_type(Some(from)), var_type(to.as_ref())))
+        .sorted_unstable()
+        .join("/");
+    let instance = generics.and_then(|data| data.remapped_instance.as_ref());
+    format!(
+        "{resolved}|{}|{mappings}|{}|{}|{}|{}",
+        types(arguments),
+        var_type(instance),
+        generics.is_some_and(|data| data.is_invocation_instance),
+        generics.is_some_and(|data| data.force_qualification),
+        generics.is_some_and(|data| data.keep_unboxing_cast),
     )
 }
 

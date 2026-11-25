@@ -16,6 +16,7 @@ import org.jetbrains.java.decompiler.code.Instruction;
 import org.jetbrains.java.decompiler.main.collectors.CounterContainer;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.*;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.*;
+import org.jetbrains.java.decompiler.struct.StructMethod;
 import org.jetbrains.java.decompiler.struct.attr.StructLocalVariableTableAttribute.LocalVariable;
 import org.jetbrains.java.decompiler.struct.consts.LinkConstant;
 import org.jetbrains.java.decompiler.struct.consts.PooledConstant;
@@ -27,7 +28,8 @@ import org.jetbrains.java.decompiler.struct.gen.generics.GenericType;
 
 class ExpressionSnapshot {
   enum Detail {
-    BASE, LOOP_HEADERS, SECONDARY_FUNCTIONS, INTERSECTION_CASTS, SWITCHES, RESOURCES, AFTER_MAIN, VARIABLE_DEFINITIONS
+    BASE, LOOP_HEADERS, SECONDARY_FUNCTIONS, INTERSECTION_CASTS, SWITCHES, RESOURCES, AFTER_MAIN, VARIABLE_DEFINITIONS,
+    METHOD_END
   }
 
   private static final Field ARRAY_HARD_TYPE = field(ArrayExprent.class, "hardType");
@@ -39,6 +41,13 @@ class ExpressionSnapshot {
   private static final Field FIELD_QUALIFIED = field(FieldExprent.class, "forceQualified");
   private static final Field INVOCATION_LAZY_CONDY = field(InvocationExprent.class, "wasLazyCondy");
   private static final Field INVOCATION_IGNORE_BOXING = field(InvocationExprent.class, "canIgnoreBoxing");
+  private static final Field INVOCATION_RESOLVED_METHOD = field(InvocationExprent.class, "desc");
+  private static final Field INVOCATION_REMAPPED_INSTANCE = field(InvocationExprent.class, "remappedInstType");
+  private static final Field INVOCATION_IS_INSTANCE = field(InvocationExprent.class, "isInvocationInstance");
+  private static final Field INVOCATION_BOXING = field(InvocationExprent.class, "boxing");
+  private static final Field INVOCATION_KEEP_BOXING_CAST = field(INVOCATION_BOXING.getType(), "keepCast");
+  private static final Field ALLOCATION_GENERIC_ARGUMENTS = field(NewExprent.class, "genericArgs");
+  private static final Field ALLOCATION_LAMBDA_TYPE = field(NewExprent.class, "inferredLambdaType");
   private static final Field FUNCTION_IMPLICIT_TYPE = field(FunctionExprent.class, "implicitType");
   private static final Field SWITCH_FALLTHROUGH = field(SwitchExprent.class, "fallthrough");
   private static final Field SWITCH_STANDALONE = field(SwitchExprent.class, "standalone");
@@ -100,7 +109,7 @@ class ExpressionSnapshot {
         if (detail.ordinal() >= Detail.SWITCHES.ordinal()) {
           fields.add("guards" + statement.id + "=" + expressions(branch.getCaseGuards()));
         }
-        if (detail == Detail.VARIABLE_DEFINITIONS) {
+        if (detail.ordinal() >= Detail.VARIABLE_DEFINITIONS.ordinal()) {
           @SuppressWarnings("unchecked")
           var scoped = (Set<Statement>) read(SCOPED_CASES, branch);
           fields.add("scoped-cases" + statement.id + "=" + scoped.stream().map(st -> st.id)
@@ -167,7 +176,7 @@ class ExpressionSnapshot {
       if (detail.ordinal() >= Detail.INTERSECTION_CASTS.ordinal()) {
         fields += "|" + var.isIntersectionType();
       }
-      if (detail == Detail.VARIABLE_DEFINITIONS) {
+      if (detail.ordinal() >= Detail.VARIABLE_DEFINITIONS.ordinal()) {
         fields += "|" + var.isDefinition();
       }
       return fields;
@@ -201,6 +210,9 @@ class ExpressionSnapshot {
       if (detail.ordinal() >= Detail.AFTER_MAIN.ordinal()) {
         fields += "|" + read(INVOCATION_IGNORE_BOXING, invocation);
       }
+      if (detail == Detail.METHOD_END) {
+        fields += "|" + invocationGenerics(invocation);
+      }
       return fields;
     }
     if (e instanceof FunctionExprent function) {
@@ -219,9 +231,15 @@ class ExpressionSnapshot {
       return expression(yield.getContent());
     }
     if (e instanceof NewExprent allocation) {
-      return parts(type(allocation.getNewType()), expressions(allocation.getLstDims()),
+      String fields = parts(type(allocation.getNewType()), expressions(allocation.getLstDims()),
         expression(allocation.getConstructor()), expressions(allocation.getLstArrayElements()),
         allocation.isAnonymous(), allocation.isLambda(), allocation.isMethodReference(), allocation.isDirectArrayInit());
+      if (detail == Detail.METHOD_END) {
+        @SuppressWarnings("unchecked")
+        var arguments = (List<VarType>) read(ALLOCATION_GENERIC_ARGUMENTS, allocation);
+        fields += "|" + parts(types(arguments), type((VarType) read(ALLOCATION_LAMBDA_TYPE, allocation)));
+      }
+      return fields;
     }
     if (e instanceof ExitExprent exit) {
       return parts(exit.getExitType().name(), expression(exit.getValue()), type(exit.getRetType()),
@@ -242,6 +260,18 @@ class ExpressionSnapshot {
       return parts(expression(branch.getValue()), cases(branch.getCaseValues()));
     }
     throw new AssertionError("unexpected expression kind " + e.type);
+  }
+
+  private static String invocationGenerics(InvocationExprent invocation) {
+    var method = (StructMethod) read(INVOCATION_RESOLVED_METHOD, invocation);
+    String resolved = method == null ? "~" : text(method.getClassQualifiedName()) + ","
+      + text(method.getName()) + "," + text(method.getDescriptor());
+    String mappings = invocation.getGenericsMap().entrySet().stream()
+      .map(entry -> type(entry.getKey()) + "=" + type(entry.getValue())).sorted()
+      .collect(Collectors.joining("/"));
+    return parts(resolved, types(invocation.getGenericArgs()), mappings,
+      type((VarType) read(INVOCATION_REMAPPED_INSTANCE, invocation)), read(INVOCATION_IS_INSTANCE, invocation),
+      invocation.forceGenericQualfication, read(INVOCATION_KEEP_BOXING_CAST, read(INVOCATION_BOXING, invocation)));
   }
 
   private static String offsets(BitSet offsets) {

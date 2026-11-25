@@ -347,15 +347,36 @@ impl VarType {
     /// type (see [`VarType::same`]) when nothing in it is mapped, and `None`
     /// when it is mapped to `null`.
     pub fn remap(&self, map: &GenericsMap) -> Option<VarType> {
-        match self.remap_changed(map) {
+        match self.remap_changed(map, Self::same) {
             Some(changed) => changed,
             None => Some(self.clone()),
         }
     }
 
+    /// Inference checks whether remapping returned the original Java object.
+    /// For example, method `T` replaced by the enclosing class's `T` can
+    /// retain the same spelling and give a qualifier more type information.
+    pub(crate) fn remap_for_inference(&self, map: &GenericsMap) -> Option<VarType> {
+        match self.remap_changed(map, Self::same_generic_reference) {
+            Some(changed) => changed,
+            None => Some(self.clone()),
+        }
+    }
+
+    pub(crate) fn same_generic_reference(&self, other: &VarType) -> bool {
+        match (&self.generic, &other.generic) {
+            (Some(left), Some(right)) => self == other && Arc::ptr_eq(left, right),
+            _ => self.same(other),
+        }
+    }
+
     /// `None` where upstream's `remap` returns `this`.
-    fn remap_changed(&self, map: &GenericsMap) -> Option<Option<VarType>> {
-        let main = self.base_remap_changed(map);
+    fn remap_changed(
+        &self,
+        map: &GenericsMap,
+        same_type: fn(&VarType, &VarType) -> bool,
+    ) -> Option<Option<VarType>> {
+        let main = self.base_remap_changed(map, same_type);
         if !self.is_generic_type() {
             return main;
         }
@@ -382,7 +403,7 @@ impl VarType {
             .iter()
             .map(|arg| {
                 let arg = arg.as_ref()?;
-                match arg.remap_changed(map) {
+                match arg.remap_changed(map, same_type) {
                     Some(new_arg) => {
                         changed = true;
                         new_arg
@@ -405,7 +426,11 @@ impl VarType {
     }
 
     /// `VarType.remap`: looks up the type itself, without its array dimensions.
-    fn base_remap_changed(&self, map: &GenericsMap) -> Option<Option<VarType>> {
+    fn base_remap_changed(
+        &self,
+        map: &GenericsMap,
+        same_type: fn(&VarType, &VarType) -> bool,
+    ) -> Option<Option<VarType>> {
         let ret = if self.array_dim == 0 {
             map.get(self)?
         } else {
@@ -418,7 +443,7 @@ impl VarType {
             ret => ret.clone(),
         };
         // A type mapped to itself is the unchanged type.
-        if ret.as_ref().is_some_and(|ret| ret.same(self)) {
+        if ret.as_ref().is_some_and(|ret| same_type(ret, self)) {
             return None;
         }
         Some(ret)

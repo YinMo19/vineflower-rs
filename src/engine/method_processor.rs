@@ -548,6 +548,37 @@ impl ExpressionMethod {
         )
     }
 
+    /// Revisit assignments and hide empty default switch edges after declarations.
+    pub fn prepare_generic_chains(&mut self, cx: &mut Cx) {
+        crate::decompiler::secondary::update_assignments(&mut cx.ir, self.root);
+        if self.content_flags(&cx.ir).has_switch {
+            crate::decompiler::labels::finish::hide_default_switch_edges(&mut cx.ir, self.root);
+        }
+    }
+
+    /// Qualify generic invocation chains at the end of the Java method passes.
+    pub fn qualify_generic_chains(&mut self, cx: &mut Cx) -> io::Result<bool> {
+        let cx = &mut *cx.enter_method(&self.flow.counters);
+        crate::decompiler::generic_chains::qualify_chains(cx, self.root)
+    }
+
+    /// Finish the built-in passes that run before JavaPassLocation.AT_END.
+    pub fn prepare_method_end(&mut self, cx: &mut Cx) -> io::Result<()> {
+        let cx = &mut *cx.enter_method(&self.flow.counters);
+        self.prepare_generic_chains(cx);
+        crate::decompiler::generic_chains::qualify_chains(cx, self.root)?;
+        crate::decompiler::expr_processor::canonicalize_casts(cx, self.root);
+        Ok(())
+    }
+
+    /// Replace continues after the last structural pass, then record diagnostics.
+    /// The label rewrite leaves the original direct-graph representation stale.
+    pub fn finish_method(&mut self, cx: &mut Cx, class: &StructClass) -> io::Result<()> {
+        let cx = &mut *cx.enter_method(&self.flow.counters);
+        crate::decompiler::labels::finish::replace_continue_with_break(&mut cx.ir, self.root);
+        crate::decompiler::expr_processor::mark_expr_oddities(cx, self.root, class)
+    }
+
     pub fn simplify_string_concat(&mut self, cx: &mut Cx, class: &StructClass) -> io::Result<()> {
         if class.version.has_indy_string_concat() {
             crate::decompiler::concat::simplify(cx, &mut self.flow.counters, self.root)?;
@@ -705,5 +736,19 @@ pub fn defined_method(
         return Ok(None);
     };
     result.set_var_definitions(cx)?;
+    Ok(Some(result))
+}
+
+/// The built-in Java path of MethodProcessor.codeToJava.
+pub fn code_to_java(
+    cx: &mut Cx,
+    class: &StructClass,
+    method: &Arc<StructMethod>,
+) -> io::Result<Option<ExpressionMethod>> {
+    let Some(mut result) = defined_method(cx, class, method)? else {
+        return Ok(None);
+    };
+    result.prepare_method_end(cx)?;
+    result.finish_method(cx, class)?;
     Ok(Some(result))
 }

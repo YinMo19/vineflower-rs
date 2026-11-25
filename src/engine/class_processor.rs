@@ -61,6 +61,11 @@ pub fn process_class_methods(
     super::class_wrapper::initialize_wrappers(cx, root, process)
 }
 
+/// Publish a compilation unit's methods through the complete built-in Java pipeline.
+pub fn initialize_java_wrappers(cx: &mut Cx, root: ClassNodeId) -> io::Result<()> {
+    process_class_methods(cx, root, super::method_processor::code_to_java)
+}
+
 fn append_wrapper_order(classes: &ClassNodes, id: ClassNodeId, order: &mut Vec<ClassNodeId>) {
     let node = &classes[id];
     if node.kind == ClassKind::Lambda {

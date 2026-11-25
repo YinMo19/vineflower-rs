@@ -361,11 +361,7 @@ impl Rewrite<'_> {
         }
         let value = match op {
             Add | And | Or | Xor if Expr::equals(self.cx, left, operands[1]) => operands[0],
-            Add | And | Or | Xor | Sub | Mul | Div | Rem | Shl | Shr | Ushr
-                if Expr::equals(self.cx, left, operands[0]) =>
-            {
-                operands[1]
-            }
+            op if op.is_arithmetic_binary() && Expr::equals(self.cx, left, operands[0]) => operands[1],
             _ => return None,
         };
         if cast_type.is_some_and(|cast| cast != Expr::expr_type(self.cx, value))

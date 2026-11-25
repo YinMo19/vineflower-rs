@@ -6,6 +6,7 @@
 pub(crate) mod bounds;
 mod bytecode;
 mod function;
+pub(crate) mod generic_inference;
 mod increments;
 mod operations;
 mod traversal;
@@ -16,6 +17,7 @@ use std::sync::Arc;
 use arcstr::ArcStr;
 use index_vec::IndexVec;
 
+pub use self::generic_inference::{AllocationGenerics, InvocationGenerics};
 pub(crate) use self::increments::{delta_by_one, increment};
 pub use self::{bytecode::BytecodeOffsets, function::FunctionType};
 pub use crate::structs::consts::ConstantValue;
@@ -85,6 +87,7 @@ pub enum ExprKind {
         anonymous: bool,
         lambda: bool,
         method_reference: bool,
+        generics: Option<Box<AllocationGenerics>>,
     },
     Exit {
         kind: ExitType,
@@ -236,6 +239,20 @@ impl Variable {
         }
     }
 
+    /// A definition's type during method processing, before a MethodWrapper is active.
+    pub(crate) fn definition_var_type(&self, cx: &Cx) -> VarType {
+        if cx.options.use_lvt_names
+            && cx.options.decompile_generics
+            && let Some(local) = &self.lvt
+            && let Some(signature) = local.get_signature()
+            && let Some(mut descriptor) = generic_main::parse_field_signature(signature)
+        {
+            descriptor.verify_loosely(cx, &local.get_var_type());
+            return descriptor.ty;
+        }
+        self.expr_type(cx)
+    }
+
     /// `VarExprent.getInferredExprType(null)` prefers the local's generic signature.
     pub(crate) fn inferred_expr_type(&self, cx: &Cx) -> VarType {
         if let Some(lvt) = &self.lvt {
@@ -313,6 +330,7 @@ pub struct Invocation {
     pub was_lazy_condy: bool,
     pub force_boxing: bool,
     pub can_ignore_boxing: bool,
+    pub generics: Option<Box<InvocationGenerics>>,
 }
 
 impl Invocation {
@@ -333,6 +351,7 @@ impl Invocation {
             was_lazy_condy: false,
             force_boxing: false,
             can_ignore_boxing: true,
+            generics: None,
         }
     }
 
@@ -417,13 +436,7 @@ impl SwitchCaseValues {
                 let StatementKind::Switch(switch) = &ir[*stat].kind else {
                     unreachable!("Switch header case values belong to a switch statement");
                 };
-                Self::Copied(
-                    switch
-                        .cases
-                        .iter()
-                        .map(|case| case.values.clone())
-                        .collect(),
-                )
+                Self::Copied(switch.case_values().map(<[_]>::to_vec).collect())
             }
             Self::Copied(_) => self.clone(),
         }
@@ -610,6 +623,7 @@ impl Expr {
                 anonymous,
                 lambda,
                 method_reference,
+                generics: None,
             },
             bytecode,
         )
@@ -660,9 +674,11 @@ impl Expr {
                 }
             }
             ExprKind::SwitchHead { value, .. } => Self::expr_type(cx, *value),
-            ExprKind::Switch { var_type, .. } | ExprKind::Yield { return_type: var_type, .. } => {
-                var_type.clone()
-            }
+            ExprKind::Switch { var_type, .. }
+            | ExprKind::Yield {
+                return_type: var_type,
+                ..
+            } => var_type.clone(),
             ExprKind::Assert { .. }
             | ExprKind::If { .. }
             | ExprKind::Exit { .. }
@@ -713,6 +729,7 @@ impl Expr {
             ExprKind::Invocation(invocation) => {
                 id = Some(counters.get_counter_and_increment(EXPRESSION_COUNTER));
                 invocation.force_boxing = false;
+                invocation.generics = None;
                 invocation.instance = invocation
                     .instance
                     .map(|expr| Self::copy(cx, counters, expr));
@@ -727,7 +744,9 @@ impl Expr {
                 }
             }
             ExprKind::Function {
-                operands, needs_cast, ..
+                operands,
+                needs_cast,
+                ..
             } => {
                 copy_entries(cx, counters, operands);
                 *needs_cast = true;
@@ -749,8 +768,10 @@ impl Expr {
                 array_elements,
                 lambda,
                 method_reference,
+                generics,
                 ..
             } => {
+                *generics = None;
                 copy_entries(cx, counters, dimensions);
                 id = Some(counters.get_counter_and_increment(EXPRESSION_COUNTER));
                 (_, *lambda, *method_reference) = allocation_flags(cx, new_type);

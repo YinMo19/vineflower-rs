@@ -111,6 +111,8 @@ CFG、语句图和 DirectGraph 具有不同的边契约。
 
 变量处理器与方法包装器共享生命周期。每轮 SSA 只替换版本、上下界和槽号来源；名字、声明和局部变量表属于方法。声明阶段从接收者和参数开始，按 JVM 槽宽保留参数名，查找可合并的变量后再沿语句树确定共同作用域。能在首次赋值处声明的变量复用左操作数，其余在第一次读取前插入声明。放置后再运行一轮合并，传播调试信息，标记重复赋值，检查分支及嵌套方法中同时可见的重名。尚无类型下界的声明可以保留空的原始类型，查询有效类型时按上游顺序回到处理器。[`defined_method`](src/engine/method_processor.rs) · [变量合并与声明](src/decompiler/vars/definitions/mod.rs) · [命名作用域](src/decompiler/vars/definitions/clashes.rs)
 
+变量声明确定后，重新检查复合赋值，隐藏空 default 的退出边，再沿调用链推断泛型实参。调用保存解析到的实际方法、类型代换和接收者类型。类型参数即使同名，也要保留来自不同声明的身份。嵌套强制转换在此之后归并。到达 `AT_END` 后，最后一次标签改写才把符合条件的 continue 换成 break；方法树保留原标签信息供写出。最终诊断在锁定导入表的作用域中查看变量声明、断言字段与残留的控制表达式。内置 Java 方法入口为 `code_to_java`，根类使用 `initialize_java_wrappers` 处理全部方法。[泛型调用链](src/decompiler/generic_chains.rs) · [最终标签](src/decompiler/labels/finish.rs) · [最终诊断](src/decompiler/expr_processor/oddities.rs)
+
 类包装器为 abstract 和 native 方法保留参数槽，并在每个成功方法返回后避开同名字段。启用局部变量表时，包装器用原槽查找调试名，再次检查变量作用域。内置 identity、JAD、Tiny 命名策略按原方法缓存参数名，局部类、匿名类及 lambda 方法可以继承外层策略状态。Tiny 开启参数重命名时，对只有调试条目且缺少类型的参数，上游会在该方法中止命名；Rust 保留对应的方法级错误。[变量状态](src/decompiler/vars/processor.rs) · [命名策略](src/decompiler/vars/naming/mod.rs)
 
 `RuntimeImage::open` 将模块化 JDK 的每个模块作为独立库登记，按 JRT 的目录遍历和模块描述符顺序提供条目。普通镜像与 ZIP 压缩镜像可由现有 JImage 库读取；该库遇到 compact-cp 压缩时返回 Unsupported。[运行时类路径](src/engine/context_source/runtime.rs)

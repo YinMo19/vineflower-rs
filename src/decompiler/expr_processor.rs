@@ -4,10 +4,14 @@
 //! Bytecode expressions used by finally analysis and method decompilation.
 
 mod block;
+mod casts;
+pub(crate) use casts::canonicalize_casts;
 mod condy;
 mod driver;
+mod oddities;
 
 pub(crate) use driver::process_statement;
+pub(crate) use oddities::mark_expr_oddities;
 
 use crate::decompiler::ir::{ExprId, VarProcessorId};
 use crate::engine::{Cx, import_collector};

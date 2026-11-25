@@ -133,6 +133,7 @@ pub struct ClassNode {
     pub hidden_members: FxHashSet<String>,
 }
 
+#[derive(Clone)]
 pub struct LambdaInformation {
     pub method_name: ArcStr,
     pub method_descriptor: ArcStr,

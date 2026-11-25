@@ -57,6 +57,27 @@ impl Cx {
         self.struct_context.resolving_with(&self.expression_ids)
     }
 
+    /// Allow lookups during speculative rendering without adding imports.
+    pub(crate) fn with_locked_imports<T>(&mut self, render: impl FnOnce(&mut Cx) -> T) -> T {
+        struct ImportLock<'a> {
+            cx: &'a mut Cx,
+            previously_locked: bool,
+        }
+
+        impl Drop for ImportLock<'_> {
+            fn drop(&mut self) {
+                self.cx.imports.set_write_locked(self.previously_locked);
+            }
+        }
+
+        let previously_locked = self.imports.set_write_locked(true);
+        let lock = ImportLock {
+            cx: self,
+            previously_locked,
+        };
+        render(lock.cx)
+    }
+
     /// Library metadata first read during this pass uses the active method's
     /// expression counter. Restore the enclosing worker scope on every exit.
     pub(crate) fn enter_method(&mut self, counters: &CounterContainer) -> MethodScope<'_> {

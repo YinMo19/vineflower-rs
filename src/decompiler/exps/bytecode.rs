@@ -125,11 +125,7 @@ impl Expr {
                         let StatementKind::Switch(switch) = &ir[*stat].kind else {
                             unreachable!("Switch header case values belong to a switch statement");
                         };
-                        for &label in switch
-                            .cases
-                            .iter()
-                            .flat_map(|case| case.values.iter().flatten())
-                        {
+                        for &label in switch.case_values().flatten().flatten() {
                             Self::measure_bytecode(ir, label, offsets);
                         }
                     }

@@ -63,6 +63,7 @@ pub(super) enum Check {
     PostSwitches = 22,
     AfterMain = 23,
     VariableDefinitions = 24,
+    MethodEnd = 25,
 }
 
 #[derive(Clone, Copy)]
@@ -366,6 +367,16 @@ const VARIABLE_DEFINITION_STAGES: &[(&str, &str)] = &[
     ("Direct graph after variable definitions", "graph="),
 ];
 
+const METHOD_END_STAGES: &[(&str, &str)] = &[
+    ("Structure before AT_END plugins", "counters="),
+    ("Expressions before AT_END plugins", "counters="),
+    ("Variables before AT_END plugins", "versions="),
+    ("Final method structure", "counters="),
+    ("Final method expressions", "counters="),
+    ("Final method variables", "versions="),
+    ("Final phantom continue edges", "phantom-continues="),
+];
+
 fn loop_iterations(row: &str) -> impl Iterator<Item = &str> {
     row.split('\t')
         .nth(3)
@@ -397,7 +408,8 @@ impl Check {
             | Self::MainLoopEnd
             | Self::PostSwitches
             | Self::AfterMain
-            | Self::VariableDefinitions => &[DEFAULT],
+            | Self::VariableDefinitions
+            | Self::MethodEnd => &[DEFAULT],
             Self::SecondaryFunctions => SECONDARY_PROFILES,
         }
     }
@@ -426,6 +438,7 @@ impl Check {
             Self::PostSwitches => POST_SWITCH_STAGES,
             Self::AfterMain => AFTER_MAIN_STAGES,
             Self::VariableDefinitions => VARIABLE_DEFINITION_STAGES,
+            Self::MethodEnd => METHOD_END_STAGES,
         }
     }
 
@@ -453,6 +466,7 @@ impl Check {
             Self::PostSwitches => "post-switches",
             Self::AfterMain => "after-main",
             Self::VariableDefinitions => "variable-definitions",
+            Self::MethodEnd => "method-end",
         }
     }
 
@@ -495,6 +509,7 @@ impl Check {
                 | Self::PostSwitches
                 | Self::AfterMain
                 | Self::VariableDefinitions
+                | Self::MethodEnd
         )
     }
 
@@ -503,12 +518,17 @@ impl Check {
     }
 
     fn finishes_post_processing(self) -> bool {
-        matches!(self, Self::AfterMain | Self::VariableDefinitions)
+        self == Self::AfterMain || self.defines_variables()
+    }
+
+    fn defines_variables(self) -> bool {
+        matches!(self, Self::VariableDefinitions | Self::MethodEnd)
     }
 
     fn expression_detail(self) -> expression_snapshot::Detail {
         use expression_snapshot::Detail;
         match self {
+            Self::MethodEnd => Detail::MethodEnd,
             Self::VariableDefinitions => Detail::VariableDefinitions,
             Self::AfterMain => Detail::AfterMain,
             _ if self.recovers_resources() => Detail::Resources,
@@ -1020,6 +1040,9 @@ pub(super) fn check(corpus: &Corpus, check: Check) {
             .unwrap();
         let (id, java) = row.split_once('\t').unwrap();
         let (java, continue_moves) = java.rsplit_once("\tcontinue-moves=").unwrap_or((java, ""));
+        let (java, at_end_moves) = java
+            .rsplit_once("\tat-end-continue-moves=")
+            .unwrap_or((java, ""));
         let rust = rust_rows
             .next()
             .expect("missing Rust stack snapshot")
@@ -1055,7 +1078,7 @@ pub(super) fn check(corpus: &Corpus, check: Check) {
             continue;
         }
         if let Err(diff) = compare_snapshots(java, &rust, stages) {
-            if same_transferred_continues(java, &rust, continue_moves) {
+            if same_transferred_continues(check, java, &rust, continue_moves, at_end_moves) {
                 transferred_continue_order += 1;
             } else {
                 errors.push(format!("{method}\n  {diff}"));
@@ -1386,21 +1409,30 @@ fn write_published_group(
                     operation.set("finish-post-processing");
                     method.finish_post_processing(cx)?;
                 }
-                if check == Check::VariableDefinitions {
+                if check.defines_variables() {
                     operation.set("set-var-definitions");
                     method.set_var_definitions(cx)?;
                 }
+                if check == Check::MethodEnd {
+                    operation.set("prepare-method-end");
+                    method.prepare_method_end(cx)?;
+                }
+                let details = format!(";post-switches={simplified}");
                 operation.set("snapshot");
-                let state = snapshot(
-                    cx,
-                    owner,
-                    &method,
-                    &initial_hidden,
-                    check,
-                    &format!(";post-switches={simplified}"),
-                );
-                let graph = direct_graph_snapshot::enhanced(&mut cx.ir, method.root);
-                writeln!(snapshots, "{state}\t{graph}").unwrap();
+                let mut state = snapshot(cx, owner, &method, &initial_hidden, check, &details);
+                if check == Check::MethodEnd {
+                    operation.set("finish-method");
+                    method.finish_method(cx, class)?;
+                    operation.set("final-snapshot");
+                    let final_state =
+                        snapshot(cx, owner, &method, &initial_hidden, check, &details);
+                    let phantom = phantom_continues(&cx.ir, method.root);
+                    write!(state, "\t{final_state}\t{phantom}").unwrap();
+                } else {
+                    let graph = direct_graph_snapshot::enhanced(&mut cx.ir, method.root);
+                    write!(state, "\t{graph}").unwrap();
+                }
+                writeln!(snapshots, "{state}").unwrap();
                 Ok::<_, io::Error>(method)
             }));
             match processed {
@@ -1722,7 +1754,13 @@ fn stage(
                 ) {}
             }
             (Check::Stack, false) => method.simplify_stack_vars(cx, class),
-            (Check::PostSwitches | Check::AfterMain | Check::VariableDefinitions, _) => {
+            (
+                Check::PostSwitches
+                | Check::AfterMain
+                | Check::VariableDefinitions
+                | Check::MethodEnd,
+                _,
+            ) => {
                 unreachable!("Post-main methods run in wrapper order")
             }
         }
@@ -1788,12 +1826,21 @@ fn snapshot(
     if check != Check::Stack {
         let processor = &cx.ir[method.flow.variables];
         let mut versions = variable_snapshot(&processor.versions);
-        if check == Check::VariableDefinitions {
+        if check.defines_variables() {
             append_definition_metadata(&mut versions, processor);
         }
         write!(snapshot, "\t{versions}").unwrap();
     }
     snapshot
+}
+
+fn phantom_continues(ir: &Ir, root: StatId) -> String {
+    let edges = structure_statements(ir, root)
+        .flat_map(|stat| ir[stat].all_successors())
+        .filter(|&&edge| ir[edge].phantom_continue)
+        .map(|&edge| edge_id(ir, Some(edge)))
+        .join("|");
+    format!("phantom-continues={edges}")
 }
 
 fn counter_snapshot(counters: &CounterContainer) -> String {
@@ -1847,7 +1894,9 @@ fn same_switch_case_rejection(check: Check, java: &str, rust: &str) -> bool {
         Check::LateLoopPasses => "prepare-late-loops",
         Check::ExitEntry | Check::ExitCondensation => "prepare-exits",
         Check::MainLoopEnd => "finish-main-loop",
-        Check::PostSwitches | Check::AfterMain | Check::VariableDefinitions => "finish-main-loop",
+        Check::PostSwitches | Check::AfterMain | Check::VariableDefinitions | Check::MethodEnd => {
+            "finish-main-loop"
+        }
         _ => return false,
     };
     let Some(java) = java.strip_prefix(check.name()) else {
@@ -1870,17 +1919,38 @@ fn same_switch_case_rejection(check: Check, java: &str, rust: &str) -> bool {
     }
 }
 
-fn same_transferred_continues(java: &str, rust: &str, transfers: &str) -> bool {
-    if transfers.is_empty() {
+fn same_transferred_continues(
+    check: Check,
+    java: &str,
+    rust: &str,
+    transfers: &str,
+    at_end_transfers: &str,
+) -> bool {
+    if java == rust || (transfers.is_empty() && at_end_transfers.is_empty()) {
         return false;
     }
-    let Some((java, java_rest)) = java.split_once('\t') else {
-        return false;
-    };
-    let Some((rust, rust_rest)) = rust.split_once('\t') else {
-        return false;
-    };
-    if java_rest != rust_rest {
+    java.split('\t')
+        .zip_longest(rust.split('\t'))
+        .enumerate()
+        .all(|(part, pair)| {
+            let itertools::EitherOrBoth::Both(java, rust) = pair else {
+                return false;
+            };
+            java == rust
+                || match part {
+                    0 if check == Check::MethodEnd => {
+                        same_continue_batches(java, rust, at_end_transfers)
+                    }
+                    0 => same_continue_batches(java, rust, transfers),
+                    // The final tree follows the three AT_END fields.
+                    3 if check == Check::MethodEnd => same_continue_batches(java, rust, transfers),
+                    _ => false,
+                }
+        })
+}
+
+fn same_continue_batches(java: &str, rust: &str, transfers: &str) -> bool {
+    if transfers.is_empty() {
         return false;
     }
     let mut batches: HashMap<&str, Vec<Vec<&str>>> = HashMap::new();

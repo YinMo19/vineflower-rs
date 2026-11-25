@@ -139,15 +139,42 @@ pub struct SwitchStatement {
     pub scoped_case_statements: rustc_hash::FxHashSet<StatId>,
     pub default_edge: Option<EdgeId>,
     pub cases: Vec<SwitchCase>,
+    /// Labels still owned by the header after terminal case bodies were hidden.
+    trailing_case_values: Vec<Vec<Option<ExprId>>>,
     /// Indexed by case. Cases beyond the end of the list have no guard.
     pub case_guards: Vec<Option<ExprId>>,
     pub head_exprents: Option<ExprListId>,
 }
 
+impl SwitchStatement {
+    pub fn case_values(&self) -> impl Iterator<Item = &[Option<ExprId>]> {
+        self.cases
+            .iter()
+            .map(|case| case.values.as_slice())
+            .chain(self.trailing_case_values.iter().map(Vec::as_slice))
+    }
+
+    /// Detach the terminal default edge from the case table alone.
+    pub(crate) fn remove_trailing_default(&mut self) {
+        let last = self.cases.last_mut().expect("Missing terminal case");
+        if let Some(index) = last
+            .edges
+            .iter()
+            .position(|&edge| Some(edge) == self.default_edge)
+        {
+            last.edges.remove(index);
+        }
+        if last.edges.is_empty() {
+            self.trailing_case_values
+                .insert(0, self.cases.pop().unwrap().values);
+        }
+    }
+}
+
 pub struct SwitchCase {
     pub statement: StatId,
     pub edges: Vec<EdgeId>,
-    /// Parallel to `edges`. The default label has no expression.
+    /// The default label has no expression. Hiding its edge retains the value.
     pub values: Vec<Option<ExprId>>,
 }
 

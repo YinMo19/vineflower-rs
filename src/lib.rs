@@ -1,9 +1,9 @@
 //! A Rust port of the Vineflower Java decompiler (upstream 1.12.0).
 //!
 //! The native Java method pipeline covers bytecode decoding, graph structuring,
-//! finally recovery, expression lifting, the main loop and local declarations.
-//! [`engine::method_processor::defined_method`] returns the resulting statement
-//! tree. [`engine::class_processor::process_class_methods`] publishes method
+//! finally recovery, expression lifting, local declarations and final rewrites.
+//! [`engine::method_processor::code_to_java`] returns the final statement
+//! tree. [`engine::class_processor::initialize_java_wrappers`] publishes method
 //! wrappers in the class order required for nested and synthetic references.
 //!
 //! # Where things are

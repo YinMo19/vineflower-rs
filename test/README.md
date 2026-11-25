@@ -60,6 +60,8 @@ The post-main switch comparison runs method callbacks in class wrapper initializ
 
 The variable-definition comparison runs the complete declaration phase in both implementations. It compares declaration positions and flags, variable names and types, propagated local-variable records, finality, and switch case scopes.
 
+The method-end comparison takes one snapshot at AT_END and one after the final edge rewrites and diagnostic comments. It compares the statement tree and edge lists directly, including hidden switch defaults and phantom continues.
+
 ## End-to-end source and CLI suite
 
 The retained `upstream_parity` target covers final source and CLI behavior. It currently requires library and binary entry points that still await migration. Use the explicit stage targets above to test the active implementation. The commands below document the end-to-end gate once those entry points are available.

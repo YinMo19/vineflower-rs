@@ -57,7 +57,7 @@ fn rewrite(
                 };
                 let cast = invocation.parameters[index];
                 if let Some(mut chain) = CastChain::read(cx, cast) {
-                    let missing: Vec<_> = parameter_bounds(cx, invocation, index)?
+                    let missing: Vec<_> = parameter_bounds(cx, expr, index)?
                         .into_iter()
                         .filter(|bound| !chain.covers(cx, bound))
                         .collect();
@@ -204,18 +204,22 @@ fn satisfies(cx: &Cx, expr: ExprId, bound: &VarType) -> bool {
 }
 
 fn collect_bounds(
-    cx: &Cx,
+    cx: &mut Cx,
     expr: ExprId,
     var: VarVersionPair,
     bounds: &mut JHashSet<VarType>,
 ) -> io::Result<()> {
-    let matches_var = |expr| Expr::variable(&cx.ir, expr).is_some_and(|other| var == other.pair());
+    let matches_var = |ir, expr| Expr::variable(ir, expr).is_some_and(|other| var == other.pair());
     match &cx.ir[expr].kind {
         ExprKind::Invocation(invocation) => {
-            for (index, &param) in invocation.parameters.iter().enumerate() {
-                if matches_var(param) {
-                    bounds.extend(parameter_bounds(cx, invocation, index)?);
-                }
+            let positions: Vec<_> = invocation
+                .parameters
+                .iter()
+                .enumerate()
+                .filter_map(|(index, &param)| matches_var(&cx.ir, param).then_some(index))
+                .collect();
+            for index in positions {
+                bounds.extend(parameter_bounds(cx, expr, index)?);
             }
         }
         ExprKind::Function {
@@ -224,27 +228,22 @@ fn collect_bounds(
             ..
         } => {
             if let &[source, target] = operands.as_slice()
-                && matches_var(source)
+                && matches_var(&cx.ir, source)
             {
                 bounds.insert(Expr::expr_type(cx, target));
             }
         }
         _ => {}
     }
-    for child in Expr::children(&cx.ir, expr) {
+    let children: Vec<_> = Expr::children(&cx.ir, expr).collect();
+    for child in children {
         collect_bounds(cx, child, var, bounds)?;
     }
     Ok(())
 }
 
-fn parameter_bounds(cx: &Cx, invocation: &Invocation, index: usize) -> io::Result<Vec<VarType>> {
-    let method = invocation
-        .classname
-        .as_deref()
-        .and_then(|name| cx.classes().get_class(name))
-        .and_then(|class| {
-            class.get_method_recursive(cx, &invocation.name, invocation.string_descriptor())
-        });
+fn parameter_bounds(cx: &mut Cx, expr: ExprId, index: usize) -> io::Result<Vec<VarType>> {
+    let method = Invocation::resolve_description(cx, expr);
     let Some(method) = method else {
         return Ok(Vec::new());
     };

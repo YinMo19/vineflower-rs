@@ -659,6 +659,15 @@ fn variable_definitions_match_upstream() {
     );
 }
 
+#[test]
+#[ignore = "requires the upstream +local.jar and JDK 17 or later"]
+fn method_end_matches_upstream() {
+    stack_snapshot::check(
+        &upstream_reference::Corpus::discover(),
+        stack_snapshot::Check::MethodEnd,
+    );
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 enum Check {
