@@ -3,5 +3,7 @@
 //! Upstream's `modules.decompiler.vars` package: variable versions, types,
 //! names and definitions.
 
+mod inference;
 pub mod var_version_pair;
 pub mod version_graph;
+pub mod versions;

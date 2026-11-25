@@ -322,7 +322,7 @@ fn function_name(op: FunctionType) -> String {
     }
 }
 
-fn var_type(ty: Option<&VarType>) -> String {
+pub(super) fn var_type(ty: Option<&VarType>) -> String {
     let Some(ty) = ty else {
         return "~".into();
     };

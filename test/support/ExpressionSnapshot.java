@@ -168,7 +168,7 @@ class ExpressionSnapshot {
     return offsets == null ? "~" : offsets.stream().mapToObj(Integer::toString).collect(Collectors.joining(","));
   }
 
-  private static String type(VarType type) {
+  static String type(VarType type) {
     if (type == null) {
       return "~";
     }

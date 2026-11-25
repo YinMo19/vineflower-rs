@@ -5,7 +5,7 @@
 
 pub mod flatten;
 
-use crate::decompiler::ir::{ExprListId, Ir, StatId};
+use crate::decompiler::ir::{Expr, ExprId, ExprListId, Ir, StatId};
 use crate::decompiler::stats::StatementKind;
 use arcstr::ArcStr;
 use index_vec::{IndexVec, define_index_type};
@@ -89,6 +89,19 @@ pub struct DirectGraph {
 }
 
 impl DirectGraph {
+    /// Regular BFS followed by Exprent.getAllExprents(true, true) within each
+    /// list. Callers may reuse this order while the expression tree is stable.
+    pub(crate) fn deep_exprents(&self, ir: &Ir) -> Vec<ExprId> {
+        let mut order = Vec::new();
+        for node in self.regular_breadth_first() {
+            for &expr in &ir[self[node].exprents] {
+                Expr::append_exprents(ir, expr, true, &mut order);
+                order.push(expr);
+            }
+        }
+        order
+    }
+
     pub fn direct_node(&self, stat: StatId) -> Option<DirectId> {
         self.destinations.get(&stat).copied()
     }

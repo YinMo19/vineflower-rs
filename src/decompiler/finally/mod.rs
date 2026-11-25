@@ -71,8 +71,11 @@ impl FinallyProcessor {
                     Some(Recovery::Inconsistent) => {}
                     Some(recovery) => {
                         let monitor = if let Recovery::Semaphore(index) = recovery {
-                            let var =
-                                ExprKind::Variable(Variable::new(index, VarType::VARTYPE_INT));
+                            let var = ExprKind::Variable(Variable::in_method(
+                                index,
+                                VarType::VARTYPE_INT,
+                                method.flow.variables,
+                            ));
                             Some(Expr::new(&mut cx.ir, &mut method.flow.counters, var, None))
                         } else {
                             None

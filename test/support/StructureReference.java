@@ -57,7 +57,8 @@ class StructureReference {
     new Fernflower(null, Map.of(IFernflowerPreferences.INCLUDE_JAVA_RUNTIME, "0"), IFernflowerLogger.NO_OP);
     try (var input = new DataInputStream(new BufferedInputStream(Files.newInputStream(Path.of(args[0]))))) {
       int phase = input.readUnsignedByte();
-      StackSnapshot.Context stackContext = phase == 3 ? new StackSnapshot.Context(readStackGroups(input)) : null;
+      StackSnapshot.Context stackContext = phase == 3 || phase == 4
+        ? new StackSnapshot.Context(readStackGroups(input), phase == 4) : null;
       Path previousPath = null;
       Options previousOptions = null;
       StructClass currentClass = null;
@@ -70,8 +71,10 @@ class StructureReference {
           int group = input.readInt();
           boolean simplify = input.readBoolean();
           boolean ternary = input.readBoolean();
+          boolean booleanAsInt = input.readBoolean();
           String classname = readText(input);
-          String snapshot = stackContext.run(input, group, simplify, ternary, classname, name, descriptor, StructureReference::snapshot);
+          var stackOptions = new StackSnapshot.Options(group, simplify, ternary, options.useLvtNames(), booleanAsInt);
+          String snapshot = stackContext.run(input, stackOptions, classname, name, descriptor, StructureReference::snapshot);
           System.out.println(index + "\t" + snapshot);
           continue;
         }

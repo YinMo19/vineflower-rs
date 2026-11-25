@@ -557,13 +557,17 @@ impl BlockProcessor<'_> {
         offsets: Option<BytecodeOffsets>,
     ) -> io::Result<ExprId> {
         let index = operand(instruction, 0)?;
-        let mut var = Variable::new(index, ty);
+        let mut var = Variable::in_method(index, ty, self.data.variables);
         var.backing_instruction = Some(Arc::clone(instruction));
-        var.lvt = self
+        let local = self
             .method
             .get_local_variable_attr()
             .and_then(|table| table.get_variable_at_start(index, end));
-        Ok(self.new_expr(ExprKind::Variable(var), offsets))
+        let expr = self.new_expr(ExprKind::Variable(var), offsets);
+        if let Some(local) = local {
+            Expr::set_local_variable(&mut self.cx.ir, expr, local);
+        }
+        Ok(expr)
     }
 
     fn push_function(
@@ -688,7 +692,8 @@ impl BlockProcessor<'_> {
 
     fn assign_stack(&mut self, index: i32, value: ExprId, ty: Option<VarType>) -> ExprId {
         let ty = ty.unwrap_or_else(|| Expr::expr_type(self.cx, value));
-        let var = Expr::new_stack_variable(&mut self.cx.ir, self.counters, index, ty);
+        let var = Variable::in_method(index, ty, self.data.variables)
+            .push_stack(&mut self.cx.ir, self.counters);
         self.assign(var, value, None);
         Expr::copy(self.cx, self.counters, var)
     }

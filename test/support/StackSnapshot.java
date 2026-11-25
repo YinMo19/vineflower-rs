@@ -33,6 +33,7 @@ import org.jetbrains.java.decompiler.modules.code.MethodPropertiesProcessor;
 import org.jetbrains.java.decompiler.modules.decompiler.ClearStructHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.ExprProcessor;
 import org.jetbrains.java.decompiler.modules.decompiler.FinallyProcessor;
+import org.jetbrains.java.decompiler.modules.decompiler.PPandMMHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.SequenceHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.SimplifyExprentsHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.StackVarsProcessor;
@@ -47,11 +48,12 @@ import org.jetbrains.java.decompiler.struct.gen.MethodDescriptor;
 import org.jetbrains.java.decompiler.util.InterpreterUtil;
 
 class StackSnapshot {
-  private record Options(int group, boolean simplify, boolean ternary) {}
+  record Options(int group, boolean simplify, boolean ternary, boolean lvt, boolean booleanAsInt) {}
   private record RootScope(ImportCollector imports, List<ClassNode> wrapperOrder, String error) {}
 
   static class Context {
     private final List<List<String>> groups;
+    private final boolean increments;
     private final Map<ClassNode, RootScope> roots = new IdentityHashMap<>();
     private final Map<ClassNode, ClassWrapper> wrappers = new IdentityHashMap<>();
     private final List<ClassNode> published = new ArrayList<>();
@@ -59,8 +61,9 @@ class StackSnapshot {
     private Fernflower engine;
     private ClassNode current;
 
-    Context(List<List<String>> groups) {
+    Context(List<List<String>> groups, boolean increments) {
       this.groups = groups;
+      this.increments = increments;
     }
 
     private void select(Options next) {
@@ -78,7 +81,9 @@ class StackSnapshot {
       engine = new Fernflower(new ConsoleFileSaver(null), Map.of(
         IFernflowerPreferences.INCLUDE_JAVA_RUNTIME, "0",
         IFernflowerPreferences.SIMPLIFY_STACK_SECOND_PASS, next.simplify() ? "1" : "0",
-        IFernflowerPreferences.TERNARY_CONDITIONS, next.ternary() ? "1" : "0"
+        IFernflowerPreferences.TERNARY_CONDITIONS, next.ternary() ? "1" : "0",
+        IFernflowerPreferences.USE_DEBUG_VAR_NAMES, next.lvt() ? "1" : "0",
+        IFernflowerPreferences.BOOLEAN_TRUE_ONE, next.booleanAsInt() ? "1" : "0"
       ), IFernflowerLogger.NO_OP);
       for (String path : groups.get(next.group())) {
         engine.addSource(Path.of(path).toFile());
@@ -126,10 +131,10 @@ class StackSnapshot {
       return wrappers.computeIfAbsent(node, StackSnapshot::wrapper);
     }
 
-    String run(DataInputStream input, int group, boolean simplify, boolean ternary, String classname,
+    String run(DataInputStream input, Options options, String classname,
                String name, String descriptor,
                BiFunction<RootStatement, CounterContainer, String> tree) throws IOException {
-      select(new Options(group, simplify, ternary));
+      select(options);
       var node = Objects.requireNonNull(DecompilerContext.getClassProcessor().getMapRootClasses().get(classname));
       var owner = node;
       while (owner.parent != null) {
@@ -154,13 +159,13 @@ class StackSnapshot {
         }
         var hidden = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_CLASS_WRAPPER).getHiddenMembers();
         var initialHidden = Set.copyOf(hidden);
-        String first = stage(firstGraph, scope.imports(), cl, method, tree, initialHidden, true);
+        String first = stage(firstGraph, scope.imports(), cl, method, tree, initialHidden, true, increments);
         hidden.clear();
         hidden.addAll(initialHidden);
         if ("rejected=parsing failure!".equals(first)) {
           return first;
         }
-        return first + "\t" + stage(settledGraph, scope.imports(), cl, method, tree, initialHidden, false);
+        return first + "\t" + stage(settledGraph, scope.imports(), cl, method, tree, initialHidden, false, increments);
       } finally {
         method.releaseResources();
       }
@@ -228,15 +233,18 @@ class StackSnapshot {
   }
 
   private static String stage(ControlFlowGraph graph, ImportCollector imports, StructClass cl, StructMethod method,
-                              BiFunction<RootStatement, CounterContainer, String> tree, Set<String> initialHidden, boolean first) {
+                              BiFunction<RootStatement, CounterContainer, String> tree, Set<String> initialHidden,
+                              boolean first, boolean increments) {
     DecompilerContext.startClass(new ImportCollector(imports));
     var descriptor = MethodDescriptor.parseDescriptor(method, null);
     var vars = new VarProcessor(method, descriptor);
     DecompilerContext.startMethod(vars);
     var counters = DecompilerContext.getCounterContainer();
     counters.setCounter(CounterContainer.VAR_COUNTER, method.getLocalVariables());
+    String operation = "structure";
     try {
       var root = DomHelper.parseGraph(graph, method, 0);
+      operation = "finally";
       var finallyProcessor = new FinallyProcessor(method, descriptor, vars);
       int iteration = 0;
       while (finallyProcessor.iterateGraph(cl, method, root, graph)) {
@@ -249,10 +257,29 @@ class StackSnapshot {
       root.buildContentFlags();
       SequenceHelper.condenseSequences(root);
       ClearStructHelper.clearStatements(root);
+      operation = "lift";
       new ExprProcessor(descriptor, vars).processStatement(root, cl);
       SequenceHelper.condenseSequences(root);
 
-      if (first) {
+      operation = "simplify-stack";
+      if (increments) {
+        boolean repeat;
+        do {
+          operation = "simplify-stack";
+          StackVarsProcessor.simplifyStackVars(root, method, cl);
+          operation = "set-var-versions";
+          vars.setVarVersions(root);
+          repeat = false;
+          if (!first) {
+            operation = "find-increments";
+            repeat = new PPandMMHelper(vars).findPPandMM(root);
+          }
+        } while (repeat);
+        if (!first) {
+          operation = "inline-increments";
+          PPandMMHelper.inlinePPIandMMIIf(root);
+        }
+      } else if (first) {
         var ssa = new SSAConstructorSparseEx();
         ssa.splitVariables(root, method);
         var reordered = new HashSet<Integer>();
@@ -264,13 +291,22 @@ class StackSnapshot {
       String allMembers = hidden.stream().sorted().map(ExpressionSnapshot::text).collect(Collectors.joining(","));
       String added = hidden.stream().filter(member -> !initialHidden.contains(member)).sorted()
         .map(ExpressionSnapshot::text).collect(Collectors.joining(","));
-      return tree.apply(root, counters) + ";hidden=" + allMembers + ";hidden-added=" + added
+      operation = "snapshot";
+      String snapshot = tree.apply(root, counters) + ";hidden=" + allMembers + ";hidden-added=" + added
         + "\t" + ExpressionSnapshot.snapshot(root, counters);
+      if (increments) {
+        snapshot += "\t" + VariableSnapshot.snapshot(vars);
+        if (first) {
+          operation = "find-increments";
+          snapshot += ";repeat=" + new PPandMMHelper(vars).findPPandMM(root);
+        }
+      }
+      return snapshot;
     } catch (RuntimeException | AssertionError | StackOverflowError error) {
       if (error.getClass() == RuntimeException.class && "parsing failure!".equals(error.getMessage())) {
         return "rejected=parsing failure!";
       }
-      return "stack-" + StructureReference.failureSnapshot(error);
+      return (increments ? "increments-" + operation + "-" : "stack-") + StructureReference.failureSnapshot(error);
     }
   }
 }

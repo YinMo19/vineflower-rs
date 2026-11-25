@@ -9,11 +9,12 @@ mod driver;
 
 pub(crate) use driver::process_statement;
 
-use crate::decompiler::ir::ExprId;
+use crate::decompiler::ir::{ExprId, VarProcessorId};
 use crate::engine::{Cx, import_collector};
 use crate::types::{CodeType, VarType};
 
 struct ExpressionData {
+    variables: VarProcessorId,
     stack: Vec<ExprId>,
     expressions: Vec<ExprId>,
 }

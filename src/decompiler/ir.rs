@@ -21,6 +21,7 @@ use index_vec::{IndexVec, define_index_type};
 
 pub use super::exps::{Expr, ExprKind};
 use super::stats::{Statement, stat_edge::StatEdge};
+use super::vars::versions::VarVersions;
 use crate::code::cfg::basic_block::BasicBlock;
 
 define_index_type! {
@@ -49,8 +50,14 @@ define_index_type! {
     pub struct BlockId = u32;
 }
 
+define_index_type! {
+    /// The variable processor shared by all local expressions of one method.
+    pub struct VarProcessorId = u32;
+}
+
 #[derive(Default)]
 pub struct Ir {
+    pub variable_processors: IndexVec<VarProcessorId, VarVersions>,
     pub stats: IndexVec<StatId, Statement>,
     pub edges: IndexVec<EdgeId, StatEdge>,
     pub exprs: IndexVec<ExprId, Expr>,
@@ -84,6 +91,7 @@ macro_rules! arena_index {
 }
 
 arena_index! {
+    variable_processors: VarProcessorId => VarVersions,
     stats: StatId => Statement,
     edges: EdgeId => StatEdge,
     exprs: ExprId => Expr,

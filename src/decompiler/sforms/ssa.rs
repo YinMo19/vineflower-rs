@@ -66,6 +66,19 @@ impl VersionAnalysis for Ssa {
 }
 
 impl Ssa {
+    /// VarVersionsProcessor.mergePhiVersions maps every member of each
+    /// connected component to its minimum version, including non-phi inputs.
+    pub(crate) fn phi_representatives(&self) -> JHashMap<Version, i32> {
+        let mut lookup = self.simple_reverse_phi_lookup();
+        for (&key, inputs) in self.phi.iter() {
+            let minimum = representative(&lookup, key).version;
+            for version in inputs {
+                lookup.insert(Version::new(key.var, version), minimum);
+            }
+        }
+        lookup
+    }
+
     /// `getSimpleReversePhiLookup`: join the phi inputs at their lowest
     /// version and flatten the representative of every phi definition.
     pub fn simple_reverse_phi_lookup(&self) -> JHashMap<Version, i32> {

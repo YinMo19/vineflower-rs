@@ -22,7 +22,7 @@ use crate::decompiler::decompose::{
 use crate::decompiler::{
     expr_processor,
     finally::FinallyProcessor,
-    ir::{Ir, StatId},
+    ir::{Ir, StatId, VarProcessorId},
 };
 use crate::engine::{
     Cx, Options,
@@ -36,6 +36,7 @@ use crate::types::MethodDescriptor;
 pub struct MethodGraph {
     pub graph: ControlFlowGraph,
     pub counters: CounterContainer,
+    pub variables: VarProcessorId,
 }
 
 /// A raw CFG retains the class and method whose constant pool and local types it uses.
@@ -61,10 +62,15 @@ impl<'a> DecodedMethod<'a> {
     ) -> io::Result<Option<Self>> {
         Ok(method.expand_data(class)?.map(|seq| {
             let graph = ControlFlowGraph::new(ir, seq);
+            let variables = ir.variable_processors.push(Default::default());
             let mut counters = CounterContainer::default();
             counters.set_counter(VAR_COUNTER, method.local_variables);
             Self {
-                flow: MethodGraph { graph, counters },
+                flow: MethodGraph {
+                    graph,
+                    counters,
+                    variables,
+                },
                 class,
                 method,
             }
@@ -188,6 +194,7 @@ impl StructuredMethod {
             class,
             &method,
             &self.descriptor,
+            self.flow.variables,
         )
     }
 }
@@ -244,6 +251,47 @@ pub struct ExpressionMethod {
 }
 
 impl ExpressionMethod {
+    pub fn set_var_versions(&mut self, cx: &mut Cx, class: &StructClass) -> io::Result<()> {
+        crate::decompiler::vars::versions::set_versions(
+            cx,
+            &mut self.flow.counters,
+            self.root,
+            self.flow.variables,
+            class,
+            &self.descriptor,
+        )
+    }
+
+    pub fn find_increments(&mut self, cx: &mut Cx) -> bool {
+        crate::decompiler::increments::find(
+            cx,
+            &mut self.flow.counters,
+            self.root,
+            self.flow.variables,
+        )
+    }
+
+    pub fn inline_increments_in_conditions(&mut self, cx: &mut Cx) -> bool {
+        let changed = crate::decompiler::increments::inline_in_conditions(cx, self.root);
+        if changed {
+            condense_sequences(cx, &mut self.flow.counters, self.root);
+        }
+        changed
+    }
+
+    /// The first fixed point in MethodProcessor after expression lifting.
+    pub fn process_increments(&mut self, cx: &mut Cx, class: &StructClass) -> io::Result<()> {
+        loop {
+            self.simplify_stack_vars(cx, class);
+            self.set_var_versions(cx, class)?;
+            if !self.find_increments(cx) {
+                break;
+            }
+        }
+        self.inline_increments_in_conditions(cx);
+        Ok(())
+    }
+
     pub fn simplify_stack_vars(&mut self, cx: &mut Cx, class: &StructClass) {
         crate::decompiler::stack::simplify_stack_vars(
             cx,

@@ -8,6 +8,7 @@ pub mod expr_processor;
 pub mod exps;
 pub mod finally;
 pub mod flow;
+pub(crate) mod increments;
 pub mod ir;
 pub mod sforms;
 pub mod stack;

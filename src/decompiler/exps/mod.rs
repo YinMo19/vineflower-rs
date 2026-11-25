@@ -3,21 +3,26 @@
 
 //! `modules.decompiler.exps`: the typed expressions produced by bytecode lifting.
 
+pub(crate) mod bounds;
 mod bytecode;
 mod function;
+mod increments;
 mod operations;
 mod traversal;
 
 use std::sync::Arc;
 
 use arcstr::ArcStr;
+use index_vec::IndexVec;
 
+pub(crate) use self::increments::{delta_by_one, increment};
 pub use self::{bytecode::BytecodeOffsets, function::FunctionType};
 pub use crate::structs::consts::ConstantValue;
 
 use crate::code::instruction::Instruction;
-use crate::decompiler::ir::{ExprId, Ir, StatId};
+use crate::decompiler::ir::{ExprId, Ir, StatId, VarProcessorId};
 use crate::decompiler::stats::StatementKind;
+use crate::decompiler::vars::{var_version_pair::VarVersionPair, versions::VarVersions};
 use crate::engine::Cx;
 use crate::engine::class_nodes::ClassKind;
 use crate::engine::counter_container::{CounterContainer, EXPRESSION_COUNTER, VAR_COUNTER};
@@ -93,6 +98,7 @@ pub enum ExprKind {
 
 #[derive(Clone, Debug)]
 pub struct Variable {
+    pub processor: Option<VarProcessorId>,
     pub index: i32,
     pub var_type: VarType,
     pub version: i32,
@@ -106,6 +112,7 @@ pub struct Variable {
 impl Variable {
     pub fn new(index: i32, var_type: VarType) -> Self {
         Self {
+            processor: None,
             index,
             var_type,
             version: 0,
@@ -117,11 +124,44 @@ impl Variable {
         }
     }
 
-    fn expr_type(&self, cx: &Cx) -> VarType {
+    pub fn pair(&self) -> VarVersionPair {
+        VarVersionPair::new(self.index, self.version)
+    }
+
+    pub(crate) fn in_method(index: i32, ty: VarType, owner: VarProcessorId) -> Self {
+        Self {
+            processor: Some(owner),
+            ..Self::new(index, ty)
+        }
+    }
+
+    pub(crate) fn push_stack(mut self, ir: &mut Ir, counters: &mut CounterContainer) -> ExprId {
+        self.stack = true;
+        Expr::new(ir, counters, ExprKind::Variable(self), None)
+    }
+
+    /// VarExprent.setLVT also seeds its method's active type processor.
+    fn record_local_type(&self, processors: &mut IndexVec<VarProcessorId, VarVersions>) {
+        if let Some(owner) = self.processor
+            && processors[owner].initialized
+            && let Some(lvt) = &self.lvt
+        {
+            processors[owner]
+                .lower
+                .insert(self.pair(), lvt.get_var_type());
+        }
+    }
+
+    pub(crate) fn expr_type(&self, cx: &Cx) -> VarType {
         if cx.options.use_lvt_names
             && let Some(lvt) = &self.lvt
         {
             lvt.get_var_type()
+        } else if self.var_type.ty == CodeType::Unknown
+            && let Some(owner) = self.processor
+            && let Some(ty) = cx.ir[owner].lower.get(&self.pair())
+        {
+            ty.clone()
         } else {
             self.var_type.clone()
         }
@@ -286,8 +326,8 @@ impl Expr {
         )
     }
 
-    pub fn int_constant(value: i32, bool_permitted: bool) -> ExprKind {
-        let var_type = match value {
+    pub(crate) fn guess_int_type(value: i32, bool_permitted: bool) -> VarType {
+        match value {
             0 | 1 if bool_permitted => VarType::VARTYPE_BOOLEAN,
             0..=127 => VarType::VARTYPE_BYTECHAR,
             -128..=-1 => VarType::VARTYPE_BYTE,
@@ -295,10 +335,13 @@ impl Expr {
             -32768..=-129 => VarType::VARTYPE_SHORT,
             32768..=65535 => VarType::VARTYPE_CHAR,
             _ => VarType::VARTYPE_INT,
-        };
+        }
+    }
+
+    pub fn int_constant(value: i32, bool_permitted: bool) -> ExprKind {
         ExprKind::Constant {
             value: ConstantValue::Integer(value),
-            var_type,
+            var_type: Self::guess_int_type(value, bool_permitted),
             bool_permitted,
             was_condy: false,
         }
@@ -353,9 +396,15 @@ impl Expr {
         index: i32,
         var_type: VarType,
     ) -> ExprId {
-        let mut variable = Variable::new(index, var_type);
-        variable.stack = true;
-        Self::new(ir, counters, ExprKind::Variable(variable), None)
+        Variable::new(index, var_type).push_stack(ir, counters)
+    }
+
+    pub(crate) fn set_local_variable(ir: &mut Ir, expr: ExprId, lvt: Arc<LocalVariable>) {
+        let ExprKind::Variable(var) = &mut ir.exprs[expr].kind else {
+            unreachable!()
+        };
+        var.lvt = Some(lvt);
+        var.record_local_type(&mut ir.variable_processors);
     }
 
     pub fn new_if(
@@ -471,6 +520,7 @@ impl Expr {
             ExprKind::Variable(variable) => {
                 variable.var_type = variable.expr_type(cx);
                 variable.backing_instruction = None;
+                variable.record_local_type(&mut cx.ir.variable_processors);
             }
             ExprKind::Assignment { left, right, .. } => {
                 *left = Self::copy(cx, counters, *left);

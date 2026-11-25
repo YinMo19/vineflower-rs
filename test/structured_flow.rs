@@ -36,6 +36,15 @@ mod ssa_snapshot;
 #[path = "support/stack_snapshot.rs"]
 mod stack_snapshot;
 
+const REFERENCE_HELPERS: &[&str] = &[
+    "DirectGraphSnapshot",
+    "ExpressionSnapshot",
+    "SsaSnapshot",
+    "FinallySnapshot",
+    "StackSnapshot",
+    "VariableSnapshot",
+];
+
 #[test]
 fn structure_retains_statement_and_edge_links() {
     let classes: &[&[u8]] = &[
@@ -217,6 +226,52 @@ fn stack_simplification_inlines_switch_selector_and_call_operands() {
 }
 
 #[test]
+fn inferred_receiver_types_follow_their_own_methods() {
+    use vineflower_rs::decompiler::exps::{Expr, InvocationFunction};
+    use vineflower_rs::engine::method_processor::{ExpressionMethod, expression_method};
+    use vineflower_rs::types::CodeType;
+
+    fn receiver(cx: &mut Cx, method: &ExpressionMethod) -> ExprId {
+        let graph =
+            vineflower_rs::decompiler::flow::flatten::build_direct_graph(&mut cx.ir, method.root);
+        graph
+            .regular_breadth_first()
+            .flat_map(|node| &cx.ir[graph[node].exprents])
+            .find_map(|&expr| match &cx.ir[expr].kind {
+                ExprKind::Invocation(call) if call.function == InvocationFunction::Init => {
+                    call.instance
+                }
+                _ => None,
+            })
+            .expect("the constructor calls its superclass")
+    }
+
+    let mut options = Options::default();
+    options.use_lvt_names = false;
+    let options = Arc::new(options);
+    let mut cx = make_context(&options);
+    let mut receivers = Vec::new();
+    for bytes in [
+        include_bytes!("smoke/java8/TestClassSwitch.class").as_slice(),
+        include_bytes!("smoke/java8/TestSimpleWhile.class"),
+    ] {
+        let class = parse_class(bytes, &options).unwrap();
+        let ctor = class.get_method("<init>", "()V").unwrap();
+        let mut method = expression_method(&mut cx, &class, ctor).unwrap().unwrap();
+        method.process_increments(&mut cx, &class).unwrap();
+        receivers.push((receiver(&mut cx, &method), class.qualified_name));
+    }
+    for (id, class_name) in receivers {
+        let ExprKind::Variable(var) = &cx.ir[id].kind else {
+            panic!("expected local this")
+        };
+        assert_eq!(var.index, 0);
+        assert_eq!(var.var_type.ty, CodeType::Unknown);
+        assert_eq!(Expr::expr_type(&cx, id).value, Some(class_name));
+    }
+}
+
+#[test]
 fn expression_method_recovers_finally_around_a_synchronized_body() {
     use vineflower_rs::engine::method_processor::expression_method;
 
@@ -283,7 +338,19 @@ fn finally_matches_upstream() {
 #[test]
 #[ignore = "requires the upstream +local.jar and JDK 17 or later"]
 fn stack_vars_match_upstream() {
-    stack_snapshot::check(&upstream_reference::Corpus::discover());
+    stack_snapshot::check(
+        &upstream_reference::Corpus::discover(),
+        stack_snapshot::Check::Stack,
+    );
+}
+
+#[test]
+#[ignore = "requires the upstream +local.jar and JDK 17 or later"]
+fn variable_versions_and_increments_match_upstream() {
+    stack_snapshot::check(
+        &upstream_reference::Corpus::discover(),
+        stack_snapshot::Check::Increments,
+    );
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -432,13 +499,7 @@ fn check_flow(check: Check) {
     let mut reference = tempfile::tempfile().unwrap();
     corpus.run_to(
         "StructureReference",
-        &[
-            "DirectGraphSnapshot",
-            "ExpressionSnapshot",
-            "SsaSnapshot",
-            "FinallySnapshot",
-            "StackSnapshot",
-        ],
+        REFERENCE_HELPERS,
         transfer.path(),
         &reference,
     );

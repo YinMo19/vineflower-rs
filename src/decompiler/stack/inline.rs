@@ -393,11 +393,9 @@ impl Inliner<'_> {
 
         while let Some(parent) = ir[stat].parent {
             if let StatementKind::Catch { vars, .. } = &ir[parent].kind {
-                for var in vars.clone() {
-                    if let ExprKind::Variable(var) = &mut ir[var].kind
-                        && var.index == index
-                    {
-                        var.lvt = Some(Arc::clone(&lvt));
+                for expr in vars.clone() {
+                    if matches!(&ir[expr].kind, ExprKind::Variable(var) if var.index == index) {
+                        Expr::set_local_variable(ir, expr, Arc::clone(&lvt));
                     }
                 }
                 break;
@@ -416,11 +414,11 @@ impl Inliner<'_> {
             for index in 0..ir[node.exprents].len() {
                 let expr = ir[node.exprents][index];
                 for child in Expr::all_exprents(ir, expr, true, true) {
-                    if let ExprKind::Variable(var) = &mut ir[child].kind
+                    if let ExprKind::Variable(var) = &ir[child].kind
                         && var.lvt.is_none()
                         && let Some(lvt) = self.locals.get(&Version::new(var.index, var.version))
                     {
-                        var.lvt = Some(Arc::clone(lvt));
+                        Expr::set_local_variable(ir, child, Arc::clone(lvt));
                     }
                 }
             }
