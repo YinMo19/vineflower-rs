@@ -69,6 +69,8 @@ CFG、语句图和 DirectGraph 具有不同的边契约。
 
 [类节点](src/engine/class_nodes/load.rs) 根据已登记类的 InnerClasses 和 EnclosingMethod 建立父子关系。类节点保存匿名类的实际父类型，表达式构造 `new` 时通过同一份节点表查询。根类的 [ImportCollector](src/engine/import_collector.rs) 结合类路径、继承层次和当前类决定短名，动态常量展开和泛型类型名都经过这个入口。方法阶段差分直接使用同一 CFG，类节点与导入的差分另用已登记文件组成的类路径。
 
+[根类准备](src/engine/class_processor.rs) 先建立该根的导入作用域，再从已有子类开始扫描 LambdaMetafactory 调用点，最后按类树顺序登记隐式名称。类节点以独立句柄保存；一次 invokedynamic 调用点分配一个节点，多个调用点可以共享合成名称，名字查找返回最后登记的节点。嵌套 lambda 保留在原类的子列表中，同时记录其实际 lambda 父节点。合成体和方法引用的区别由 owner 与目标方法的 synthetic 属性决定。
+
 [稀疏变量版本分析](src/decompiler/sforms/mod.rs) 在同一套直接图传播规则上实现 SSA 和 SSAU。普通边传递分支出口状态，异常边传递保护区内可见的局部变量。普通 SSA 保留汇合点的来源版本；重编号按表达式里的指令对象登记映射，使 finally 能在 CFG 上识别等价的变量访问。SSAU 为读位置分配版本，记录使用关系、保护范围及存活集合，最后在版本图上计算支配关系。两次分析之间按原版遍历次序清除表达式上的版本号。
 
 后续方法主线从 `FinallyProcessor.iterateGraph` 继续，复用表达式构建与稀疏变量版本分析。完整 finally 循环、方法重写、源码输出与 CLI 的端到端验证仍待接入。

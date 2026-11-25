@@ -533,7 +533,11 @@ fn allocation_flags(cx: &Cx, new_type: &VarType) -> (bool, bool, bool) {
         (
             node.kind == ClassKind::Anonymous || lambda,
             lambda,
-            lambda && node.method_reference,
+            lambda
+                && node
+                    .lambda
+                    .as_ref()
+                    .is_some_and(|info| info.is_method_reference),
         )
     } else {
         (false, false, false)

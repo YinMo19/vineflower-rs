@@ -2,13 +2,15 @@
 
 use std::{fmt::Display, io::Write, sync::Arc};
 
+#[path = "support/lambda_nodes.rs"]
+mod lambda_nodes;
 #[path = "support/upstream_reference.rs"]
 mod upstream_reference;
 
 use vineflower_rs::decompiler::exps::Expr;
 use vineflower_rs::engine::{
     Cx, Options,
-    class_nodes::{ClassKind, load_classes},
+    class_nodes::{ClassKind, ClassNodeId, load_classes},
     counter_container::CounterContainer,
     import_collector::{ImportCollector, get_short_name_in_class_context},
 };
@@ -29,22 +31,7 @@ fn loaded_class_nodes_and_imports_match_upstream() {
         let mut options = Options::default();
         options.verify_anonymous_classes = mode == "verify";
         options.decompile_inner = mode != "flat";
-        let options = Arc::new(options);
-        let mut context = StructContext::new(options.clone(), None);
-        for path in &corpus.classes {
-            context.add_space(
-                Arc::new(SingleFileContextSource::open(path, &options, None).unwrap()),
-                true,
-            );
-        }
-        let mut cx = Cx::new(Arc::new(context));
-        cx.class_nodes = load_classes(
-            &cx.struct_context,
-            &options,
-            |_| true,
-            |_| true,
-            |_, _| None,
-        );
+        let mut cx = load_context(&corpus, options);
         let mut roots: Vec<_> = cx
             .class_nodes
             .iter()
@@ -53,12 +40,10 @@ fn loaded_class_nodes_and_imports_match_upstream() {
             .collect();
         roots.sort_unstable_by(|a, b| a.encode_utf16().cmp(b.encode_utf16()));
         for name in roots {
-            cx.imports = ImportCollector::for_root(
-                &cx.struct_context,
-                &cx.class_nodes,
-                &cx.class_nodes[&name],
-            );
-            snapshot(&mut cx, &name, mode, &mut records);
+            let id = cx.class_nodes.id(&name).unwrap();
+            cx.imports =
+                ImportCollector::for_root(&cx.struct_context, &cx.class_nodes, &cx.class_nodes[id]);
+            snapshot(&mut cx, id, mode, &mut records);
             records.push(format!(
                 "{mode}\timports\t{name}\t{}",
                 list(cx.imports.imports())
@@ -81,9 +66,30 @@ fn loaded_class_nodes_and_imports_match_upstream() {
     );
 }
 
-fn snapshot(cx: &mut Cx, name: &str, mode: &str, records: &mut Vec<String>) {
-    let node = &cx.class_nodes[name];
+fn load_context(corpus: &upstream_reference::Corpus, options: Options) -> Cx {
+    let options = Arc::new(options);
+    let mut context = StructContext::new(options.clone(), None);
+    for path in &corpus.classes {
+        context.add_space(
+            Arc::new(SingleFileContextSource::open(path, &options, None).unwrap()),
+            true,
+        );
+    }
+    let mut cx = Cx::new(Arc::new(context));
+    cx.class_nodes = load_classes(
+        &cx.struct_context,
+        &options,
+        |_| true,
+        |_| true,
+        |_, _| None,
+    );
+    cx
+}
+
+fn snapshot(cx: &mut Cx, id: ClassNodeId, mode: &str, records: &mut Vec<String>) {
+    let node = &cx.class_nodes[id];
     let class = Arc::clone(&node.class);
+    let name = &class.qualified_name;
     let mut owners: Vec<_> = node.enclosing_classes.iter().collect();
     owners.sort_unstable_by(|a, b| a.encode_utf16().cmp(b.encode_utf16()));
     let nested = node.nested.clone();
@@ -96,13 +102,20 @@ fn snapshot(cx: &mut Cx, name: &str, mode: &str, records: &mut Vec<String>) {
             .unwrap_or("null")
             .to_string(),
         list(owners),
-        node.parent.as_deref().unwrap_or("null").to_string(),
-        list(&nested),
+        node.parent.map_or_else(
+            || "null".to_owned(),
+            |parent| cx.class_nodes[parent].class.qualified_name.to_string(),
+        ),
+        list(
+            nested
+                .iter()
+                .map(|&child| &cx.class_nodes[child].class.qualified_name),
+        ),
         node.anonymous_type
             .as_ref()
             .map_or_else(|| "null".into(), ToString::to_string),
     ];
-    cx.current_class_node = Some(name.into());
+    cx.current_class_node = Some(name.clone());
     let alloc = Expr::new_allocation(
         cx,
         &mut CounterContainer::default(),
@@ -129,7 +142,7 @@ fn snapshot(cx: &mut Cx, name: &str, mode: &str, records: &mut Vec<String>) {
         list(resolved)
     ));
     for child in nested {
-        snapshot(cx, &child, mode, records);
+        snapshot(cx, child, mode, records);
     }
 }
 

@@ -204,20 +204,22 @@ impl Nesting {
 
     fn attach(&self, nodes: &mut ClassNodes, verify_anonymous: bool) {
         let roots: Vec<_> = nodes
-            .keys()
-            .filter(|name| !self.inner.contains_key(*name))
-            .cloned()
+            .names
+            .iter()
+            .filter(|(name, _)| !self.inner.contains_key(*name))
+            .map(|(_, &id)| id)
             .collect();
 
         for root in roots {
             let mut visited = FxHashSet::default();
-            visited.insert(root.clone());
+            visited.insert(nodes[root].class.qualified_name.clone());
             let mut pending = VecDeque::from([root]);
-            while let Some(name) = pending.pop_front() {
-                let Some(references) = self.nested_refs.get(&name) else {
+            while let Some(owner) = pending.pop_front() {
+                let enclosing = Arc::clone(&nodes[owner].class);
+                let name = &enclosing.qualified_name;
+                let Some(references) = self.nested_refs.get(name) else {
                     continue;
                 };
-                let enclosing = Arc::clone(&nodes[&name].class);
                 let Some(inner) = enclosing
                     .attributes
                     .inner_classes
@@ -234,27 +236,24 @@ impl Nesting {
                         continue;
                     }
                     let record = &self.inner[child];
-                    if record.enclosing_name.as_ref() != Some(&name)
+                    if record.enclosing_name.as_ref() != Some(name)
                         || !visited.insert(child.clone())
                     {
                         continue;
                     }
-                    let Some(node) = nodes.get_mut(child) else {
+                    let Some(child_id) = nodes.id(child) else {
                         log::warn!("Nested class {child} missing!");
                         continue;
                     };
+                    let node = &mut nodes[child_id];
                     Self::attach_child(node, record, &enclosing, verify_anonymous);
-                    node.parent = Some(name.clone());
+                    node.parent = Some(owner);
                     node.enclosing_classes
                         .extend(self.enclosing_refs[child].iter().cloned());
-                    nodes.get_mut(&name).unwrap().nested.push(child.clone());
-                    pending.push_back(child.clone());
+                    nodes[owner].nested.push(child_id);
+                    pending.push_back(child_id);
                 }
-                nodes
-                    .get_mut(&name)
-                    .unwrap()
-                    .nested
-                    .sort_by(|a, b| a.encode_utf16().cmp(b.encode_utf16()));
+                nodes.sort_nested(owner);
             }
         }
     }

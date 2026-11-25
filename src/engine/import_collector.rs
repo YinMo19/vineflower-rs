@@ -59,17 +59,25 @@ impl ImportCollector {
 
     pub fn for_root(context: &StructContext, nodes: &ClassNodes, root: &ClassNode) -> Self {
         let mut collector = Self::for_class(context, &root.class);
-        let mut pending = vec![root];
-        while let Some(node) = pending.pop() {
-            for name in &node.nested {
-                let child = &nodes[name];
-                let parent_names = collector.inner_names[&node.class.qualified_name].clone();
-                let names = inherited_names(context, &child.class, parent_names);
-                collector
-                    .inner_names
-                    .insert(child.class.qualified_name.clone(), names);
-                pending.push(child);
-            }
+        let root_names = &collector.inner_names[&root.class.qualified_name];
+        let mut pending: Vec<_> = root
+            .nested
+            .iter()
+            .rev()
+            .map(|&child| (child, root_names.clone()))
+            .collect();
+        while let Some((id, inherited)) = pending.pop() {
+            let node = &nodes[id];
+            let names = inherited_names(context, &node.class, inherited);
+            pending.extend(
+                node.nested
+                    .iter()
+                    .rev()
+                    .map(|&child| (child, names.clone())),
+            );
+            collector
+                .inner_names
+                .insert(node.class.qualified_name.clone(), names);
         }
         collector
     }
@@ -111,7 +119,7 @@ impl ImportCollector {
         {
             member = node.simple_name.as_ref().map(ToString::to_string);
             while node.kind == ClassKind::Member {
-                let Some(parent) = node.parent.as_ref().and_then(|key| nodes.get(key)) else {
+                let Some(parent) = node.parent.map(|id| &nodes[id]) else {
                     break;
                 };
                 let Some(name) = &parent.simple_name else {
@@ -230,10 +238,15 @@ fn inherited_names(
 }
 
 pub fn short_name(cx: &mut Cx, full_name: &str, imported: bool) -> Option<String> {
+    let current = cx.current_class_node.as_deref().map(|name| {
+        cx.class_nodes
+            .get(name)
+            .map_or(name, |node| node.class.qualified_name.as_str())
+    });
     cx.imports.resolve(
         &cx.struct_context,
         &cx.class_nodes,
-        cx.current_class_node.as_deref(),
+        current,
         full_name,
         imported,
     )
