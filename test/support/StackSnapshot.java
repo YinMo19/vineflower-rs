@@ -11,7 +11,9 @@ import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.function.BiFunction;
+import java.util.stream.Collectors;
 
 import org.jetbrains.java.decompiler.code.CodeConstants;
 import org.jetbrains.java.decompiler.code.MethodProperties;
@@ -150,11 +152,15 @@ class StackSnapshot {
         if (scope.error() != null) {
           return "class-rejected=" + scope.error();
         }
-        String first = stage(firstGraph, scope.imports(), cl, method, tree, true);
+        var hidden = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_CLASS_WRAPPER).getHiddenMembers();
+        var initialHidden = Set.copyOf(hidden);
+        String first = stage(firstGraph, scope.imports(), cl, method, tree, initialHidden, true);
+        hidden.clear();
+        hidden.addAll(initialHidden);
         if ("rejected=parsing failure!".equals(first)) {
           return first;
         }
-        return first + "\t" + stage(settledGraph, scope.imports(), cl, method, tree, false);
+        return first + "\t" + stage(settledGraph, scope.imports(), cl, method, tree, initialHidden, false);
       } finally {
         method.releaseResources();
       }
@@ -222,7 +228,7 @@ class StackSnapshot {
   }
 
   private static String stage(ControlFlowGraph graph, ImportCollector imports, StructClass cl, StructMethod method,
-                              BiFunction<RootStatement, CounterContainer, String> tree, boolean first) {
+                              BiFunction<RootStatement, CounterContainer, String> tree, Set<String> initialHidden, boolean first) {
     DecompilerContext.startClass(new ImportCollector(imports));
     var descriptor = MethodDescriptor.parseDescriptor(method, null);
     var vars = new VarProcessor(method, descriptor);
@@ -254,7 +260,12 @@ class StackSnapshot {
       } else {
         StackVarsProcessor.simplifyStackVars(root, method, cl);
       }
-      return tree.apply(root, counters) + "\t" + ExpressionSnapshot.snapshot(root, counters);
+      var hidden = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_CLASS_WRAPPER).getHiddenMembers();
+      String allMembers = hidden.stream().sorted().map(ExpressionSnapshot::text).collect(Collectors.joining(","));
+      String added = hidden.stream().filter(member -> !initialHidden.contains(member)).sorted()
+        .map(ExpressionSnapshot::text).collect(Collectors.joining(","));
+      return tree.apply(root, counters) + ";hidden=" + allMembers + ";hidden-added=" + added
+        + "\t" + ExpressionSnapshot.snapshot(root, counters);
     } catch (RuntimeException | AssertionError | StackOverflowError error) {
       if (error.getClass() == RuntimeException.class && "parsing failure!".equals(error.getMessage())) {
         return "rejected=parsing failure!";

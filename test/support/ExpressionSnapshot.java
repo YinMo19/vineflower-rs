@@ -59,6 +59,7 @@ class ExpressionSnapshot {
       if (statement instanceof IfStatement branch) {
         fields.add("head" + statement.id + "=" + expressions(branch.getHeadexprentList()));
         fields.add("pattern" + statement.id + "=" + branch.isPatternMatched());
+        fields.add("ppmm" + statement.id + "=" + branch.hasPPMM());
       } else if (statement instanceof SwitchStatement branch) {
         fields.add("head" + statement.id + "=" + expressions(branch.getHeadexprentList()));
         boolean linked = branch.getHeadexprent() instanceof SwitchHeadExprent head
@@ -247,7 +248,7 @@ class ExpressionSnapshot {
   }
 
   // Escape UTF-16 units directly so the protocol preserves even isolated surrogates.
-  private static String text(String text) {
+  static String text(String text) {
     if (text == null) {
       return "~";
     }

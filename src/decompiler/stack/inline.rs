@@ -411,13 +411,8 @@ impl Inliner<'_> {
             return;
         }
         let ir = &mut self.cx.ir;
-        let mut visited = FxHashSet::default();
-        let mut pending = VecDeque::from([graph.first]);
-        while let Some(id) = pending.pop_front() {
+        for id in graph.regular_breadth_first() {
             let node = &graph[id];
-            if !visited.insert(&node.id) {
-                continue;
-            }
             for index in 0..ir[node.exprents].len() {
                 let expr = ir[node.exprents][index];
                 for child in Expr::all_exprents(ir, expr, true, true) {
@@ -429,7 +424,6 @@ impl Inliner<'_> {
                     }
                 }
             }
-            pending.extend(node.successors(DirectEdgeType::Regular));
         }
     }
 

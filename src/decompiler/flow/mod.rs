@@ -10,6 +10,7 @@ use crate::decompiler::stats::StatementKind;
 use arcstr::ArcStr;
 use index_vec::{IndexVec, define_index_type};
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::VecDeque;
 use std::ops::Index;
 
 define_index_type! { pub struct DirectId = u32; }
@@ -90,6 +91,25 @@ pub struct DirectGraph {
 impl DirectGraph {
     pub fn direct_node(&self, stat: StatId) -> Option<DirectId> {
         self.destinations.get(&stat).copied()
+    }
+
+    /// The node order of `DirectGraph.iterateExprents`. The ordered regular
+    /// edges determine which equal direct node is reached first.
+    pub fn regular_breadth_first(&self) -> impl Iterator<Item = DirectId> + '_ {
+        let mut seen = FxHashSet::default();
+        seen.insert(&self[self.first].id);
+        let mut pending = VecDeque::from([self.first]);
+        std::iter::from_fn(move || {
+            let node = pending.pop_front()?;
+            pending.extend(
+                self[node]
+                    .successors(DirectEdgeType::Regular)
+                    .iter()
+                    .copied()
+                    .filter(|&id| seen.insert(&self[id].id)),
+            );
+            Some(node)
+        })
     }
 }
 

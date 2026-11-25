@@ -7,10 +7,11 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use itertools::Itertools;
 use rustc_hash::FxHashSet;
 use vineflower_rs::decompiler::sforms::split_ssa;
 use vineflower_rs::decompiler::stack::simplify_statement;
-use vineflower_rs::engine::class_nodes::load_classes;
+use vineflower_rs::engine::class_nodes::{ClassNodeId, load_classes};
 use vineflower_rs::engine::class_processor::prepare_class;
 use vineflower_rs::engine::import_collector::ImportCollector;
 use vineflower_rs::engine::method_processor::{InitialMethod, initial_statement_graph};
@@ -123,6 +124,7 @@ pub fn check(corpus: &Corpus) {
     ];
     let mut errors = Vec::new();
     let mut rejected = 0;
+    let mut hidden_changes = [0, 0];
     for (index, method) in methods.iter().enumerate() {
         let row = java_rows
             .next()
@@ -138,6 +140,16 @@ pub fn check(corpus: &Corpus) {
             rejected += 1;
         } else if let Err(diff) = compare_snapshots(java, &rust, &stages) {
             errors.push(format!("{method}\n  {diff}"));
+        } else {
+            for (tree, changes) in rust.split('\t').step_by(2).zip(&mut hidden_changes) {
+                if tree.split(';').any(|field| {
+                    field
+                        .strip_prefix("hidden-added=")
+                        .is_some_and(|added| !added.is_empty())
+                }) {
+                    *changes += 1;
+                }
+            }
         }
     }
     assert!(java_rows.next().is_none() && rust_rows.next().is_none());
@@ -158,6 +170,8 @@ pub fn check(corpus: &Corpus) {
         methods.len() - rejected,
         corpus.classes.len()
     );
+    let [first, settled] = hidden_changes;
+    eprintln!("{first} first simplifications and {settled} settled runs added hidden members");
 }
 
 fn write_group(
@@ -227,7 +241,7 @@ fn write_group(
             write_cfg(input, &cx.ir, &initial.flow.graph).unwrap();
 
             let snapshot = match imports {
-                Ok(imports) => describe(&mut cx, &class, method, initial, imports),
+                Ok(imports) => describe(&mut cx, id, &class, method, initial, imports),
                 Err(error) => format!("class-rejected={}", one_line(error)),
             };
             writeln!(snapshots, "{snapshot}").unwrap();
@@ -243,13 +257,18 @@ fn write_group(
 
 fn describe(
     cx: &mut Cx,
+    owner: ClassNodeId,
     class: &StructClass,
     method: &Arc<StructMethod>,
     initial: InitialMethod,
     imports: &ImportCollector,
 ) -> String {
+    let initial_hidden = cx.class_nodes[owner].hidden_members.clone();
     cx.imports = imports.clone();
-    let first = stage(cx, class, initial, true);
+    let first = stage(cx, owner, class, initial, &initial_hidden, true);
+    cx.class_nodes[owner]
+        .hidden_members
+        .clone_from(&initial_hidden);
     if first == "rejected=parsing failure!" {
         return first;
     }
@@ -257,11 +276,18 @@ fn describe(
     cx.ir = Default::default();
     cx.imports = imports.clone();
     let initial = initial_statement_graph(cx, class, method).unwrap().unwrap();
-    let settled = stage(cx, class, initial, false);
+    let settled = stage(cx, owner, class, initial, &initial_hidden, false);
     format!("{first}\t{settled}")
 }
 
-fn stage(cx: &mut Cx, class: &StructClass, initial: InitialMethod, first: bool) -> String {
+fn stage(
+    cx: &mut Cx,
+    owner: ClassNodeId,
+    class: &StructClass,
+    initial: InitialMethod,
+    initial_hidden: &FxHashSet<String>,
+    first: bool,
+) -> String {
     let result = catch_unwind(AssertUnwindSafe(|| {
         let structured = initial.structure(cx)?;
         let mut method = structured
@@ -284,8 +310,13 @@ fn stage(cx: &mut Cx, class: &StructClass, initial: InitialMethod, first: bool) 
             method.simplify_stack_vars(cx, class);
         }
         let tree = structure_snapshot(cx, method.root, &method.flow.counters);
+        let hidden = &cx.class_nodes[owner].hidden_members;
+        let all_members = hidden_members(hidden.iter());
+        let added = hidden_members(hidden.difference(initial_hidden));
         let expressions = expression_snapshot::snapshot(cx, method.root, &method.flow.counters);
-        Ok::<_, io::Error>(format!("{tree}\t{expressions}"))
+        Ok::<_, io::Error>(format!(
+            "{tree};hidden={all_members};hidden-added={added}\t{expressions}"
+        ))
     }));
     match result {
         Ok(Ok(snapshot)) => snapshot,
@@ -298,4 +329,11 @@ fn stage(cx: &mut Cx, class: &StructClass, initial: InitialMethod, first: bool) 
         Ok(Err(error)) => format!("stack-error={}", one_line(&error.to_string())),
         Err(error) => format!("stack-panic={}", panic_text(&*error)),
     }
+}
+
+fn hidden_members<'a>(members: impl Iterator<Item = &'a String>) -> String {
+    members
+        .sorted_unstable_by(|left, right| left.encode_utf16().cmp(right.encode_utf16()))
+        .map(|member| expression_snapshot::text(Some(member)))
+        .join(",")
 }

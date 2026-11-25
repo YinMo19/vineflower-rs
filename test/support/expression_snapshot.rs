@@ -40,6 +40,7 @@ pub fn snapshot(cx: &Cx, root: StatId, counters: &CounterContainer) -> String {
             StatementKind::If(branch) => {
                 fields.push(format!("head{id}={}", snapshot.list(branch.head_exprents)));
                 fields.push(format!("pattern{id}={}", branch.pattern_matched));
+                fields.push(format!("ppmm{id}={}", branch.has_ppmm));
             }
             StatementKind::Switch(branch) => {
                 fields.push(format!("head{id}={}", snapshot.list(branch.head_exprents)));
@@ -458,7 +459,7 @@ fn constant_value(value: &ConstantValue) -> String {
     }
 }
 
-fn text(value: Option<&str>) -> String {
+pub(super) fn text(value: Option<&str>) -> String {
     value.map_or_else(|| "~".into(), |value| utf16(value.encode_utf16()))
 }
 
