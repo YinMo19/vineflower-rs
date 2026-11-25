@@ -1,7 +1,9 @@
 // Copyright 2000-2020 JetBrains s.r.o. and the Vineflower contributors.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The statement rewrites at the end of `DomHelper.parseGraph`.
+//! Statement rewrites after parsing and after finally recovery.
+
+use std::collections::VecDeque;
 
 use indexmap::IndexSet;
 use rustc_hash::FxHashSet;
@@ -18,6 +20,21 @@ pub fn finish(cx: &mut Cx, counters: &mut CounterContainer, root: StatId) {
     condense_sequences(cx, counters, root);
     root.build_monitor_flags(&mut cx.ir);
     build_synchronized(&mut cx.ir, counters, root);
+}
+
+/// Prepare the final statement tree for expression lifting once finally
+/// processing has finished rebuilding it.
+pub fn prepare_expressions(cx: &mut Cx, counters: &mut CounterContainer, root: StatId) {
+    build_synchronized(&mut cx.ir, counters, root);
+    remove_synchronized_handlers(&mut cx.ir, root);
+    root.build_content_flags(&mut cx.ir);
+    condense_sequences(cx, counters, root);
+
+    let mut pending = VecDeque::from([root]);
+    while let Some(stat) = pending.pop_front() {
+        cx.ir[stat].clear_temp_information();
+        pending.extend(cx.ir[stat].stats.iter().copied());
+    }
 }
 
 fn low_continue_labels(ir: &mut Ir, stat: StatId, edges: &mut IndexSet<EdgeId>) {
@@ -41,7 +58,7 @@ fn low_continue_labels(ir: &mut Ir, stat: StatId, edges: &mut IndexSet<EdgeId>) 
     }
 }
 
-fn condense_sequences(cx: &mut Cx, counters: &mut CounterContainer, mut stat: StatId) {
+pub(crate) fn condense_sequences(cx: &mut Cx, counters: &mut CounterContainer, mut stat: StatId) {
     let ir = &mut cx.ir;
     if matches!(ir[stat].kind, StatementKind::Sequence) {
         let mut children = ir[stat].stats.to_vec();
@@ -307,6 +324,18 @@ fn destroy_statement_content(ir: &mut Ir, stat: StatId, remove_self: bool) {
         for edge in stat.get_predecessor_edges(ir, STATEDGE_ALL) {
             edge.remove(ir);
         }
+    }
+}
+
+fn remove_synchronized_handlers(ir: &mut Ir, stat: StatId) {
+    for index in 0..ir[stat].stats.len() {
+        remove_synchronized_handlers(ir, ir[stat].stats[index]);
+    }
+    if matches!(ir[stat].kind, StatementKind::Synchronized { .. }) {
+        let handler = ir[stat].stats[2];
+        destroy_statement_content(ir, handler, true);
+        let handler_id = ir[handler].id;
+        ir[stat].stats.remove_with_key(&handler_id);
     }
 }
 

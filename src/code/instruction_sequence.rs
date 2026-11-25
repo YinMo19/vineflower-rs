@@ -60,6 +60,13 @@ impl InstructionSequence {
         self.instructions.remove(index as usize);
     }
 
+    /// Move the suffix to another block, preserving the identity of its instructions.
+    pub(crate) fn split_off(&mut self, index: usize) -> Self {
+        Self {
+            instructions: self.instructions.split_off(index),
+        }
+    }
+
     /// Visits instructions in execution order, retaining those selected by the pass.
     pub(crate) fn retain(&mut self, mut keep: impl FnMut(&Instruction) -> bool) {
         self.instructions.retain(|instruction| keep(instruction));

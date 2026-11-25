@@ -1,7 +1,7 @@
 // Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors.
 // SPDX-License-Identifier: Apache-2.0
 
-//! CFG and statement decomposition stages of `MethodProcessor.codeToJava`.
+//! Method stages of `MethodProcessor.codeToJava` through expression lifting.
 //!
 //! The language-independent stages end immediately before upstream dispatches
 //! to a language's CFG passes. Java then prepares exception regions for
@@ -10,17 +10,19 @@
 use std::io;
 use std::sync::Arc;
 
+use indexmap::IndexSet;
+
 use crate::code::{
     cfg::ControlFlowGraph, dead_code_helper as dead, exception_deobfuscator as exceptions,
 };
 use crate::decompiler::decompose::{
     dom_helper::{graph_to_statement, process_statement},
-    finish::finish as finish_statement_graph,
+    finish::{condense_sequences, finish, prepare_expressions},
 };
 use crate::decompiler::{
     expr_processor,
+    finally::FinallyProcessor,
     ir::{Ir, StatId},
-    stats::StatementKind,
 };
 use crate::engine::{
     Cx, Options,
@@ -129,14 +131,16 @@ pub fn initial_statement_graph(
     };
     let common = decoded.prepare_control_flow(&mut cx.ir, &cx.options);
     let mut flow = common.prepare_java_graph(&mut cx.ir, &cx.options);
-    let root = graph_to_statement(
-        &mut cx.ir,
-        &mut flow.counters,
-        &flow.graph,
-        Arc::clone(method),
-    );
-    cx.ir[root].add_graph_comments(&flow.graph);
+    let root = flow.statement_root(&mut cx.ir, Arc::clone(method));
     Ok(Some(InitialMethod { flow, root }))
+}
+
+impl MethodGraph {
+    fn statement_root(&mut self, ir: &mut Ir, method: Arc<StructMethod>) -> StatId {
+        let root = graph_to_statement(ir, &mut self.counters, &self.graph, method);
+        ir[root].add_graph_comments(&self.graph);
+        root
+    }
 }
 
 /// A Java method after the structure recognition and cleanup in DomHelper.parseGraph.
@@ -144,46 +148,71 @@ pub fn initial_statement_graph(
 pub struct StructuredMethod {
     pub flow: MethodGraph,
     pub root: StatId,
+    descriptor: Arc<MethodDescriptor>,
 }
 
 impl StructuredMethod {
+    /// Rebuilds the tree from the rewritten CFG. Counters continue across parses.
+    pub fn reparse(&mut self, cx: &mut Cx) -> io::Result<()> {
+        let method = Arc::clone(self.root.method(&cx.ir));
+        let root = self.flow.statement_root(&mut cx.ir, method);
+        structure_root(cx, &mut self.flow.counters, root)?;
+        root.add_comments_from(&mut cx.ir, self.root);
+        self.root = root;
+        Ok(())
+    }
+
+    pub fn recover_finally(
+        mut self,
+        cx: &mut Cx,
+        class: &StructClass,
+    ) -> io::Result<RecoveredMethod> {
+        let mut processor = FinallyProcessor::default();
+        while processor.iterate_graph(cx, class, &mut self)? {
+            self.reparse(cx)?;
+        }
+        Ok(RecoveredMethod {
+            structured: self,
+            synthetic_semaphores: processor.synthetic_semaphores,
+        })
+    }
+
     /// Runs the expression pass on the current statement tree. Finally analysis
     /// calls this before assigning versions, and may later rebuild the tree.
     pub fn process_expressions(&mut self, cx: &mut Cx, class: &StructClass) -> io::Result<()> {
-        let StatementKind::Root { method, .. } = &cx.ir[self.root].kind else {
-            unreachable!("StructuredMethod owns a root statement")
-        };
-        let method = Arc::clone(method);
-        let mut descriptor = MethodDescriptor::parse_descriptor(&method.descriptor);
-        if let Some(signature) = method.shared_signature() {
-            descriptor.add_generic_descriptor(Arc::clone(signature));
-        }
+        let method = Arc::clone(self.root.method(&cx.ir));
         expr_processor::process_statement(
             cx,
             &mut self.flow.counters,
             self.root,
             class,
             &method,
-            &Arc::new(descriptor),
+            &self.descriptor,
         )
     }
 }
 
+fn structure_root(cx: &mut Cx, counters: &mut CounterContainer, root: StatId) -> io::Result<()> {
+    if !process_statement(&mut cx.ir, counters, root, cx.options.try_loop_fix) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "parsing failure!",
+        ));
+    }
+    finish(cx, counters, root);
+    Ok(())
+}
+
 impl InitialMethod {
     pub fn structure(mut self, cx: &mut Cx) -> io::Result<StructuredMethod> {
-        if !process_statement(
-            &mut cx.ir,
-            &mut self.flow.counters,
-            self.root,
-            cx.options.try_loop_fix,
-        ) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "parsing failure!",
-            ));
+        structure_root(cx, &mut self.flow.counters, self.root)?;
+        let method = self.root.method(&cx.ir);
+        let mut descriptor = MethodDescriptor::parse_descriptor(&method.descriptor);
+        if let Some(signature) = method.shared_signature() {
+            descriptor.add_generic_descriptor(Arc::clone(signature));
         }
-        finish_statement_graph(cx, &mut self.flow.counters, self.root);
         Ok(StructuredMethod {
+            descriptor: Arc::new(descriptor),
             flow: self.flow,
             root: self.root,
         })
@@ -198,4 +227,52 @@ pub fn structured_statement_graph(
     initial_statement_graph(cx, class, method)?
         .map(|method| method.structure(cx))
         .transpose()
+}
+
+/// The stable tree after finally recovery and the synthetic locals introduced by it.
+pub struct RecoveredMethod {
+    pub structured: StructuredMethod,
+    pub synthetic_semaphores: IndexSet<i32>,
+}
+
+/// Method state passed on to stack simplification after the final expression lift.
+pub struct ExpressionMethod {
+    pub flow: MethodGraph,
+    pub root: StatId,
+    pub descriptor: Arc<MethodDescriptor>,
+    pub synthetic_semaphores: IndexSet<i32>,
+}
+
+impl RecoveredMethod {
+    /// Removing the synchronized handlers consumes the recovered statement tree.
+    pub fn into_expressions(
+        mut self,
+        cx: &mut Cx,
+        class: &StructClass,
+    ) -> io::Result<ExpressionMethod> {
+        let method = &mut self.structured;
+        prepare_expressions(cx, &mut method.flow.counters, method.root);
+        method.process_expressions(cx, class)?;
+        condense_sequences(cx, &mut method.flow.counters, method.root);
+        Ok(ExpressionMethod {
+            flow: self.structured.flow,
+            root: self.structured.root,
+            descriptor: self.structured.descriptor,
+            synthetic_semaphores: self.synthetic_semaphores,
+        })
+    }
+}
+
+pub fn expression_method(
+    cx: &mut Cx,
+    class: &StructClass,
+    method: &Arc<StructMethod>,
+) -> io::Result<Option<ExpressionMethod>> {
+    let Some(structured) = structured_statement_graph(cx, class, method)? else {
+        return Ok(None);
+    };
+    structured
+        .recover_finally(cx, class)?
+        .into_expressions(cx, class)
+        .map(Some)
 }

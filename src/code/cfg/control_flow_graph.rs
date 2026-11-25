@@ -255,6 +255,16 @@ impl ControlFlowGraph {
     }
 
     pub fn remove_block(&mut self, ir: &mut Ir, block: BlockId) {
+        self.remove_block_tracking_ranges(ir, block, |_| {});
+    }
+
+    /// Reports removed ranges in increasing order of their pre-removal positions.
+    pub(crate) fn remove_block_tracking_ranges(
+        &mut self,
+        ir: &mut Ir,
+        block: BlockId,
+        mut range_removed: impl FnMut(usize),
+    ) {
         while let Some(&succ) = ir[block].succs.last() {
             block.remove_successor(ir, succ);
         }
@@ -269,18 +279,26 @@ impl ControlFlowGraph {
         }
         self.last.remove_predecessor(ir, block);
         self.blocks.remove_with_key(&ir[block].id);
+        let mut index = 0;
         self.exceptions.retain_mut(|range| {
-            if range.handler == block {
-                return false;
+            let position = index;
+            index += 1;
+            let keep = if range.handler == block {
+                false
+            } else {
+                if let Some(i) = range
+                    .protected_range
+                    .iter()
+                    .position(|&member| member == block)
+                {
+                    range.protected_range.remove(i);
+                }
+                !range.protected_range.is_empty()
+            };
+            if !keep {
+                range_removed(position);
             }
-            if let Some(i) = range
-                .protected_range
-                .iter()
-                .position(|&member| member == block)
-            {
-                range.protected_range.remove(i);
-            }
-            !range.protected_range.is_empty()
+            keep
         });
         self.subroutines
             .retain(|&entry, exit| entry != block && *exit != block);
@@ -292,9 +310,8 @@ impl ControlFlowGraph {
         handler: BlockId,
         block: BlockId,
     ) -> Option<&ExceptionRangeCFG> {
-        self.exceptions
-            .iter()
-            .rfind(|range| range.protects(handler, block))
+        let index = self.get_exception_range_index(handler, block)?;
+        Some(&self.exceptions[index])
     }
 
     pub fn get_exception_range_mut(
@@ -302,9 +319,18 @@ impl ControlFlowGraph {
         handler: BlockId,
         block: BlockId,
     ) -> Option<&mut ExceptionRangeCFG> {
+        let index = self.get_exception_range_index(handler, block)?;
+        Some(&mut self.exceptions[index])
+    }
+
+    pub(crate) fn get_exception_range_index(
+        &self,
+        handler: BlockId,
+        block: BlockId,
+    ) -> Option<usize> {
         self.exceptions
-            .iter_mut()
-            .rfind(|range| range.protects(handler, block))
+            .iter()
+            .rposition(|range| range.protects(handler, block))
     }
 
     pub fn get_reverse_post_order(&self, ir: &Ir) -> Vec<BlockId> {

@@ -73,8 +73,16 @@ pub enum StatementKind {
         dummy_exit: StatId,
         comment_lines: Option<IndexSet<String>>,
         add_error_comment: bool,
+        content_flags: ContentFlags,
     },
     DummyExit,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ContentFlags {
+    pub has_try_catch: bool,
+    pub has_loops: bool,
+    pub has_switch: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -229,6 +237,7 @@ impl Statement {
                 dummy_exit,
                 comment_lines: None,
                 add_error_comment: false,
+                content_flags: ContentFlags::default(),
             },
             id,
         );
@@ -319,24 +328,102 @@ impl Statement {
 
     /// The comments transferred at the start of `DomHelper.parseGraph`.
     pub fn add_graph_comments(&mut self, graph: &ControlFlowGraph) {
+        self.add_comments(graph.comment_lines.iter().cloned(), graph.add_error_comment);
+    }
+
+    pub fn add_comment(&mut self, text: &str, error: bool) {
+        self.add_comments([text.to_owned()], error);
+    }
+
+    fn add_comments(&mut self, comments: impl IntoIterator<Item = String>, error: bool) {
         let StatementKind::Root {
             comment_lines,
             add_error_comment,
             ..
         } = &mut self.kind
         else {
-            panic!("Only root statements carry graph comments");
+            panic!("Only root statements carry comments");
         };
-        if !graph.comment_lines.is_empty() {
+        for comment in comments {
             comment_lines
                 .get_or_insert_with(IndexSet::new)
-                .extend(graph.comment_lines.iter().cloned());
+                .insert(comment);
         }
-        *add_error_comment |= graph.add_error_comment;
+        *add_error_comment |= error;
+    }
+
+    pub(crate) fn clear_temp_information(&mut self) {
+        self.post = None;
+        self.continue_set = IndexSet::new();
+        self.copied = false;
+        self.is_monitor_enter = false;
+        self.contains_monitor_exit = false;
+
+        // Copy the direct view into the all-edge view. These are index changes;
+        // the edge objects and the statement's remaining metadata stay live.
+        for index in [&mut self.successor_edges, &mut self.predecessor_edges] {
+            index.remove(&EdgeType::Exception.mask());
+            if let Some(direct) = index.get(&STATEDGE_DIRECT_ALL).cloned() {
+                index.insert(STATEDGE_ALL, direct);
+            } else {
+                index.remove(&STATEDGE_ALL);
+            }
+        }
     }
 }
 
 impl StatId {
+    pub fn method(self, ir: &Ir) -> &Arc<StructMethod> {
+        let StatementKind::Root { method, .. } = &ir[self].kind else {
+            unreachable!("Only the root owns the method")
+        };
+        method
+    }
+
+    /// Append the previous root's comments when finally processing reparses the CFG.
+    pub fn add_comments_from(self, ir: &mut Ir, previous: StatId) {
+        let StatementKind::Root {
+            comment_lines,
+            add_error_comment,
+            ..
+        } = &ir[previous].kind
+        else {
+            panic!("Comments must come from a root statement");
+        };
+        let previous_comments = comment_lines.clone();
+        let previous_error = *add_error_comment;
+        ir[self].add_comments(previous_comments.into_iter().flatten(), previous_error);
+    }
+
+    pub fn build_content_flags(self, ir: &mut Ir) {
+        let StatementKind::Root {
+            mut content_flags, ..
+        } = ir[self].kind
+        else {
+            panic!("Only root statements carry content flags");
+        };
+        let mut pending = vec![self];
+        while let Some(stat) = pending.pop() {
+            match ir[stat].kind {
+                StatementKind::Catch { .. } | StatementKind::CatchAll { .. } => {
+                    content_flags.has_try_catch = true;
+                }
+                StatementKind::Do => content_flags.has_loops = true,
+                StatementKind::Switch(_) => content_flags.has_switch = true,
+                _ => {}
+            }
+            pending.extend(ir[stat].stats.iter().copied());
+        }
+        let StatementKind::Root {
+            content_flags: flags,
+            ..
+        } = &mut ir[self].kind
+        else {
+            unreachable!();
+        };
+        *flags = content_flags;
+    }
+
     pub fn is_placeholder(self, ir: &Ir) -> bool {
         matches!(ir[self].kind, StatementKind::General { placeholder: true })
     }

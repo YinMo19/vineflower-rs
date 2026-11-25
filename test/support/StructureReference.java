@@ -3,12 +3,12 @@
 import java.io.BufferedInputStream;
 import java.io.DataInputStream;
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
@@ -49,12 +49,14 @@ import org.jetbrains.java.decompiler.struct.gen.MethodDescriptor;
 import org.jetbrains.java.decompiler.util.DataInputFullStream;
 
 class StructureReference {
-  private record Options(boolean forceJsr, boolean useLvtNames, boolean complexCondy) { }
+  private static final Field SUBROUTINES = subroutinesField();
+
+  private record Options(boolean forceJsr, boolean useLvtNames, boolean complexCondy, boolean decompileFinally) { }
 
   public static void main(String[] args) throws IOException {
     new Fernflower(null, Map.of(IFernflowerPreferences.INCLUDE_JAVA_RUNTIME, "0"), IFernflowerLogger.NO_OP);
     try (var input = new DataInputStream(new BufferedInputStream(Files.newInputStream(Path.of(args[0]))))) {
-      boolean checkSsa = input.readBoolean();
+      int phase = input.readUnsignedByte();
       Path previousPath = null;
       Options previousOptions = null;
       StructClass currentClass = null;
@@ -62,11 +64,12 @@ class StructureReference {
         Path classPath = Path.of(readText(input));
         String name = readText(input);
         String descriptor = readText(input);
-        Options options = new Options(input.readBoolean(), input.readBoolean(), input.readBoolean());
+        Options options = new Options(input.readBoolean(), input.readBoolean(), input.readBoolean(), input.readBoolean());
         if (!classPath.equals(previousPath) || !options.equals(previousOptions)) {
           DecompilerContext.setProperty(IFernflowerPreferences.FORCE_JSR_INLINE, flag(options.forceJsr()));
           DecompilerContext.setProperty(IFernflowerPreferences.USE_DEBUG_VAR_NAMES, flag(options.useLvtNames()));
           DecompilerContext.setProperty(IFernflowerPreferences.DECOMPILE_COMPLEX_CONDYS, flag(options.complexCondy()));
+          DecompilerContext.setProperty(IFernflowerPreferences.FINALLY_DEINLINE, flag(options.decompileFinally()));
           currentClass = StructClass.create(new DataInputFullStream(Files.readAllBytes(classPath)), true);
           DecompilerContext.setProperty(DecompilerContext.CURRENT_CLASS, currentClass);
           DecompilerContext.startClass(new ImportCollector(new ClassNode(ClassNode.Type.ROOT, currentClass)));
@@ -86,8 +89,14 @@ class StructureReference {
           String snapshot;
           try {
             RootStatement root = DomHelper.parseGraph(graph, method, 0);
-            snapshot = checkSsa ? "" : snapshot(root, counters) + "\t" + directSnapshot(root) + "\t";
-            snapshot += lift(root, currentClass, method, methodDescriptor, varProcessor, counters, checkSsa);
+            snapshot = switch (phase) {
+              case 0 -> snapshot(root, counters) + "\t" + directSnapshot(root) + "\t"
+                + lift(root, currentClass, method, methodDescriptor, varProcessor, counters, false);
+              case 1 -> lift(root, currentClass, method, methodDescriptor, varProcessor, counters, true);
+              case 2 -> FinallySnapshot.run(graph, root, currentClass, method, methodDescriptor,
+                varProcessor, counters, tree -> snapshot(tree, counters));
+              default -> throw new IllegalArgumentException("unknown parity phase " + phase);
+            };
           } catch (RuntimeException | AssertionError | StackOverflowError failure) {
             if (failure.getClass() == RuntimeException.class && "parsing failure!".equals(failure.getMessage())) {
               snapshot = "rejected=parsing failure!";
@@ -129,7 +138,7 @@ class StructureReference {
     return "error=" + failure.toString().replace('\t', ' ').replace('\n', ' ').replace('\r', ' ');
   }
 
-  private record PendingBlock(BasicBlock block, int[] successors, int[] handlers) { }
+  private record PendingBlock(BasicBlock block, int[] successors, int[] handlers, int[] predecessors, int[] throwers) { }
 
   // Reuse the real method and decoded bytecode as context. Both implementations
   // receive the same prepared graph, including synthetic handler blocks and IDs.
@@ -148,6 +157,8 @@ class StructureReference {
       throw new IllegalStateException("mismatched dummy CFG exit: " + exit.id + " vs " + exitId);
     }
     graph.last_id = input.readInt();
+    int[] exitPredecessors = readInts(input);
+    int[] exitThrowers = readInts(input);
     graph.addErrorComment = input.readBoolean();
     List<String> comments = readTexts(input);
     if (!comments.isEmpty()) {
@@ -168,20 +179,26 @@ class StructureReference {
       for (int offset : readInts(input)) {
         block.getInstrOldOffsets().add(offset);
       }
-      pending.add(new PendingBlock(block, readInts(input), readInts(input)));
+      pending.add(new PendingBlock(block, readInts(input), readInts(input), readInts(input), readInts(input)));
       int length = input.readInt();
       for (int j = 0; j < length; j++) {
         int identity = input.readInt();
         if (identity == instructions.size()) {
-          int opcode = input.readInt();
-          boolean wide = input.readBoolean();
-          int group = input.readInt();
-          int offset = input.readInt();
-          int size = input.readInt();
-          int[] operands = readInts(input);
-          Instruction instruction = Instruction.create(
-            opcode, wide, group, method.getBytecodeVersion(), operands, offset, size);
-          instruction.initInstruction(sequence);
+          int original = input.readInt();
+          Instruction instruction;
+          if (original >= 0) {
+            instruction = sequence.getInstr(original);
+          } else {
+            int opcode = input.readInt();
+            boolean wide = input.readBoolean();
+            int group = input.readInt();
+            int offset = input.readInt();
+            int size = input.readInt();
+            int[] operands = readInts(input);
+            instruction = Instruction.create(
+              opcode, wide, group, method.getBytecodeVersion(), operands, offset, size);
+            instruction.initInstruction(sequence);
+          }
           instructions.add(instruction);
         }
         block.getSeq().addInstruction(instructions.get(identity));
@@ -190,25 +207,59 @@ class StructureReference {
 
     graph.setFirst(blocks.get(firstId));
     for (PendingBlock entry : pending) {
-      for (int successor : entry.successors()) {
-        entry.block().addSuccessor(blocks.get(successor));
-      }
-      for (int handler : entry.handlers()) {
-        entry.block().addSuccessorException(blocks.get(handler));
-      }
+      addBlocks(entry.block().getSuccs(), entry.successors(), blocks);
+      addBlocks(entry.block().getSuccExceptions(), entry.handlers(), blocks);
+      addBlocks(entry.block().getPreds(), entry.predecessors(), blocks);
+      addBlocks(entry.block().getPredExceptions(), entry.throwers(), blocks);
     }
+    exit.getPredExceptions().clear();
+    addBlocks(exit.getPreds(), exitPredecessors, blocks);
+    addBlocks(exit.getPredExceptions(), exitThrowers, blocks);
 
     int rangeCount = input.readInt();
     for (int i = 0; i < rangeCount; i++) {
       BasicBlock handler = blocks.get(input.readInt());
-      List<BasicBlock> protectedBlocks = Arrays.stream(readInts(input)).mapToObj(blocks::get).toList();
+      List<BasicBlock> protectedBlocks = new ArrayList<>();
+      addBlocks(protectedBlocks, readInts(input), blocks);
       List<String> types = input.readBoolean() ? readTexts(input) : null;
       graph.getExceptions().add(new ExceptionRangeCFG(protectedBlocks, handler, types));
     }
     for (int finallyExit : readInts(input)) {
       graph.getFinallyExits().add(blocks.get(finallyExit));
     }
+    Map<BasicBlock, BasicBlock> subroutines = subroutines(graph);
+    subroutines.clear();
+    int count = input.readInt();
+    for (int i = 0; i < count; i++) {
+      subroutines.put(Objects.requireNonNull(blocks.get(input.readInt())),
+        Objects.requireNonNull(blocks.get(input.readInt())));
+    }
     return graph;
+  }
+
+  private static void addBlocks(List<BasicBlock> dest, int[] ids, Map<Integer, BasicBlock> blocks) {
+    for (int id : ids) {
+      dest.add(Objects.requireNonNull(blocks.get(id)));
+    }
+  }
+
+  private static Field subroutinesField() {
+    try {
+      Field field = ControlFlowGraph.class.getDeclaredField("subroutines");
+      field.setAccessible(true);
+      return field;
+    } catch (ReflectiveOperationException failure) {
+      throw new AssertionError(failure);
+    }
+  }
+
+  @SuppressWarnings("unchecked")
+  static Map<BasicBlock, BasicBlock> subroutines(ControlFlowGraph graph) {
+    try {
+      return (Map<BasicBlock, BasicBlock>) SUBROUTINES.get(graph);
+    } catch (IllegalAccessException failure) {
+      throw new AssertionError(failure);
+    }
   }
 
   private static int[] readInts(DataInputStream input) throws IOException {

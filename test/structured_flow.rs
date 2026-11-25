@@ -15,11 +15,11 @@ use vineflower_rs::decompiler::ir::{EdgeId, ExprId, ExprKind, Ir, StatId};
 use vineflower_rs::decompiler::stats::stat_edge::EdgeType;
 use vineflower_rs::decompiler::stats::{LastBasicType, STATEDGE_ALL, StatementKind};
 use vineflower_rs::engine::counter_container::{
-    EXPRESSION_COUNTER, STATEMENT_COUNTER, VAR_COUNTER,
+    CounterContainer, EXPRESSION_COUNTER, STATEMENT_COUNTER, VAR_COUNTER,
 };
 use vineflower_rs::engine::import_collector::ImportCollector;
 use vineflower_rs::engine::method_processor::{
-    StructuredMethod, initial_statement_graph, structured_statement_graph,
+    initial_statement_graph, structured_statement_graph,
 };
 use vineflower_rs::engine::{Cx, Options};
 use vineflower_rs::structs::{StructClass, StructContext, consts::ConstantValue};
@@ -29,6 +29,8 @@ use vineflower_rs::util::data_input::DataInputFullStream;
 mod direct_graph_snapshot;
 #[path = "support/expression_snapshot.rs"]
 mod expression_snapshot;
+#[path = "support/finally_snapshot.rs"]
+mod finally_snapshot;
 #[path = "support/ssa_snapshot.rs"]
 mod ssa_snapshot;
 
@@ -152,39 +154,112 @@ fn structured_method_lifts_switch_expressions() {
 }
 
 #[test]
+fn expression_method_recovers_finally_around_a_synchronized_body() {
+    use vineflower_rs::engine::method_processor::expression_method;
+
+    let bytes = include_bytes!("upstream/testData/classes/custom/TestJava1Synchronized.class");
+    for deinline in [true, false] {
+        let mut options = Options::default();
+        options.decompile_finally = deinline;
+        let options = Arc::new(options);
+        let class = parse_class(bytes, &options).unwrap();
+        let mut cx = make_context(&options);
+        let method = class.get_method("test3", "()V").unwrap();
+        let result = expression_method(&mut cx, &class, method).unwrap().unwrap();
+        assert!(Arc::ptr_eq(result.root.method(&cx.ir), method));
+        assert_eq!(result.synthetic_semaphores.is_empty(), deinline);
+
+        let mut synchronized = false;
+        let mut finally = false;
+        let mut pending = vec![result.root];
+        while let Some(stat) = pending.pop() {
+            let statement = &cx.ir[stat];
+            match &statement.kind {
+                StatementKind::Synchronized { head_exprents, .. } => {
+                    synchronized = true;
+                    assert_eq!(statement.stats.len(), 2);
+                    assert!(head_exprents.is_some());
+                }
+                StatementKind::CatchAll {
+                    is_finally: true,
+                    monitor,
+                    ..
+                } => {
+                    finally = true;
+                    assert_eq!(monitor.is_none(), deinline);
+                }
+                _ => {}
+            }
+            pending.extend(statement.stats.iter().copied());
+        }
+        assert!(finally);
+        // With forced semaphores the inner monitor remains an explicit
+        // monitorenter plus a catch-all containing monitorexit.
+        assert_eq!(synchronized, deinline);
+    }
+}
+
+#[test]
 #[ignore = "requires the upstream +local.jar and JDK 17 or later"]
 fn structured_flow_matches_upstream() {
-    check_flow(false);
+    check_flow(Check::Structure);
 }
 
 #[test]
 #[ignore = "requires the upstream +local.jar and JDK 17 or later"]
 fn ssa_matches_upstream() {
-    check_flow(true);
+    check_flow(Check::Ssa);
 }
 
-fn check_flow(check_ssa: bool) {
+#[test]
+#[ignore = "requires the upstream +local.jar and JDK 17 or later"]
+fn finally_matches_upstream() {
+    check_flow(Check::Finally);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum Check {
+    Structure,
+    Ssa,
+    Finally,
+}
+
+fn check_flow(check: Check) {
     let corpus = upstream_reference::Corpus::discover();
     let paths = &corpus.classes;
     let mut transfer = tempfile::NamedTempFile::new().unwrap();
     let mut rust_snapshots = tempfile::tempfile().unwrap();
     let mut methods = Vec::new();
-    let mut profiles = vec![(false, true, false), (true, true, false)];
-    if !check_ssa {
-        profiles.extend([(false, false, false), (false, true, true)]);
-    }
+    let mut finally_coverage = finally_snapshot::Coverage::default();
+    let profiles: &[(bool, bool, bool, bool)] = match check {
+        Check::Structure => &[
+            (false, true, false, true),
+            (true, true, false, true),
+            (false, false, false, true),
+            (false, true, true, true),
+        ],
+        Check::Ssa => &[(false, true, false, true), (true, true, false, true)],
+        Check::Finally => &[(false, true, false, true), (false, true, false, false)],
+    };
     {
         let mut transfer = BufWriter::new(transfer.as_file_mut());
         let mut rust_snapshots = BufWriter::new(&mut rust_snapshots);
-        write_flag(&mut transfer, check_ssa).unwrap();
+        transfer.write_all(&[check as u8]).unwrap();
         for path in paths {
             let bytes = fs::read(path).unwrap();
-            for &(force_jsr_inline, use_lvt_names, decompile_complex_constant_dynamic) in &profiles
+            for &(
+                force_jsr_inline,
+                use_lvt_names,
+                decompile_complex_constant_dynamic,
+                decompile_finally,
+            ) in profiles
             {
                 let mut options = Options::default();
                 options.force_jsr_inline = force_jsr_inline;
                 options.use_lvt_names = use_lvt_names;
                 options.decompile_complex_constant_dynamic = decompile_complex_constant_dynamic;
+                options.decompile_finally = decompile_finally;
                 let options = Arc::new(options);
                 let class = parse_class(&bytes, &options).unwrap();
                 let mut cx = make_context(&options);
@@ -204,14 +279,25 @@ fn check_flow(check_ssa: bool) {
                     write_flag(&mut transfer, force_jsr_inline).unwrap();
                     write_flag(&mut transfer, use_lvt_names).unwrap();
                     write_flag(&mut transfer, decompile_complex_constant_dynamic).unwrap();
+                    write_flag(&mut transfer, decompile_finally).unwrap();
                     write_cfg(&mut transfer, &cx.ir, &initial.flow.graph).unwrap();
 
                     let result = catch_unwind(AssertUnwindSafe(|| initial.structure(&mut cx)));
                     let snapshot = match result {
+                        Ok(Ok(structured)) if check == Check::Finally => finally_snapshot::run(
+                            &mut cx,
+                            structured,
+                            &class,
+                            &mut finally_coverage,
+                        ),
                         Ok(Ok(mut structured)) => {
                             let mut snapshot = String::new();
-                            if !check_ssa {
-                                let statement = structure_snapshot(&cx.ir, &structured);
+                            if check == Check::Structure {
+                                let statement = structure_snapshot(
+                                    &cx.ir,
+                                    structured.root,
+                                    &structured.flow.counters,
+                                );
                                 let direct = catch_unwind(AssertUnwindSafe(|| {
                                     format!(
                                         "graph={}",
@@ -228,7 +314,7 @@ fn check_flow(check_ssa: bool) {
                                 structured.process_expressions(&mut cx, &class)
                             }));
                             let expressions = match lifted {
-                                Ok(Ok(())) if check_ssa => {
+                                Ok(Ok(())) if check == Check::Ssa => {
                                     ssa_snapshot::run(&mut cx.ir, &structured, method)
                                 }
                                 Ok(Ok(())) => catch_unwind(AssertUnwindSafe(|| {
@@ -263,7 +349,7 @@ fn check_flow(check_ssa: bool) {
                     writeln!(rust_snapshots, "{snapshot}").unwrap();
                     methods.push(format!(
                         "{} {method} force-jsr={force_jsr_inline} lvt={use_lvt_names} \
-                         complex-condy={decompile_complex_constant_dynamic}",
+                         complex-condy={decompile_complex_constant_dynamic} finally={decompile_finally}",
                         path.display()
                     ));
                 }
@@ -277,7 +363,12 @@ fn check_flow(check_ssa: bool) {
     let mut reference = tempfile::tempfile().unwrap();
     corpus.run_to(
         "StructureReference",
-        &["DirectGraphSnapshot", "ExpressionSnapshot", "SsaSnapshot"],
+        &[
+            "DirectGraphSnapshot",
+            "ExpressionSnapshot",
+            "SsaSnapshot",
+            "FinallySnapshot",
+        ],
         transfer.path(),
         &reference,
     );
@@ -285,23 +376,31 @@ fn check_flow(check_ssa: bool) {
     rust_snapshots.rewind().unwrap();
     let mut rust_rows = BufReader::new(rust_snapshots).lines();
     let mut java_rows = BufReader::new(reference).lines();
-    let stages: &[(&str, &str)] = if check_ssa {
-        &[
+    let stages: &[(&str, &str)] = match check {
+        Check::Ssa => &[
             ("SSA splitting", "split="),
             ("SSA reassignment", "reassigned="),
             ("SSA version reset", "reset="),
             ("SSAU splitting", "ssau="),
             ("SSAU version reset", "ssau-reset="),
-        ]
-    } else {
-        &[
+        ],
+        Check::Structure => &[
             ("Structure", "counters="),
             ("Direct graph", "graph="),
             ("Expression lifting", "counters="),
-        ]
+        ],
+        Check::Finally => &[
+            ("Transferred CFG", "input="),
+            ("Finally recovery CFG and semaphores", "recovered="),
+            ("Recovered statement tree", "counters="),
+            ("Post-finally statement tree", "counters="),
+            ("Post-finally expressions", "counters="),
+        ],
     };
     let mut mismatches = Vec::new();
     let mut rejected = 0;
+    let mut recovery_rejected = 0;
+    let mut predecessor_order_only = 0;
     for (index, method) in methods.iter().enumerate() {
         let row = java_rows.next().expect("missing Java result").unwrap();
         let (row_id, java) = row.split_once('\t').unwrap();
@@ -309,12 +408,20 @@ fn check_flow(check_ssa: bool) {
         assert_eq!(row_id.parse::<usize>().unwrap(), index);
         if java == "rejected=parsing failure!" && java == rust {
             rejected += 1;
-        } else if let Some(diff) = compare_snapshots(java, &rust, stages) {
-            mismatches.push(format!("{method}\n  {diff}"));
+        } else {
+            match compare_snapshots(java, &rust, stages) {
+                Ok(Comparison::Exact) => {}
+                Ok(Comparison::PredecessorOrderOnly) => predecessor_order_only += 1,
+                Ok(Comparison::RecoveryRejected) => recovery_rejected += 1,
+                Err(diff) => mismatches.push(format!("{method}\n  {diff}")),
+            }
         }
     }
     assert!(java_rows.next().is_none(), "unexpected extra Java results");
     assert!(rust_rows.next().is_none(), "unexpected extra Rust results");
+    if check == Check::Finally {
+        finally_coverage.report();
+    }
     assert!(
         mismatches.is_empty(),
         "{} of {} method snapshots differ:\n{}",
@@ -322,24 +429,56 @@ fn check_flow(check_ssa: bool) {
         methods.len(),
         mismatches.iter().take(30).join("\n")
     );
-    let checked = if check_ssa {
-        "SSA splits, reassignments, SSAU splits and version resets"
-    } else {
-        "statement trees, direct graphs and expression snapshots"
+    let checked = match check {
+        Check::Ssa => "SSA splits, reassignments, SSAU splits and version resets",
+        Check::Structure => "statement trees, direct graphs and expression snapshots",
+        Check::Finally => "finally CFG recoveries, statement trees and post-finally expressions",
     };
     eprintln!(
         "{} exact {checked}, and {rejected} matching decomposition rejections from {} class files",
-        methods.len() - rejected,
+        methods.len() - rejected - recovery_rejected - predecessor_order_only,
         paths.len()
     );
+    if check == Check::Finally {
+        eprintln!(
+            "{predecessor_order_only} finally recoveries matching modulo predecessor order, {recovery_rejected} matching recovery rejections"
+        );
+    }
 }
 
-fn compare_snapshots(java: &str, rust: &str, stages: &[(&str, &str)]) -> Option<String> {
+enum Comparison {
+    Exact,
+    PredecessorOrderOnly,
+    RecoveryRejected,
+}
+
+fn compare_snapshots(
+    java: &str,
+    rust: &str,
+    stages: &[(&str, &str)],
+) -> Result<Comparison, String> {
     let mut java = java.split('\t');
     let mut rust = rust.split('\t');
+    let mut comparison = Comparison::Exact;
     for &(stage, prefix) in stages {
         match (java.next(), rust.next()) {
             (Some(java), Some(rust)) if java == rust && java.starts_with(prefix) => {}
+            (Some(j), Some(r))
+                if prefix == "recovered=" && j == r && j.starts_with("recovery-rejected=") =>
+            {
+                if java.next().is_none() && rust.next().is_none() {
+                    return Ok(Comparison::RecoveryRejected);
+                }
+                return Err("Unexpected stages after rejected recovery".into());
+            }
+            (Some(java), Some(rust))
+                if prefix == "recovered="
+                    && java.starts_with(prefix)
+                    && rust.starts_with(prefix)
+                    && finally_snapshot::same_predecessor_membership(java, rust) =>
+            {
+                comparison = Comparison::PredecessorOrderOnly;
+            }
             (Some(java), Some(rust)) => {
                 let stage = if [java, rust].iter().any(|result| {
                     result.starts_with("structure-") || result.starts_with("rejected=")
@@ -353,15 +492,15 @@ fn compare_snapshots(java: &str, rust: &str, stages: &[(&str, &str)]) -> Option<
                 } else {
                     stage
                 };
-                return Some(format!("{stage} {}", difference(java, rust)));
+                return Err(format!("{stage} {}", difference(java, rust)));
             }
-            _ => return Some(format!("Missing {stage}")),
+            _ => return Err(format!("Missing {stage}")),
         }
     }
     if java.next().is_some() || rust.next().is_some() {
-        return Some("Unexpected extra stages".into());
+        return Err("Unexpected extra stages".into());
     }
-    None
+    Ok(comparison)
 }
 
 fn difference(java: &str, rust: &str) -> String {
@@ -400,12 +539,27 @@ fn write_cfg(out: &mut impl Write, ir: &Ir, graph: &ControlFlowGraph) -> io::Res
     write_int(out, ir[graph.first].id)?;
     write_int(out, ir[graph.last].id)?;
     write_int(out, graph.last_id)?;
+    write_ints(out, ir[graph.last].preds.iter().map(|&block| ir[block].id))?;
+    write_ints(
+        out,
+        ir[graph.last]
+            .pred_exceptions
+            .iter()
+            .map(|&block| ir[block].id),
+    )?;
     write_flag(out, graph.add_error_comment)?;
     write_count(out, graph.comment_lines.len())?;
     for comment in &graph.comment_lines {
         write_text(out, comment)?;
     }
     write_count(out, graph.blocks.len())?;
+    let originals: HashMap<_, _> = graph
+        .sequence
+        .instructions
+        .iter()
+        .enumerate()
+        .map(|(index, instruction)| (Arc::as_ptr(instruction), i32::try_from(index).unwrap()))
+        .collect();
     let mut instructions = HashMap::new();
     for &block in &graph.blocks {
         let block = &ir[block];
@@ -416,12 +570,25 @@ fn write_cfg(out: &mut impl Write, ir: &Ir, graph: &ControlFlowGraph) -> io::Res
             out,
             block.succ_exceptions.iter().map(|&handler| ir[handler].id),
         )?;
+        write_ints(out, block.preds.iter().map(|&pred| ir[pred].id))?;
+        write_ints(
+            out,
+            block.pred_exceptions.iter().map(|&thrower| ir[thrower].id),
+        )?;
         write_int(out, block.seq.length())?;
         for instruction in &block.seq {
             let next = i32::try_from(instructions.len()).unwrap();
             let identity = *instructions.entry(Arc::as_ptr(instruction)).or_insert(next);
             write_int(out, identity)?;
             if identity != next {
+                continue;
+            }
+            let original = originals
+                .get(&Arc::as_ptr(instruction))
+                .copied()
+                .unwrap_or(-1);
+            write_int(out, original)?;
+            if original >= 0 {
                 continue;
             }
             write_int(out, i32::from(instruction.opcode))?;
@@ -447,7 +614,13 @@ fn write_cfg(out: &mut impl Write, ir: &Ir, graph: &ControlFlowGraph) -> io::Res
             }
         }
     }
-    write_ints(out, graph.finally_exits.iter().map(|&block| ir[block].id))
+    write_ints(out, graph.finally_exits.iter().map(|&block| ir[block].id))?;
+    write_count(out, graph.subroutines.len())?;
+    for (&entry, &exit) in &graph.subroutines {
+        write_int(out, ir[entry].id)?;
+        write_int(out, ir[exit].id)?;
+    }
+    Ok(())
 }
 
 fn write_ints(out: &mut impl Write, ints: impl ExactSizeIterator<Item = i32>) -> io::Result<()> {
@@ -475,18 +648,16 @@ fn write_text(out: &mut impl Write, text: &str) -> io::Result<()> {
     out.write_all(text.as_bytes())
 }
 
-fn structure_snapshot(ir: &Ir, method: &StructuredMethod) -> String {
-    let root = &ir[method.root];
+fn structure_snapshot(ir: &Ir, root: StatId, counters: &CounterContainer) -> String {
     let StatementKind::Root {
         dummy_exit,
         comment_lines,
         add_error_comment,
         ..
-    } = &root.kind
+    } = &ir[root].kind
     else {
         unreachable!()
     };
-    let counters = &method.flow.counters;
     let mut fields = vec![
         format!(
             "counters={},{},{}",
@@ -497,7 +668,7 @@ fn structure_snapshot(ir: &Ir, method: &StructuredMethod) -> String {
         format!("error={add_error_comment}"),
         format!("comments={}", comment_lines.iter().flatten().join("|")),
     ];
-    let mut pending = vec![*dummy_exit, method.root];
+    let mut pending = vec![*dummy_exit, root];
     while let Some(stat) = pending.pop() {
         let node = &ir[stat];
         let id = |stat| statement_id(ir, stat);
