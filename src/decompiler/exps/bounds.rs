@@ -3,6 +3,8 @@
 
 //! Type constraints emitted by `Exprent.checkExprTypeBounds`.
 
+use std::io;
+
 use crate::decompiler::ir::ExprId;
 use crate::decompiler::stats::StatementKind;
 use crate::engine::Cx;
@@ -28,7 +30,7 @@ impl ExprBounds {
 }
 
 impl Expr {
-    pub(crate) fn type_bounds(cx: &Cx, expr: ExprId) -> ExprBounds {
+    pub(crate) fn type_bounds(cx: &Cx, expr: ExprId) -> io::Result<ExprBounds> {
         let mut bounds = ExprBounds::default();
         match &cx.ir[expr].kind {
             ExprKind::Variable(var) => {
@@ -39,7 +41,7 @@ impl Expr {
                 }
             }
             ExprKind::Assignment { left, right, .. } => {
-                bounds.lower.push(assignment_bound(cx, *left, *right));
+                bounds.lower.push(Self::assignment_bound(cx, *left, *right));
             }
             ExprKind::Array { index, .. } => {
                 bounds.restrict(*index, VarType::VARTYPE_BYTECHAR, VarType::VARTYPE_INT);
@@ -81,7 +83,12 @@ impl Expr {
                 }
             }
             ExprKind::SwitchHead { value, case_values } => {
-                switch_bounds(cx, *value, case_values.as_ref(), &mut bounds);
+                switch_bounds(cx, *value, case_values.as_ref(), &mut bounds)?;
+            }
+            ExprKind::Yield { value, return_type } => {
+                if return_type.ty != CodeType::Void {
+                    bounds.restrict_to_family(*value, return_type.clone());
+                }
             }
             ExprKind::Pattern(pattern) => {
                 let components = pattern
@@ -114,39 +121,40 @@ impl Expr {
             | ExprKind::Constant { .. }
             | ExprKind::Field(_)
             | ExprKind::Exit { .. }
+            | ExprKind::Switch { .. }
             | ExprKind::Monitor { .. }
             | ExprKind::If { .. } => {}
         }
-        bounds
+        Ok(bounds)
     }
-}
 
-fn assignment_bound(cx: &Cx, left: ExprId, right: ExprId) -> (ExprId, VarType) {
-    use std::cmp::Ordering;
+    pub(crate) fn assignment_bound(cx: &Cx, left: ExprId, right: ExprId) -> (ExprId, VarType) {
+        use std::cmp::Ordering;
 
-    let left_type = Expr::expr_type(cx, left);
-    let mut right_type = Expr::expr_type(cx, right);
-    match left_type.type_family.cmp(&right_type.type_family) {
-        Ordering::Greater => (right, VarType::find_family_bottom(left_type.type_family)),
-        Ordering::Less => (left, right_type),
-        Ordering::Equal => {
-            // The ternary's Java expression type promotes integer constants.
-            // An assignment may still target a narrower integer type.
-            if right_type == VarType::VARTYPE_INT
-                && matches!(
-                    cx.ir[right].kind,
-                    ExprKind::Function {
-                        op: FunctionType::Ternary,
-                        ..
-                    }
+        let left_type = Expr::expr_type(cx, left);
+        let mut right_type = Expr::expr_type(cx, right);
+        match left_type.type_family.cmp(&right_type.type_family) {
+            Ordering::Greater => (right, VarType::find_family_bottom(left_type.type_family)),
+            Ordering::Less => (left, right_type),
+            Ordering::Equal => {
+                // The ternary's Java expression type promotes integer constants.
+                // An assignment may still target a narrower integer type.
+                if right_type == VarType::VARTYPE_INT
+                    && matches!(
+                        cx.ir[right].kind,
+                        ExprKind::Function {
+                            op: FunctionType::Ternary,
+                            ..
+                        }
+                    )
+                {
+                    right_type = VarType::VARTYPE_BYTECHAR;
+                }
+                (
+                    left,
+                    VarType::join(cx, &left_type, &right_type).expect("Null assignment type bound"),
                 )
-            {
-                right_type = VarType::VARTYPE_BYTECHAR;
             }
-            (
-                left,
-                VarType::join(cx, &left_type, &right_type).expect("Null assignment type bound"),
-            )
         }
     }
 }
@@ -165,7 +173,7 @@ fn switch_bounds(
     selector: ExprId,
     cases: Option<&SwitchCaseValues>,
     bounds: &mut ExprBounds,
-) {
+) -> io::Result<()> {
     bounds.restrict(selector, VarType::VARTYPE_BYTECHAR, VarType::VARTYPE_INT);
     let mut selector_type = Some(Expr::expr_type(cx, selector));
     let mut check_cases = |labels: &[Option<ExprId>]| {
@@ -175,9 +183,15 @@ fn switch_bounds(
                 _ => label,
             };
             let case_type = Expr::expr_type(cx, type_expr);
-            let current = selector_type
-                .as_ref()
-                .expect("Invalid switch case set for selector");
+            let current = selector_type.as_ref().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Invalid switch case set for selector of type {}",
+                        Expr::expr_type(cx, selector)
+                    ),
+                )
+            })?;
             if case_type == *current
                 || current
                     .unboxing_type()
@@ -190,6 +204,7 @@ fn switch_bounds(
                 bounds.lower.push((selector, ty.clone()));
             }
         }
+        Ok::<(), io::Error>(())
     };
     match cases {
         Some(SwitchCaseValues::Statement(stat)) => {
@@ -197,16 +212,17 @@ fn switch_bounds(
                 unreachable!("Switch header case values belong to a switch statement");
             };
             for case in &switch.cases {
-                check_cases(&case.values);
+                check_cases(&case.values)?;
             }
         }
         Some(SwitchCaseValues::Copied(cases)) => {
             for case in cases {
-                check_cases(case);
+                check_cases(case)?;
             }
         }
         None => {}
     }
+    Ok(())
 }
 
 fn function_bounds(

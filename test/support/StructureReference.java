@@ -71,6 +71,8 @@ class StructureReference {
         case 11 -> StackSnapshot.Check.PATTERN_MATCHING_ENTRY;
         case 12 -> StackSnapshot.Check.IF_PATTERNS;
         case 13 -> StackSnapshot.Check.SWITCH_ENTRY;
+        case 14 -> StackSnapshot.Check.SWITCH_PASSES;
+        case 15 -> StackSnapshot.Check.TRY_ENTRY;
         default -> null;
       };
       StackSnapshot.Context stackContext = stackCheck == null ? null
@@ -327,10 +329,10 @@ class StructureReference {
   }
 
   private static String snapshot(RootStatement root, CounterContainer counters) {
-    return snapshot(root, counters, false);
+    return snapshot(root, counters, false, false);
   }
 
-  static String snapshot(RootStatement root, CounterContainer counters, boolean loopStage) {
+  static String snapshot(RootStatement root, CounterContainer counters, boolean loopStage, boolean switchStage) {
     List<String> fields = new ArrayList<>();
     fields.add("counters=" + counters.getCounter(CounterContainer.STATEMENT_COUNTER)
       + "," + counters.getCounter(CounterContainer.EXPRESSION_COUNTER)
@@ -345,6 +347,9 @@ class StructureReference {
         + statement.getStats().stream().map(StructureReference::statementId).collect(Collectors.joining(",")));
       fields.add("flags=" + statement.getLastBasicType().name() + "/" + statement.isMonitorEnter()
         + "/" + statement.containsMonitorExitOrAthrow() + "/" + statement.containsMonitorExit() + "/" + statement.isCopied());
+      if (switchStage) {
+        fields.add("phantom=" + statement.isPhantom());
+      }
       fields.add("out=" + edges(statement.getAllSuccessorEdges()));
       if (loopStage) {
         fields.add("in=" + edges(statement.getAllPredecessorEdges()));
@@ -359,10 +364,14 @@ class StructureReference {
       } else if (statement instanceof SwitchStatement branch) {
         List<String> cases = new ArrayList<>();
         for (int i = 0; i < branch.getCaseStatements().size(); i++) {
-          cases.add(statementId(branch.getCaseStatements().get(i)) + ":" + edges(branch.getCaseEdges().get(i))
-            + ":" + expressions(branch.getCaseValues().get(i)));
+          var edges = branch.getCaseEdges().get(i).stream().map(edge -> switchEdge(edge, switchStage))
+            .collect(Collectors.joining("|"));
+          var values = branch.getCaseValues().get(i).stream()
+            .map(expr -> switchStage ? expr == null ? "-" : Integer.toString(expr.id) : expression(expr))
+            .collect(Collectors.joining("|"));
+          cases.add(statementId(branch.getCaseStatements().get(i)) + ":" + edges + ":" + values);
         }
-        fields.add("switch=" + edgeId(branch.getDefaultEdge()) + "/" + String.join("/", cases));
+        fields.add("switch=" + switchEdge(branch.getDefaultEdge(), switchStage) + "/" + String.join("/", cases));
       } else if (statement instanceof CatchStatement caught) {
         fields.add("catch=" + caught.getExctStrings().stream().map(types -> String.join(",", types))
           .collect(Collectors.joining("|")) + "/" + expressions(caught.getVars()));
@@ -376,6 +385,15 @@ class StructureReference {
       }
     }
     return String.join(";", fields);
+  }
+
+  private static String switchEdge(StatEdge edge, boolean includeAlias) {
+    String description = edgeId(edge);
+    if (includeAlias && edge != null) {
+      int index = edge.getSource().getAllSuccessorEdges().indexOf(edge);
+      return description + "@" + (index == -1 ? "-" : Integer.toString(index));
+    }
+    return description;
   }
 
   static List<Statement> statements(RootStatement root) {

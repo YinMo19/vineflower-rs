@@ -356,6 +356,14 @@ impl Statement {
         self.all_successors().first().copied()
     }
 
+    pub(crate) fn has_basic_succ_edge(&self) -> bool {
+        match self.kind {
+            StatementKind::BasicBlock { .. } | StatementKind::If(IfStatement { has_else: false, .. }) => true,
+            StatementKind::Do(header) => header.ty != LoopType::Infinite,
+            _ => false,
+        }
+    }
+
     pub(super) fn add_edge_to_index(&mut self, direction: EdgeDirection, mask: u32, edge: EdgeId) {
         self.edge_index_mut(direction)
             .entry(mask)

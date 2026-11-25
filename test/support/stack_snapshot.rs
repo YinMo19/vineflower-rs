@@ -20,7 +20,7 @@ use vineflower_rs::engine::class_nodes::{ClassNodeId, load_classes};
 use vineflower_rs::engine::class_processor::prepare_class;
 use vineflower_rs::engine::context_source::{ContextSource, RuntimeImage};
 use vineflower_rs::engine::counter_container::{
-    EXPRESSION_COUNTER, STATEMENT_COUNTER, VAR_COUNTER,
+    CounterContainer, EXPRESSION_COUNTER, STATEMENT_COUNTER, VAR_COUNTER,
 };
 use vineflower_rs::engine::import_collector::ImportCollector;
 use vineflower_rs::engine::method_processor::{
@@ -50,6 +50,8 @@ pub(super) enum Check {
     PatternMatchingEntry = 11,
     IfPatterns = 12,
     SwitchEntry = 13,
+    SwitchPasses = 14,
+    TryEntry = 15,
 }
 
 #[derive(Clone, Copy)]
@@ -234,6 +236,26 @@ const SWITCH_ENTRY_STAGES: &[(&str, &str)] = &[
     ("Direct graph before switch processing", "graph="),
 ];
 
+const SWITCH_PASS_STAGES: &[(&str, &str)] = &[
+    (
+        "Structure and pass results after switch recovery",
+        "counters=",
+    ),
+    (
+        "Switch and yield expressions after switch recovery",
+        "counters=",
+    ),
+    ("Variable versions after switch recovery", "versions="),
+    ("Direct graph after switch recovery", "graph="),
+];
+
+const TRY_ENTRY_STAGES: &[(&str, &str)] = &[
+    ("Structure before try processing", "counters="),
+    ("Expressions before try processing", "counters="),
+    ("Variable versions before try processing", "versions="),
+    ("Direct graph before try processing", "graph="),
+];
+
 fn loop_iterations(row: &str) -> impl Iterator<Item = &str> {
     row.split('\t')
         .nth(3)
@@ -254,7 +276,9 @@ impl Check {
             | Self::MainLoopLabels
             | Self::PatternMatchingEntry
             | Self::IfPatterns
-            | Self::SwitchEntry => &[DEFAULT],
+            | Self::SwitchEntry
+            | Self::SwitchPasses
+            | Self::TryEntry => &[DEFAULT],
             Self::SecondaryFunctions => SECONDARY_PROFILES,
         }
     }
@@ -272,6 +296,8 @@ impl Check {
             Self::PatternMatchingEntry => PATTERN_MATCHING_ENTRY_STAGES,
             Self::IfPatterns => IF_PATTERN_STAGES,
             Self::SwitchEntry => SWITCH_ENTRY_STAGES,
+            Self::SwitchPasses => SWITCH_PASS_STAGES,
+            Self::TryEntry => TRY_ENTRY_STAGES,
         }
     }
 
@@ -288,6 +314,8 @@ impl Check {
             Self::PatternMatchingEntry => "pattern-matching-entry",
             Self::IfPatterns => "if-patterns",
             Self::SwitchEntry => "switch-entry",
+            Self::SwitchPasses => "switch-passes",
+            Self::TryEntry => "try-entry",
         }
     }
 
@@ -311,12 +339,17 @@ impl Check {
     }
 
     fn matches_if_patterns(self) -> bool {
-        matches!(self, Self::IfPatterns | Self::SwitchEntry)
+        matches!(self, Self::IfPatterns | Self::SwitchEntry) || self.recovers_switches()
+    }
+
+    fn recovers_switches(self) -> bool {
+        matches!(self, Self::SwitchPasses | Self::TryEntry)
     }
 
     fn expression_detail(self) -> expression_snapshot::Detail {
         use expression_snapshot::Detail;
         match self {
+            _ if self.recovers_switches() => Detail::Switches,
             _ if self.settles_pattern_entry() => Detail::IntersectionCasts,
             Self::SecondaryFunctions => Detail::SecondaryFunctions,
             _ if self.uses_loop_headers() => Detail::LoopHeaders,
@@ -495,6 +528,59 @@ struct IfPatternCoverage {
     unchanged_with_counter_updates: usize,
 }
 
+#[derive(Default)]
+struct SwitchCoverage {
+    pattern_methods: usize,
+    expression_methods: usize,
+    both_methods: usize,
+    phantom: usize,
+    guards: usize,
+    switch_expressions: usize,
+    yields: usize,
+}
+
+impl SwitchCoverage {
+    fn record(&mut self, row: &str) {
+        let mut snapshots = row.split('\t');
+        let tree = snapshots.next().unwrap();
+        let patterns = tree.split(';').any(|field| field == "switch-patterns=true");
+        let expressions = tree.ends_with(";switch-expressions=true");
+        self.pattern_methods += usize::from(patterns);
+        self.expression_methods += usize::from(expressions);
+        self.both_methods += usize::from(patterns && expressions);
+        self.phantom += tree
+            .split(';')
+            .filter(|field| *field == "phantom=true")
+            .count();
+        for field in snapshots.next().unwrap().split(';') {
+            if let Some((key, value)) = field.split_once('=') {
+                if key.starts_with("guards") {
+                    self.guards += value
+                        .split(',')
+                        .filter(|guard| !guard.is_empty() && *guard != "~")
+                        .count();
+                } else if key.starts_with('e') {
+                    self.switch_expressions += usize::from(value.starts_with("SWITCH|"));
+                    self.yields += usize::from(value.starts_with("YIELD|"));
+                }
+            }
+        }
+    }
+
+    fn report(&self, check: Check) {
+        if check == Check::SwitchPasses {
+            eprintln!(
+                "{} methods changed during switch pattern recovery, {} during switch expression recovery, and {} during both",
+                self.pattern_methods, self.expression_methods, self.both_methods
+            );
+        }
+        eprintln!(
+            "{} switch expressions, {} yields, {} guarded cases, and {} phantom statements",
+            self.switch_expressions, self.yields, self.guards, self.phantom
+        );
+    }
+}
+
 impl IfPatternCoverage {
     fn record(&mut self, check: Check, row: &str) {
         let mut snapshots = row.split('\t');
@@ -668,6 +754,7 @@ pub(super) fn check(corpus: &Corpus, check: Check) {
     let mut rust_rows = BufReader::new(snapshots).lines();
     let mut errors = Vec::new();
     let mut rejected = 0;
+    let mut switch_rejected = 0;
     let mut hidden_changes = [0, 0];
     let mut repeats = 0;
     let mut changed_original = 0;
@@ -678,6 +765,7 @@ pub(super) fn check(corpus: &Corpus, check: Check) {
     let mut secondary_coverage = EnhancementCoverage::default();
     let mut secondary_comparison = SecondaryComparison::default();
     let mut if_pattern_coverage = IfPatternCoverage::default();
+    let mut switch_coverage = SwitchCoverage::default();
     let methods_per_profile = methods.len() / check.profiles().len();
     for (index, method) in methods.iter().enumerate() {
         let row = java_rows
@@ -714,6 +802,8 @@ pub(super) fn check(corpus: &Corpus, check: Check) {
         };
         if java == rust && (java.starts_with("rejected=") || java.starts_with("class-rejected=")) {
             rejected += 1;
+        } else if same_switch_case_rejection(check, java, &rust) {
+            switch_rejected += 1;
         } else if let Err(diff) = compare_snapshots(java, &rust, stages) {
             errors.push(format!("{method}\n  {diff}"));
         } else if secondary_variant {
@@ -722,6 +812,9 @@ pub(super) fn check(corpus: &Corpus, check: Check) {
             enhancement_coverage.record(check, method, &rust);
             if check.matches_if_patterns() {
                 if_pattern_coverage.record(check, &rust);
+            }
+            if check.recovers_switches() {
+                switch_coverage.record(&rust);
             }
         } else {
             let stage_size = if check == Check::Stack { 2 } else { 3 };
@@ -783,10 +876,13 @@ pub(super) fn check(corpus: &Corpus, check: Check) {
     };
     eprintln!(
         "{} exact {stages}{} snapshots and {rejected} matching rejections across {} class files",
-        methods.len() - rejected,
+        methods.len() - rejected - switch_rejected,
         check.name(),
         groups.iter().map(Vec::len).sum::<usize>()
     );
+    if switch_rejected > 0 {
+        eprintln!("{switch_rejected} matching switch case type rejections in variable versioning");
+    }
     if check.uses_loop_headers() {
         if check == Check::SecondaryFunctions {
             eprintln!("With default ternary constant simplification");
@@ -794,6 +890,9 @@ pub(super) fn check(corpus: &Corpus, check: Check) {
         enhancement_coverage.report(check);
         if check.matches_if_patterns() {
             if_pattern_coverage.report(check);
+        }
+        if check.recovers_switches() {
+            switch_coverage.report(check);
         }
         if check == Check::SecondaryFunctions {
             eprintln!("With ternary constant simplification enabled");
@@ -992,7 +1091,9 @@ fn stage(
                 | Check::SecondaryFunctions
                 | Check::PatternMatchingEntry
                 | Check::IfPatterns
-                | Check::SwitchEntry,
+                | Check::SwitchEntry
+                | Check::SwitchPasses
+                | Check::TryEntry,
                 _,
             ) => {
                 loop {
@@ -1029,22 +1130,31 @@ fn stage(
                         operation.set("merge-loops");
                         method.merge_loops(cx, class)?;
                         String::new()
-                    } else if check == Check::SwitchEntry {
+                    } else if check == Check::TryEntry {
+                        operation.set("prepare-try");
+                        method.prepare_try(cx, class)?;
+                        String::new()
+                    } else if matches!(check, Check::SwitchEntry | Check::SwitchPasses) {
                         operation.set("prepare-switches");
                         method.prepare_switches(cx, class)?;
-                        String::new()
+                        if check == Check::SwitchPasses {
+                            operation.set("process-switch-patterns");
+                            let patterns = method.process_switch_patterns(cx)?;
+                            let counters = counter_snapshot(&method.flow.counters);
+                            operation.set("process-switch-expressions");
+                            let expressions = method.process_switch_expressions(cx)?;
+                            format!(
+                                ";switch-patterns={patterns};switch-pattern-counters={counters};switch-expressions={expressions}"
+                            )
+                        } else {
+                            String::new()
+                        }
                     } else if check.settles_pattern_entry() {
                         operation.set("prepare-pattern-matching");
                         method.prepare_pattern_matching(cx, class)?;
                         if check == Check::IfPatterns {
                             operation.set("match-if-patterns");
-                            let counters = &method.flow.counters;
-                            let before = format!(
-                                "{},{},{}",
-                                counters.get_counter(STATEMENT_COUNTER),
-                                counters.get_counter(EXPRESSION_COUNTER),
-                                counters.get_counter(VAR_COUNTER)
-                            );
+                            let before = counter_snapshot(&method.flow.counters);
                             let changed = method.match_if_patterns(cx, class)?;
                             format!(";pattern-counters-before={before};if-patterns={changed}")
                         } else {
@@ -1150,6 +1260,17 @@ fn stage(
         {
             "rejected=parsing failure!".into()
         }
+        Ok(Err(error))
+            if error.kind() == io::ErrorKind::InvalidData
+                && error.to_string().starts_with("Invalid switch case set") =>
+        {
+            stage_error(
+                check,
+                operation.get(),
+                "invalid-data",
+                &one_line(&error.to_string()),
+            )
+        }
         Ok(Err(error)) => stage_error(
             check,
             operation.get(),
@@ -1169,8 +1290,13 @@ fn snapshot(
     details: &str,
 ) -> String {
     let loop_stage = check == Check::LoopElimination || check.uses_loop_headers();
-    let mut tree =
-        structure_snapshot_with_edges(cx, method.root, &method.flow.counters, loop_stage);
+    let mut tree = structure_snapshot_with_edges(
+        cx,
+        method.root,
+        &method.flow.counters,
+        loop_stage,
+        check.recovers_switches(),
+    );
     if check == Check::PreMain || loop_stage {
         let content = root_content_flags(cx, method.root);
         write!(
@@ -1198,6 +1324,15 @@ fn snapshot(
     snapshot
 }
 
+fn counter_snapshot(counters: &CounterContainer) -> String {
+    format!(
+        "{},{},{}",
+        counters.get_counter(STATEMENT_COUNTER),
+        counters.get_counter(EXPRESSION_COUNTER),
+        counters.get_counter(VAR_COUNTER)
+    )
+}
+
 fn root_content_flags(cx: &Cx, root: StatId) -> ContentFlags {
     let StatementKind::Root { content_flags, .. } = cx.ir[root].kind else {
         unreachable!()
@@ -1217,6 +1352,20 @@ fn stage_error(check: Check, operation: &str, kind: &str, message: &str) -> Stri
         format!("stack-{kind}={message}")
     } else {
         format!("{}-{operation}-{kind}={message}", check.name())
+    }
+}
+
+fn same_switch_case_rejection(check: Check, java: &str, rust: &str) -> bool {
+    if check != Check::TryEntry
+        || !java.starts_with("try-entry-set-var-versions-error=java.lang.IllegalStateException: Invalid switch case set:")
+        || !rust.starts_with("try-entry-prepare-try-invalid-data=Invalid switch case set")
+    {
+        return false;
+    }
+    let selector = " for selector of type ";
+    match (java.rsplit_once(selector), rust.rsplit_once(selector)) {
+        (Some((_, java)), Some((_, rust))) => !java.is_empty() && java == rust,
+        _ => false,
     }
 }
 

@@ -207,8 +207,7 @@ impl Expr {
             | (ExprKind::SwitchHead { value: a, .. }, ExprKind::SwitchHead { value: b, .. }) => {
                 eq(*a, *b)
             }
-            // PatternExprent inherits Object.equals. The identical-handle case
-            // was handled before comparing expression kinds.
+            // Patterns, switch expressions and yields use expression identity.
             _ => false,
         }
     }
@@ -240,6 +239,7 @@ impl Expr {
             // PatternExprent exposes its children for traversal and uses
             // Exprent's default replaceExprent implementation.
             ExprKind::Constant { .. } | ExprKind::Variable(_) | ExprKind::Pattern(_) => {}
+            ExprKind::Switch { .. } => {}
             ExprKind::Assignment { left, right, .. } => {
                 replace(left);
                 replace(right);
@@ -279,7 +279,9 @@ impl Expr {
                 array_elements.iter_mut().for_each(replace);
             }
             ExprKind::Exit { value, .. } => replace_optional(value),
-            ExprKind::Monitor { value, .. } | ExprKind::SwitchHead { value, .. } => replace(value),
+            ExprKind::Monitor { value, .. }
+            | ExprKind::SwitchHead { value, .. }
+            | ExprKind::Yield { value, .. } => replace(value),
             ExprKind::If { condition } => replace(condition),
         }
     }

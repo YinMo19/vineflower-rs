@@ -14,7 +14,9 @@ impl Expr {
     pub fn children(ir: &Ir, expr: ExprId) -> impl Iterator<Item = ExprId> + '_ {
         let (leading, lists): ([Option<ExprId>; 2], [&[ExprId]; 2]) = match &ir[expr].kind {
             ExprKind::Assert { condition, message } => ([*condition, *message], [&[], &[]]),
-            ExprKind::Constant { .. } | ExprKind::Variable(_) => ([None, None], [&[], &[]]),
+            ExprKind::Constant { .. } | ExprKind::Variable(_) | ExprKind::Switch { .. } => {
+                ([None, None], [&[], &[]])
+            }
             ExprKind::Assignment { left, right, .. } => ([Some(*left), Some(*right)], [&[], &[]]),
             ExprKind::Array { array, index, .. } => ([Some(*array), Some(*index)], [&[], &[]]),
             ExprKind::Field(field) => ([field.instance, None], [&[], &[]]),
@@ -41,7 +43,9 @@ impl Expr {
                 constructor: None, ..
             } => ([None, None], [&[], &[]]),
             ExprKind::Exit { value, .. } => ([*value, None], [&[], &[]]),
-            ExprKind::Monitor { value, .. } | ExprKind::SwitchHead { value, .. } => {
+            ExprKind::Monitor { value, .. }
+            | ExprKind::SwitchHead { value, .. }
+            | ExprKind::Yield { value, .. } => {
                 ([Some(*value), None], [&[], &[]])
             }
             ExprKind::If { condition } => ([Some(*condition), None], [&[], &[]]),

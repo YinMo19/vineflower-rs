@@ -22,6 +22,7 @@ pub enum Detail {
     LoopHeaders,
     SecondaryFunctions,
     IntersectionCasts,
+    Switches,
 }
 
 pub fn snapshot(cx: &Cx, root: StatId, counters: &CounterContainer) -> String {
@@ -41,6 +42,7 @@ pub fn snapshot_details(
     let mut pending = vec![dummy_exit, root];
     let mut snapshot = Snapshot {
         cx,
+        root,
         nodes: BTreeMap::new(),
         detail,
     };
@@ -97,6 +99,14 @@ pub fn snapshot_details(
                     "cases{id}={}|{linked}",
                     snapshot.cases(&branch.cases)
                 ));
+                if detail >= Detail::Switches {
+                    let guards = branch
+                        .case_guards
+                        .iter()
+                        .map(|&expr| snapshot.expression(expr))
+                        .join(",");
+                    fields.push(format!("guards{id}={guards}"));
+                }
             }
             StatementKind::Synchronized { head_exprents, .. } => {
                 fields.push(format!("head{id}={}", snapshot.list(*head_exprents)));
@@ -121,6 +131,7 @@ pub fn snapshot_details(
 
 struct Snapshot<'a> {
     cx: &'a Cx,
+    root: StatId,
     nodes: BTreeMap<i32, (ExprId, String)>,
     detail: Detail,
 }
@@ -302,6 +313,20 @@ impl Snapshot<'_> {
                         .join("/")
                 ),
             ),
+            ExprKind::Switch {
+                backing,
+                fallthrough,
+                standalone,
+                ..
+            } => (
+                "SWITCH",
+                format!(
+                    "{}|{}|{fallthrough}|{standalone}",
+                    ir[*backing].id,
+                    super::structure_statements(ir, self.root).any(|stat| stat == *backing),
+                ),
+            ),
+            ExprKind::Yield { value, .. } => ("YIELD", self.expression(Some(*value))),
             ExprKind::New {
                 new_type,
                 dimensions,

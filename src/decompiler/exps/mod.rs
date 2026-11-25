@@ -104,6 +104,16 @@ pub enum ExprKind {
         value: ExprId,
         case_values: Option<SwitchCaseValues>,
     },
+    Switch {
+        backing: StatId,
+        var_type: VarType,
+        fallthrough: bool,
+        standalone: bool,
+    },
+    Yield {
+        value: ExprId,
+        return_type: VarType,
+    },
 }
 
 /// A record pattern with bindings in declaration order.
@@ -624,6 +634,9 @@ impl Expr {
                 }
             }
             ExprKind::SwitchHead { value, .. } => Self::expr_type(cx, *value),
+            ExprKind::Switch { var_type, .. } | ExprKind::Yield { return_type: var_type, .. } => {
+                var_type.clone()
+            }
             ExprKind::Assert { .. }
             | ExprKind::If { .. }
             | ExprKind::Exit { .. }
@@ -729,6 +742,11 @@ impl Expr {
             ExprKind::SwitchHead { value, case_values } => {
                 *value = Self::copy(cx, counters, *value);
                 *case_values = case_values.as_ref().map(|cases| cases.copy(&cx.ir));
+            }
+            ExprKind::Switch { .. } => bytecode = None,
+            ExprKind::Yield { value, .. } => {
+                *value = Self::copy(cx, counters, *value);
+                bytecode = None;
             }
         }
         cx.ir.exprs.push(Self {

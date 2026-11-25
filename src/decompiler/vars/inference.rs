@@ -146,7 +146,7 @@ fn check_expression(
         cx.ir[owner].lower.entry(pair).or_insert(var_type);
     }
 
-    let bounds = Expr::type_bounds(cx, expr);
+    let bounds = Expr::type_bounds(cx, expr)?;
     for (expr, ty) in bounds.upper {
         apply_bound(cx, counters, owner, expr, ty, Bound::Upper)?;
     }
@@ -194,6 +194,17 @@ fn apply_bound(
             let left_changed = apply_bound(cx, counters, owner, left, ty.clone(), bound)?;
             let right_changed = apply_bound(cx, counters, owner, right, ty, bound)?;
             return Ok(left_changed || right_changed);
+        }
+        ExprKind::Switch { var_type, .. } => {
+            let promote = ty.type_family == TypeFamily::Integer
+                && ty.higher_in_lattice_than(cx, var_type);
+            if promote {
+                let ExprKind::Switch { var_type, .. } = &mut cx.ir[expr].kind else {
+                    unreachable!();
+                };
+                *var_type = ty;
+            }
+            return Ok(promote);
         }
         _ => return Ok(false),
     };

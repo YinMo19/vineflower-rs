@@ -7,8 +7,8 @@ use rustc_hash::FxHashSet;
 
 use super::recognize;
 use super::stat_edge::{EdgeType, StatEdge};
-use super::{EdgeDirection, STATEDGE_ALL, STATEDGE_DIRECT_ALL};
-use crate::decompiler::ir::{Ir, StatId};
+use super::{EdgeDirection, STATEDGE_ALL, STATEDGE_DIRECT_ALL, StatementKind};
+use crate::decompiler::ir::{EdgeId, Ir, StatId};
 use crate::engine::counter_container::CounterContainer;
 
 impl StatId {
@@ -29,6 +29,48 @@ impl StatId {
             );
         }
         false
+    }
+
+    /// Ordered exits from this subtree across the boundary used by switch
+    /// expressions and try-with-resources. An ancestor's exit to a destination
+    /// suppresses an implicit edge to that same destination in its descendants.
+    pub(crate) fn edges_leaving(self, ir: &Ir, boundary: StatId, allow_exit: bool) -> Vec<EdgeId> {
+        fn visit(
+            ir: &Ir,
+            stat: StatId,
+            region: &FxHashSet<StatId>,
+            allow_exit: bool,
+            ancestor_targets: &mut Vec<StatId>,
+            exits: &mut Vec<EdgeId>,
+        ) {
+            let inherited = ancestor_targets.len();
+            for &edge in ir[stat].all_successors() {
+                let e = &ir[edge];
+                if region.contains(&e.destination)
+                    || (!allow_exit && matches!(ir[e.destination].kind, StatementKind::DummyExit))
+                {
+                    continue;
+                }
+                if e.explicit || !ancestor_targets.contains(&e.destination) {
+                    exits.push(edge);
+                    ancestor_targets.push(e.destination);
+                }
+            }
+            for &child in &ir[stat].stats {
+                visit(ir, child, region, allow_exit, ancestor_targets, exits);
+            }
+            ancestor_targets.truncate(inherited);
+        }
+
+        let mut region = FxHashSet::default();
+        let mut pending = vec![boundary];
+        while let Some(stat) = pending.pop() {
+            region.insert(stat);
+            pending.extend(ir[stat].stats.iter().copied());
+        }
+        let mut exits = Vec::new();
+        visit(ir, self, &region, allow_exit, &mut Vec::new(), &mut exits);
+        exits
     }
 
     pub fn collapse_nodes_to_statement(

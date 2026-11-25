@@ -25,7 +25,7 @@ import org.jetbrains.java.decompiler.struct.gen.generics.GenericMethodDescriptor
 import org.jetbrains.java.decompiler.struct.gen.generics.GenericType;
 
 class ExpressionSnapshot {
-  enum Detail { BASE, LOOP_HEADERS, SECONDARY_FUNCTIONS, INTERSECTION_CASTS }
+  enum Detail { BASE, LOOP_HEADERS, SECONDARY_FUNCTIONS, INTERSECTION_CASTS, SWITCHES }
 
   private static final Field ARRAY_HARD_TYPE = field(ArrayExprent.class, "hardType");
   private static final Field VARIABLE_TYPE = field(VarExprent.class, "varType");
@@ -35,14 +35,18 @@ class ExpressionSnapshot {
   private static final Field FIELD_QUALIFIED = field(FieldExprent.class, "forceQualified");
   private static final Field INVOCATION_LAZY_CONDY = field(InvocationExprent.class, "wasLazyCondy");
   private static final Field FUNCTION_IMPLICIT_TYPE = field(FunctionExprent.class, "implicitType");
+  private static final Field SWITCH_FALLTHROUGH = field(SwitchExprent.class, "fallthrough");
+  private static final Field SWITCH_STANDALONE = field(SwitchExprent.class, "standalone");
   private static final Field ASSERT_PARAMETERS = field(AssertExprent.class, "parameters");
 
   // Record shared nodes once and keep references by the upstream expression ID.
   private final Map<Integer, Exprent> nodes = new TreeMap<>();
   private final Detail detail;
+  private final RootStatement root;
 
-  private ExpressionSnapshot(Detail detail) {
+  private ExpressionSnapshot(Detail detail, RootStatement root) {
     this.detail = detail;
+    this.root = root;
   }
 
   static String snapshot(RootStatement root, CounterContainer counters) {
@@ -51,13 +55,13 @@ class ExpressionSnapshot {
 
   static String snapshot(RootStatement root, CounterContainer counters, Detail detail) {
     try {
-      return new ExpressionSnapshot(detail).describe(root, counters);
+      return new ExpressionSnapshot(detail, root).describe(counters);
     } catch (RuntimeException | AssertionError | StackOverflowError failure) {
       return "snapshot-error=" + text(failure.toString());
     }
   }
 
-  private String describe(RootStatement root, CounterContainer counters) {
+  private String describe(CounterContainer counters) {
     StringJoiner fields = new StringJoiner(";");
     fields.add("counters=" + counters.getCounter(CounterContainer.STATEMENT_COUNTER)
       + "," + counters.getCounter(CounterContainer.EXPRESSION_COUNTER)
@@ -88,6 +92,9 @@ class ExpressionSnapshot {
         boolean linked = branch.getHeadexprent() instanceof SwitchHeadExprent head
           && head.getCaseValues() == branch.getCaseValues();
         fields.add("cases" + statement.id + "=" + cases(branch.getCaseValues()) + "|" + linked);
+        if (detail == Detail.SWITCHES) {
+          fields.add("guards" + statement.id + "=" + expressions(branch.getCaseGuards()));
+        }
       } else if (statement instanceof SynchronizedStatement sync) {
         fields.add("head" + statement.id + "=" + expressions(sync.getHeadexprentList()));
       } else if (statement instanceof CatchStatement caught) {
@@ -177,6 +184,13 @@ class ExpressionSnapshot {
     }
     if (e instanceof PatternExprent pattern && pattern.getData() instanceof PatternExprent.PatternData.RecordPatternData record) {
       return parts(text(record.cl().qualifiedName), expressions(pattern.getExprents()), types(pattern.getBoundTypes()));
+    }
+    if (e instanceof SwitchExprent branch) {
+      return parts(branch.getBacking().id, StructureReference.statements(root).stream().anyMatch(stat -> stat == branch.getBacking()),
+        read(SWITCH_FALLTHROUGH, branch), read(SWITCH_STANDALONE, branch));
+    }
+    if (e instanceof YieldExprent yield) {
+      return expression(yield.getContent());
     }
     if (e instanceof NewExprent allocation) {
       return parts(type(allocation.getNewType()), expressions(allocation.getLstDims()),

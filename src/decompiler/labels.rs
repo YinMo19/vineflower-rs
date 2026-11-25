@@ -10,7 +10,7 @@ use indexmap::IndexSet;
 
 use crate::decompiler::ir::{EdgeId, Ir, StatId};
 use crate::decompiler::stats::stat_edge::EdgeType;
-use crate::decompiler::stats::{IfStatement, LoopType, STATEDGE_ALL, StatementKind};
+use crate::decompiler::stats::{LoopType, STATEDGE_ALL, StatementKind};
 
 pub(crate) fn clean_up_edges(ir: &mut Ir, root: StatId) {
     reset_all_edges(ir, root);
@@ -36,15 +36,7 @@ fn remove_non_immediate_edges(ir: &mut Ir, stat: StatId) {
         remove_non_immediate_edges(ir, ir[stat].stats[index]);
     }
 
-    let has_basic_successor = match ir[stat].kind {
-        StatementKind::BasicBlock { .. }
-        | StatementKind::If(IfStatement {
-            has_else: false, ..
-        }) => true,
-        StatementKind::Do(loop_stat) => loop_stat.ty != LoopType::Infinite,
-        _ => false,
-    };
-    if !has_basic_successor {
+    if !ir[stat].has_basic_succ_edge() {
         let mask = EdgeType::Continue.mask() | EdgeType::Break.mask();
         for edge in stat.get_successor_edges(ir, mask) {
             stat.remove_successor(ir, edge);

@@ -251,24 +251,31 @@ pub struct ExpressionMethod {
     pub synthetic_semaphores: IndexSet<i32>,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum MainLoopStage {
+    IfPatterns,
+    Switches,
+    Try,
+}
+
 impl ExpressionMethod {
     /// Refreshes explicit jumps and their enclosing statements at main-loop entry.
     pub fn clean_up_edges(&mut self, cx: &mut Cx) {
         crate::decompiler::labels::clean_up_edges(&mut cx.ir, self.root);
     }
 
-    fn has_loops(&self, ir: &Ir) -> bool {
+    fn content_flags(&self, ir: &Ir) -> crate::decompiler::stats::ContentFlags {
         let crate::decompiler::stats::StatementKind::Root { content_flags, .. } =
             ir[self.root].kind
         else {
             unreachable!("Expected a method root")
         };
-        content_flags.has_loops
+        content_flags
     }
 
     /// One pass of redundant-loop elimination. A change restarts the merge loop.
     pub fn eliminate_loops(&mut self, cx: &mut Cx, class: &StructClass) -> io::Result<bool> {
-        if self.has_loops(&cx.ir) {
+        if self.content_flags(&cx.ir).has_loops {
             crate::decompiler::loops::eliminate::eliminate(
                 cx,
                 &mut self.flow.counters,
@@ -282,7 +289,7 @@ impl ExpressionMethod {
 
     /// Recover while, counted for and enhanced for loops to a fixed point.
     pub fn enhance_loops(&mut self, cx: &mut Cx) -> io::Result<bool> {
-        if self.has_loops(&cx.ir) {
+        if self.content_flags(&cx.ir).has_loops {
             crate::decompiler::loops::enhance::enhance(cx, &mut self.flow.counters, self.root)
         } else {
             Ok(false)
@@ -291,7 +298,7 @@ impl ExpressionMethod {
 
     /// Run the native loop passes through MethodProcessor's MergeLoopEnd.
     pub fn merge_loops(&mut self, cx: &mut Cx, class: &StructClass) -> io::Result<()> {
-        if self.has_loops(&cx.ir) {
+        if self.content_flags(&cx.ir).has_loops {
             crate::decompiler::loops::merge(cx, &mut self.flow.counters, self.root, class)?;
         }
         Ok(())
@@ -324,16 +331,7 @@ impl ExpressionMethod {
 
     /// Run each main-loop iteration up to the Java pattern-matching passes.
     pub fn prepare_pattern_matching(&mut self, cx: &mut Cx, class: &StructClass) -> io::Result<()> {
-        loop {
-            self.identify_main_loop_labels(cx, class)?;
-            if self.identify_secondary(cx)? {
-                continue;
-            }
-            if !crate::decompiler::intersection::make_casts(cx, &mut self.flow.counters, self.root)?
-            {
-                return Ok(());
-            }
-        }
+        self.run_until(cx, class, MainLoopStage::IfPatterns)
     }
 
     /// Match instanceof bindings in the class versions supported by MethodProcessor.
@@ -352,9 +350,65 @@ impl ExpressionMethod {
 
     /// Restart label and data-flow processing after each successful pattern pass.
     pub fn prepare_switches(&mut self, cx: &mut Cx, class: &StructClass) -> io::Result<()> {
+        self.run_until(cx, class, MainLoopStage::Switches)
+    }
+
+    pub fn process_switch_patterns(&mut self, cx: &mut Cx) -> io::Result<bool> {
+        if !self.content_flags(&cx.ir).has_switch {
+            return Ok(false);
+        }
+        let cx = &mut *cx.enter_method(&self.flow.counters);
+        crate::decompiler::switches::patterns::process(
+            cx,
+            &mut self.flow.counters,
+            self.root,
+            self.flow.variables,
+        )
+    }
+
+    pub fn process_switch_expressions(&mut self, cx: &mut Cx) -> io::Result<bool> {
+        if !self.content_flags(&cx.ir).has_switch {
+            return Ok(false);
+        }
+        let cx = &mut *cx.enter_method(&self.flow.counters);
+        crate::decompiler::switches::expression::process(cx, &mut self.flow.counters, self.root)
+    }
+
+    /// Both switch passes see the same iteration before either can cause a restart.
+    pub fn prepare_try(&mut self, cx: &mut Cx, class: &StructClass) -> io::Result<()> {
+        self.run_until(cx, class, MainLoopStage::Try)
+    }
+
+    /// Execute the Java method loop up to the specified stage in a stable iteration.
+    fn run_until(
+        &mut self,
+        cx: &mut Cx,
+        class: &StructClass,
+        stage: MainLoopStage,
+    ) -> io::Result<()> {
         loop {
-            self.prepare_pattern_matching(cx, class)?;
-            if !self.match_if_patterns(cx, class)? {
+            self.identify_main_loop_labels(cx, class)?;
+            if self.identify_secondary(cx)?
+                || crate::decompiler::intersection::make_casts(
+                    cx,
+                    &mut self.flow.counters,
+                    self.root,
+                )?
+            {
+                continue;
+            }
+            if stage == MainLoopStage::IfPatterns {
+                return Ok(());
+            }
+            if self.match_if_patterns(cx, class)? {
+                continue;
+            }
+            if stage == MainLoopStage::Switches {
+                return Ok(());
+            }
+            let patterns = self.process_switch_patterns(cx)?;
+            let expressions = self.process_switch_expressions(cx)?;
+            if !patterns && !expressions {
                 return Ok(());
             }
         }

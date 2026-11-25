@@ -273,16 +273,11 @@ impl ForEach {
     }
 
     fn retain_bound(&self, cx: &mut Cx) {
-        if let Some((_, bound)) = Expr::type_bounds(cx, self.element.expr)
-            .lower
-            .into_iter()
-            .next()
-        {
-            let ExprKind::Variable(var) = &mut cx.ir[self.element.left].kind else {
-                unreachable!("Loop element must be a variable");
-            };
-            var.bound_type = Some(Box::new(bound));
-        }
+        let (_, bound) = Expr::assignment_bound(cx, self.element.left, self.element.right);
+        let ExprKind::Variable(var) = &mut cx.ir[self.element.left].kind else {
+            unreachable!("Loop element must be a variable");
+        };
+        var.bound_type = Some(Box::new(bound));
     }
 }
 

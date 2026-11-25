@@ -20,4 +20,5 @@ pub(crate) mod secondary;
 pub mod sforms;
 pub mod stack;
 pub mod stats;
+pub(crate) mod switches;
 pub mod vars;

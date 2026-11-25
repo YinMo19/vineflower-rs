@@ -48,6 +48,8 @@ The `instanceof` pattern comparison starts from that entry and runs one call to 
 
 The switch-entry comparison restarts at edge cleanup after each successful `instanceof` pattern pass. It compares the settled tree, expressions, variable state, counters, and fresh direct graph immediately before switch processing.
 
+The switch-pass comparison runs pattern and expression recovery in order on the same method. It checks both return values, counters between the passes and after both, shared case values and edges, case guards, phantom statements, and switch expressions with their backing statements and yields. The try-entry comparison also runs the outer restart after any successful switch pass and compares the settled method immediately before try processing.
+
 ## End-to-end source and CLI suite
 
 The retained `upstream_parity` target covers final source and CLI behavior. It currently requires library and binary entry points that still await migration. Use the explicit stage targets above to test the active implementation. The commands below document the end-to-end gate once those entry points are available.

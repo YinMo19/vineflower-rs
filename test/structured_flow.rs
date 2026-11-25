@@ -560,6 +560,24 @@ fn switch_entry_matches_upstream() {
     );
 }
 
+#[test]
+#[ignore = "requires the upstream +local.jar and JDK 17 or later"]
+fn switch_passes_match_upstream() {
+    stack_snapshot::check(
+        &upstream_reference::Corpus::discover(),
+        stack_snapshot::Check::SwitchPasses,
+    );
+}
+
+#[test]
+#[ignore = "requires the upstream +local.jar and JDK 17 or later"]
+fn try_entry_matches_upstream() {
+    stack_snapshot::check(
+        &upstream_reference::Corpus::discover(),
+        stack_snapshot::Check::TryEntry,
+    );
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 enum Check {
@@ -987,7 +1005,7 @@ fn write_text(out: &mut impl Write, text: &str) -> io::Result<()> {
 }
 
 fn structure_snapshot(cx: &Cx, root: StatId, counters: &CounterContainer) -> String {
-    structure_snapshot_with_edges(cx, root, counters, false)
+    structure_snapshot_with_edges(cx, root, counters, false, false)
 }
 
 fn structure_snapshot_with_edges(
@@ -995,6 +1013,7 @@ fn structure_snapshot_with_edges(
     root: StatId,
     counters: &CounterContainer,
     loop_stage: bool,
+    switch_stage: bool,
 ) -> String {
     let ir = &cx.ir;
     let StatementKind::Root {
@@ -1039,6 +1058,9 @@ fn structure_snapshot_with_edges(
             node.contains_monitor_exit,
             node.copied
         ));
+        if switch_stage {
+            fields.push(format!("phantom={}", node.phantom));
+        }
         fields.push(format!(
             "out={}",
             stat.get_successor_edges(ir, STATEDGE_ALL)
@@ -1075,17 +1097,26 @@ fn structure_snapshot_with_edges(
             )),
             StatementKind::Switch(switch) => fields.push(format!(
                 "switch={}/{}",
-                edge(switch.default_edge),
+                switch_edge(ir, switch.default_edge, switch_stage),
                 switch
                     .cases
                     .iter()
                     .map(|case| format!(
                         "{}:{}:{}",
                         ir[case.statement].id,
-                        case.edges.iter().map(|&e| edge(Some(e))).join("|"),
+                        case.edges
+                            .iter()
+                            .map(|&e| switch_edge(ir, Some(e), switch_stage))
+                            .join("|"),
                         case.values
                             .iter()
-                            .map(|&expr| expression(cx, expr))
+                            .map(|&expr| {
+                                if switch_stage {
+                                    expr.map_or_else(|| "-".to_owned(), |id| ir[id].id.to_string())
+                                } else {
+                                    expression(cx, expr)
+                                }
+                            })
                             .join("|")
                     ))
                     .join("/")
@@ -1133,6 +1164,21 @@ fn structure_snapshot_with_edges(
         }
     }
     fields.join(";")
+}
+
+fn switch_edge(ir: &Ir, edge: Option<EdgeId>, include_alias: bool) -> String {
+    let description = edge_id(ir, edge);
+    if include_alias && let Some(edge) = edge {
+        let index = ir[edge]
+            .source
+            .get_successor_edges(ir, STATEDGE_ALL)
+            .iter()
+            .position(|&candidate| candidate == edge);
+        let index = index.map_or_else(|| "-".to_owned(), |index| index.to_string());
+        format!("{description}@{index}")
+    } else {
+        description
+    }
 }
 
 fn structure_statements(ir: &Ir, root: StatId) -> impl Iterator<Item = StatId> + '_ {

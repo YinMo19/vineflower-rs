@@ -47,6 +47,8 @@ import org.jetbrains.java.decompiler.modules.decompiler.SecondaryFunctionsHelper
 import org.jetbrains.java.decompiler.modules.decompiler.SequenceHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.SimplifyExprentsHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.StackVarsProcessor;
+import org.jetbrains.java.decompiler.modules.decompiler.SwitchExpressionHelper;
+import org.jetbrains.java.decompiler.modules.decompiler.SwitchPatternMatchProcessor;
 import org.jetbrains.java.decompiler.modules.decompiler.decompose.DomHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.sforms.SSAConstructorSparseEx;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.RootStatement;
@@ -60,7 +62,7 @@ import org.jetbrains.java.decompiler.util.InterpreterUtil;
 class StackSnapshot {
   enum Check {
     STACK, INCREMENTS, PRE_MAIN, LOOP_ELIMINATION, LOOP_ENHANCEMENT, LOOP_MERGE, MAIN_LOOP_LABELS,
-    SECONDARY_FUNCTIONS, PATTERN_MATCHING_ENTRY, IF_PATTERNS, SWITCH_ENTRY;
+    SECONDARY_FUNCTIONS, PATTERN_MATCHING_ENTRY, IF_PATTERNS, SWITCH_ENTRY, SWITCH_PASSES, TRY_ENTRY;
 
     boolean usesLoopHeaders() {
       return this == LOOP_ENHANCEMENT || this == LOOP_MERGE || identifiesLabels();
@@ -75,11 +77,16 @@ class StackSnapshot {
     }
 
     boolean matchesIfPatterns() {
-      return this == IF_PATTERNS || this == SWITCH_ENTRY;
+      return this == IF_PATTERNS || this == SWITCH_ENTRY || recoversSwitches();
+    }
+
+    boolean recoversSwitches() {
+      return this == SWITCH_PASSES || this == TRY_ENTRY;
     }
 
     ExpressionSnapshot.Detail expressionDetail() {
       return switch (this) {
+        case SWITCH_PASSES, TRY_ENTRY -> ExpressionSnapshot.Detail.SWITCHES;
         case PATTERN_MATCHING_ENTRY, IF_PATTERNS, SWITCH_ENTRY -> ExpressionSnapshot.Detail.INTERSECTION_CASTS;
         case SECONDARY_FUNCTIONS -> ExpressionSnapshot.Detail.SECONDARY_FUNCTIONS;
         default -> usesLoopHeaders() ? ExpressionSnapshot.Detail.LOOP_HEADERS : ExpressionSnapshot.Detail.BASE;
@@ -395,14 +402,33 @@ class StackSnapshot {
           }
           if (check.matchesIfPatterns()) {
             operation = "match-if-patterns";
-            String before = counters.getCounter(CounterContainer.STATEMENT_COUNTER)
-              + "," + counters.getCounter(CounterContainer.EXPRESSION_COUNTER)
-              + "," + counters.getCounter(CounterContainer.VAR_COUNTER);
+            String before = counterSnapshot(counters);
             boolean changed = DecompilerContext.getOption(IFernflowerPreferences.PATTERN_MATCHING)
               && cl.getVersion().hasIfPatternMatching() && IfPatternMatchProcessor.matchInstanceof(root);
             if (check == Check.IF_PATTERNS) {
               details = ";pattern-counters-before=" + before + ";if-patterns=" + changed;
             } else if (changed) {
+              continue;
+            }
+          }
+          if (check.recoversSwitches()) {
+            boolean patterns = false;
+            boolean expressions = false;
+            String afterPatterns = null;
+            if (root.hasSwitch()) {
+              operation = "process-switch-patterns";
+              patterns = SwitchPatternMatchProcessor.hasPatternMatch(root)
+                && SwitchPatternMatchProcessor.processPatternMatching(root);
+              afterPatterns = counterSnapshot(counters);
+              operation = "process-switch-expressions";
+              expressions = SwitchExpressionHelper.hasSwitchExpressions(root)
+                && SwitchExpressionHelper.processSwitchExpressions(root);
+            }
+            if (check == Check.SWITCH_PASSES) {
+              details = ";switch-patterns=" + patterns + ";switch-pattern-counters="
+                + (afterPatterns == null ? counterSnapshot(counters) : afterPatterns)
+                + ";switch-expressions=" + expressions;
+            } else if (patterns || expressions) {
               continue;
             }
           }
@@ -468,6 +494,8 @@ class StackSnapshot {
         case PATTERN_MATCHING_ENTRY -> "pattern-matching-entry-" + operation + "-";
         case IF_PATTERNS -> "if-patterns-" + operation + "-";
         case SWITCH_ENTRY -> "switch-entry-" + operation + "-";
+        case SWITCH_PASSES -> "switch-passes-" + operation + "-";
+        case TRY_ENTRY -> "try-entry-" + operation + "-";
       };
       return failure + StructureReference.failureSnapshot(error);
     }
@@ -482,9 +510,15 @@ class StackSnapshot {
     boolean loopStage = check == Check.LOOP_ELIMINATION || check.usesLoopHeaders();
     String content = check == Check.PRE_MAIN || loopStage
       ? ";content=" + root.hasTryCatch() + "," + root.hasLoops() + "," + root.hasSwitch() : "";
-    String snapshot = StructureReference.snapshot(root, counters, loopStage)
+    String snapshot = StructureReference.snapshot(root, counters, loopStage, check.recoversSwitches())
       + content + ";hidden=" + allMembers + ";hidden-added=" + added + details
       + "\t" + ExpressionSnapshot.snapshot(root, counters, check.expressionDetail());
     return check == Check.STACK ? snapshot : snapshot + "\t" + VariableSnapshot.snapshot(vars);
+  }
+
+  private static String counterSnapshot(CounterContainer counters) {
+    return counters.getCounter(CounterContainer.STATEMENT_COUNTER)
+      + "," + counters.getCounter(CounterContainer.EXPRESSION_COUNTER)
+      + "," + counters.getCounter(CounterContainer.VAR_COUNTER);
   }
 }
