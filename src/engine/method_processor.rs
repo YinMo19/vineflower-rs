@@ -258,6 +258,8 @@ enum MainLoopStage {
     Try,
     InlineBlocks,
     LateLoops,
+    Exits,
+    End,
 }
 
 impl ExpressionMethod {
@@ -398,6 +400,38 @@ impl ExpressionMethod {
         self.run_until(cx, class, MainLoopStage::LateLoops)
     }
 
+    pub fn make_do_while_loops(&mut self, cx: &mut Cx) -> io::Result<bool> {
+        if self.content_flags(&cx.ir).has_loops {
+            crate::decompiler::loops::late::make_do_while(cx, &mut self.flow.counters, self.root)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub fn condense_infinite_loops(&mut self, cx: &mut Cx) -> io::Result<bool> {
+        if self.content_flags(&cx.ir).has_loops {
+            crate::decompiler::loops::late::condense_returns(cx, &mut self.flow.counters, self.root)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub fn prepare_exits(&mut self, cx: &mut Cx, class: &StructClass) -> io::Result<()> {
+        self.run_until(cx, class, MainLoopStage::Exits)
+    }
+
+    pub fn condense_exits(&mut self, cx: &mut Cx) -> io::Result<bool> {
+        if self.root.method(&cx.ir).name == crate::code::code_constants::CLINIT_NAME {
+            return Ok(false);
+        }
+        crate::decompiler::exits::condense(cx, &mut self.flow.counters, self.root)
+    }
+
+    /// Finish the built-in Java passes at MethodProcessor's MainLoopEnd.
+    pub fn finish_main_loop(&mut self, cx: &mut Cx, class: &StructClass) -> io::Result<()> {
+        self.run_until(cx, class, MainLoopStage::End)
+    }
+
     /// Execute the Java method loop up to the specified stage in a stable iteration.
     fn run_until(
         &mut self,
@@ -439,7 +473,16 @@ impl ExpressionMethod {
             if stage == MainLoopStage::InlineBlocks {
                 return Ok(());
             }
-            if !self.inline_single_blocks(cx)? {
+            if self.inline_single_blocks(cx)? {
+                continue;
+            }
+            if stage == MainLoopStage::LateLoops {
+                return Ok(());
+            }
+            if self.make_do_while_loops(cx)? || self.condense_infinite_loops(cx)? {
+                continue;
+            }
+            if stage == MainLoopStage::Exits || !self.condense_exits(cx)? {
                 return Ok(());
             }
         }
@@ -562,5 +605,18 @@ pub fn pre_main_method(
         return Ok(None);
     };
     result.prepare_main_loop(cx, class)?;
+    Ok(Some(result))
+}
+
+/// Native method processing through the end of the built-in Java main loop.
+pub fn main_loop_method(
+    cx: &mut Cx,
+    class: &StructClass,
+    method: &Arc<StructMethod>,
+) -> io::Result<Option<ExpressionMethod>> {
+    let Some(mut result) = pre_main_method(cx, class, method)? else {
+        return Ok(None);
+    };
+    result.finish_main_loop(cx, class)?;
     Ok(Some(result))
 }

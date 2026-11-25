@@ -148,7 +148,7 @@ fn match_while(cx: &mut Cx, counters: &mut CounterContainer, stat: StatId) -> bo
 
 /// Copy the entire IfExprent before transferring its condition. The wrapper
 /// also consumes an expression ID in the original pass.
-fn move_condition(
+pub(super) fn move_condition(
     cx: &mut Cx,
     counters: &mut CounterContainer,
     stat: StatId,

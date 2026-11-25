@@ -168,7 +168,12 @@ fn action_uses_preexisting_slots(ir: &mut Ir, root: StatId, stat: StatId, action
         .all(|index| used_before(ir, &graph, stat, index))
 }
 
-fn remove_last_empty(ir: &mut Ir, counters: &mut CounterContainer, stat: StatId, empty: StatId) {
+pub(super) fn remove_last_empty(
+    ir: &mut Ir,
+    counters: &mut CounterContainer,
+    stat: StatId,
+    empty: StatId,
+) {
     if ir[stat].first == Some(empty) {
         let new = Statement::new_empty_basic_block(ir, counters);
         stat.replace_statement(ir, empty, new);

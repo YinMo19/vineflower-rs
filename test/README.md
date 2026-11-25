@@ -52,6 +52,10 @@ The switch-pass comparison runs pattern and expression recovery in order on the 
 
 The resource comparison checks one try-with-resources recovery pass, including the return value, resource order, catches and their variables, jumps, and return expressions. The single-block comparison restarts the main loop after try recovery until it reaches the inlining pass, then checks that pass's result and the same method state. The graph captures when a try node shares its resource expression list with the statement.
 
+The late-loop comparison checks do-while recovery and infinite-loop return condensation after single-block inlining settles. A successful do-while recovery skips return condensation for that iteration. The exit comparisons check the settled input to exit condensation, one invocation of that pass, and the state after the Java main loop finishes restarting.
+
+The late-loop and exit comparisons separately report incoming continue edges moved in a single Java loop-elimination call. Java iterates those edges from an identity-hashed set. A comparison allows reordering only among the observed edges in each batch and only in the same occupied positions. It checks all other edges and snapshot fields exactly.
+
 ## End-to-end source and CLI suite
 
 The retained `upstream_parity` target covers final source and CLI behavior. It currently requires library and binary entry points that still await migration. Use the explicit stage targets above to test the active implementation. The commands below document the end-to-end gate once those entry points are available.

@@ -75,6 +75,10 @@ class StructureReference {
         case 15 -> StackSnapshot.Check.TRY_ENTRY;
         case 16 -> StackSnapshot.Check.TRY_RESOURCES;
         case 17 -> StackSnapshot.Check.INLINE_BLOCKS;
+        case 18 -> StackSnapshot.Check.LATE_LOOP_PASSES;
+        case 19 -> StackSnapshot.Check.EXIT_ENTRY;
+        case 20 -> StackSnapshot.Check.EXIT_CONDENSATION;
+        case 21 -> StackSnapshot.Check.MAIN_LOOP_END;
         default -> null;
       };
       StackSnapshot.Context stackContext = stackCheck == null ? null
@@ -431,7 +435,7 @@ class StructureReference {
     return edges.stream().map(StructureReference::edgeId).collect(Collectors.joining("|"));
   }
 
-  private static String edgeId(StatEdge edge) {
+  static String edgeId(StatEdge edge) {
     if (edge == null) {
       return "-";
     }

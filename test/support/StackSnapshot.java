@@ -34,6 +34,7 @@ import org.jetbrains.java.decompiler.modules.decompiler.AssertProcessor;
 import org.jetbrains.java.decompiler.modules.decompiler.ClearStructHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.ConcatenationHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.EliminateLoopsHelper;
+import org.jetbrains.java.decompiler.modules.decompiler.ExitHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.ExprProcessor;
 import org.jetbrains.java.decompiler.modules.decompiler.FinallyProcessor;
 import org.jetbrains.java.decompiler.modules.decompiler.IfHelper;
@@ -48,12 +49,15 @@ import org.jetbrains.java.decompiler.modules.decompiler.SecondaryFunctionsHelper
 import org.jetbrains.java.decompiler.modules.decompiler.SequenceHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.SimplifyExprentsHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.StackVarsProcessor;
+import org.jetbrains.java.decompiler.modules.decompiler.StatEdge;
 import org.jetbrains.java.decompiler.modules.decompiler.SwitchExpressionHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.SwitchPatternMatchProcessor;
 import org.jetbrains.java.decompiler.modules.decompiler.TryHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.decompose.DomHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.sforms.SSAConstructorSparseEx;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.RootStatement;
+import org.jetbrains.java.decompiler.modules.decompiler.stats.DoStatement;
+import org.jetbrains.java.decompiler.modules.decompiler.stats.Statement;
 import org.jetbrains.java.decompiler.modules.decompiler.vars.VarProcessor;
 import org.jetbrains.java.decompiler.struct.StructClass;
 import org.jetbrains.java.decompiler.struct.StructMethod;
@@ -65,7 +69,7 @@ class StackSnapshot {
   enum Check {
     STACK, INCREMENTS, PRE_MAIN, LOOP_ELIMINATION, LOOP_ENHANCEMENT, LOOP_MERGE, MAIN_LOOP_LABELS,
     SECONDARY_FUNCTIONS, PATTERN_MATCHING_ENTRY, IF_PATTERNS, SWITCH_ENTRY, SWITCH_PASSES, TRY_ENTRY,
-    TRY_RESOURCES, INLINE_BLOCKS;
+    TRY_RESOURCES, INLINE_BLOCKS, LATE_LOOP_PASSES, EXIT_ENTRY, EXIT_CONDENSATION, MAIN_LOOP_END;
 
     boolean usesLoopHeaders() {
       return this == LOOP_ENHANCEMENT || this == LOOP_MERGE || identifiesLabels();
@@ -88,13 +92,22 @@ class StackSnapshot {
     }
 
     boolean recoversResources() {
-      return this == TRY_RESOURCES || this == INLINE_BLOCKS;
+      return this == TRY_RESOURCES || this == INLINE_BLOCKS || recoversLateLoops();
+    }
+
+    boolean recoversLateLoops() {
+      return this == LATE_LOOP_PASSES || this == EXIT_ENTRY || condensesExits();
+    }
+
+    boolean condensesExits() {
+      return this == EXIT_CONDENSATION || this == MAIN_LOOP_END;
     }
 
     ExpressionSnapshot.Detail expressionDetail() {
       return switch (this) {
         case SWITCH_PASSES, TRY_ENTRY -> ExpressionSnapshot.Detail.SWITCHES;
-        case TRY_RESOURCES, INLINE_BLOCKS -> ExpressionSnapshot.Detail.RESOURCES;
+        case TRY_RESOURCES, INLINE_BLOCKS, LATE_LOOP_PASSES, EXIT_ENTRY, EXIT_CONDENSATION, MAIN_LOOP_END
+          -> ExpressionSnapshot.Detail.RESOURCES;
         case PATTERN_MATCHING_ENTRY, IF_PATTERNS, SWITCH_ENTRY -> ExpressionSnapshot.Detail.INTERSECTION_CASTS;
         case SECONDARY_FUNCTIONS -> ExpressionSnapshot.Detail.SECONDARY_FUNCTIONS;
         default -> usesLoopHeaders() ? ExpressionSnapshot.Detail.LOOP_HEADERS : ExpressionSnapshot.Detail.BASE;
@@ -360,6 +373,7 @@ class StackSnapshot {
       }
       if (check.usesLoopHeaders()) {
         String details = "";
+        var movedContinues = check.recoversLateLoops() ? new ArrayList<List<StatEdge>>() : null;
         while (true) {
           operation = "clean-up-edges";
           LabelHelper.cleanUpEdges(root);
@@ -373,7 +387,7 @@ class StackSnapshot {
           } else if (root.hasLoops()) {
             operation = "merge-loops";
             while (true) {
-              if (EliminateLoopsHelper.eliminateLoops(root, cl)) {
+              if (eliminateLoops(root, cl, movedContinues)) {
                 continue;
               }
               MergeHelper.enhanceLoops(root);
@@ -450,14 +464,44 @@ class StackSnapshot {
                 continue;
               }
               operation = "inline-single-blocks";
-              details = ";inline-blocks=" + InlineSingleBlockHelper.inlineSingleBlocks(root);
+              boolean inlined = InlineSingleBlockHelper.inlineSingleBlocks(root);
+              if (check == Check.INLINE_BLOCKS) {
+                details = ";inline-blocks=" + inlined;
+              } else if (inlined) {
+                continue;
+              }
+            }
+          }
+          if (check.recoversLateLoops()) {
+            operation = "make-do-while-loops";
+            boolean doWhile = root.hasLoops() && MergeHelper.makeDoWhileLoops(root);
+            boolean condensed = false;
+            if (!doWhile) {
+              operation = "condense-infinite-loops";
+              condensed = root.hasLoops() && MergeHelper.condenseInfiniteLoopsWithReturn(root);
+            }
+            if (check == Check.LATE_LOOP_PASSES) {
+              details = ";do-while=" + doWhile + ";condense-loops="
+                + (doWhile ? "skipped" : Boolean.toString(condensed));
+            } else if (doWhile || condensed) {
+              continue;
+            }
+          }
+          if (check.condensesExits()) {
+            operation = "condense-exits";
+            boolean changed = !CodeConstants.CLINIT_NAME.equals(method.getName()) && ExitHelper.condenseExits(root);
+            if (check == Check.EXIT_CONDENSATION) {
+              details = ";condense-exits=" + changed;
+            } else if (changed) {
+              continue;
             }
           }
           break;
         }
         operation = "snapshot";
-        return snapshot(root, counters, vars, initialHidden, check, details)
+        var state = snapshot(root, counters, vars, initialHidden, check, details)
           + "\t" + DirectGraphSnapshot.enhanced(root);
+        return movedContinues == null ? state : state + "\tcontinue-moves=" + continueMoves(root, movedContinues);
       } else if (check == Check.LOOP_ELIMINATION) {
         operation = "snapshot";
         var originalEdges = first ? StructureReference.edgeStates(root) : Map.of();
@@ -519,9 +563,78 @@ class StackSnapshot {
         case TRY_ENTRY -> "try-entry-" + operation + "-";
         case TRY_RESOURCES -> "try-resources-" + operation + "-";
         case INLINE_BLOCKS -> "inline-blocks-" + operation + "-";
+        case LATE_LOOP_PASSES -> "late-loop-passes-" + operation + "-";
+        case EXIT_ENTRY -> "exit-entry-" + operation + "-";
+        case EXIT_CONDENSATION -> "exit-condensation-" + operation + "-";
+        case MAIN_LOOP_END -> "main-loop-end-" + operation + "-";
       };
       return failure + StructureReference.failureSnapshot(error);
     }
+  }
+
+  private record ContinueBatch(DoStatement oldLoop, DoStatement parentLoop, List<StatEdge> edges) {}
+
+  // EliminateLoopsHelper.eliminateLoop retargets labels in identity HashSet order.
+  // Capture the identities around each real call, then report their final slots.
+  private static boolean eliminateLoops(RootStatement root, StructClass cl, List<List<StatEdge>> changes) {
+    if (changes == null) {
+      return EliminateLoopsHelper.eliminateLoops(root, cl);
+    }
+    List<ContinueBatch> batches = new ArrayList<>();
+    for (Statement stat : StructureReference.statements(root)) {
+      if (stat instanceof DoStatement loop) {
+        Statement parent = loop.getParent();
+        while (parent != null && !(parent instanceof DoStatement)) {
+          parent = parent.getParent();
+        }
+        if (parent instanceof DoStatement outer) {
+          var incoming = loop.getPredecessorEdges(StatEdge.TYPE_CONTINUE);
+          var candidates = loop.getLabelEdges().stream()
+            .filter(edge -> edge.getType() == StatEdge.TYPE_CONTINUE && edge.getDestination() == loop
+              && edge.closure == loop && incoming.contains(edge)).toList();
+          if (candidates.size() > 1) {
+            batches.add(new ContinueBatch(loop, outer, candidates));
+          }
+        }
+      }
+    }
+    boolean changed = EliminateLoopsHelper.eliminateLoops(root, cl);
+    if (changed && !batches.isEmpty()) {
+      var active = StructureReference.statements(root);
+      for (var batch : batches) {
+        if (!active.contains(batch.oldLoop()) && active.contains(batch.parentLoop())) {
+          var moved = batch.edges().stream()
+            .filter(edge -> edge.getDestination() == batch.parentLoop() && edge.closure == batch.parentLoop()
+              && batch.parentLoop().getPredecessorEdges(StatEdge.TYPE_CONTINUE).contains(edge)).toList();
+          if (moved.size() > 1) {
+            changes.add(moved);
+          }
+        }
+      }
+    }
+    return changed;
+  }
+
+  private static String continueMoves(RootStatement root, List<List<StatEdge>> changes) {
+    var active = StructureReference.statements(root);
+    var groups = new StringJoiner(";");
+    for (var batch : changes) {
+      var byDestination = new IdentityHashMap<Statement, List<StatEdge>>();
+      for (var edge : batch) {
+        var dest = edge.getDestination();
+        if (dest instanceof DoStatement && active.contains(dest) && edge.getType() == StatEdge.TYPE_CONTINUE
+            && dest.getPredecessorEdges(StatEdge.TYPE_CONTINUE).contains(edge)) {
+          byDestination.computeIfAbsent(dest, ignored -> new ArrayList<>()).add(edge);
+        }
+      }
+      for (var group : byDestination.entrySet()) {
+        if (group.getValue().size() > 1) {
+          groups.add(group.getKey().id + ":" + group.getValue().stream()
+            .map(StructureReference::edgeId).collect(Collectors.joining("|")));
+        }
+      }
+    }
+    return groups.toString();
   }
 
   private static String snapshot(RootStatement root, CounterContainer counters, VarProcessor vars,

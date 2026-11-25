@@ -54,6 +54,10 @@ pub(super) enum Check {
     TryEntry = 15,
     TryResources = 16,
     InlineBlocks = 17,
+    LateLoopPasses = 18,
+    ExitEntry = 19,
+    ExitCondensation = 20,
+    MainLoopEnd = 21,
 }
 
 #[derive(Clone, Copy)]
@@ -278,6 +282,43 @@ const INLINE_BLOCK_STAGES: &[(&str, &str)] = &[
     ("Direct graph after single-block inlining", "graph="),
 ];
 
+const LATE_LOOP_PASS_STAGES: &[(&str, &str)] = &[
+    (
+        "Structure and return values after late loop passes",
+        "counters=",
+    ),
+    (
+        "Loop headers and expressions after late loop passes",
+        "counters=",
+    ),
+    ("Variable versions after late loop passes", "versions="),
+    ("Direct graph after late loop passes", "graph="),
+];
+
+const EXIT_ENTRY_STAGES: &[(&str, &str)] = &[
+    ("Structure before exit condensation", "counters="),
+    ("Expressions before exit condensation", "counters="),
+    ("Variable versions before exit condensation", "versions="),
+    ("Direct graph before exit condensation", "graph="),
+];
+
+const EXIT_CONDENSATION_STAGES: &[(&str, &str)] = &[
+    (
+        "Structure and return value after exit condensation",
+        "counters=",
+    ),
+    ("Expressions after exit condensation", "counters="),
+    ("Variable versions after exit condensation", "versions="),
+    ("Direct graph after exit condensation", "graph="),
+];
+
+const MAIN_LOOP_END_STAGES: &[(&str, &str)] = &[
+    ("Structure at main loop completion", "counters="),
+    ("Expressions at main loop completion", "counters="),
+    ("Variable versions at main loop completion", "versions="),
+    ("Direct graph at main loop completion", "graph="),
+];
+
 fn loop_iterations(row: &str) -> impl Iterator<Item = &str> {
     row.split('\t')
         .nth(3)
@@ -302,7 +343,11 @@ impl Check {
             | Self::SwitchPasses
             | Self::TryEntry
             | Self::TryResources
-            | Self::InlineBlocks => &[DEFAULT],
+            | Self::InlineBlocks
+            | Self::LateLoopPasses
+            | Self::ExitEntry
+            | Self::ExitCondensation
+            | Self::MainLoopEnd => &[DEFAULT],
             Self::SecondaryFunctions => SECONDARY_PROFILES,
         }
     }
@@ -324,6 +369,10 @@ impl Check {
             Self::TryEntry => TRY_ENTRY_STAGES,
             Self::TryResources => TRY_RESOURCE_STAGES,
             Self::InlineBlocks => INLINE_BLOCK_STAGES,
+            Self::LateLoopPasses => LATE_LOOP_PASS_STAGES,
+            Self::ExitEntry => EXIT_ENTRY_STAGES,
+            Self::ExitCondensation => EXIT_CONDENSATION_STAGES,
+            Self::MainLoopEnd => MAIN_LOOP_END_STAGES,
         }
     }
 
@@ -344,6 +393,10 @@ impl Check {
             Self::TryEntry => "try-entry",
             Self::TryResources => "try-resources",
             Self::InlineBlocks => "inline-blocks",
+            Self::LateLoopPasses => "late-loop-passes",
+            Self::ExitEntry => "exit-entry",
+            Self::ExitCondensation => "exit-condensation",
+            Self::MainLoopEnd => "main-loop-end",
         }
     }
 
@@ -375,7 +428,15 @@ impl Check {
     }
 
     fn recovers_resources(self) -> bool {
-        matches!(self, Self::TryResources | Self::InlineBlocks)
+        matches!(
+            self,
+            Self::TryResources
+                | Self::InlineBlocks
+                | Self::LateLoopPasses
+                | Self::ExitEntry
+                | Self::ExitCondensation
+                | Self::MainLoopEnd
+        )
     }
 
     fn expression_detail(self) -> expression_snapshot::Detail {
@@ -578,6 +639,9 @@ struct ResourceCoverage {
     methods_with_resources: usize,
     resource_statements: usize,
     resources: usize,
+    changed_do_whiles: usize,
+    condensed_loops: usize,
+    condensed_exits: usize,
 }
 
 impl ResourceCoverage {
@@ -587,6 +651,10 @@ impl ResourceCoverage {
         self.changed_methods += usize::from(
             tree.ends_with(";try-resources=true") || tree.ends_with(";inline-blocks=true"),
         );
+        self.changed_do_whiles +=
+            usize::from(tree.ends_with(";do-while=true;condense-loops=skipped"));
+        self.condensed_loops += usize::from(tree.ends_with(";condense-loops=true"));
+        self.condensed_exits += usize::from(tree.ends_with(";condense-exits=true"));
         let mut method_has_resources = false;
         for field in snapshots.next().unwrap().split(';') {
             if let Some((key, list)) = field.split_once('=')
@@ -601,13 +669,23 @@ impl ResourceCoverage {
         self.methods_with_resources += usize::from(method_has_resources);
     }
 
-    fn report(&self) {
+    fn report(&self, check: Check) {
+        match check {
+            Check::TryResources | Check::InlineBlocks => {
+                eprintln!("{} methods reported a change.", self.changed_methods);
+            }
+            Check::LateLoopPasses => eprintln!(
+                "{} methods changed in do-while recovery and {} in infinite-loop return condensation.",
+                self.changed_do_whiles, self.condensed_loops
+            ),
+            Check::ExitCondensation => {
+                eprintln!("{} methods condensed exits.", self.condensed_exits)
+            }
+            _ => {}
+        }
         eprintln!(
-            "{} methods reported a change. {} methods contain {} resources across {} try statements.",
-            self.changed_methods,
-            self.methods_with_resources,
-            self.resources,
-            self.resource_statements
+            "{} methods contain {} resources across {} try statements.",
+            self.methods_with_resources, self.resources, self.resource_statements
         );
     }
 }
@@ -828,6 +906,7 @@ pub(super) fn check(corpus: &Corpus, check: Check) {
     let mut errors = Vec::new();
     let mut rejected = 0;
     let mut switch_rejected = 0;
+    let mut transferred_continue_order = 0;
     let mut hidden_changes = [0, 0];
     let mut repeats = 0;
     let mut changed_original = 0;
@@ -847,6 +926,7 @@ pub(super) fn check(corpus: &Corpus, check: Check) {
             .expect("missing Java stack snapshot")
             .unwrap();
         let (id, java) = row.split_once('\t').unwrap();
+        let (java, continue_moves) = java.rsplit_once("\tcontinue-moves=").unwrap_or((java, ""));
         let rust = rust_rows
             .next()
             .expect("missing Rust stack snapshot")
@@ -876,11 +956,20 @@ pub(super) fn check(corpus: &Corpus, check: Check) {
         };
         if java == rust && (java.starts_with("rejected=") || java.starts_with("class-rejected=")) {
             rejected += 1;
+            continue;
         } else if same_switch_case_rejection(check, java, &rust) {
             switch_rejected += 1;
-        } else if let Err(diff) = compare_snapshots(java, &rust, stages) {
-            errors.push(format!("{method}\n  {diff}"));
-        } else if secondary_variant {
+            continue;
+        }
+        if let Err(diff) = compare_snapshots(java, &rust, stages) {
+            if same_transferred_continues(java, &rust, continue_moves) {
+                transferred_continue_order += 1;
+            } else {
+                errors.push(format!("{method}\n  {diff}"));
+                continue;
+            }
+        }
+        if secondary_variant {
             secondary_coverage.record(check, method, &rust);
         } else if check.uses_loop_headers() {
             enhancement_coverage.record(check, method, &rust);
@@ -953,12 +1042,17 @@ pub(super) fn check(corpus: &Corpus, check: Check) {
     };
     eprintln!(
         "{} exact {stages}{} snapshots and {rejected} matching rejections across {} class files",
-        methods.len() - rejected - switch_rejected,
+        methods.len() - rejected - switch_rejected - transferred_continue_order,
         check.name(),
         groups.iter().map(Vec::len).sum::<usize>()
     );
     if switch_rejected > 0 {
         eprintln!("{switch_rejected} matching switch case type rejections in variable versioning");
+    }
+    if transferred_continue_order > 0 {
+        eprintln!(
+            "{transferred_continue_order} snapshots agree after accounting for continue order in recorded loop-elimination batches"
+        );
     }
     if check.uses_loop_headers() {
         if check == Check::SecondaryFunctions {
@@ -972,7 +1066,7 @@ pub(super) fn check(corpus: &Corpus, check: Check) {
             switch_coverage.report(check);
         }
         if check.recovers_resources() {
-            resource_coverage.report();
+            resource_coverage.report(check);
         }
         if check == Check::SecondaryFunctions {
             eprintln!("With ternary constant simplification enabled");
@@ -1175,7 +1269,11 @@ fn stage(
                 | Check::SwitchPasses
                 | Check::TryEntry
                 | Check::TryResources
-                | Check::InlineBlocks,
+                | Check::InlineBlocks
+                | Check::LateLoopPasses
+                | Check::ExitEntry
+                | Check::ExitCondensation
+                | Check::MainLoopEnd,
                 _,
             ) => {
                 loop {
@@ -1212,6 +1310,33 @@ fn stage(
                         operation.set("merge-loops");
                         method.merge_loops(cx, class)?;
                         String::new()
+                    } else if check == Check::MainLoopEnd {
+                        operation.set("finish-main-loop");
+                        method.finish_main_loop(cx, class)?;
+                        String::new()
+                    } else if matches!(check, Check::ExitEntry | Check::ExitCondensation) {
+                        operation.set("prepare-exits");
+                        method.prepare_exits(cx, class)?;
+                        if check == Check::ExitCondensation {
+                            operation.set("condense-exits");
+                            format!(";condense-exits={}", method.condense_exits(cx)?)
+                        } else {
+                            String::new()
+                        }
+                    } else if check == Check::LateLoopPasses {
+                        operation.set("prepare-late-loops");
+                        method.prepare_late_loops(cx, class)?;
+                        operation.set("make-do-while-loops");
+                        let changed = method.make_do_while_loops(cx)?;
+                        if changed {
+                            ";do-while=true;condense-loops=skipped".to_owned()
+                        } else {
+                            operation.set("condense-infinite-loops");
+                            format!(
+                                ";do-while=false;condense-loops={}",
+                                method.condense_infinite_loops(cx)?
+                            )
+                        }
                     } else if check == Check::InlineBlocks {
                         operation.set("prepare-inline");
                         method.prepare_inline(cx, class)?;
@@ -1451,6 +1576,9 @@ fn same_switch_case_rejection(check: Check, java: &str, rust: &str) -> bool {
     let operation = match check {
         Check::TryEntry | Check::TryResources => "prepare-try",
         Check::InlineBlocks => "prepare-inline",
+        Check::LateLoopPasses => "prepare-late-loops",
+        Check::ExitEntry | Check::ExitCondensation => "prepare-exits",
+        Check::MainLoopEnd => "finish-main-loop",
         _ => return false,
     };
     let Some(java) = java.strip_prefix(check.name()) else {
@@ -1471,6 +1599,88 @@ fn same_switch_case_rejection(check: Check, java: &str, rust: &str) -> bool {
         (Some((_, java)), Some((_, rust))) => !java.is_empty() && java == rust,
         _ => false,
     }
+}
+
+fn same_transferred_continues(java: &str, rust: &str, transfers: &str) -> bool {
+    if transfers.is_empty() {
+        return false;
+    }
+    let Some((java, java_rest)) = java.split_once('\t') else {
+        return false;
+    };
+    let Some((rust, rust_rest)) = rust.split_once('\t') else {
+        return false;
+    };
+    if java_rest != rust_rest {
+        return false;
+    }
+    let mut batches: HashMap<&str, Vec<Vec<&str>>> = HashMap::new();
+    for batch in transfers.split(';') {
+        let (loop_id, edges) = batch.split_once(':').unwrap();
+        batches
+            .entry(loop_id)
+            .or_default()
+            .push(edges.split('|').collect());
+    }
+    let mut loop_id = None;
+    java.split(';').zip_longest(rust.split(';')).all(|pair| {
+        let itertools::EitherOrBoth::Both(java, rust) = pair else {
+            return false;
+        };
+        if let Some(stat) = java.strip_prefix("stat=") {
+            loop_id = stat.strip_suffix(":DO");
+        }
+        java == rust
+            || loop_id.is_some_and(|id| {
+                batches
+                    .get(id)
+                    .is_some_and(|batches| matching_incoming_slots(java, rust, batches))
+            })
+    })
+}
+
+fn matching_incoming_slots(java: &str, rust: &str, batches: &[Vec<&str>]) -> bool {
+    let (Some(java), Some(rust)) = (java.strip_prefix("in="), rust.strip_prefix("in=")) else {
+        return false;
+    };
+    let java: Vec<_> = java.split('|').collect();
+    let rust: Vec<_> = rust.split('|').collect();
+    if java.len() != rust.len() {
+        return false;
+    }
+    let mut reordered = FxHashSet::default();
+    for batch in batches {
+        let slots = java
+            .iter()
+            .positions(|edge| batch.contains(edge))
+            .collect_vec();
+        if slots.len() != batch.len()
+            || !slots
+                .iter()
+                .copied()
+                .eq(rust.iter().positions(|edge| batch.contains(edge)))
+        {
+            continue;
+        }
+        // The same edges must occupy the same slots on both sides.
+        if slots
+            .iter()
+            .map(|&slot| java[slot])
+            .sorted()
+            .eq(batch.iter().copied().sorted())
+            && slots
+                .iter()
+                .map(|&slot| rust[slot])
+                .sorted()
+                .eq(batch.iter().copied().sorted())
+        {
+            reordered.extend(slots);
+        }
+    }
+    java.iter()
+        .zip(&rust)
+        .enumerate()
+        .all(|(slot, (left, right))| left == right || reordered.contains(&slot))
 }
 
 fn variable_snapshot(versions: &VarVersions) -> String {

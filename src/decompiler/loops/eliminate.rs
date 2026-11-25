@@ -265,6 +265,8 @@ fn remove_loop(ir: &mut Ir, loop_stat: StatId, parent_loop: StatId, body: StatId
         }
     }
 
+    // Java appends this batch in identity HashSet order. Discovery order
+    // retains every edge and keeps the other predecessor slots stable.
     let edges: Vec<_> = ir[loop_stat].label_edges.iter().copied().collect();
     for edge in edges {
         edge.change_destination(ir, parent_loop);

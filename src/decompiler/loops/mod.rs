@@ -8,6 +8,7 @@ pub(crate) mod eliminate;
 pub(crate) mod enhance;
 mod extract;
 mod foreach;
+pub(crate) mod late;
 
 use std::collections::VecDeque;
 
