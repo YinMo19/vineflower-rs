@@ -479,6 +479,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
+name = "rawzip"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ebe3170012078772481d436f07d89252ed3334a1173de1ea99247459a2931313"
+
+[[package]]
 name = "rustc-hash"
 version = "2.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -670,6 +676,7 @@ dependencies = [
  "arcstr",
  "bit-set",
  "clap",
+ "flate2",
  "index_vec",
  "indexmap",
  "itertools",
@@ -678,6 +685,7 @@ dependencies = [
  "log",
  "num-integer",
  "prost",
+ "rawzip",
  "rustc-hash",
  "tempfile",
  "thiserror",

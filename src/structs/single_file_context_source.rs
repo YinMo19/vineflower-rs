@@ -13,6 +13,7 @@ use std::{
 use crate::engine::{
     Options,
     context_source::{CLASS_SUFFIX, ContextSource, Entries, Entry},
+    counter_container::ExpressionIds,
 };
 use crate::renamer::pool_interceptor::PoolInterceptor;
 use crate::structs::StructClass;
@@ -31,6 +32,15 @@ impl SingleFileContextSource {
         options: &Options,
         interceptor: Option<Arc<PoolInterceptor>>,
     ) -> io::Result<Self> {
+        Self::open_with_ids(path, options, interceptor, &ExpressionIds::default())
+    }
+
+    pub(super) fn open_with_ids(
+        path: &Path,
+        options: &Options,
+        interceptor: Option<Arc<PoolInterceptor>>,
+        ids: &ExpressionIds,
+    ) -> io::Result<Self> {
         let contents = path.is_file().then(|| fs::read(path)).transpose()?;
         let qualified_name = match &contents {
             Some(bytes)
@@ -40,11 +50,12 @@ impl SingleFileContextSource {
                     .ends_with(CLASS_SUFFIX.as_bytes()) =>
             {
                 Some(
-                    StructClass::create(
+                    StructClass::create_with_ids(
                         &mut DataInputFullStream::new(bytes),
                         false,
                         options,
                         interceptor,
+                        ids,
                     )?
                     .qualified_name,
                 )

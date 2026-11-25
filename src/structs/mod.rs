@@ -6,6 +6,8 @@
 pub mod attr;
 pub mod consts;
 pub mod context_unit;
+pub mod directory_context_source;
+pub mod jar_context_source;
 pub(crate) mod matcher;
 pub mod struct_class;
 pub mod struct_context;

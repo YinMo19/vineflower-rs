@@ -8,12 +8,17 @@
 //! Saving the decompiled classes (`saveContext`) is the driver's part and
 //! lives with it.
 
+use std::io;
+use std::path::Path;
 use std::sync::{Arc, OnceLock, RwLock};
 
 use arcstr::ArcStr;
 use rustc_hash::FxHashMap;
 
 use super::context_unit::ContextUnit;
+use super::directory_context_source::DirectoryContextSource;
+use super::jar_context_source::{JarContextSource, is_jar_file};
+use super::single_file_context_source::SingleFileContextSource;
 use super::struct_class::StructClass;
 use crate::engine::Options;
 use crate::engine::context_source::ContextSource;
@@ -113,34 +118,69 @@ impl StructContext {
     /// Reads every class again, for instance to see the names an
     /// interceptor now gives them.
     pub fn reload_context(&mut self, interceptor: Option<Arc<PoolInterceptor>>) {
-        self.interceptor = interceptor;
-        self.classes.get_mut().unwrap().clear();
-        self.units_by_class_name.get_mut().unwrap().clear();
-        self.abstract_names.clear();
+        self.try_reload_context(interceptor)
+            .expect("Could not reload class context");
+    }
 
-        let units = std::mem::take(&mut self.units);
-        self.lazy_units.clear();
-
-        for unit in units.iter().filter(|unit| unit.root) {
-            self.add_unit(Arc::clone(&unit.source), unit.own, true);
+    pub fn try_reload_context(
+        &mut self,
+        interceptor: Option<Arc<PoolInterceptor>>,
+    ) -> io::Result<()> {
+        let mut updated = Self::new(Arc::clone(&self.options), interceptor);
+        updated.metadata_ids = self.metadata_ids.clone();
+        for unit in self.units.iter().filter(|unit| unit.root) {
+            updated.add_unit(Arc::clone(&unit.source), unit.own, true)?;
         }
+        *self = updated;
+        Ok(())
+    }
+
+    /// `addSpace(File, isOwn)` registers a folder, archive, class or resource.
+    pub fn add_file(&mut self, path: &Path, own: bool) -> io::Result<()> {
+        let source: Arc<dyn ContextSource> = if path.is_dir() {
+            Arc::new(DirectoryContextSource::open(path)?)
+        } else if is_jar_file(path) {
+            Arc::new(JarContextSource::open(path)?)
+        } else {
+            Arc::new(
+                SingleFileContextSource::open_with_ids(
+                    path,
+                    &self.options,
+                    self.interceptor.clone(),
+                    self.metadata_ids(),
+                )
+                .map_err(|err| invalid_source("file", path, err))?,
+            )
+        };
+        self.add_unit(source, own, true)
     }
 
     /// `addSpace(source, isOwn)`.
     pub fn add_space(&mut self, source: Arc<dyn ContextSource>, is_own: bool) {
-        self.add_unit(source, is_own, true);
+        self.add_unit(source, is_own, true)
+            .expect("Could not add context source");
     }
 
-    fn add_unit(&mut self, source: Arc<dyn ContextSource>, is_own: bool, is_root: bool) {
-        let unit = Arc::new(ContextUnit::new(source, is_own, is_root, &self.options));
+    fn add_unit(
+        &mut self,
+        source: Arc<dyn ContextSource>,
+        is_own: bool,
+        is_root: bool,
+    ) -> io::Result<()> {
+        let unit = Arc::new(ContextUnit::try_new(
+            source,
+            is_own,
+            is_root,
+            &self.options,
+        )?);
         self.units.push(Arc::clone(&unit));
         if unit.is_lazy() {
             self.lazy_units.push(Arc::clone(&unit));
         }
-        self.init_unit(&unit);
+        self.init_unit(&unit)
     }
 
-    fn init_unit(&mut self, unit: &Arc<ContextUnit>) {
+    fn init_unit(&mut self, unit: &Arc<ContextUnit>) -> io::Result<()> {
         for metadata in &unit.abstract_metadata {
             self.load_abstract_metadata(metadata);
         }
@@ -164,8 +204,9 @@ impl StructContext {
         }
 
         for child in &unit.child_contexts {
-            self.add_unit(Arc::clone(child), is_own, false);
+            self.add_unit(Arc::clone(child), is_own, false)?;
         }
+        Ok(())
     }
 
     pub fn instance_of(&self, valclass: &str, refclass: &str) -> bool {
@@ -214,6 +255,13 @@ impl StructContext {
     pub fn get_units(&self) -> &[Arc<ContextUnit>] {
         &self.units
     }
+}
+
+pub(super) fn invalid_source(kind: &str, path: &Path, error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!("Invalid {kind} {}: {error}", path.display()),
+    )
 }
 
 impl ClassResolver<'_> {

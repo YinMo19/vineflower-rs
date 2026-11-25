@@ -7,6 +7,8 @@
 use std::io;
 use std::sync::Arc;
 
+use unicode_general_category::{GeneralCategory, get_general_category};
+
 mod runtime;
 
 pub use runtime::RuntimeImage;
@@ -23,6 +25,11 @@ pub trait ContextSource: Send + Sync {
 
     /// A listing of all entries in this context unit.
     fn get_entries(&self) -> Entries;
+
+    /// List entries from a source whose contents can fail to enumerate.
+    fn try_get_entries(&self) -> io::Result<Entries> {
+        Ok(self.get_entries())
+    }
 
     /// Whether this context source is lazy. A lazy context source may return
     /// no entries from [`get_entries`](Self::get_entries) in case listing
@@ -77,16 +84,28 @@ impl Entry {
 
     /// Parse an entry from a raw jar path; it may indicate a multirelease resource.
     pub fn parse(path: &str) -> Entry {
+        Self::try_parse(path).expect("Invalid multirelease entry")
+    }
+
+    pub(crate) fn try_parse(path: &str) -> io::Result<Entry> {
         let versioned = path
             .strip_prefix(Self::MULTIRELEASE_PREFIX)
             .and_then(|rest| rest.split_once('/'))
             .and_then(|(version, _)| {
                 let multirelease = parse_java_int(version)?;
                 let next_slash = Self::MULTIRELEASE_PREFIX.len() + version.len();
-                Some(Entry::new(&path[next_slash..], multirelease))
+                Some((&path[next_slash..], multirelease))
             });
-        // unversioned
-        versioned.unwrap_or_else(|| Entry::at_base(path))
+        let Some((base_path, multirelease)) = versioned else {
+            return Ok(Entry::at_base(path));
+        };
+        if multirelease != Self::BASE_VERSION && multirelease < 9 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "A multirelease variant must target a Java runtime >= 9",
+            ));
+        }
+        Ok(Entry::new(base_path, multirelease))
     }
 
     /// An entry at the base version, without attempting to parse any
@@ -119,7 +138,35 @@ impl Entry {
     }
 }
 
-/// `Integer.parseInt`, which accepts a sign but no surrounding text.
+/// `Integer.parseInt`, which tests each UTF-16 code unit with `Character.digit`.
 fn parse_java_int(text: &str) -> Option<i32> {
-    text.parse().ok()
+    if text.is_ascii() {
+        return text.parse().ok();
+    }
+    let (digits, negative) = if let Some(digits) = text.strip_prefix('-') {
+        (digits, true)
+    } else {
+        (text.strip_prefix('+').unwrap_or(text), false)
+    };
+    let value = digits.chars().try_fold(0i32, |value, digit| {
+        if digit.len_utf16() != 1 || get_general_category(digit) != GeneralCategory::DecimalNumber {
+            return None;
+        }
+        // Decimal digits occur in consecutive groups from zero through nine.
+        let previous_digits = (0..digit as u32)
+            .rev()
+            .take_while(|&unit| {
+                char::from_u32(unit)
+                    .is_some_and(|ch| get_general_category(ch) == GeneralCategory::DecimalNumber)
+            })
+            .count();
+        value
+            .checked_mul(10)?
+            .checked_sub((previous_digits % 10) as i32)
+    })?;
+    if negative {
+        Some(value)
+    } else {
+        value.checked_neg()
+    }
 }

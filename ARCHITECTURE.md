@@ -51,7 +51,7 @@ CFG、语句图和 DirectGraph 具有不同的边契约。
 
 | 操作 | 选择与原因 |
 | --- | --- |
-| 文件系统、ZIP/JAR、JDK 镜像 | 用标准库、`zip` 和 `jimage-rs` 读取字节。在 `StructContext` 保留自有类与库类的区别、类路径遮蔽顺序以及懒加载。 |
+| 文件系统、ZIP/JAR、JDK 镜像 | 用标准库读取文件，`rawzip` 枚举 ZIP 中央目录的原始条目，`flate2` 解压 Deflate 数据，`jimage-rs` 读取 JDK 镜像。在 `StructContext` 保留自有类与库类的区别、类路径遮蔽顺序以及懒加载。 |
 | class 文件、描述符、签名、指令 | 复用现有解码器。保留常量池索引、宽指令归一化、原字节偏移、跳转目标与异常表。JSR 展开使用上游的类型步进规则；后续表达式构建有独立的栈语义。 |
 | lexer、`syn`、规则匹配 | 输入是 class 字节。`syn` 解析 Rust 源码。上游 `struct.match.MatchEngine` 的规则字符串描述待匹配的语句和表达式，适合在匹配器内实现这一小段语法。writer 直接在生成标识符时登记 token 和字符区间。 |
 | 图、集合和编号 | 用 arena 提供稳定句柄。基本块普通边是有序多重边，异常范围独立于边；图的归并、后支配候选排序由移植代码控制。库可承载位集合与索引。对遍历会影响结果的 Java 值键表，`JHashMap` 保留 JDK 桶遍历、扩容以及 `put` 和 `computeIfAbsent` 的不同插入位置。当前保留链表桶，尚缺 JDK 树化桶的遍历语义。 |
@@ -98,6 +98,8 @@ CFG、语句图和 DirectGraph 具有不同的边契约。
 交叉类型转换检查方法参数的泛型上界和赋值变量在整棵树中的使用位置。合并时将具体类放在接口之前，保留各类型表达式的身份，并标记需要写成 `var` 的局部变量。次级表达式或交叉转换有改动时，`ExpressionMethod::prepare_pattern_matching` 都从边清理重新开始。两者稳定后的树是原版进入 `instanceof` 模式匹配的位置，此时变量声明仍待后续阶段确定。[交叉类型转换](src/decompiler/intersection.rs) · [方法主循环](src/engine/method_processor.rs)
 
 `RuntimeImage::open` 将模块化 JDK 的每个模块作为独立库登记，按 JRT 的目录遍历和模块描述符顺序提供条目。普通镜像与 ZIP 压缩镜像可由现有 JImage 库读取；该库遇到 compact-cp 压缩时返回 Unsupported。[运行时类路径](src/engine/context_source/runtime.rs)
+
+`StructContext::add_file` 根据文件后缀和 ZIP 结束记录登记目录、归档或单文件。重新载入上下文时再次扫描目录及其子归档。ZIP 保留中央目录顺序和重复条目，按 Java 的规则解释多版本路径。单个 class 文件在预读内部名称和正式解析时使用同一上下文的注解表达式计数器。直接读取缺失资源或目录时，Rust 的 `ContextSource` 返回 `Ok(None)`。Java 的目录源打开这些路径时抛出 I/O 异常，ZIP 源读取缺失条目时抛出空引用异常，读取显式目录条目时返回空流。正常登记按已有条目读取类和资源。[文件登记](src/structs/struct_context.rs)
 
 同步区扩展有一处有意的终止条件。当共享后继的首个前驱来自另一保护区，上游可能反复向已覆盖的区间追加同一块。如果本轮既不会新增覆盖关系、也不会增加异常边或移动指令，Rust 跳过这个候选，继续检查其他区间。
 

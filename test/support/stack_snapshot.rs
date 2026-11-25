@@ -24,7 +24,6 @@ use vineflower_rs::engine::method_processor::{
     ExpressionMethod, InitialMethod, initial_statement_graph,
 };
 use vineflower_rs::engine::{Cx, Options};
-use vineflower_rs::structs::single_file_context_source::SingleFileContextSource;
 use vineflower_rs::structs::{StructClass, StructContext, StructMethod};
 
 use super::upstream_reference::{Corpus, jdk_home};
@@ -739,8 +738,7 @@ fn write_group(
         context.add_space(Arc::clone(runtime), false);
     }
     for fixture in group {
-        let source = SingleFileContextSource::open(&fixture.path, &options, None).unwrap();
-        context.add_space(Arc::new(source), true);
+        context.add_file(&fixture.path, true).unwrap();
     }
     let mut cx = Cx::new(Arc::new(context));
     cx.class_nodes = load_classes(

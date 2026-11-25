@@ -32,6 +32,15 @@ pub struct ContextUnit {
 
 impl ContextUnit {
     pub fn new(source: Arc<dyn ContextSource>, own: bool, root: bool, options: &Options) -> Self {
+        Self::try_new(source, own, root, options).expect("Could not list context entries")
+    }
+
+    pub(super) fn try_new(
+        source: Arc<dyn ContextSource>,
+        own: bool,
+        root: bool,
+        options: &Options,
+    ) -> io::Result<Self> {
         let mut unit = ContextUnit {
             source,
             own,
@@ -43,10 +52,10 @@ impl ContextUnit {
             abstract_metadata: Vec::new(),
         };
         if unit.is_lazy() {
-            return unit;
+            return Ok(unit);
         }
 
-        let entries = unit.source.get_entries();
+        let entries = unit.source.try_get_entries()?;
         // TODO: more proper handling of multirelease jars, rather than just stripping them
         unit.class_entries = entries
             .classes
@@ -60,9 +69,9 @@ impl ContextUnit {
         for entry in entries.others {
             if entry.base_path == "fernflower_abstract_parameter_names.txt" {
                 match unit.source.get_input_stream(&entry.path()) {
-                    Ok(data) => unit.abstract_metadata.push(
-                        String::from_utf8_lossy(&data.unwrap_or_default()).into_owned(),
-                    ),
+                    Ok(data) => unit
+                        .abstract_metadata
+                        .push(String::from_utf8_lossy(&data.unwrap_or_default()).into_owned()),
                     Err(error) => {
                         log::error!("Failed to load abstract parameter names file: {error}");
                     }
@@ -73,7 +82,7 @@ impl ContextUnit {
         }
         unit.child_contexts = entries.child_contexts;
 
-        unit
+        Ok(unit)
     }
 
     pub fn has_class(&self, class_name: &str) -> io::Result<bool> {

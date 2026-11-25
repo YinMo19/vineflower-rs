@@ -15,8 +15,174 @@ use vineflower_rs::engine::{
     counter_container::CounterContainer,
     import_collector::{ImportCollector, get_short_name_in_class_context},
 };
-use vineflower_rs::structs::{StructContext, single_file_context_source::SingleFileContextSource};
+use vineflower_rs::structs::StructContext;
 use vineflower_rs::types::VarType;
+
+#[test]
+#[ignore = "requires the upstream +local.jar and JDK 17 or later"]
+fn file_and_archive_registration_matches_upstream() {
+    fn context() -> StructContext {
+        StructContext::new(Arc::new(Options::default()), None)
+    }
+
+    fn dump(label: &str, context: &StructContext, rows: &mut Vec<String>) {
+        let entry = |kind, entry: &vineflower_rs::engine::context_source::Entry| {
+            format!(
+                "{kind}\t{}\t{}\t{}",
+                entry.base_path,
+                entry.multirelease,
+                entry.path()
+            )
+        };
+        rows.push(label.to_owned());
+        for unit in context.get_units() {
+            rows.push(format!(
+                "unit\t{}\t{}\t{}",
+                unit.own,
+                unit.root,
+                unit.get_name()
+            ));
+            let raw = unit.source.get_entries();
+            rows.extend(raw.classes.iter().map(|file| entry("raw-class", file)));
+            rows.extend(
+                unit.class_entries
+                    .iter()
+                    .map(|class| format!("class\t{class}")),
+            );
+            rows.extend(unit.dir_entries.iter().map(|dir| format!("dir\t{dir}")));
+            rows.extend(unit.other_entries.iter().map(|file| entry("other", file)));
+        }
+    }
+
+    fn resource(context: &StructContext, path: &str) -> String {
+        let bytes = context.get_units()[0]
+            .source
+            .get_input_stream(path)
+            .unwrap()
+            .unwrap();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    let scratch = tempfile::tempdir().unwrap();
+    let corpus = upstream_reference::Corpus::discover();
+    let reference = corpus.run(
+        "InputSourcesReference",
+        &["AnnotationIdsReference"],
+        scratch.path(),
+    );
+    let mut rows = Vec::new();
+
+    let mut directory = context();
+    let folder = scratch.path().join("folder");
+    directory.add_file(&folder, true).unwrap();
+    dump("folder", &directory, &mut rows);
+    rows.push(format!(
+        "directory-resource\t{}",
+        resource(&directory, "/assets/note.txt")
+    ));
+    for path in ["assets", "absent"] {
+        assert_eq!(
+            directory.get_units()[0]
+                .source
+                .get_input_stream(path)
+                .unwrap(),
+            None
+        );
+    }
+    assert!(!directory.has_class("InputAddedFixture"));
+    fs::copy(
+        scratch.path().join("InputAddedFixture.class"),
+        folder.join("InputAddedFixture.class"),
+    )
+    .unwrap();
+    directory.try_reload_context(None).unwrap();
+    dump("reloaded", &directory, &mut rows);
+    assert!(directory.get_class("InputAddedFixture").unwrap().own);
+
+    let mut archive = context();
+    for (path, own) in [
+        ("archive.data", false),
+        ("long-comment.data", true),
+        ("empty.data", true),
+        ("missing.jar", true),
+    ] {
+        archive.add_file(&scratch.path().join(path), own).unwrap();
+    }
+    dump("archives", &archive, &mut rows);
+    rows.push(format!(
+        "duplicate-resource\t{}",
+        resource(&archive, "copy-a.txt")
+    ));
+    rows.push(format!(
+        "utf8-resource\t{}",
+        resource(&archive, "unicodé.txt")
+    ));
+    for name in ["alpha.txt", "beta.txt"] {
+        rows.push(format!(
+            "raw-name-resource\t{name}\t{}",
+            resource(&archive, name)
+        ));
+    }
+    for path in ["empty/", "absent"] {
+        assert_eq!(
+            archive.get_units()[0]
+                .source
+                .get_input_stream(path)
+                .unwrap(),
+            None
+        );
+    }
+    let class = archive.get_class("InputNestedFixture").unwrap();
+    rows.push(format!("archive-class\t{}", class.qualified_name));
+    assert!(!class.own);
+
+    let mut single = context();
+    single
+        .add_file(&scratch.path().join("Alias.class"), true)
+        .unwrap();
+    dump("renamed", &single, &mut rows);
+    let class = single.get_class("IdDecor").unwrap();
+    let ids: Vec<_> = class
+        .attributes
+        .runtime_visible_annotations
+        .as_ref()
+        .unwrap()
+        .annotations
+        .iter()
+        .map(|annotation| annotation.id)
+        .collect();
+    rows.push(format!("annotation-ids\t{ids:?}"));
+
+    for bad in ["broken.zip", "broken-folder", "broken.class"] {
+        let error = single
+            .add_file(&scratch.path().join(bad), true)
+            .unwrap_err();
+        let kind = if bad.ends_with(".class") {
+            "file"
+        } else {
+            "archive"
+        };
+        assert!(
+            error.to_string().starts_with(&format!("Invalid {kind} ")),
+            "{error}"
+        );
+        assert_eq!(single.get_units().len(), 1);
+        rows.push(format!("rejected\t{bad}"));
+    }
+    fs::copy(
+        scratch.path().join("broken.zip"),
+        folder.join("invalid.zip"),
+    )
+    .unwrap();
+    assert!(directory.try_reload_context(None).is_err());
+    assert!(directory.get_class("InputAddedFixture").unwrap().own);
+
+    let expected: Vec<_> = reference.lines().collect();
+    assert_eq!(rows.len(), expected.len());
+    for (actual, expected) in rows.iter().zip(expected) {
+        assert_eq!(actual, expected);
+    }
+}
 
 #[test]
 #[ignore = "requires a modular JDK 17 or later"]
@@ -120,15 +286,14 @@ fn runtime_image_entries_and_lookup_match_jrt() {
         "java.base"
     );
 
-    let own = Arc::new(SingleFileContextSource::open(&own_file, &options, None).unwrap());
     for own_first in [true, false] {
         let mut context = StructContext::new(Arc::clone(&options), None);
         if own_first {
-            context.add_space(own.clone(), true);
+            context.add_file(&own_file, true).unwrap();
             context.add_space(runtime.clone(), false);
         } else {
             context.add_space(runtime.clone(), false);
-            context.add_space(own.clone(), true);
+            context.add_file(&own_file, true).unwrap();
         }
         assert!(context.get_class(iterator).unwrap().own);
     }
@@ -187,10 +352,7 @@ fn load_context(corpus: &upstream_reference::Corpus, options: Options) -> Cx {
     let options = Arc::new(options);
     let mut context = StructContext::new(options.clone(), None);
     for path in &corpus.classes {
-        context.add_space(
-            Arc::new(SingleFileContextSource::open(path, &options, None).unwrap()),
-            true,
-        );
+        context.add_file(path, true).unwrap();
     }
     let mut cx = Cx::new(Arc::new(context));
     cx.class_nodes = load_classes(
