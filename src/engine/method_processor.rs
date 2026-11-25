@@ -537,6 +537,17 @@ impl ExpressionMethod {
         Ok(())
     }
 
+    /// Place Java local declarations, propagate debug types and resolve naming conflicts.
+    pub fn set_var_definitions(&mut self, cx: &mut Cx) -> io::Result<()> {
+        crate::decompiler::vars::definitions::define(
+            cx,
+            &mut self.flow.counters,
+            self.root,
+            self.flow.variables,
+            &self.descriptor,
+        )
+    }
+
     pub fn simplify_string_concat(&mut self, cx: &mut Cx, class: &StructClass) -> io::Result<()> {
         if class.version.has_indy_string_concat() {
             crate::decompiler::concat::simplify(cx, &mut self.flow.counters, self.root)?;
@@ -681,5 +692,18 @@ pub fn after_main_method(
     };
     result.simplify_switches(cx, class)?;
     result.finish_post_processing(cx)?;
+    Ok(Some(result))
+}
+
+/// Process Java bytecode through local variable definition and naming.
+pub fn defined_method(
+    cx: &mut Cx,
+    class: &StructClass,
+    method: &Arc<StructMethod>,
+) -> io::Result<Option<ExpressionMethod>> {
+    let Some(mut result) = after_main_method(cx, class, method)? else {
+        return Ok(None);
+    };
+    result.set_var_definitions(cx)?;
     Ok(Some(result))
 }

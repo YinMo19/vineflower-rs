@@ -199,6 +199,14 @@ impl StructLocalVariableTableAttribute {
         })
     }
 
+    /// First debug entry in table order, shared with the expressions that use it.
+    pub(crate) fn first_entry(&self, slot: i32) -> Option<Arc<LocalVariable>> {
+        self.local_variables
+            .iter()
+            .find(|var| var.index == slot)
+            .cloned()
+    }
+
     /// `matchingVars(index)`.
     pub fn matching_vars(&self, index: i32) -> impl Iterator<Item = &LocalVariable> {
         self.get_variables().filter(move |var| var.index == index)

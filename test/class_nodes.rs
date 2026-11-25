@@ -677,3 +677,77 @@ fn annotation_expression_ids_match_upstream() {
         .collect();
     assert_eq!(actual, expected.lines().collect::<Vec<_>>());
 }
+
+#[test]
+#[ignore = "requires the upstream +local.jar and JDK 17 or later"]
+fn variable_names_and_debug_tables_match_published_method_wrappers() {
+    use vineflower_rs::engine::{
+        class_processor::process_class_methods, method_processor::defined_method,
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    let reference =
+        upstream_reference::Corpus::discover().run("VariableNamesReference", &[], scratch.path());
+    let mut rows = Vec::new();
+    for provider in ["identity", "jad", "tiny"] {
+        for debug in [false, true] {
+            let mut options = Options::default();
+            options.rename_parameters = true;
+            options.use_lvt_names = debug;
+            options.variable_renaming = (provider != "identity").then(|| provider.to_owned());
+            let options = Arc::new(options);
+            let mut classes = StructContext::new(options.clone(), None);
+            classes
+                .add_file(&scratch.path().join("classes"), true)
+                .unwrap();
+            let mut cx = Cx::new(Arc::new(classes));
+            cx.class_nodes = load_classes(
+                &cx.struct_context,
+                &options,
+                |_| true,
+                |_| true,
+                |_, _| None,
+            );
+            let root = cx.class_nodes.id("Names").unwrap();
+            process_class_methods(&mut cx, root, defined_method).unwrap();
+            rows.push(format!("{provider} {}", i32::from(debug)));
+            for (name, node) in cx
+                .class_nodes
+                .iter()
+                .collect::<std::collections::BTreeMap<_, _>>()
+            {
+                if node.kind == ClassKind::Lambda {
+                    continue;
+                }
+                for wrapper in &node.wrapper.as_ref().unwrap().methods {
+                    rows.push(format!("{name} {}", wrapper.method));
+                    if let Err(error) = &wrapper.body {
+                        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+                        rows.push(error.to_string());
+                        continue;
+                    }
+                    let vars = &cx.ir[wrapper.variables];
+                    let mut pairs: Vec<_> = vars.names.keys().copied().collect();
+                    pairs.sort_unstable();
+                    for pair in pairs {
+                        rows.push(format!(
+                            "{} {} {} {} {}",
+                            pair.var,
+                            pair.version,
+                            vars.names
+                                .get(&pair)
+                                .and_then(Option::as_deref)
+                                .unwrap_or("null"),
+                            vars.local_variables
+                                .get(&pair)
+                                .map_or("-", |lvt| lvt.get_name().as_str()),
+                            vars.clashing_names
+                                .get(&pair)
+                                .map_or("-", |name| name.as_str())
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(rows, reference.lines().collect::<Vec<_>>());
+}

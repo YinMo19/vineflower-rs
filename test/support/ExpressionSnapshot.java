@@ -6,6 +6,7 @@ import java.util.BitSet;
 import java.util.Deque;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.StringJoiner;
 import java.util.TreeMap;
 import java.util.stream.Collectors;
@@ -25,11 +26,14 @@ import org.jetbrains.java.decompiler.struct.gen.generics.GenericMethodDescriptor
 import org.jetbrains.java.decompiler.struct.gen.generics.GenericType;
 
 class ExpressionSnapshot {
-  enum Detail { BASE, LOOP_HEADERS, SECONDARY_FUNCTIONS, INTERSECTION_CASTS, SWITCHES, RESOURCES, AFTER_MAIN }
+  enum Detail {
+    BASE, LOOP_HEADERS, SECONDARY_FUNCTIONS, INTERSECTION_CASTS, SWITCHES, RESOURCES, AFTER_MAIN, VARIABLE_DEFINITIONS
+  }
 
   private static final Field ARRAY_HARD_TYPE = field(ArrayExprent.class, "hardType");
   private static final Field VARIABLE_TYPE = field(VarExprent.class, "varType");
   private static final Field VARIABLE_BOUND = field(VarExprent.class, "boundType");
+  private static final Field SCOPED_CASES = field(SwitchStatement.class, "scopedCaseStatements");
   private static final Field CONSTANT_CONDY = field(ConstExprent.class, "wasCondy");
   private static final Field FIELD_CONDY = field(FieldExprent.class, "wasCondy");
   private static final Field FIELD_QUALIFIED = field(FieldExprent.class, "forceQualified");
@@ -96,6 +100,12 @@ class ExpressionSnapshot {
         if (detail.ordinal() >= Detail.SWITCHES.ordinal()) {
           fields.add("guards" + statement.id + "=" + expressions(branch.getCaseGuards()));
         }
+        if (detail == Detail.VARIABLE_DEFINITIONS) {
+          @SuppressWarnings("unchecked")
+          var scoped = (Set<Statement>) read(SCOPED_CASES, branch);
+          fields.add("scoped-cases" + statement.id + "=" + scoped.stream().map(st -> st.id)
+            .sorted().map(Object::toString).collect(Collectors.joining(",")));
+        }
       } else if (statement instanceof SynchronizedStatement sync) {
         fields.add("head" + statement.id + "=" + expressions(sync.getHeadexprentList()));
       } else if (statement instanceof CatchStatement caught) {
@@ -105,7 +115,7 @@ class ExpressionSnapshot {
         }
       } else if (statement instanceof CatchAllStatement caught) {
         fields.add("catch" + statement.id + "=" + expressions(caught.getVars()) + "|" + expression(caught.getMonitor()));
-      } else if (detail == Detail.AFTER_MAIN && statement instanceof DummyExitStatement exit) {
+      } else if (detail.ordinal() >= Detail.AFTER_MAIN.ordinal() && statement instanceof DummyExitStatement exit) {
         fields.add("exit-offsets" + statement.id + "=" + offsets(exit.bytecode));
       }
       for (int i = statement.getStats().size() - 1; i >= 0; i--) {
@@ -147,14 +157,18 @@ class ExpressionSnapshot {
 
   private String operands(Exprent e) {
     if (e instanceof VarExprent var) {
+      VarType storedType = (VarType) read(VARIABLE_TYPE, var);
       String fields = parts(var.getIndex(), var.getVersion(), var.isStack(), var.isCatchTempVar(),
-        type((VarType) read(VARIABLE_TYPE, var)), lvt(var.getLVT()), instruction(var.getBackingInstr()),
+        type(storedType), lvt(var.getLVT()), instruction(var.getBackingInstr()),
         var.isEffectivelyFinal());
       if (detail.ordinal() >= Detail.LOOP_HEADERS.ordinal()) {
         fields += "|" + type((VarType) read(VARIABLE_BOUND, var));
       }
       if (detail.ordinal() >= Detail.INTERSECTION_CASTS.ordinal()) {
         fields += "|" + var.isIntersectionType();
+      }
+      if (detail == Detail.VARIABLE_DEFINITIONS) {
+        fields += "|" + var.isDefinition();
       }
       return fields;
     }
@@ -184,7 +198,7 @@ class ExpressionSnapshot {
       if (detail.ordinal() >= Detail.SECONDARY_FUNCTIONS.ordinal()) {
         fields += "|" + invocation.shouldForceBoxing();
       }
-      if (detail == Detail.AFTER_MAIN) {
+      if (detail.ordinal() >= Detail.AFTER_MAIN.ordinal()) {
         fields += "|" + read(INVOCATION_IGNORE_BOXING, invocation);
       }
       return fields;
@@ -265,7 +279,7 @@ class ExpressionSnapshot {
     return types.stream().map(ExpressionSnapshot::type).collect(Collectors.joining("/"));
   }
 
-  private static String lvt(LocalVariable local) {
+  static String lvt(LocalVariable local) {
     return local == null ? "~" : local.getVersion().var + "," + local.getVersion().version + ","
       + local.getStart() + "," + local.getEnd() + "," + text(local.getName())
       + "," + text(local.getDescriptor()) + "," + text(local.getSignature());
@@ -342,7 +356,7 @@ class ExpressionSnapshot {
     return field == null ? "~" : field.name();
   }
 
-  private static Field field(Class<?> owner, String name) {
+  static Field field(Class<?> owner, String name) {
     try {
       Field field = owner.getDeclaredField(name);
       field.setAccessible(true);
@@ -352,7 +366,7 @@ class ExpressionSnapshot {
     }
   }
 
-  private static Object read(Field field, Object owner) {
+  static Object read(Field field, Object owner) {
     try {
       return field.get(owner);
     } catch (IllegalAccessException failure) {

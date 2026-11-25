@@ -21,6 +21,10 @@ struct ExpressionData {
 
 /// ExprProcessor.getCastTypeName, including the array rank of the outer type.
 pub fn get_cast_type_name(cx: &mut Cx, ty: &VarType) -> String {
+    cast_type_name(cx, ty, true)
+}
+
+pub(crate) fn cast_type_name(cx: &mut Cx, ty: &VarType, short: bool) -> String {
     let mut name = match ty.ty {
         CodeType::Object if ty.is_generic() => ty.get_cast_name(cx),
         CodeType::Object => {
@@ -34,7 +38,11 @@ pub fn get_cast_type_name(cx: &mut Cx, ty: &VarType) -> String {
             {
                 dotted = dotted.replace('$', ".");
             }
-            import_collector::get_short_name(cx, &dotted)
+            if short {
+                import_collector::get_short_name(cx, &dotted)
+            } else {
+                dotted
+            }
         }
         CodeType::Genvar if ty.is_generic() => ty.name().to_owned(),
         other => match other {

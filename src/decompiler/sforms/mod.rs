@@ -36,14 +36,26 @@ pub type SsaResult = VariableVersions<Ssa>;
 
 pub fn split_ssa(ir: &mut Ir, root: StatId, method: &StructMethod) -> SsaResult {
     dataflow::split(ir, root, method, Ssa::default())
+        .unwrap_or_else(|missing| panic!("missing variable version {missing}"))
 }
 
 pub type SsauResult = VariableVersions<Ssau>;
 
 pub fn split_ssau(ir: &mut Ir, root: StatId, method: &StructMethod) -> SsauResult {
-    let mut result = dataflow::split(ir, root, method, Ssau::default());
+    try_split_ssau(ir, root, method)
+        .unwrap_or_else(|missing| panic!("missing variable version {missing}"))
+}
+
+/// A missing reaching version invalidates the result. A caller that only
+/// takes a diagnostic snapshot can discard it and reset the IR's versions.
+pub(crate) fn try_split_ssau(
+    ir: &mut Ir,
+    root: StatId,
+    method: &StructMethod,
+) -> Result<SsauResult, Version> {
+    let mut result = dataflow::split(ir, root, method, Ssau::default())?;
     result.versions.graph.init_dominators();
-    result
+    Ok(result)
 }
 
 /// The direct-graph propagation is common to SSA and SSAU. The two analyses
@@ -52,6 +64,10 @@ trait VersionAnalysis {
     const CALCULATE_LIVENESS: bool = false;
     const TRACK_FIELDS: bool = false;
     const TRACK_DIRECT_ASSIGNMENTS: bool = false;
+
+    fn missing_version(&self) -> Option<Version> {
+        None
+    }
 
     fn init_parameter(&mut self, var: i32, catch: bool) -> i32;
     fn init_write(&mut self, ir: &Ir, stat: StatId, pair: Version) -> i32;

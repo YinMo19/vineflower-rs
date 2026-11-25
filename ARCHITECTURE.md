@@ -109,6 +109,10 @@ CFG、语句图和 DirectGraph 具有不同的边契约。
 
 `after_main_method` 接着按方法返回类型调整常量，移除隐式路径末尾的空返回，再处理次级表达式和同步锁。移除返回时将对应字节码位置并入方法的虚拟出口；用装箱调用的结果充当锁时，调用必须保留装箱。该入口抵达 Java 插件钩子 `AFTER_MAIN`，变量声明的位置和名称由此后的阶段确定。[方法处理](src/engine/method_processor.rs) · [返回与同步锁](src/decompiler/post_process.rs)
 
+变量处理器与方法包装器共享生命周期。每轮 SSA 只替换版本、上下界和槽号来源；名字、声明和局部变量表属于方法。声明阶段从接收者和参数开始，按 JVM 槽宽保留参数名，查找可合并的变量后再沿语句树确定共同作用域。能在首次赋值处声明的变量复用左操作数，其余在第一次读取前插入声明。放置后再运行一轮合并，传播调试信息，标记重复赋值，检查分支及嵌套方法中同时可见的重名。尚无类型下界的声明可以保留空的原始类型，查询有效类型时按上游顺序回到处理器。[`defined_method`](src/engine/method_processor.rs) · [变量合并与声明](src/decompiler/vars/definitions/mod.rs) · [命名作用域](src/decompiler/vars/definitions/clashes.rs)
+
+类包装器为 abstract 和 native 方法保留参数槽，并在每个成功方法返回后避开同名字段。启用局部变量表时，包装器用原槽查找调试名，再次检查变量作用域。内置 identity、JAD、Tiny 命名策略按原方法缓存参数名，局部类、匿名类及 lambda 方法可以继承外层策略状态。Tiny 开启参数重命名时，对只有调试条目且缺少类型的参数，上游会在该方法中止命名；Rust 保留对应的方法级错误。[变量状态](src/decompiler/vars/processor.rs) · [命名策略](src/decompiler/vars/naming/mod.rs)
+
 `RuntimeImage::open` 将模块化 JDK 的每个模块作为独立库登记，按 JRT 的目录遍历和模块描述符顺序提供条目。普通镜像与 ZIP 压缩镜像可由现有 JImage 库读取；该库遇到 compact-cp 压缩时返回 Unsupported。[运行时类路径](src/engine/context_source/runtime.rs)
 
 `StructContext::add_file` 根据文件后缀和 ZIP 结束记录登记目录、归档或单文件。重新载入上下文时再次扫描目录及其子归档。ZIP 保留中央目录顺序和重复条目，按 Java 的规则解释多版本路径。单个 class 文件在预读内部名称和正式解析时使用同一上下文的注解表达式计数器。直接读取缺失资源或目录时，Rust 的 `ContextSource` 返回 `Ok(None)`。Java 的目录源打开这些路径时抛出 I/O 异常，ZIP 源读取缺失条目时抛出空引用异常，读取显式目录条目时返回空流。正常登记按已有条目读取类和资源。[文件登记](src/structs/struct_context.rs)

@@ -29,7 +29,7 @@ pub(super) fn split<A: VersionAnalysis>(
     root: StatId,
     method: &StructMethod,
     mut analysis: A,
-) -> VariableVersions<A> {
+) -> Result<VariableVersions<A>, Version> {
     let graph = build_direct_graph(ir, root);
     let factory = FastSparseSetFactory::new(0..64);
     let mut entry = VersionMap::new(&factory);
@@ -46,15 +46,15 @@ pub(super) fn split<A: VersionAnalysis>(
     flow.seeds.insert(graph[graph.first].id.clone(), entry);
     flow.seed_handlers(ir, root, &graph, &mut analysis);
     let extra = graph.extra_nodes.iter().map(|&id| &graph[id].id).collect();
-    while flow.sweep(ir, &graph, &extra, &mut analysis, false) {}
+    while flow.sweep(ir, &graph, &extra, &mut analysis, false)? {}
     if A::CALCULATE_LIVENESS {
-        flow.sweep(ir, &graph, &extra, &mut analysis, true);
+        flow.sweep(ir, &graph, &extra, &mut analysis, true)?;
     }
-    VariableVersions {
+    Ok(VariableVersions {
         graph,
         versions: analysis,
         read_counts: flow.reads,
-    }
+    })
 }
 
 type NodeMaps = FxHashMap<ArcStr, VersionMap>;
@@ -112,7 +112,7 @@ impl FlowState {
         extra: &FxHashSet<&ArcStr>,
         analysis: &mut impl VersionAnalysis,
         live: bool,
-    ) -> bool {
+    ) -> Result<bool, Version> {
         let mut updated = FxHashSet::default();
         for &id in &graph.order {
             let node = &graph[id];
@@ -163,7 +163,13 @@ impl FlowState {
                     let expr = ir[node.exprents][index];
                     maps.merge_branches();
                     transfer.process(ir, expr, &mut maps);
+                    if transfer.analysis.missing_version().is_some() {
+                        break;
+                    }
                 }
+            }
+            if let Some(missing) = transfer.analysis.missing_version() {
+                return Err(missing);
             }
 
             let negative = graph.neg_if_branch.contains_key(&id);
@@ -182,7 +188,7 @@ impl FlowState {
                 }
             }
         }
-        !updated.is_empty()
+        Ok(!updated.is_empty())
     }
 
     fn merge_inputs(&self, ir: &Ir, graph: &DirectGraph, id: DirectId) -> VersionMap {

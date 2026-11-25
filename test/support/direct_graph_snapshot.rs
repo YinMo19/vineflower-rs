@@ -124,7 +124,10 @@ fn exprent(ir: &Ir, expr: ExprId) -> String {
             var_type,
             ..
         } => (format!("const={value}:{bool_permitted}"), var_type),
-        ExprKind::Variable(variable) => (format!("var={}", variable.index), &variable.var_type),
+        ExprKind::Variable(variable) => (
+            format!("var={}", variable.index),
+            variable.var_type.as_ref().unwrap(),
+        ),
         _ => unreachable!("Direct graph snapshot runs before expression lifting"),
     };
     format!(

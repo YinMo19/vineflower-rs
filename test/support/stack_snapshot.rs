@@ -15,6 +15,8 @@ use vineflower_rs::decompiler::ir::{EdgeId, Ir, StatId};
 use vineflower_rs::decompiler::sforms::split_ssa;
 use vineflower_rs::decompiler::stack::simplify_statement;
 use vineflower_rs::decompiler::stats::{ContentFlags, STATEDGE_ALL, StatementKind};
+use vineflower_rs::decompiler::vars::processor::VarProcessor;
+use vineflower_rs::decompiler::vars::var_version_pair::VarVersionPair;
 use vineflower_rs::decompiler::vars::versions::{FinalType, VarVersions};
 use vineflower_rs::engine::class_nodes::{ClassNodeId, load_classes};
 use vineflower_rs::engine::class_processor::{prepare_class, process_class_methods};
@@ -60,6 +62,7 @@ pub(super) enum Check {
     MainLoopEnd = 21,
     PostSwitches = 22,
     AfterMain = 23,
+    VariableDefinitions = 24,
 }
 
 #[derive(Clone, Copy)]
@@ -350,6 +353,19 @@ const AFTER_MAIN_STAGES: &[(&str, &str)] = &[
     ("Direct graph before AFTER_MAIN plugins", "graph="),
 ];
 
+const VARIABLE_DEFINITION_STAGES: &[(&str, &str)] = &[
+    ("Structure after variable definitions", "counters="),
+    (
+        "Declarations and expressions after variable definitions",
+        "counters=",
+    ),
+    (
+        "Variable names, types and scopes after variable definitions",
+        "versions=",
+    ),
+    ("Direct graph after variable definitions", "graph="),
+];
+
 fn loop_iterations(row: &str) -> impl Iterator<Item = &str> {
     row.split('\t')
         .nth(3)
@@ -380,7 +396,8 @@ impl Check {
             | Self::ExitCondensation
             | Self::MainLoopEnd
             | Self::PostSwitches
-            | Self::AfterMain => &[DEFAULT],
+            | Self::AfterMain
+            | Self::VariableDefinitions => &[DEFAULT],
             Self::SecondaryFunctions => SECONDARY_PROFILES,
         }
     }
@@ -408,6 +425,7 @@ impl Check {
             Self::MainLoopEnd => MAIN_LOOP_END_STAGES,
             Self::PostSwitches => POST_SWITCH_STAGES,
             Self::AfterMain => AFTER_MAIN_STAGES,
+            Self::VariableDefinitions => VARIABLE_DEFINITION_STAGES,
         }
     }
 
@@ -434,6 +452,7 @@ impl Check {
             Self::MainLoopEnd => "main-loop-end",
             Self::PostSwitches => "post-switches",
             Self::AfterMain => "after-main",
+            Self::VariableDefinitions => "variable-definitions",
         }
     }
 
@@ -475,16 +494,22 @@ impl Check {
                 | Self::MainLoopEnd
                 | Self::PostSwitches
                 | Self::AfterMain
+                | Self::VariableDefinitions
         )
     }
 
     fn publishes_wrappers(self) -> bool {
-        matches!(self, Self::PostSwitches | Self::AfterMain)
+        self == Self::PostSwitches || self.finishes_post_processing()
+    }
+
+    fn finishes_post_processing(self) -> bool {
+        matches!(self, Self::AfterMain | Self::VariableDefinitions)
     }
 
     fn expression_detail(self) -> expression_snapshot::Detail {
         use expression_snapshot::Detail;
         match self {
+            Self::VariableDefinitions => Detail::VariableDefinitions,
             Self::AfterMain => Detail::AfterMain,
             _ if self.recovers_resources() => Detail::Resources,
             _ if self.recovers_switches() => Detail::Switches,
@@ -1357,9 +1382,13 @@ fn write_published_group(
                 method.finish_main_loop(cx, class)?;
                 operation.set("simplify-switches");
                 let simplified = method.simplify_switches(cx, class)?;
-                if check == Check::AfterMain {
+                if check.finishes_post_processing() {
                     operation.set("finish-post-processing");
                     method.finish_post_processing(cx)?;
+                }
+                if check == Check::VariableDefinitions {
+                    operation.set("set-var-definitions");
+                    method.set_var_definitions(cx)?;
                 }
                 operation.set("snapshot");
                 let state = snapshot(
@@ -1693,7 +1722,7 @@ fn stage(
                 ) {}
             }
             (Check::Stack, false) => method.simplify_stack_vars(cx, class),
-            (Check::PostSwitches | Check::AfterMain, _) => {
+            (Check::PostSwitches | Check::AfterMain | Check::VariableDefinitions, _) => {
                 unreachable!("Post-main methods run in wrapper order")
             }
         }
@@ -1757,7 +1786,11 @@ fn snapshot(
     let mut snapshot =
         format!("{tree};hidden={all_members};hidden-added={added}{details}\t{expressions}");
     if check != Check::Stack {
-        let versions = variable_snapshot(&cx.ir[method.flow.variables].versions);
+        let processor = &cx.ir[method.flow.variables];
+        let mut versions = variable_snapshot(&processor.versions);
+        if check == Check::VariableDefinitions {
+            append_definition_metadata(&mut versions, processor);
+        }
         write!(snapshot, "\t{versions}").unwrap();
     }
     snapshot
@@ -1814,7 +1847,7 @@ fn same_switch_case_rejection(check: Check, java: &str, rust: &str) -> bool {
         Check::LateLoopPasses => "prepare-late-loops",
         Check::ExitEntry | Check::ExitCondensation => "prepare-exits",
         Check::MainLoopEnd => "finish-main-loop",
-        Check::PostSwitches | Check::AfterMain => "finish-main-loop",
+        Check::PostSwitches | Check::AfterMain | Check::VariableDefinitions => "finish-main-loop",
         _ => return false,
     };
     let Some(java) = java.strip_prefix(check.name()) else {
@@ -1969,6 +2002,33 @@ fn variable_snapshot(versions: &VarVersions) -> String {
         write!(fields, ";original{index}={},{}", pair.var, pair.version).unwrap();
     }
     fields
+}
+
+fn append_definition_metadata(fields: &mut String, processor: &VarProcessor) {
+    append_variable_bindings(fields, "name", processor.names.iter(), |name| {
+        expression_snapshot::text(name.as_deref())
+    });
+    append_variable_bindings(fields, "this", processor.this_vars.iter(), |name| {
+        expression_snapshot::text(Some(name.as_str()))
+    });
+    append_variable_bindings(fields, "local", processor.local_variables.iter(), |local| {
+        expression_snapshot::local_variable(Some(local.as_ref()))
+    });
+    append_variable_bindings(fields, "clash", processor.clashing_names.iter(), |name| {
+        expression_snapshot::text(Some(name.as_str()))
+    });
+}
+
+fn append_variable_bindings<'a, T: 'a>(
+    fields: &mut String,
+    label: &str,
+    bindings: impl Iterator<Item = (&'a VarVersionPair, &'a T)>,
+    format_value: impl Fn(&T) -> String,
+) {
+    for (pair, value) in bindings.sorted_unstable_by_key(|&(pair, _)| *pair) {
+        let value = format_value(value);
+        write!(fields, ";{label}{},{}={value}", pair.var, pair.version).unwrap();
+    }
 }
 
 fn hidden_members<'a>(members: impl Iterator<Item = &'a String>) -> String {

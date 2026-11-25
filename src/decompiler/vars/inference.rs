@@ -93,7 +93,7 @@ fn reset_expression_types(
 ) -> io::Result<()> {
     for &expr in expressions {
         match &mut ir[expr].kind {
-            ExprKind::Variable(var) => var.var_type = VarType::VARTYPE_UNKNOWN,
+            ExprKind::Variable(var) => var.var_type = Some(VarType::VARTYPE_UNKNOWN),
             ExprKind::Constant {
                 value,
                 var_type,

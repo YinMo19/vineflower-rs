@@ -72,7 +72,8 @@ class StackSnapshot {
   enum Check {
     STACK, INCREMENTS, PRE_MAIN, LOOP_ELIMINATION, LOOP_ENHANCEMENT, LOOP_MERGE, MAIN_LOOP_LABELS,
     SECONDARY_FUNCTIONS, PATTERN_MATCHING_ENTRY, IF_PATTERNS, SWITCH_ENTRY, SWITCH_PASSES, TRY_ENTRY,
-    TRY_RESOURCES, INLINE_BLOCKS, LATE_LOOP_PASSES, EXIT_ENTRY, EXIT_CONDENSATION, MAIN_LOOP_END, POST_SWITCHES, AFTER_MAIN;
+    TRY_RESOURCES, INLINE_BLOCKS, LATE_LOOP_PASSES, EXIT_ENTRY, EXIT_CONDENSATION, MAIN_LOOP_END, POST_SWITCHES,
+    AFTER_MAIN, VARIABLE_DEFINITIONS;
 
     boolean usesLoopHeaders() {
       return this == LOOP_ENHANCEMENT || this == LOOP_MERGE || identifiesLabels();
@@ -107,11 +108,16 @@ class StackSnapshot {
     }
 
     boolean publishesWrappers() {
-      return this == POST_SWITCHES || this == AFTER_MAIN;
+      return this == POST_SWITCHES || finishesPostProcessing();
+    }
+
+    boolean finishesPostProcessing() {
+      return this == AFTER_MAIN || this == VARIABLE_DEFINITIONS;
     }
 
     ExpressionSnapshot.Detail expressionDetail() {
       return switch (this) {
+        case VARIABLE_DEFINITIONS -> ExpressionSnapshot.Detail.VARIABLE_DEFINITIONS;
         case AFTER_MAIN -> ExpressionSnapshot.Detail.AFTER_MAIN;
         case SWITCH_PASSES, TRY_ENTRY -> ExpressionSnapshot.Detail.SWITCHES;
         case TRY_RESOURCES, INLINE_BLOCKS, LATE_LOOP_PASSES, EXIT_ENTRY, EXIT_CONDENSATION, MAIN_LOOP_END, POST_SWITCHES
@@ -581,7 +587,7 @@ class StackSnapshot {
           }
           details = ";post-switches=" + simplified;
         }
-        if (check == Check.AFTER_MAIN) {
+        if (check.finishesPostProcessing()) {
           operation = "adjust-return-type";
           ExitHelper.adjustReturnType(root, descriptor);
           operation = "remove-redundant-returns";
@@ -592,6 +598,10 @@ class StackSnapshot {
           SynchronizedHelper.cleanSynchronizedVar(root);
           operation = "insert-monitor-sinks";
           SynchronizedHelper.insertSink(root, vars, root);
+        }
+        if (check == Check.VARIABLE_DEFINITIONS) {
+          operation = "set-var-definitions";
+          vars.setVarDefinitions(root);
         }
         operation = "snapshot";
         var state = snapshot(root, counters, vars, initialHidden, check, details)
@@ -670,6 +680,7 @@ class StackSnapshot {
         case MAIN_LOOP_END -> "main-loop-end-" + operation + "-";
         case POST_SWITCHES -> "post-switches-" + operation + "-";
         case AFTER_MAIN -> "after-main-" + operation + "-";
+        case VARIABLE_DEFINITIONS -> "variable-definitions-" + operation + "-";
       };
       return failure + StructureReference.failureSnapshot(error);
     }
@@ -752,7 +763,8 @@ class StackSnapshot {
     String snapshot = StructureReference.snapshot(root, counters, loopStage, check.recoversSwitches())
       + content + ";hidden=" + allMembers + ";hidden-added=" + added + details
       + "\t" + ExpressionSnapshot.snapshot(root, counters, check.expressionDetail());
-    return check == Check.STACK ? snapshot : snapshot + "\t" + VariableSnapshot.snapshot(vars);
+    return check == Check.STACK ? snapshot
+      : snapshot + "\t" + VariableSnapshot.snapshot(vars, check == Check.VARIABLE_DEFINITIONS);
   }
 
   private static String counterSnapshot(CounterContainer counters) {

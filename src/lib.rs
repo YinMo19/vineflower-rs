@@ -1,10 +1,10 @@
 //! A Rust port of the Vineflower Java decompiler (upstream 1.12.0).
 //!
-//! The port follows upstream's algorithms, iteration orders and method-local
-//! counters. [`engine::method_processor::pre_main_method`] processes a method
-//! through finally recovery, expression lifting, type inference and the Java
-//! passes preceding `BEFORE_MAIN`. [`engine::method_processor::ExpressionMethod`]
-//! exposes the tree and the first main-loop rewrites.
+//! The native Java method pipeline covers bytecode decoding, graph structuring,
+//! finally recovery, expression lifting, the main loop and local declarations.
+//! [`engine::method_processor::defined_method`] returns the resulting statement
+//! tree. [`engine::class_processor::process_class_methods`] publishes method
+//! wrappers in the class order required for nested and synthetic references.
 //!
 //! # Where things are
 //!

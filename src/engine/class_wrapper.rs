@@ -114,6 +114,17 @@ fn process_method(
                 collector.add_name(&field.name);
             }
             processor.refresh_names(&mut collector);
+            if cx.options.use_lvt_names
+                && processor.definitions_set
+                && let Some(method_body) = &result
+            {
+                crate::decompiler::vars::processor::apply_debug_names(
+                    cx,
+                    method_body.root,
+                    variables,
+                    method,
+                )?;
+            }
             Ok(result.map(MethodBody::from))
         }
         Err(error) if error.kind() == io::ErrorKind::Interrupted => return Err(error),

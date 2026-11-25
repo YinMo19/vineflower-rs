@@ -25,6 +25,7 @@ pub enum Detail {
     Switches,
     Resources,
     AfterMain,
+    VariableDefinitions,
 }
 
 pub fn snapshot(cx: &Cx, root: StatId, counters: &CounterContainer) -> String {
@@ -108,6 +109,15 @@ pub fn snapshot_details(
                         .map(|&expr| snapshot.expression(expr))
                         .join(",");
                     fields.push(format!("guards{id}={guards}"));
+                }
+                if detail == Detail::VariableDefinitions {
+                    let scoped = branch
+                        .scoped_case_statements
+                        .iter()
+                        .map(|&case| ir[case].id)
+                        .sorted_unstable()
+                        .join(",");
+                    fields.push(format!("scoped-cases{id}={scoped}"));
                 }
             }
             StatementKind::Synchronized { head_exprents, .. } => {
@@ -207,7 +217,7 @@ impl Snapshot<'_> {
                     var.version,
                     var.stack,
                     var.catch_temp,
-                    var_type(Some(&var.var_type)),
+                    var_type(var.var_type.as_ref()),
                     local_variable(var.lvt.as_deref()),
                     instruction(var.backing_instruction.as_deref()),
                     var.effectively_final
@@ -217,6 +227,9 @@ impl Snapshot<'_> {
                 }
                 if self.detail >= Detail::IntersectionCasts {
                     write!(operands, "|{}", var.intersection_type).unwrap();
+                }
+                if self.detail == Detail::VariableDefinitions {
+                    write!(operands, "|{}", var.definition).unwrap();
                 }
                 ("VAR", operands)
             }
@@ -504,7 +517,7 @@ fn types(types: &[VarType]) -> String {
     types.iter().map(|ty| var_type(Some(ty))).join("/")
 }
 
-fn local_variable(local: Option<&LocalVariable>) -> String {
+pub(super) fn local_variable(local: Option<&LocalVariable>) -> String {
     local.map_or_else(
         || "~".into(),
         |local| {

@@ -266,7 +266,7 @@ fn inferred_receiver_types_follow_their_own_methods() {
             panic!("expected local this")
         };
         assert_eq!(var.index, 0);
-        assert_eq!(var.var_type.ty, CodeType::Unknown);
+        assert_eq!(var.var_type.as_ref().unwrap().ty, CodeType::Unknown);
         assert_eq!(Expr::expr_type(&cx, id).value, Some(class_name));
     }
 }
@@ -647,6 +647,15 @@ fn after_main_matches_upstream() {
     stack_snapshot::check(
         &upstream_reference::Corpus::discover(),
         stack_snapshot::Check::AfterMain,
+    );
+}
+
+#[test]
+#[ignore = "requires the upstream +local.jar and JDK 17 or later"]
+fn variable_definitions_match_upstream() {
+    stack_snapshot::check(
+        &upstream_reference::Corpus::discover(),
+        stack_snapshot::Check::VariableDefinitions,
     );
 }
 

@@ -140,7 +140,8 @@ impl fmt::Debug for Pattern {
 pub struct Variable {
     pub processor: Option<VarProcessorId>,
     pub index: i32,
-    pub var_type: VarType,
+    /// The stored type can be absent on a declaration with no inferred lower bound.
+    pub var_type: Option<VarType>,
     pub version: i32,
     pub stack: bool,
     pub definition: bool,
@@ -154,11 +155,11 @@ pub struct Variable {
 }
 
 impl Variable {
-    pub fn new(index: i32, var_type: VarType) -> Self {
+    pub fn new(index: i32, var_type: impl Into<Option<VarType>>) -> Self {
         Self {
             processor: None,
             index,
-            var_type,
+            var_type: var_type.into(),
             version: 0,
             stack: false,
             definition: false,
@@ -175,7 +176,11 @@ impl Variable {
         VarVersionPair::new(self.index, self.version)
     }
 
-    pub(crate) fn in_method(index: i32, ty: VarType, owner: VarProcessorId) -> Self {
+    pub(crate) fn in_method(
+        index: i32,
+        ty: impl Into<Option<VarType>>,
+        owner: VarProcessorId,
+    ) -> Self {
         Self {
             processor: Some(owner),
             ..Self::new(index, ty)
@@ -205,8 +210,10 @@ impl Variable {
             && let Some(lvt) = &self.lvt
         {
             lvt.get_var_type()
-        } else if self.var_type.ty != CodeType::Unknown {
-            self.var_type.clone()
+        } else if let Some(ty) = &self.var_type
+            && ty.ty != CodeType::Unknown
+        {
+            ty.clone()
         } else if let Some(owner) = self.processor {
             let pair = self.pair();
             let processor = &cx.ir[owner];
@@ -223,9 +230,9 @@ impl Variable {
                     return VarType::with_value(CodeType::Object, 0, name.clone());
                 }
             }
-            inferred.cloned().unwrap_or_else(|| self.var_type.clone())
+            inferred.cloned().unwrap_or(VarType::VARTYPE_UNKNOWN)
         } else {
-            self.var_type.clone()
+            VarType::VARTYPE_UNKNOWN
         }
     }
 
@@ -686,7 +693,7 @@ impl Expr {
                 }
             }
             ExprKind::Variable(variable) => {
-                variable.var_type = variable.expr_type(cx);
+                variable.var_type = Some(variable.expr_type(cx));
                 variable.backing_instruction = None;
                 variable.bound_type = None;
                 variable.intersection_type = false;

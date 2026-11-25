@@ -99,6 +99,36 @@ impl Expr {
 }
 
 impl StatId {
+    /// All expression occurrences in Java StatementIterator order, including
+    /// declarations. Aliases appear at each live position.
+    pub(crate) fn all_exprents(self, ir: &Ir) -> Vec<ExprId> {
+        fn append(ir: &Ir, stat: StatId, expressions: &mut Vec<ExprId>) {
+            fn extend(
+                ir: &Ir,
+                ids: impl IntoIterator<Item = ExprId>,
+                expressions: &mut Vec<ExprId>,
+            ) {
+                for expr in ids {
+                    Expr::append_exprents(ir, expr, true, expressions);
+                    expressions.push(expr);
+                }
+            }
+            extend(ir, ir[stat].var_definitions.iter().copied(), expressions);
+            if let Some(body) = ir[stat].exprents {
+                extend(ir, ir[body].iter().copied(), expressions);
+            } else {
+                for &child in &ir[stat].stats {
+                    append(ir, child, expressions);
+                }
+                extend(ir, stat.stat_exprents(ir), expressions);
+            }
+        }
+
+        let mut result = Vec::new();
+        append(ir, self, &mut result);
+        result
+    }
+
     /// `Statement.getImplicitlyDefinedVars`, in declaration and expression order.
     pub(crate) fn implicitly_defined_vars(self, ir: &Ir) -> Vec<ExprId> {
         match &ir[self].kind {

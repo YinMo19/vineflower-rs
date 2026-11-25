@@ -20,7 +20,7 @@
 
 use std::fmt;
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arcstr::ArcStr;
 
@@ -32,6 +32,7 @@ use super::struct_member::{
 };
 use crate::code::bytecode_parser::parse_bytecode;
 use crate::code::{BytecodeVersion, FullInstructionSequence};
+use crate::decompiler::vars::naming::VariableNamer;
 use crate::engine::Options;
 use crate::engine::counter_container::ExpressionIds;
 use crate::types::{GenericMethodDescriptor, SharedSignature, generic_main};
@@ -48,6 +49,7 @@ pub struct StructMethod {
     code_and_exceptions: Option<Vec<u8>>,
     pub class_qualified_name: ArcStr,
     signature: Option<Arc<SharedSignature<GenericMethodDescriptor>>>,
+    variable_namer: Mutex<Option<VariableNamer>>,
 }
 
 impl StructMethod {
@@ -121,7 +123,20 @@ impl StructMethod {
             code_and_exceptions,
             class_qualified_name: cl_qualified_name.clone(),
             signature,
+            variable_namer: Mutex::default(),
         })
+    }
+
+    pub(crate) fn with_variable_namer<T>(
+        &self,
+        options: &Options,
+        f: impl FnOnce(&mut VariableNamer) -> T,
+    ) -> T {
+        let mut guard = self
+            .variable_namer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        f(guard.get_or_insert_with(|| VariableNamer::new(options)))
     }
 
     /// `expandData(classStruct)` followed by `getInstructionSequence()`: the

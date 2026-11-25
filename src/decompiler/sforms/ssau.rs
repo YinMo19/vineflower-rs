@@ -17,6 +17,7 @@ pub struct Ssau {
     pub field_vars: FxHashMap<i32, i32>,
     counters: VersionCounters,
     next_field: i32,
+    missing_version: Option<Version>,
 }
 
 impl Default for Ssau {
@@ -28,6 +29,7 @@ impl Default for Ssau {
             field_vars: FxHashMap::default(),
             counters: VersionCounters::default(),
             next_field: -1,
+            missing_version: None,
         }
     }
 }
@@ -36,6 +38,10 @@ impl VersionAnalysis for Ssau {
     const TRACK_FIELDS: bool = true;
     const TRACK_DIRECT_ASSIGNMENTS: bool = true;
     const CALCULATE_LIVENESS: bool = true;
+
+    fn missing_version(&self) -> Option<Version> {
+        self.missing_version
+    }
 
     fn init_parameter(&mut self, var: i32, catch: bool) -> i32 {
         let state = if catch {
@@ -68,7 +74,7 @@ impl VersionAnalysis for Ssau {
         let version = if pair.version == 0 {
             let range = first_protected_range(ir, stat).map(|stat| ir[stat].id);
             self.create_read(Version::new(pair.var, last), range)
-                .version
+                .map_or(last, |pair| pair.version)
         } else {
             pair.version
         };
@@ -105,7 +111,11 @@ impl VersionAnalysis for Ssau {
     }
 
     fn phantom(&mut self, pair: Version) -> Version {
-        if let Some(phantom) = self.graph[pair].phantom_node {
+        let Some(node) = self.graph.get(pair) else {
+            self.missing_version.get_or_insert(pair);
+            return pair;
+        };
+        if let Some(phantom) = node.phantom_node {
             return phantom;
         }
         let phantom = self.create_version(pair.var, None, VersionState::Phantom);
@@ -134,21 +144,33 @@ impl Ssau {
         pair
     }
 
-    fn create_read(&mut self, source: Version, range: Option<i32>) -> Version {
+    fn create_read(&mut self, source: Version, range: Option<i32>) -> Option<Version> {
+        if self.graph.get(source).is_none() {
+            self.missing_version.get_or_insert(source);
+            return None;
+        }
         let read = self.create_version(source.var, range, VersionState::Read);
         self.graph.add_read_edge(source, read);
-        read
+        Some(read)
     }
 
     fn update_live(&mut self, pair: Version, map: &VersionMap, live: bool) {
         if live {
-            self.graph[pair].live = Some(map.clone());
+            if let Some(node) = self.graph.nodes.get_with_key_mut(&pair) {
+                node.live = Some(map.clone());
+            } else {
+                self.missing_version.get_or_insert(pair);
+            }
         }
     }
 
     fn update_phi(&mut self, phi: Version, reaching: &Versions, range: Option<i32>) {
+        let Some(node) = self.graph.get(phi) else {
+            self.missing_version.get_or_insert(phi);
+            return;
+        };
         let mut existing = FxHashSet::default();
-        let predecessors = &self.graph[phi].predecessors;
+        let predecessors = &node.predecessors;
         match predecessors.len() {
             0 => {}
             1 => {
@@ -176,7 +198,9 @@ impl Ssau {
         }
         for version in reaching {
             if !existing.contains(&version) {
-                let read = self.create_read(Version::new(phi.var, version), range);
+                let Some(read) = self.create_read(Version::new(phi.var, version), range) else {
+                    return;
+                };
                 self.graph.add_read_edge(read, phi);
             }
         }

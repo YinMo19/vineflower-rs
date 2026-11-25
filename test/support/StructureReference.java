@@ -81,6 +81,7 @@ class StructureReference {
         case 21 -> StackSnapshot.Check.MAIN_LOOP_END;
         case 22 -> StackSnapshot.Check.POST_SWITCHES;
         case 23 -> StackSnapshot.Check.AFTER_MAIN;
+        case 24 -> StackSnapshot.Check.VARIABLE_DEFINITIONS;
         default -> null;
       };
       StackSnapshot.Context stackContext = stackCheck == null ? null

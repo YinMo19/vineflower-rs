@@ -136,6 +136,7 @@ pub struct IfStatement {
 
 #[derive(Default)]
 pub struct SwitchStatement {
+    pub scoped_case_statements: rustc_hash::FxHashSet<StatId>,
     pub default_edge: Option<EdgeId>,
     pub cases: Vec<SwitchCase>,
     /// Indexed by case. Cases beyond the end of the list have no guard.

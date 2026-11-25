@@ -58,6 +58,8 @@ The late-loop and exit comparisons separately report incoming continue edges mov
 
 The post-main switch comparison runs method callbacks in class wrapper initialization order and publishes complete method roots only once a class finishes its callbacks. This lets switch simplification consult the actual graphs of initialized synthetic enum-table holders while the class being measured remains unpublished. The `AFTER_MAIN` comparison also checks return normalization and monitor rewriting, including bytecode offsets on the dummy exit and boxing flags.
 
+The variable-definition comparison runs the complete declaration phase in both implementations. It compares declaration positions and flags, variable names and types, propagated local-variable records, finality, and switch case scopes.
+
 ## End-to-end source and CLI suite
 
 The retained `upstream_parity` target covers final source and CLI behavior. It currently requires library and binary entry points that still await migration. Use the explicit stage targets above to test the active implementation. The commands below document the end-to-end gate once those entry points are available.
