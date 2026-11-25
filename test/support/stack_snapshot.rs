@@ -45,6 +45,7 @@ pub(super) enum Check {
     LoopMerge = 8,
     MainLoopLabels = 9,
     SecondaryFunctions = 10,
+    PatternMatchingEntry = 11,
 }
 
 #[derive(Clone, Copy)]
@@ -199,6 +200,16 @@ const SECONDARY_FUNCTION_STAGES: &[(&str, &str)] = &[
     ("Direct graph after secondary functions", "graph="),
 ];
 
+const PATTERN_MATCHING_ENTRY_STAGES: &[(&str, &str)] = &[
+    ("Structure before pattern matching", "counters="),
+    (
+        "Expressions and intersection casts before pattern matching",
+        "counters=",
+    ),
+    ("Variable versions before pattern matching", "versions="),
+    ("Direct graph before pattern matching", "graph="),
+];
+
 fn loop_iterations(row: &str) -> impl Iterator<Item = &str> {
     row.split('\t')
         .nth(3)
@@ -216,7 +227,8 @@ impl Check {
             Self::LoopElimination
             | Self::LoopEnhancement
             | Self::LoopMerge
-            | Self::MainLoopLabels => &[DEFAULT],
+            | Self::MainLoopLabels
+            | Self::PatternMatchingEntry => &[DEFAULT],
             Self::SecondaryFunctions => SECONDARY_PROFILES,
         }
     }
@@ -231,6 +243,7 @@ impl Check {
             Self::LoopMerge => LOOP_MERGE_STAGES,
             Self::MainLoopLabels => MAIN_LOOP_LABEL_STAGES,
             Self::SecondaryFunctions => SECONDARY_FUNCTION_STAGES,
+            Self::PatternMatchingEntry => PATTERN_MATCHING_ENTRY_STAGES,
         }
     }
 
@@ -244,6 +257,7 @@ impl Check {
             Self::LoopMerge => "loop-merge",
             Self::MainLoopLabels => "main-loop-labels",
             Self::SecondaryFunctions => "secondary-functions",
+            Self::PatternMatchingEntry => "pattern-matching-entry",
         }
     }
 
@@ -254,11 +268,25 @@ impl Check {
                 | Self::LoopMerge
                 | Self::MainLoopLabels
                 | Self::SecondaryFunctions
+                | Self::PatternMatchingEntry
         )
     }
 
     fn identifies_labels(self) -> bool {
-        matches!(self, Self::MainLoopLabels | Self::SecondaryFunctions)
+        matches!(
+            self,
+            Self::MainLoopLabels | Self::SecondaryFunctions | Self::PatternMatchingEntry
+        )
+    }
+
+    fn expression_detail(self) -> expression_snapshot::Detail {
+        use expression_snapshot::Detail;
+        match self {
+            Self::PatternMatchingEntry => Detail::IntersectionCasts,
+            Self::SecondaryFunctions => Detail::SecondaryFunctions,
+            _ if self.uses_loop_headers() => Detail::LoopHeaders,
+            _ => Detail::Base,
+        }
     }
 }
 
@@ -326,6 +354,8 @@ struct EnhancementCoverage {
     list_iterator: bool,
     optional_casts: usize,
     forced_boxing: usize,
+    intersection_casts: usize,
+    intersection_variables: usize,
 }
 
 impl EnhancementCoverage {
@@ -349,7 +379,7 @@ impl EnhancementCoverage {
                 self.list_iterator |= kind == "iterator"
                     && method.contains("TestListIteratorHierarchy.class print (Ljava/util/List;)V");
             }
-            if check == Check::SecondaryFunctions
+            if check.expression_detail() >= expression_snapshot::Detail::SecondaryFunctions
                 && field.starts_with('e')
                 && let Some((_, node)) = field.split_once('=')
             {
@@ -357,6 +387,15 @@ impl EnhancementCoverage {
                     usize::from(node.starts_with("FUNCTION|") && node.ends_with("|false"));
                 self.forced_boxing +=
                     usize::from(node.starts_with("INVOCATION|") && node.ends_with("|true"));
+                if check == Check::PatternMatchingEntry {
+                    self.intersection_variables +=
+                        usize::from(node.starts_with("VAR|") && node.ends_with("|true"));
+                    let mut fields = node.split('|');
+                    if fields.next() == Some("FUNCTION") && fields.nth(2) == Some("CAST") {
+                        self.intersection_casts +=
+                            usize::from(fields.next().unwrap().split(',').count() > 2);
+                    }
+                }
             }
         }
     }
@@ -379,6 +418,11 @@ impl EnhancementCoverage {
             eprintln!(
                 "{} expressions omit casts and {} invocations retain explicit boxing",
                 self.optional_casts, self.forced_boxing
+            );
+        } else if check == Check::PatternMatchingEntry {
+            eprintln!(
+                "{} intersection casts and {} variable expressions marked as intersection types",
+                self.intersection_casts, self.intersection_variables
             );
         }
         for kind in ["INFINITE", "DO_WHILE", "WHILE", "FOR", "FOR_EACH"] {
@@ -837,7 +881,8 @@ fn stage(
                 | Check::LoopEnhancement
                 | Check::LoopMerge
                 | Check::MainLoopLabels
-                | Check::SecondaryFunctions,
+                | Check::SecondaryFunctions
+                | Check::PatternMatchingEntry,
                 _,
             ) => {
                 loop {
@@ -873,6 +918,10 @@ fn stage(
                     } else if check == Check::LoopMerge {
                         operation.set("merge-loops");
                         method.merge_loops(cx, class)?;
+                        String::new()
+                    } else if check == Check::PatternMatchingEntry {
+                        operation.set("prepare-pattern-matching");
+                        method.prepare_pattern_matching(cx, class)?;
                         String::new()
                     } else {
                         operation.set("identify-main-loop-labels");
@@ -1011,8 +1060,7 @@ fn snapshot(
         cx,
         method.root,
         &method.flow.counters,
-        check.uses_loop_headers(),
-        check == Check::SecondaryFunctions,
+        check.expression_detail(),
     );
     let mut snapshot =
         format!("{tree};hidden={all_members};hidden-added={added}{details}\t{expressions}");

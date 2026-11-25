@@ -42,6 +42,8 @@ The main-loop label comparison starts at the prepared method and runs edge clean
 
 The secondary-function comparison invokes the pass immediately after label identification and checks its return value and complete method snapshots. It includes expression flags that preserve explicit casts and boxing calls. The test runs with default options and with ternary constant simplification enabled, and reports which method results, trees, and expressions change between profiles.
 
+The pattern-matching entry comparison runs the outer main-loop prefix from edge cleanup. A secondary-function or intersection-cast change restarts the prefix. The snapshot follows the iteration in which both passes return false and also checks intersection-cast operand order and variable flags.
+
 ## End-to-end source and CLI suite
 
 The retained `upstream_parity` target covers final source and CLI behavior. It currently requires library and binary entry points that still await migration. Use the explicit stage targets above to test the active implementation. The commands below document the end-to-end gate once those entry points are available.

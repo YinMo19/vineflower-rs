@@ -110,6 +110,7 @@ pub struct Variable {
     pub version: i32,
     pub stack: bool,
     pub catch_temp: bool,
+    pub intersection_type: bool,
     pub effectively_final: bool,
     pub backing_instruction: Option<Arc<Instruction>>,
     pub lvt: Option<Arc<LocalVariable>>,
@@ -126,6 +127,7 @@ impl Variable {
             version: 0,
             stack: false,
             catch_temp: false,
+            intersection_type: false,
             effectively_final: false,
             backing_instruction: None,
             lvt: None,
@@ -586,6 +588,7 @@ impl Expr {
                 variable.var_type = variable.expr_type(cx);
                 variable.backing_instruction = None;
                 variable.bound_type = None;
+                variable.intersection_type = false;
                 variable.record_local_type(&mut cx.ir.variable_processors);
             }
             ExprKind::Assignment { left, right, .. } => {

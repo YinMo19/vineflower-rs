@@ -37,6 +37,7 @@ import org.jetbrains.java.decompiler.modules.decompiler.EliminateLoopsHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.ExprProcessor;
 import org.jetbrains.java.decompiler.modules.decompiler.FinallyProcessor;
 import org.jetbrains.java.decompiler.modules.decompiler.IfHelper;
+import org.jetbrains.java.decompiler.modules.decompiler.IntersectionCastProcessor;
 import org.jetbrains.java.decompiler.modules.decompiler.LabelHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.LoopExtractHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.MergeHelper;
@@ -58,14 +59,22 @@ import org.jetbrains.java.decompiler.util.InterpreterUtil;
 class StackSnapshot {
   enum Check {
     STACK, INCREMENTS, PRE_MAIN, LOOP_ELIMINATION, LOOP_ENHANCEMENT, LOOP_MERGE, MAIN_LOOP_LABELS,
-    SECONDARY_FUNCTIONS;
+    SECONDARY_FUNCTIONS, PATTERN_MATCHING_ENTRY;
 
     boolean usesLoopHeaders() {
       return this == LOOP_ENHANCEMENT || this == LOOP_MERGE || identifiesLabels();
     }
 
     boolean identifiesLabels() {
-      return this == MAIN_LOOP_LABELS || this == SECONDARY_FUNCTIONS;
+      return this == MAIN_LOOP_LABELS || this == SECONDARY_FUNCTIONS || this == PATTERN_MATCHING_ENTRY;
+    }
+
+    ExpressionSnapshot.Detail expressionDetail() {
+      return switch (this) {
+        case PATTERN_MATCHING_ENTRY -> ExpressionSnapshot.Detail.INTERSECTION_CASTS;
+        case SECONDARY_FUNCTIONS -> ExpressionSnapshot.Detail.SECONDARY_FUNCTIONS;
+        default -> usesLoopHeaders() ? ExpressionSnapshot.Detail.LOOP_HEADERS : ExpressionSnapshot.Detail.BASE;
+      };
     }
   }
 
@@ -326,42 +335,56 @@ class StackSnapshot {
         StackVarsProcessor.simplifyStackVars(root, method, cl);
       }
       if (check.usesLoopHeaders()) {
-        operation = "clean-up-edges";
-        LabelHelper.cleanUpEdges(root);
         String details = "";
-        if (check == Check.LOOP_ENHANCEMENT) {
-          operation = "eliminate-loops";
-          if (root.hasLoops()) {
-            while (EliminateLoopsHelper.eliminateLoops(root, cl)) {}
+        while (true) {
+          operation = "clean-up-edges";
+          LabelHelper.cleanUpEdges(root);
+          if (check == Check.LOOP_ENHANCEMENT) {
+            operation = "eliminate-loops";
+            if (root.hasLoops()) {
+              while (EliminateLoopsHelper.eliminateLoops(root, cl)) {}
+            }
+            operation = "enhance-loops";
+            details = ";enhanced=" + (root.hasLoops() && MergeHelper.enhanceLoops(root));
+          } else if (root.hasLoops()) {
+            operation = "merge-loops";
+            while (true) {
+              if (EliminateLoopsHelper.eliminateLoops(root, cl)) {
+                continue;
+              }
+              MergeHelper.enhanceLoops(root);
+              if (LoopExtractHelper.extractLoops(root)) {
+                continue;
+              }
+              if (!IfHelper.mergeAllIfs(root)) {
+                break;
+              }
+            }
           }
-          operation = "enhance-loops";
-          details = ";enhanced=" + (root.hasLoops() && MergeHelper.enhanceLoops(root));
-        } else if (root.hasLoops()) {
-          operation = "merge-loops";
-          while (true) {
-            if (EliminateLoopsHelper.eliminateLoops(root, cl)) {
-              continue;
-            }
-            MergeHelper.enhanceLoops(root);
-            if (LoopExtractHelper.extractLoops(root)) {
-              continue;
-            }
-            if (!IfHelper.mergeAllIfs(root)) {
-              break;
+          if (check.identifiesLabels()) {
+            operation = "simplify-stack";
+            StackVarsProcessor.simplifyStackVars(root, method, cl);
+            operation = "set-var-versions";
+            vars.setVarVersions(root);
+            operation = "identify-labels";
+            LabelHelper.identifyLabels(root);
+          }
+          if (check == Check.SECONDARY_FUNCTIONS || check == Check.PATTERN_MATCHING_ENTRY) {
+            operation = "identify-secondary";
+            boolean changed = SecondaryFunctionsHelper.identifySecondaryFunctions(root, vars);
+            if (check == Check.SECONDARY_FUNCTIONS) {
+              details = ";secondary=" + changed;
+            } else {
+              if (changed) {
+                continue;
+              }
+              operation = "intersection-casts";
+              if (IntersectionCastProcessor.makeIntersectionCasts(root)) {
+                continue;
+              }
             }
           }
-        }
-        if (check.identifiesLabels()) {
-          operation = "simplify-stack";
-          StackVarsProcessor.simplifyStackVars(root, method, cl);
-          operation = "set-var-versions";
-          vars.setVarVersions(root);
-          operation = "identify-labels";
-          LabelHelper.identifyLabels(root);
-        }
-        if (check == Check.SECONDARY_FUNCTIONS) {
-          operation = "identify-secondary";
-          details = ";secondary=" + SecondaryFunctionsHelper.identifySecondaryFunctions(root, vars);
+          break;
         }
         operation = "snapshot";
         return snapshot(root, counters, vars, initialHidden, check, details)
@@ -420,6 +443,7 @@ class StackSnapshot {
         case LOOP_MERGE -> "loop-merge-" + operation + "-";
         case MAIN_LOOP_LABELS -> "main-loop-labels-" + operation + "-";
         case SECONDARY_FUNCTIONS -> "secondary-functions-" + operation + "-";
+        case PATTERN_MATCHING_ENTRY -> "pattern-matching-entry-" + operation + "-";
       };
       return failure + StructureReference.failureSnapshot(error);
     }
@@ -436,8 +460,7 @@ class StackSnapshot {
       ? ";content=" + root.hasTryCatch() + "," + root.hasLoops() + "," + root.hasSwitch() : "";
     String snapshot = StructureReference.snapshot(root, counters, loopStage)
       + content + ";hidden=" + allMembers + ";hidden-added=" + added + details
-      + "\t" + ExpressionSnapshot.snapshot(root, counters, check.usesLoopHeaders(),
-        check == Check.SECONDARY_FUNCTIONS);
+      + "\t" + ExpressionSnapshot.snapshot(root, counters, check.expressionDetail());
     return check == Check.STACK ? snapshot : snapshot + "\t" + VariableSnapshot.snapshot(vars);
   }
 }

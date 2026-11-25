@@ -95,6 +95,8 @@ CFG、语句图和 DirectGraph 具有不同的边契约。
 
 次级表达式改写在标签确定后运行。先尝试消除空 then 分支，再按原版的先后次序处理逻辑取反、浮点比较、三元式、复合赋值与装箱。某些改写只改变强制类型转换或装箱的写出标志；调用方是否重启由改写函数的返回值决定。[次级表达式](src/decompiler/secondary/mod.rs)
 
+交叉类型转换检查方法参数的泛型上界和赋值变量在整棵树中的使用位置。合并时将具体类放在接口之前，保留各类型表达式的身份，并标记需要写成 `var` 的局部变量。次级表达式或交叉转换有改动时，`ExpressionMethod::prepare_pattern_matching` 都从边清理重新开始。两者稳定后的树是原版进入 `instanceof` 模式匹配的位置，此时变量声明仍待后续阶段确定。[交叉类型转换](src/decompiler/intersection.rs) · [方法主循环](src/engine/method_processor.rs)
+
 `RuntimeImage::open` 将模块化 JDK 的每个模块作为独立库登记，按 JRT 的目录遍历和模块描述符顺序提供条目。普通镜像与 ZIP 压缩镜像可由现有 JImage 库读取；该库遇到 compact-cp 压缩时返回 Unsupported。[运行时类路径](src/engine/context_source/runtime.rs)
 
 同步区扩展有一处有意的终止条件。当共享后继的首个前驱来自另一保护区，上游可能反复向已覆盖的区间追加同一块。如果本轮既不会新增覆盖关系、也不会增加异常边或移动指令，Rust 跳过这个候选，继续检查其他区间。

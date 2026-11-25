@@ -68,6 +68,7 @@ class StructureReference {
         case 8 -> StackSnapshot.Check.LOOP_MERGE;
         case 9 -> StackSnapshot.Check.MAIN_LOOP_LABELS;
         case 10 -> StackSnapshot.Check.SECONDARY_FUNCTIONS;
+        case 11 -> StackSnapshot.Check.PATTERN_MATCHING_ENTRY;
         default -> null;
       };
       StackSnapshot.Context stackContext = stackCheck == null ? null

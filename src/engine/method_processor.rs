@@ -322,6 +322,20 @@ impl ExpressionMethod {
         )
     }
 
+    /// Run each main-loop iteration up to the Java pattern-matching passes.
+    pub fn prepare_pattern_matching(&mut self, cx: &mut Cx, class: &StructClass) -> io::Result<()> {
+        loop {
+            self.identify_main_loop_labels(cx, class)?;
+            if self.identify_secondary(cx)? {
+                continue;
+            }
+            if !crate::decompiler::intersection::make_casts(cx, &mut self.flow.counters, self.root)?
+            {
+                return Ok(());
+            }
+        }
+    }
+
     pub fn simplify_string_concat(&mut self, cx: &mut Cx, class: &StructClass) -> io::Result<()> {
         if class.version.has_indy_string_concat() {
             crate::decompiler::concat::simplify(cx, &mut self.flow.counters, self.root)?;

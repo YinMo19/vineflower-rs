@@ -25,6 +25,8 @@ import org.jetbrains.java.decompiler.struct.gen.generics.GenericMethodDescriptor
 import org.jetbrains.java.decompiler.struct.gen.generics.GenericType;
 
 class ExpressionSnapshot {
+  enum Detail { BASE, LOOP_HEADERS, SECONDARY_FUNCTIONS, INTERSECTION_CASTS }
+
   private static final Field ARRAY_HARD_TYPE = field(ArrayExprent.class, "hardType");
   private static final Field VARIABLE_TYPE = field(VarExprent.class, "varType");
   private static final Field VARIABLE_BOUND = field(VarExprent.class, "boundType");
@@ -37,21 +39,19 @@ class ExpressionSnapshot {
 
   // Record shared nodes once and keep references by the upstream expression ID.
   private final Map<Integer, Exprent> nodes = new TreeMap<>();
-  private final boolean enhanced;
-  private final boolean secondary;
+  private final Detail detail;
 
-  private ExpressionSnapshot(boolean enhanced, boolean secondary) {
-    this.enhanced = enhanced;
-    this.secondary = secondary;
+  private ExpressionSnapshot(Detail detail) {
+    this.detail = detail;
   }
 
   static String snapshot(RootStatement root, CounterContainer counters) {
-    return snapshot(root, counters, false, false);
+    return snapshot(root, counters, Detail.BASE);
   }
 
-  static String snapshot(RootStatement root, CounterContainer counters, boolean enhanced, boolean secondary) {
+  static String snapshot(RootStatement root, CounterContainer counters, Detail detail) {
     try {
-      return new ExpressionSnapshot(enhanced, secondary).describe(root, counters);
+      return new ExpressionSnapshot(detail).describe(root, counters);
     } catch (RuntimeException | AssertionError | StackOverflowError failure) {
       return "snapshot-error=" + text(failure.toString());
     }
@@ -69,10 +69,10 @@ class ExpressionSnapshot {
     while (!pending.isEmpty()) {
       Statement statement = pending.removeFirst();
       fields.add("body" + statement.id + "=" + expressions(statement.getExprents()));
-      if (enhanced) {
+      if (detail.ordinal() >= Detail.LOOP_HEADERS.ordinal()) {
         fields.add("definitions" + statement.id + "=" + expressions(statement.getVarDefinitions()));
       }
-      if (enhanced && statement instanceof DoStatement loop) {
+      if (detail.ordinal() >= Detail.LOOP_HEADERS.ordinal() && statement instanceof DoStatement loop) {
         fields.add("loop" + statement.id + "=" + expression(loop.getInitExprent()) + ","
           + expression(loop.getConditionExprent()) + "," + expression(loop.getIncExprent()));
         if (loop.getLooptype() == DoStatement.Type.FOR_EACH) {
@@ -137,7 +137,13 @@ class ExpressionSnapshot {
       String fields = parts(var.getIndex(), var.getVersion(), var.isStack(), var.isCatchTempVar(),
         type((VarType) read(VARIABLE_TYPE, var)), lvt(var.getLVT()), instruction(var.getBackingInstr()),
         var.isEffectivelyFinal());
-      return enhanced ? fields + "|" + type((VarType) read(VARIABLE_BOUND, var)) : fields;
+      if (detail.ordinal() >= Detail.LOOP_HEADERS.ordinal()) {
+        fields += "|" + type((VarType) read(VARIABLE_BOUND, var));
+      }
+      if (detail.ordinal() >= Detail.INTERSECTION_CASTS.ordinal()) {
+        fields += "|" + var.isIntersectionType();
+      }
+      return fields;
     }
     if (e instanceof ConstExprent constant) {
       return parts(value(constant.getValue()), constant.isBoolPermitted(), read(CONSTANT_CONDY, constant));
@@ -162,12 +168,12 @@ class ExpressionSnapshot {
         expressions(invocation.getLstParameters()), constant(invocation.getBootstrapMethod()),
         arguments == null ? "~" : arguments.stream().map(ExpressionSnapshot::constant).collect(Collectors.joining("/")),
         invocation.isSyntheticNullCheck(), read(INVOCATION_LAZY_CONDY, invocation));
-      return secondary ? fields + "|" + invocation.shouldForceBoxing() : fields;
+      return detail.ordinal() >= Detail.SECONDARY_FUNCTIONS.ordinal() ? fields + "|" + invocation.shouldForceBoxing() : fields;
     }
     if (e instanceof FunctionExprent function) {
       String fields = parts(function.getFuncType().name(), expressions(function.getLstOperands()),
         type((VarType) read(FUNCTION_IMPLICIT_TYPE, function)));
-      return secondary ? fields + "|" + function.doesCast() : fields;
+      return detail.ordinal() >= Detail.SECONDARY_FUNCTIONS.ordinal() ? fields + "|" + function.doesCast() : fields;
     }
     if (e instanceof NewExprent allocation) {
       return parts(type(allocation.getNewType()), expressions(allocation.getLstDims()),

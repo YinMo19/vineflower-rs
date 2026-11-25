@@ -16,16 +16,23 @@ use vineflower_rs::structs::attr::LocalVariable;
 use vineflower_rs::structs::consts::{ConstantValue, LinkConstant, PooledConstant};
 use vineflower_rs::types::{MethodDescriptor, VarType};
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Detail {
+    Base,
+    LoopHeaders,
+    SecondaryFunctions,
+    IntersectionCasts,
+}
+
 pub fn snapshot(cx: &Cx, root: StatId, counters: &CounterContainer) -> String {
-    snapshot_details(cx, root, counters, false, false)
+    snapshot_details(cx, root, counters, Detail::Base)
 }
 
 pub fn snapshot_details(
     cx: &Cx,
     root: StatId,
     counters: &CounterContainer,
-    enhanced: bool,
-    secondary: bool,
+    detail: Detail,
 ) -> String {
     let ir = &cx.ir;
     let StatementKind::Root { dummy_exit, .. } = ir[root].kind else {
@@ -35,8 +42,7 @@ pub fn snapshot_details(
     let mut snapshot = Snapshot {
         cx,
         nodes: BTreeMap::new(),
-        enhanced,
-        secondary,
+        detail,
     };
     let mut fields = vec![format!(
         "counters={},{},{}",
@@ -48,14 +54,14 @@ pub fn snapshot_details(
         let statement = &ir[stat];
         let id = statement.id;
         fields.push(format!("body{id}={}", snapshot.list(statement.exprents)));
-        if enhanced {
+        if detail >= Detail::LoopHeaders {
             fields.push(format!(
                 "definitions{id}={}",
                 snapshot.expressions(&statement.var_definitions)
             ));
         }
         match &statement.kind {
-            StatementKind::Do(loop_) if enhanced => {
+            StatementKind::Do(loop_) if detail >= Detail::LoopHeaders => {
                 fields.push(format!(
                     "loop{id}={},{},{}",
                     snapshot.expression(loop_.init(ir)),
@@ -116,8 +122,7 @@ pub fn snapshot_details(
 struct Snapshot<'a> {
     cx: &'a Cx,
     nodes: BTreeMap<i32, (ExprId, String)>,
-    enhanced: bool,
-    secondary: bool,
+    detail: Detail,
 }
 
 impl Snapshot<'_> {
@@ -182,8 +187,11 @@ impl Snapshot<'_> {
                     instruction(var.backing_instruction.as_deref()),
                     var.effectively_final
                 );
-                if self.enhanced {
+                if self.detail >= Detail::LoopHeaders {
                     write!(operands, "|{}", var_type(var.bound_type.as_deref())).unwrap();
+                }
+                if self.detail >= Detail::IntersectionCasts {
+                    write!(operands, "|{}", var.intersection_type).unwrap();
                 }
                 ("VAR", operands)
             }
@@ -259,7 +267,7 @@ impl Snapshot<'_> {
                     invocation.synthetic_null_check,
                     invocation.was_lazy_condy
                 );
-                if self.secondary {
+                if self.detail >= Detail::SecondaryFunctions {
                     write!(operands, "|{}", invocation.force_boxing).unwrap();
                 }
                 ("INVOCATION", operands)
@@ -276,7 +284,7 @@ impl Snapshot<'_> {
                     self.expressions(operands),
                     var_type(implicit_type.as_deref()),
                 );
-                if self.secondary {
+                if self.detail >= Detail::SecondaryFunctions {
                     write!(operands, "|{needs_cast}").unwrap();
                 }
                 ("FUNCTION", operands)

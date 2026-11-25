@@ -11,6 +11,7 @@ pub mod exps;
 pub mod finally;
 pub mod flow;
 pub(crate) mod increments;
+pub(crate) mod intersection;
 pub mod ir;
 pub(crate) mod labels;
 pub(crate) mod loops;

@@ -318,6 +318,59 @@ fn pre_main_recovers_the_order_of_dynamic_string_concatenation() {
 }
 
 #[test]
+fn main_loop_preserves_the_chain_of_local_definitions_before_declarations() {
+    use vineflower_rs::decompiler::exps::FunctionType::{
+        Add, And, Div, Mul, Or, Shl, Shr, Sub, Ushr, Xor,
+    };
+    use vineflower_rs::engine::method_processor::pre_main_method;
+
+    let options = Arc::new(Options::default());
+    let class = parse_class(
+        include_bytes!("smoke/java8/TestCompoundAssignment.class"),
+        &options,
+    )
+    .unwrap();
+    let method = class.get_method("testSimple", "(II)I").unwrap();
+    let mut cx = make_context(&options);
+    let mut result = pre_main_method(&mut cx, &class, method).unwrap().unwrap();
+    result.prepare_pattern_matching(&mut cx, &class).unwrap();
+    let head = result.root.get_basic_head(&cx.ir);
+    let (ret, assignments) = cx.ir[cx.ir[head].exprents.unwrap()].split_last().unwrap();
+    let slot = |expr: ExprId| match &cx.ir[expr].kind {
+        ExprKind::Variable(var) => var.index,
+        _ => panic!("expected a local variable"),
+    };
+    let operands = |expr: ExprId| match &cx.ir[expr].kind {
+        ExprKind::Function { op, operands, .. } => (*op, slot(operands[0]), slot(operands[1])),
+        _ => panic!("expected a binary arithmetic operation"),
+    };
+    let mut previous = 1;
+    let mut operators = Vec::new();
+    for &expr in assignments {
+        let ExprKind::Assignment {
+            left,
+            right,
+            compound: None,
+        } = cx.ir[expr].kind
+        else {
+            panic!("expected a fresh local definition");
+        };
+        let (op, lhs, rhs) = operands(right);
+        assert_eq!((lhs, rhs), (previous, 2));
+        previous = slot(left);
+        operators.push(op);
+    }
+    assert_eq!(operators, [Add, Sub, Mul, Div, And, Or, Xor, Shr, Shl]);
+    let ExprKind::Exit {
+        value: Some(value), ..
+    } = cx.ir[*ret].kind
+    else {
+        panic!("expected a return value")
+    };
+    assert_eq!(operands(value), (Ushr, previous, 2));
+}
+
+#[test]
 fn redundant_loop_elimination_keeps_the_enclosing_loops() {
     use vineflower_rs::engine::method_processor::pre_main_method;
 
@@ -477,6 +530,15 @@ fn secondary_functions_match_upstream() {
     stack_snapshot::check(
         &upstream_reference::Corpus::discover(),
         stack_snapshot::Check::SecondaryFunctions,
+    );
+}
+
+#[test]
+#[ignore = "requires the upstream +local.jar and JDK 17 or later"]
+fn pattern_matching_entry_matches_upstream() {
+    stack_snapshot::check(
+        &upstream_reference::Corpus::discover(),
+        stack_snapshot::Check::PatternMatchingEntry,
     );
 }
 
