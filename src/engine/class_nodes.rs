@@ -11,7 +11,9 @@ use arcstr::ArcStr;
 use index_vec::{IndexVec, define_index_type};
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use crate::decompiler::{ir::ExprId, vars::var_version_pair::VarVersionPair};
 use crate::structs::StructClass;
+use crate::util::jhash::{JHashMap, JHashSet};
 use crate::types::VarType;
 use crate::util::interpreter_util::make_unique_key;
 
@@ -122,13 +124,15 @@ pub struct ClassNode {
     pub access: i32,
     pub simple_name: Option<ArcStr>,
     pub enclosing_method: Option<ArcStr>,
-    pub enclosing_classes: FxHashSet<ArcStr>,
+    pub enclosing_classes: JHashSet<ArcStr>,
     pub parent: Option<ClassNodeId>,
     pub nested: Vec<ClassNodeId>,
     pub anonymous_type: Option<VarType>,
     pub lambda: Option<LambdaInformation>,
     /// Published after all declared methods finish processing.
     pub wrapper: Option<super::class_wrapper::ClassWrapper>,
+    pub fields_to_vars: JHashMap<String, VarVersionPair>,
+    pub super_invocation: Option<ExprId>,
     /// ClassWrapper members consumed by source-level rewrites.
     pub hidden_members: FxHashSet<String>,
 }
@@ -164,12 +168,14 @@ impl ClassNode {
             kind: ClassKind::Root,
             simple_name: Some(simple_name),
             enclosing_method,
-            enclosing_classes: FxHashSet::default(),
+            enclosing_classes: JHashSet::new(),
             parent: None,
             nested: Vec::new(),
             anonymous_type: None,
             lambda: None,
             wrapper: None,
+            fields_to_vars: Default::default(),
+            super_invocation: None,
             hidden_members: Default::default(),
         }
     }

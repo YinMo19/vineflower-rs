@@ -20,6 +20,7 @@ pub fn prepare_class(cx: &mut Cx, root: ClassNodeId) -> io::Result<()> {
         return Ok(());
     }
     cx.imports = ImportCollector::for_root(&cx.struct_context, &cx.class_nodes, node);
+    cx.expression_ids = Default::default(); // DecompilerContext.startClass
     let package_info =
         node.class.is_synthetic() && node.simple_name.as_deref() == Some("package-info");
     let module_info = node.class.has_modifier(ACC_MODULE) && node.class.attributes.module.is_some();
@@ -64,6 +65,19 @@ pub fn process_class_methods(
 /// Publish a compilation unit's methods through the complete built-in Java pipeline.
 pub fn initialize_java_wrappers(cx: &mut Cx, root: ClassNodeId) -> io::Result<()> {
     process_class_methods(cx, root, super::method_processor::code_to_java)
+}
+
+/// Run the built-in Java processing for a root class and its nested classes.
+pub fn process_class(cx: &mut Cx, root: ClassNodeId) -> io::Result<()> {
+    if cx.class_nodes[root].kind != ClassKind::Root {
+        return Ok(());
+    }
+    initialize_java_wrappers(cx, root)?;
+    if cx.class_nodes[root].wrapper.is_some() {
+        super::nested::process_class(cx, root)?;
+        super::nested::propagate_member_access(cx, root)?;
+    }
+    Ok(())
 }
 
 fn append_wrapper_order(classes: &ClassNodes, id: ClassNodeId, order: &mut Vec<ClassNodeId>) {

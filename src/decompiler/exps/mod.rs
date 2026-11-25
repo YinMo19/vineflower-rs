@@ -148,6 +148,7 @@ pub struct Variable {
     pub version: i32,
     pub stack: bool,
     pub definition: bool,
+    pub class_definition: bool,
     pub catch_temp: bool,
     pub intersection_type: bool,
     pub effectively_final: bool,
@@ -166,6 +167,7 @@ impl Variable {
             version: 0,
             stack: false,
             definition: false,
+            class_definition: false,
             catch_temp: false,
             intersection_type: false,
             effectively_final: false,
@@ -452,6 +454,19 @@ impl Expr {
     ) -> ExprId {
         ir.exprs.push(Self {
             id: counters.get_counter_and_increment(EXPRESSION_COUNTER),
+            kind,
+            bytecode,
+        })
+    }
+
+    /// Class-level rewrites use the counter still active in DecompilerContext.
+    pub(crate) fn new_ambient(
+        cx: &mut Cx,
+        kind: ExprKind,
+        bytecode: Option<BytecodeOffsets>,
+    ) -> ExprId {
+        cx.ir.exprs.push(Self {
+            id: cx.expression_ids.next(),
             kind,
             bytecode,
         })

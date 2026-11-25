@@ -3,6 +3,9 @@
 
 //! Method results published together at the end of ClassWrapper.init.
 
+use arcstr::ArcStr;
+use indexmap::IndexSet;
+use rustc_hash::FxHashSet;
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
@@ -12,8 +15,9 @@ use super::context::Cx;
 use super::counter_container::CounterContainer;
 use super::method_processor::ExpressionMethod;
 use crate::decompiler::flow::{DirectGraph, flatten::build_direct_graph};
-use crate::decompiler::ir::{ExprListId, StatId, VarProcessorId};
-use crate::decompiler::vars::processor::VarNamesCollector;
+use crate::decompiler::ir::{ExprListId, Ir, StatId, VarProcessorId};
+use crate::decompiler::stats::StatementKind;
+use crate::decompiler::vars::{processor::VarNamesCollector, var_version_pair::VarVersionPair};
 use crate::structs::{StructClass, StructMethod};
 use crate::util::interpreter_util::make_unique_key;
 
@@ -27,12 +31,31 @@ pub struct MethodWrapper {
     pub method: Arc<StructMethod>,
     pub body: io::Result<Option<MethodBody>>,
     pub variables: VarProcessorId,
+    pub synthetic_parameters: Option<Vec<Option<VarVersionPair>>>,
+    pub outer_var_names: FxHashSet<Option<ArcStr>>,
+    pub comment_lines: Option<IndexSet<String>>,
+    pub add_error_comment: bool,
+}
+
+impl MethodWrapper {
+    pub(super) fn add_comment(&mut self, comment: &str) {
+        self.comment_lines
+            .get_or_insert_with(IndexSet::new)
+            .insert(comment.to_owned());
+    }
 }
 
 pub struct MethodBody {
     pub root: StatId,
     pub counters: CounterContainer,
     graph: Option<DirectGraph>,
+}
+
+impl MethodBody {
+    pub fn graph(&mut self, ir: &mut Ir) -> &DirectGraph {
+        self.graph
+            .get_or_insert_with(|| build_direct_graph(ir, self.root))
+    }
 }
 
 impl From<ExpressionMethod> for MethodBody {
@@ -87,6 +110,9 @@ fn process_method(
     // ClassWrapper catches failures at the method boundary. A failure in
     // graph recognition leaves other methods in this class available.
     let variables = cx.ir.variable_processors.push(Default::default());
+    // startMethod installs a new sequence even for methods without code. The
+    // last method remains the ambient sequence during nested-class processing.
+    cx.expression_ids = Default::default();
     let previous = cx.current_method.replace((Arc::clone(method), variables));
     let outcome =
         catch_unwind(AssertUnwindSafe(|| process(cx, class, method))).unwrap_or_else(|payload| {
@@ -103,6 +129,20 @@ fn process_method(
         .ok()
         .and_then(Option::as_ref)
         .map_or(variables, |method| method.flow.variables);
+    let (comment_lines, add_error_comment) = if let Ok(Some(body)) = &outcome
+        && let StatementKind::Root {
+            comment_lines: Some(comments),
+            add_error_comment,
+            ..
+        } = &cx.ir[body.root].kind
+    {
+        (
+            (!comments.is_empty()).then(|| comments.clone()),
+            *add_error_comment,
+        )
+    } else {
+        (None, false)
+    };
     let body = match outcome {
         Ok(result) => {
             let processor = &mut cx.ir[variables];
@@ -141,14 +181,36 @@ fn process_method(
     Ok(MethodWrapper {
         method: Arc::clone(method),
         variables,
+        synthetic_parameters: None,
+        outer_var_names: Default::default(),
+        comment_lines,
+        add_error_comment,
         body,
     })
 }
 
 #[derive(Clone, Copy)]
 pub(crate) struct MethodSlot {
-    node: ClassNodeId,
-    index: usize,
+    pub(super) node: ClassNodeId,
+    pub(super) index: usize,
+}
+
+impl MethodSlot {
+    pub(super) fn by_key(cx: &Cx, node: ClassNodeId, key: &str) -> Option<Self> {
+        let node = cx.class_nodes.wrapper_owner(node)?;
+        let class = &cx.class_nodes[node];
+        class.wrapper.as_ref()?;
+        let index = class.class.methods.index_of_key(key)?;
+        Some(Self { node, index })
+    }
+
+    pub(super) fn get(self, cx: &Cx) -> &MethodWrapper {
+        &cx.class_nodes[self.node].wrapper.as_ref().unwrap().methods[self.index]
+    }
+
+    pub(super) fn get_mut(self, cx: &mut Cx) -> &mut MethodWrapper {
+        &mut cx.class_nodes[self.node].wrapper.as_mut().unwrap().methods[self.index]
+    }
 }
 
 pub(crate) enum WrapperMethod {
@@ -192,6 +254,14 @@ impl Cx {
     /// Cache the direct graph, but read each node's live expression list in
     /// regular breadth-first order just as DirectGraph.iterateExprents does.
     pub(crate) fn wrapper_expr_lists(&mut self, method: MethodSlot) -> Vec<ExprListId> {
+        let graph = self.wrapper_graph(method);
+        graph
+            .regular_breadth_first()
+            .map(|node| graph[node].exprents)
+            .collect()
+    }
+
+    pub(super) fn wrapper_graph(&mut self, method: MethodSlot) -> &DirectGraph {
         let wrapper = self.class_nodes[method.node]
             .wrapper
             .as_mut()
@@ -199,12 +269,6 @@ impl Cx {
         let Ok(Some(body)) = &mut wrapper.methods[method.index].body else {
             unreachable!()
         };
-        let graph = body
-            .graph
-            .get_or_insert_with(|| build_direct_graph(&mut self.ir, body.root));
-        graph
-            .regular_breadth_first()
-            .map(|node| graph[node].exprents)
-            .collect()
+        body.graph(&mut self.ir)
     }
 }

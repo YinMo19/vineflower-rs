@@ -8,6 +8,8 @@ use std::{env, fs, io};
 
 pub struct Corpus {
     pub classes: Vec<PathBuf>,
+    #[allow(dead_code, reason = "only class-level comparisons register whole compilation groups")]
+    pub root: PathBuf,
     jar: PathBuf,
 }
 
@@ -38,7 +40,7 @@ impl Corpus {
             })
             .min()
             .unwrap_or_else(|| panic!("no *+local.jar in {}", libs.display()));
-        Self { classes, jar }
+        Self { classes, root, jar }
     }
 
     #[allow(

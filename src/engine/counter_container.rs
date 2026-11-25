@@ -45,9 +45,15 @@ pub struct CounterContainer {
 
 impl Default for CounterContainer {
     fn default() -> Self {
+        Self::with_expression_ids(ExpressionIds::default())
+    }
+}
+
+impl CounterContainer {
+    pub(crate) fn with_expression_ids(expressions: ExpressionIds) -> Self {
         Self {
             statements: 1,
-            expressions: ExpressionIds::default(),
+            expressions,
             variables: 1,
             dot_files: 1,
         }

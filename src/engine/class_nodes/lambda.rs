@@ -203,6 +203,8 @@ fn lambda_node(
         anonymous_type: Some(VarType::from_signature_cl(lambda_class, true)),
         lambda: Some(info),
         wrapper: None,
+        fields_to_vars: Default::default(),
+        super_invocation: None,
         hidden_members: Default::default(),
     })
 }

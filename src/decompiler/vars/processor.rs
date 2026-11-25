@@ -24,6 +24,10 @@ pub struct VarProcessor {
     pub versions: VarVersions,
     pub(crate) definitions_set: bool,
     pub names: JHashMap<VarVersionPair, Option<ArcStr>>,
+    pub inherited_names: FxHashMap<VarVersionPair, Option<ArcStr>>,
+    pub sources: FxHashMap<VarVersionPair, (ArcStr, VarVersionPair)>,
+    pub nested_processed: bool,
+    pub external_vars: FxHashSet<VarVersionPair>,
     pub this_vars: JHashMap<VarVersionPair, ArcStr>,
     pub name_collector: VarNamesCollector,
     pub params: Vec<VarVersionPair>,
@@ -51,6 +55,11 @@ impl VarProcessor {
         }
     }
 
+    pub(crate) fn inherit_name(&mut self, pair: VarVersionPair, name: Option<ArcStr>) {
+        self.names.insert(pair, name.clone());
+        self.inherited_names.insert(pair, name);
+    }
+
     pub(crate) fn refresh_names(&mut self, collector: &mut VarNamesCollector) {
         for (pair, name) in JHashMap::copy_of(&self.names).iter() {
             self.names
@@ -59,9 +68,9 @@ impl VarProcessor {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct VarNamesCollector {
-    used: FxHashSet<Option<ArcStr>>,
+    pub(crate) used: FxHashSet<Option<ArcStr>>,
 }
 
 impl VarNamesCollector {

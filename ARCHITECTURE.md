@@ -115,6 +115,8 @@ CFG、语句图和 DirectGraph 具有不同的边契约。
 
 类包装器为 abstract 和 native 方法保留参数槽，并在每个成功方法返回后避开同名字段。启用局部变量表时，包装器用原槽查找调试名，再次检查变量作用域。内置 identity、JAD、Tiny 命名策略按原方法缓存参数名，局部类、匿名类及 lambda 方法可以继承外层策略状态。Tiny 开启参数重命名时，对只有调试条目且缺少类型的参数，上游会在该方法中止命名；Rust 保留对应的方法级错误。[变量状态](src/decompiler/vars/processor.rs) · [命名策略](src/decompiler/vars/naming/mod.rs)
 
+根类及其子类的所有方法包装器发布后，`process_class` 才处理嵌套类。它先从构造器和调用点归并合成参数，沿外层方法继承变量名、调试类型和来源，再放置局部类声明。每次替换既保留所属方法的变量槽，又从当前上下文分配表达式编号。最后识别旧版字节码用于跨类访问的合成方法，重写调用并隐藏已经消除的成员。写出阶段可以继续使用同一份方法体、导入表和已经建立的直接图。[类级入口](src/engine/class_processor.rs) · [捕获参数](src/engine/nested/captures.rs) · [局部类声明](src/engine/nested/declaration.rs) · [合成访问器](src/engine/nested/member_access.rs)
+
 `RuntimeImage::open` 将模块化 JDK 的每个模块作为独立库登记，按 JRT 的目录遍历和模块描述符顺序提供条目。普通镜像与 ZIP 压缩镜像可由现有 JImage 库读取；该库遇到 compact-cp 压缩时返回 Unsupported。[运行时类路径](src/engine/context_source/runtime.rs)
 
 `StructContext::add_file` 根据文件后缀和 ZIP 结束记录登记目录、归档或单文件。重新载入上下文时再次扫描目录及其子归档。ZIP 保留中央目录顺序和重复条目，按 Java 的规则解释多版本路径。单个 class 文件在预读内部名称和正式解析时使用同一上下文的注解表达式计数器。直接读取缺失资源或目录时，Rust 的 `ContextSource` 返回 `Ok(None)`。Java 的目录源打开这些路径时抛出 I/O 异常，ZIP 源读取缺失条目时抛出空引用异常，读取显式目录条目时返回空流。正常登记按已有条目读取类和资源。[文件登记](src/structs/struct_context.rs)

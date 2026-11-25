@@ -15,7 +15,7 @@ use crate::engine::Options;
 use crate::structs::attr::InnerClassEntry;
 use crate::structs::{StructClass, StructContext};
 use crate::types::VarType;
-use crate::util::interpreter_util::make_unique_key;
+use crate::util::{interpreter_util::make_unique_key, jhash::JHashSet};
 
 /// Loads nodes for the eligible own classes. `include` combines the configured
 /// include/exclude name filters. The whitelist limits node creation while
@@ -90,7 +90,7 @@ impl Inner {
 struct Nesting {
     inner: FxHashMap<ArcStr, Inner>,
     nested_refs: FxHashMap<ArcStr, FxHashSet<ArcStr>>,
-    enclosing_refs: FxHashMap<ArcStr, FxHashSet<ArcStr>>,
+    enclosing_refs: FxHashMap<ArcStr, JHashSet<ArcStr>>,
     renamed_simple_names: FxHashMap<ArcStr, ArcStr>,
 }
 

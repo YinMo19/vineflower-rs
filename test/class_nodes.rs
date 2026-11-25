@@ -4,6 +4,10 @@ use std::{env, fmt::Display, fs, io::Write, path::Path, process::Command, sync::
 
 #[path = "support/generic_chains.rs"]
 mod generic_chains;
+#[path = "support/nested_classes.rs"]
+mod nested_classes;
+#[path = "support/nested_member_access.rs"]
+mod nested_member_access;
 #[path = "support/lambda_nodes.rs"]
 mod lambda_nodes;
 #[path = "support/upstream_reference.rs"]
@@ -688,7 +692,7 @@ fn variable_names_and_debug_tables_match_published_method_wrappers() {
     };
     let scratch = tempfile::tempdir().unwrap();
     let reference =
-        upstream_reference::Corpus::discover().run("VariableNamesReference", &[], scratch.path());
+        upstream_reference::Corpus::discover().run("VariableNamesReference", &["WrapperStages"], scratch.path());
     let mut rows = Vec::new();
     for provider in ["identity", "jad", "tiny"] {
         for debug in [false, true] {

@@ -7,12 +7,6 @@ import java.util.HashMap;
 import java.util.TreeMap;
 import javax.tools.ToolProvider;
 import org.jetbrains.java.decompiler.main.ClassesProcessor;
-import org.jetbrains.java.decompiler.main.DecompilerContext;
-import org.jetbrains.java.decompiler.main.Fernflower;
-import org.jetbrains.java.decompiler.main.collectors.ImportCollector;
-import org.jetbrains.java.decompiler.main.extern.IFernflowerLogger;
-import org.jetbrains.java.decompiler.main.rels.LambdaProcessor;
-import org.jetbrains.java.decompiler.api.plugin.LanguageSpec;
 import org.jetbrains.java.decompiler.modules.decompiler.vars.VarVersionPair;
 
 class VariableNamesReference {
@@ -53,19 +47,7 @@ class VariableNamesReference {
         options.put("use-lvt-names",debug);
         options.put("rename-parameters","1");
         if (!provider.equals("identity")) options.put("variable-renaming",provider);
-        var engine = new Fernflower(null, options, IFernflowerLogger.NO_OP);
-        engine.addSource(classes.toFile());
-        var cp = DecompilerContext.getClassProcessor();
-        cp.loadClasses(null);
-        var root = cp.getMapRootClasses().get("Names");
-        DecompilerContext.startClass(new ImportCollector(root));
-        new LambdaProcessor().processClass(root);
-        var imports = ClassesProcessor.class.getDeclaredMethod("addClassNameToImport", ClassesProcessor.ClassNode.class, ImportCollector.class);
-        imports.setAccessible(true);
-        imports.invoke(null, root, DecompilerContext.getImportCollector());
-        var initialize = ClassesProcessor.class.getDeclaredMethod("initWrappers", ClassesProcessor.ClassNode.class, LanguageSpec.class);
-        initialize.setAccessible(true);
-        initialize.invoke(null, root, null);
+        var cp = WrapperStages.initialize(classes,"Names",options);
         System.out.println(provider + " " + debug);
         for (var node : new TreeMap<>(cp.getMapRootClasses()).values()) {
           if (node.type == ClassesProcessor.ClassNode.Type.LAMBDA) continue;

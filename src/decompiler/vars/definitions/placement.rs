@@ -92,7 +92,9 @@ pub(super) fn place(
         let Some(scope) = place_in_loop_header(ir, stat, index) else {
             continue;
         };
-        let first_block = scopes.find_first_block(ir, scope, index);
+        let first_block = scope.find_first_block(ir, |stat| {
+            scopes.statement_vars[&ir[stat].id].contains(&index)
+        });
         let body = first_block.and_then(|first| ir[first].exprents);
         let first = first_block.unwrap_or(scope);
         let expressions = body.map_or(&ir[first].var_definitions, |list| &ir[list]);
@@ -196,31 +198,6 @@ impl DeclarationScopes {
         let id = ir[stat].id;
         self.statement_vars.insert(id, variables);
         &self.statement_vars[&id]
-    }
-
-    fn find_first_block(&self, ir: &Ir, scope: StatId, index: i32) -> Option<StatId> {
-        let mut pending = VecDeque::from([scope]);
-        while let Some(stat) = pending.pop_front() {
-            if !pending.is_empty() && !self.statement_vars[&ir[stat].id].contains(&index) {
-                continue;
-            }
-            if (!pending.is_empty() && stat.is_labeled(ir)) || ir[stat].exprents.is_some() {
-                return Some(stat);
-            }
-
-            pending.clear();
-            match ir[stat].kind {
-                StatementKind::Sequence => pending.extend(ir[stat].stats.iter().copied()),
-                StatementKind::If(_)
-                | StatementKind::Root { .. }
-                | StatementKind::Switch(_)
-                | StatementKind::Synchronized { .. } => {
-                    pending.push_back(ir[stat].first.expect("Missing first statement"));
-                }
-                _ => return Some(stat),
-            }
-        }
-        None
     }
 }
 

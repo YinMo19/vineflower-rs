@@ -67,13 +67,17 @@ impl<'a> DecodedMethod<'a> {
         ir: &mut Ir,
         class: &'a StructClass,
         method: &'a StructMethod,
-        variables: Option<VarProcessorId>,
+        scope: Option<(VarProcessorId, super::counter_container::ExpressionIds)>,
     ) -> io::Result<Option<Self>> {
         Ok(method.expand_data(class)?.map(|seq| {
             let graph = ControlFlowGraph::new(ir, seq);
-            let variables =
-                variables.unwrap_or_else(|| ir.variable_processors.push(Default::default()));
-            let mut counters = CounterContainer::default();
+            let (variables, ids) = scope.unwrap_or_else(|| {
+                (
+                    ir.variable_processors.push(Default::default()),
+                    Default::default(),
+                )
+            });
+            let mut counters = CounterContainer::with_expression_ids(ids);
             counters.set_counter(VAR_COUNTER, method.local_variables);
             Self {
                 flow: MethodGraph {
@@ -142,12 +146,12 @@ pub fn initial_statement_graph(
     class: &StructClass,
     method: &Arc<StructMethod>,
 ) -> io::Result<Option<InitialMethod>> {
-    let variables = cx
+    let scope = cx
         .current_method
         .as_ref()
         .filter(|(active, _)| Arc::ptr_eq(active, method))
-        .map(|(_, variables)| *variables);
-    let Some(decoded) = DecodedMethod::decode(&mut cx.ir, class, method, variables)? else {
+        .map(|(_, variables)| (*variables, cx.expression_ids.clone()));
+    let Some(decoded) = DecodedMethod::decode(&mut cx.ir, class, method, scope)? else {
         return Ok(None);
     };
     let common = decoded.prepare_control_flow(&mut cx.ir, &cx.options);

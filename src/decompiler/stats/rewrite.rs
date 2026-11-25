@@ -3,6 +3,8 @@
 
 //! Tree and edge changes shared by statement recognition and replacement.
 
+use std::collections::VecDeque;
+
 use rustc_hash::FxHashSet;
 
 use super::recognize;
@@ -12,6 +14,36 @@ use crate::decompiler::ir::{EdgeId, Ir, StatId};
 use crate::engine::counter_container::CounterContainer;
 
 impl StatId {
+    /// Find where a declaration can be written within its common scope.
+    pub(crate) fn find_first_block(
+        self,
+        ir: &Ir,
+        contains_reference: impl Fn(StatId) -> bool,
+    ) -> Option<StatId> {
+        let mut pending = VecDeque::from([self]);
+        while let Some(stat) = pending.pop_front() {
+            if !pending.is_empty() && !contains_reference(stat) {
+                continue;
+            }
+            if (!pending.is_empty() && stat.is_labeled(ir)) || ir[stat].exprents.is_some() {
+                return Some(stat);
+            }
+
+            pending.clear();
+            match ir[stat].kind {
+                StatementKind::Sequence => pending.extend(ir[stat].stats.iter().copied()),
+                StatementKind::If(_)
+                | StatementKind::Root { .. }
+                | StatementKind::Switch(_)
+                | StatementKind::Synchronized { .. } => {
+                    pending.push_back(ir[stat].first.expect("Missing first statement"));
+                }
+                _ => return Some(stat),
+            }
+        }
+        None
+    }
+
     /// Looks through the child tree even while a candidate's parent links
     /// still point into its enclosing general statement.
     pub fn contains_statement_strict(self, ir: &Ir, target: StatId) -> bool {
