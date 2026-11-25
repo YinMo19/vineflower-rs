@@ -39,6 +39,7 @@ pub fn snapshot(cx: &Cx, root: StatId, counters: &CounterContainer) -> String {
         match &statement.kind {
             StatementKind::If(branch) => {
                 fields.push(format!("head{id}={}", snapshot.list(branch.head_exprents)));
+                fields.push(format!("pattern{id}={}", branch.pattern_matched));
             }
             StatementKind::Switch(branch) => {
                 fields.push(format!("head{id}={}", snapshot.list(branch.head_exprents)));
@@ -134,14 +135,15 @@ impl Snapshot<'_> {
             ExprKind::Variable(var) => (
                 "VAR",
                 format!(
-                    "{}|{}|{}|{}|{}|{}|{}",
+                    "{}|{}|{}|{}|{}|{}|{}|{}",
                     var.index,
                     var.version,
                     var.stack,
                     var.catch_temp,
                     var_type(Some(&var.var_type)),
                     local_variable(var.lvt.as_deref()),
-                    instruction(var.backing_instruction.as_deref())
+                    instruction(var.backing_instruction.as_deref()),
+                    var.effectively_final
                 ),
             ),
             ExprKind::Constant {
@@ -218,9 +220,18 @@ impl Snapshot<'_> {
                     invocation.was_lazy_condy
                 ),
             ),
-            ExprKind::Function { op, operands } => (
+            ExprKind::Function {
+                op,
+                operands,
+                implicit_type,
+            } => (
                 "FUNCTION",
-                format!("{}|{}", function_name(*op), self.expressions(operands)),
+                format!(
+                    "{}|{}|{}",
+                    function_name(*op),
+                    self.expressions(operands),
+                    var_type(implicit_type.as_deref()),
+                ),
             ),
             ExprKind::New {
                 new_type,
@@ -230,10 +241,11 @@ impl Snapshot<'_> {
                 anonymous,
                 lambda,
                 method_reference,
+                direct_array_init,
             } => (
                 "NEW",
                 format!(
-                    "{}|{}|{}|{}|{anonymous}|{lambda}|{method_reference}",
+                    "{}|{}|{}|{}|{anonymous}|{lambda}|{method_reference}|{direct_array_init}",
                     var_type(Some(new_type)),
                     self.expressions(dimensions),
                     self.expression(*constructor),
@@ -303,6 +315,8 @@ fn function_name(op: FunctionType) -> String {
         FunctionType::ArrayLength => "ARRAY_LENGTH".into(),
         FunctionType::BitNot => "BIT_NOT".into(),
         FunctionType::BoolNot => "BOOL_NOT".into(),
+        FunctionType::BoolAnd => "BOOLEAN_AND".into(),
+        FunctionType::BoolOr => "BOOLEAN_OR".into(),
         _ => enum_name(op),
     }
 }

@@ -89,6 +89,8 @@ pub struct ContentFlags {
 pub struct IfStatement {
     pub has_else: bool,
     pub negated: bool,
+    pub pattern_matched: bool,
+    pub has_ppmm: bool,
     pub if_stat: Option<StatId>,
     pub else_stat: Option<StatId>,
     pub if_edge: Option<EdgeId>,

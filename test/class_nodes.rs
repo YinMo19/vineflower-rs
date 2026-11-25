@@ -149,3 +149,40 @@ fn snapshot(cx: &mut Cx, id: ClassNodeId, mode: &str, records: &mut Vec<String>)
 fn list(items: impl IntoIterator<Item = impl Display>) -> String {
     format!("[{}]", itertools::join(items, ", "))
 }
+
+#[test]
+#[ignore = "requires the upstream +local.jar and JDK 17 or later"]
+fn method_properties_match_upstream() {
+    use vineflower_rs::structs::StructClass;
+    use vineflower_rs::util::data_input::DataInputFullStream;
+
+    let corpus = upstream_reference::Corpus::discover();
+    let mut paths = tempfile::NamedTempFile::new().unwrap();
+    let mut actual = Vec::new();
+    let options = Options::default();
+    for path in &corpus.classes {
+        writeln!(paths, "{}", path.display()).unwrap();
+        let bytes = std::fs::read(path).unwrap();
+        let class =
+            StructClass::create(&mut DataInputFullStream::new(&bytes), true, &options, None)
+                .unwrap();
+        for method in &class.methods {
+            let key = method.to_string();
+            let props = class.method_properties(&key).unwrap();
+            let field = props.assert_field.as_ref().map_or("-", |f| f.name.as_str());
+            actual.push(format!(
+                "{}\t{key}\t{}\t{field}",
+                class.qualified_name, props.is_synthetic_reference_lambda
+            ));
+        }
+    }
+    let reference = corpus.run("MethodPropertiesReference", &[], paths.path());
+    assert_eq!(actual.len(), reference.lines().count());
+    for (actual, expected) in actual.iter().zip(reference.lines()) {
+        assert_eq!(actual, expected);
+    }
+    eprintln!(
+        "{} bytecode-derived method properties matched",
+        actual.len()
+    );
+}

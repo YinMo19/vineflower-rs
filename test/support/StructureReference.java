@@ -57,6 +57,7 @@ class StructureReference {
     new Fernflower(null, Map.of(IFernflowerPreferences.INCLUDE_JAVA_RUNTIME, "0"), IFernflowerLogger.NO_OP);
     try (var input = new DataInputStream(new BufferedInputStream(Files.newInputStream(Path.of(args[0]))))) {
       int phase = input.readUnsignedByte();
+      StackSnapshot.Context stackContext = phase == 3 ? new StackSnapshot.Context(readStackGroups(input)) : null;
       Path previousPath = null;
       Options previousOptions = null;
       StructClass currentClass = null;
@@ -65,6 +66,15 @@ class StructureReference {
         String name = readText(input);
         String descriptor = readText(input);
         Options options = new Options(input.readBoolean(), input.readBoolean(), input.readBoolean(), input.readBoolean());
+        if (stackContext != null) {
+          int group = input.readInt();
+          boolean simplify = input.readBoolean();
+          boolean ternary = input.readBoolean();
+          String classname = readText(input);
+          String snapshot = stackContext.run(input, group, simplify, ternary, classname, name, descriptor, StructureReference::snapshot);
+          System.out.println(index + "\t" + snapshot);
+          continue;
+        }
         if (!classPath.equals(previousPath) || !options.equals(previousOptions)) {
           DecompilerContext.setProperty(IFernflowerPreferences.FORCE_JSR_INLINE, flag(options.forceJsr()));
           DecompilerContext.setProperty(IFernflowerPreferences.USE_DEBUG_VAR_NAMES, flag(options.useLvtNames()));
@@ -112,6 +122,15 @@ class StructureReference {
     }
   }
 
+  private static List<List<String>> readStackGroups(DataInputStream input) throws IOException {
+    int count = input.readInt();
+    var groups = new ArrayList<List<String>>(count);
+    for (int i = 0; i < count; i++) {
+      groups.add(readTexts(input));
+    }
+    return groups;
+  }
+
   private static String lift(RootStatement root, StructClass cl, StructMethod method, MethodDescriptor descriptor,
                              VarProcessor vars, CounterContainer counters, boolean checkSsa) {
     try {
@@ -142,7 +161,7 @@ class StructureReference {
 
   // Reuse the real method and decoded bytecode as context. Both implementations
   // receive the same prepared graph, including synthetic handler blocks and IDs.
-  private static ControlFlowGraph readGraph(DataInputStream input, StructMethod method) throws IOException {
+  static ControlFlowGraph readGraph(DataInputStream input, StructMethod method) throws IOException {
     FullInstructionSequence sequence = method.getInstructionSequence();
     ControlFlowGraph graph = new ControlFlowGraph(sequence);
     graph.getBlocks().clear();

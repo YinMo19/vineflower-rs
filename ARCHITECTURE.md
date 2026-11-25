@@ -75,7 +75,13 @@ CFG、语句图和 DirectGraph 具有不同的边契约。
 
 [finally 恢复](src/decompiler/finally/mod.rs) 每轮分析一个新的 catch-all handler。通过变量版本追踪异常的保存和重抛，再比较每个正常出口的指令、后继和异常保护关系。可以验证的重复清理块从 CFG 中删除；需要保留原控制流时，在 try 的入口和出口插入一个合成整型局部变量。每轮改写后从同一 CFG 重建语句树，保留方法计数器、方法描述符和累积注释。
 
-[`expression_method`](src/engine/method_processor.rs) 串起解码、控制流清理、结构分解、finally 恢复和最终表达式构建。finally 稳定后重新识别 synchronized，移除它的异常处理器，记录树中是否有循环、switch 和 try/catch，清理临时边索引并压缩顺序语句。返回的表达式树保留对应 CFG 和合成变量，供后续 `StackVarsProcessor.simplifyStackVars` 使用。方法重写、整类写出与 CLI 的端到端验证仍待接入。
+[`expression_method`](src/engine/method_processor.rs) 串起解码、控制流清理、结构分解、finally 恢复和最终表达式构建。finally 稳定后重新识别 synchronized，移除它的异常处理器，记录树中是否有循环、switch 和 try/catch，清理临时边索引并压缩顺序语句。返回的表达式树保留对应 CFG 和合成变量。
+
+`ExpressionMethod::simplify_stack_vars` 从这棵树开始。每轮先建立 SSA，在同一组 phi 信息下反复处理构造器、数组初始化、条件合并和三元表达式。清除版本并压缩顺序语句后，重新建立 SSAU。首轮沿构造器和 lambda 捕获参数标记需要保持 effectively final 的赋值，再沿直接图内联临时变量。内联要同时检查使用次数、支配关系、异常保护范围及来源表达式所依赖的变量版本。替换时合并字节码位置，迁移局部变量表信息，并更新仍存活的版本。两部分都稳定后，按原版再建一次 SSAU，处理最后一轮产生的冗余赋值。[栈变量处理入口](src/decompiler/stack/mod.rs)
+
+表达式 arena 区分对象身份与结构相等。原版按身份替换子表达式的位置保留身份比较；在查找等价赋值目标、重复出现的匹配变量时使用相应表达式类型的相等规则。多个使用点需要独立副本时，按 Java 值键集合的迭代顺序复制，使表达式编号与求值顺序各自可核对。Java 1.4 类字面量沿用声明式语句树模式；匹配器只编译静态描述，每次匹配独立保存捕获值。[表达式操作](src/decompiler/exps/operations.rs) · [树模式匹配](src/structs/matcher.rs)
+
+当前方法入口的下一步是 `VarProcessor.setVarVersions` 的变量编号与类型收敛，随后才执行方法级自增识别。主循环、整类写出与 CLI 的端到端验证仍待接入。
 
 同步区扩展有一处有意的终止条件。当共享后继的首个前驱来自另一保护区，上游可能反复向已覆盖的区间追加同一块。如果本轮既不会新增覆盖关系、也不会增加异常边或移动指令，Rust 跳过这个候选，继续检查其他区间。
 

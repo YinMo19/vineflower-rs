@@ -6,10 +6,10 @@
 use std::io;
 
 use super::Cx;
-use super::class_nodes::{ClassKind, ClassNodeId, process_lambdas};
+use super::class_nodes::{ClassKind, ClassNodeId, ClassNodes, process_lambdas};
 use super::import_collector::{ImportCollector, short_name};
-use crate::code::code_constants::ACC_MODULE;
-use crate::structs::StructMember;
+use crate::code::code_constants::{ACC_FINAL, ACC_MODULE, ACC_STATIC, ACC_SYNTHETIC, CLINIT_NAME};
+use crate::structs::{StructClass, StructMember};
 
 /// Start the root's import scope before discovering lambda classes. Nested
 /// classes share this scope throughout method processing and source writing.
@@ -40,5 +40,38 @@ pub fn prepare_class(cx: &mut Cx, root: ClassNodeId) -> io::Result<()> {
             short_name(cx, &name, false);
         }
     }
+    let mut order = Vec::new();
+    append_wrapper_order(&cx.class_nodes, root, &mut order);
+    cx.class_nodes.set_wrapper_order(root, order);
     Ok(())
+}
+
+fn append_wrapper_order(classes: &ClassNodes, id: ClassNodeId, order: &mut Vec<ClassNodeId>) {
+    let node = &classes[id];
+    if node.kind == ClassKind::Lambda {
+        return;
+    }
+
+    let (early, later): (Vec<_>, Vec<_>) = node
+        .nested
+        .iter()
+        .copied()
+        .partition(|&child| should_init_early(&classes[child].class));
+    for child in early {
+        append_wrapper_order(classes, child, order);
+    }
+    order.push(id);
+    for child in later {
+        append_wrapper_order(classes, child, order);
+    }
+}
+
+/// Synthetic holders for switch maps and assertion fields initialize before their owner.
+fn should_init_early(class: &StructClass) -> bool {
+    class.has_modifier(ACC_SYNTHETIC)
+        && matches!(&class.methods[..], [method] if method.name == CLINIT_NAME)
+        && class.fields.iter().all(|field| {
+            matches!(field.descriptor.as_str(), "[I" | "Z")
+                && field.has_modifier(ACC_STATIC | ACC_FINAL | ACC_SYNTHETIC)
+        })
 }

@@ -31,6 +31,7 @@ class ExpressionSnapshot {
   private static final Field FIELD_CONDY = field(FieldExprent.class, "wasCondy");
   private static final Field FIELD_QUALIFIED = field(FieldExprent.class, "forceQualified");
   private static final Field INVOCATION_LAZY_CONDY = field(InvocationExprent.class, "wasLazyCondy");
+  private static final Field FUNCTION_IMPLICIT_TYPE = field(FunctionExprent.class, "implicitType");
 
   // Record shared nodes once and keep references by the upstream expression ID.
   private final Map<Integer, Exprent> nodes = new TreeMap<>();
@@ -57,6 +58,7 @@ class ExpressionSnapshot {
       fields.add("body" + statement.id + "=" + expressions(statement.getExprents()));
       if (statement instanceof IfStatement branch) {
         fields.add("head" + statement.id + "=" + expressions(branch.getHeadexprentList()));
+        fields.add("pattern" + statement.id + "=" + branch.isPatternMatched());
       } else if (statement instanceof SwitchStatement branch) {
         fields.add("head" + statement.id + "=" + expressions(branch.getHeadexprentList()));
         boolean linked = branch.getHeadexprent() instanceof SwitchHeadExprent head
@@ -109,7 +111,8 @@ class ExpressionSnapshot {
   private String operands(Exprent e) {
     if (e instanceof VarExprent var) {
       return parts(var.getIndex(), var.getVersion(), var.isStack(), var.isCatchTempVar(),
-        type((VarType) read(VARIABLE_TYPE, var)), lvt(var.getLVT()), instruction(var.getBackingInstr()));
+        type((VarType) read(VARIABLE_TYPE, var)), lvt(var.getLVT()), instruction(var.getBackingInstr()),
+        var.isEffectivelyFinal());
     }
     if (e instanceof ConstExprent constant) {
       return parts(value(constant.getValue()), constant.isBoolPermitted(), read(CONSTANT_CONDY, constant));
@@ -136,12 +139,13 @@ class ExpressionSnapshot {
         invocation.isSyntheticNullCheck(), read(INVOCATION_LAZY_CONDY, invocation));
     }
     if (e instanceof FunctionExprent function) {
-      return parts(function.getFuncType().name(), expressions(function.getLstOperands()));
+      return parts(function.getFuncType().name(), expressions(function.getLstOperands()),
+        type((VarType) read(FUNCTION_IMPLICIT_TYPE, function)));
     }
     if (e instanceof NewExprent allocation) {
       return parts(type(allocation.getNewType()), expressions(allocation.getLstDims()),
         expression(allocation.getConstructor()), expressions(allocation.getLstArrayElements()),
-        allocation.isAnonymous(), allocation.isLambda(), allocation.isMethodReference());
+        allocation.isAnonymous(), allocation.isLambda(), allocation.isMethodReference(), allocation.isDirectArrayInit());
     }
     if (e instanceof ExitExprent exit) {
       return parts(exit.getExitType().name(), expression(exit.getValue()), type(exit.getRetType()),

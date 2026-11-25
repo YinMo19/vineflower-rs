@@ -33,6 +33,8 @@ mod expression_snapshot;
 mod finally_snapshot;
 #[path = "support/ssa_snapshot.rs"]
 mod ssa_snapshot;
+#[path = "support/stack_snapshot.rs"]
+mod stack_snapshot;
 
 #[test]
 fn structure_retains_statement_and_edge_links() {
@@ -154,6 +156,67 @@ fn structured_method_lifts_switch_expressions() {
 }
 
 #[test]
+fn stack_simplification_inlines_switch_selector_and_call_operands() {
+    use vineflower_rs::decompiler::exps::Expr;
+    use vineflower_rs::engine::method_processor::expression_method;
+
+    let options = Arc::new(Options::default());
+    let class = parse_class(
+        include_bytes!("smoke/java8/TestClassSwitch.class"),
+        &options,
+    )
+    .unwrap();
+    let method = class.get_method("testCaseOrder", "(I)V").unwrap();
+    let mut cx = make_context(&options);
+    let mut lifted = expression_method(&mut cx, &class, method).unwrap().unwrap();
+    lifted.simplify_stack_vars(&mut cx, &class);
+
+    let ir = &cx.ir;
+    let mut pending = vec![lifted.root];
+    let mut arguments = Vec::new();
+    let mut selectors = Vec::new();
+    while let Some(stat) = pending.pop() {
+        pending.extend(ir[stat].stats.iter().copied());
+        if let StatementKind::Switch(switch) = &ir[stat].kind {
+            let head = ir[switch.head_exprents.unwrap()][0];
+            let ExprKind::SwitchHead { value, .. } = ir[head].kind else {
+                panic!("expected switch head");
+            };
+            let ExprKind::Variable(var) = &ir[value].kind else {
+                panic!("expected the switch argument");
+            };
+            assert!(!var.stack);
+            selectors.push((var.index, var.version));
+        }
+        for &expr in ir[stat].exprents.into_iter().flat_map(|list| &ir[list]) {
+            for id in Expr::all_exprents(ir, expr, true, true) {
+                let ExprKind::Invocation(call) = &ir[id].kind else {
+                    continue;
+                };
+                assert_eq!(call.name, "println");
+                let receiver = call.instance.expect("PrintStream receiver");
+                assert!(matches!(&ir[receiver].kind, ExprKind::Field(f)
+                    if f.classname.as_deref() == Some("java/lang/System") && f.name == "out"));
+                let [arg] = call.parameters[..] else {
+                    panic!("expected one argument")
+                };
+                let ExprKind::Constant {
+                    value: ConstantValue::Integer(n),
+                    ..
+                } = ir[arg].kind
+                else {
+                    panic!("expected the case's integer argument")
+                };
+                arguments.push(n);
+            }
+        }
+    }
+    arguments.sort_unstable();
+    assert_eq!(selectors, [(1, 0)]);
+    assert_eq!(arguments, [5, 13]);
+}
+
+#[test]
 fn expression_method_recovers_finally_around_a_synchronized_body() {
     use vineflower_rs::engine::method_processor::expression_method;
 
@@ -215,6 +278,12 @@ fn ssa_matches_upstream() {
 #[ignore = "requires the upstream +local.jar and JDK 17 or later"]
 fn finally_matches_upstream() {
     check_flow(Check::Finally);
+}
+
+#[test]
+#[ignore = "requires the upstream +local.jar and JDK 17 or later"]
+fn stack_vars_match_upstream() {
+    stack_snapshot::check(&upstream_reference::Corpus::discover());
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -294,7 +363,7 @@ fn check_flow(check: Check) {
                             let mut snapshot = String::new();
                             if check == Check::Structure {
                                 let statement = structure_snapshot(
-                                    &cx.ir,
+                                    &cx,
                                     structured.root,
                                     &structured.flow.counters,
                                 );
@@ -368,6 +437,7 @@ fn check_flow(check: Check) {
             "ExpressionSnapshot",
             "SsaSnapshot",
             "FinallySnapshot",
+            "StackSnapshot",
         ],
         transfer.path(),
         &reference,
@@ -648,7 +718,8 @@ fn write_text(out: &mut impl Write, text: &str) -> io::Result<()> {
     out.write_all(text.as_bytes())
 }
 
-fn structure_snapshot(ir: &Ir, root: StatId, counters: &CounterContainer) -> String {
+fn structure_snapshot(cx: &Cx, root: StatId, counters: &CounterContainer) -> String {
+    let ir = &cx.ir;
     let StatementKind::Root {
         dummy_exit,
         comment_lines,
@@ -730,7 +801,7 @@ fn structure_snapshot(ir: &Ir, root: StatId, counters: &CounterContainer) -> Str
                         case.edges.iter().map(|&e| edge(Some(e))).join("|"),
                         case.values
                             .iter()
-                            .map(|&expr| expression(ir, expr))
+                            .map(|&expr| expression(cx, expr))
                             .join("|")
                     ))
                     .join("/")
@@ -744,7 +815,7 @@ fn structure_snapshot(ir: &Ir, root: StatId, counters: &CounterContainer) -> Str
                     .map(|types| types.iter().join(","))
                     .join("|"),
                 vars.iter()
-                    .map(|&expr| expression(ir, Some(expr)))
+                    .map(|&expr| expression(cx, Some(expr)))
                     .join("|")
             )),
             StatementKind::CatchAll {
@@ -756,9 +827,9 @@ fn structure_snapshot(ir: &Ir, root: StatId, counters: &CounterContainer) -> Str
                 "catch-all={}/{}/{}/{}",
                 id(*handler),
                 is_finally,
-                expression(ir, *monitor),
+                expression(cx, *monitor),
                 vars.iter()
-                    .map(|&expr| expression(ir, Some(expr)))
+                    .map(|&expr| expression(cx, Some(expr)))
                     .join("|")
             )),
             StatementKind::Synchronized { body, .. } => {
@@ -814,11 +885,11 @@ fn edge_id(ir: &Ir, edge: Option<EdgeId>) -> String {
     )
 }
 
-fn expression(ir: &Ir, expr: Option<ExprId>) -> String {
+fn expression(cx: &Cx, expr: Option<ExprId>) -> String {
     expr.map_or_else(
         || "-".to_owned(),
-        |expr| {
-            let expr = &ir[expr];
+        |id| {
+            let expr = &cx.ir[id];
             match &expr.kind {
                 ExprKind::Constant {
                     value: ConstantValue::Integer(value),
@@ -828,7 +899,10 @@ fn expression(ir: &Ir, expr: Option<ExprId>) -> String {
                     "{}={}:{}",
                     expr.id,
                     var.index,
-                    var.var_type.value.as_deref().unwrap_or("*")
+                    vineflower_rs::decompiler::exps::Expr::expr_type(cx, id)
+                        .value
+                        .as_deref()
+                        .unwrap_or("*")
                 ),
                 _ => panic!("unexpected expression before lifting: {:?}", expr.kind),
             }

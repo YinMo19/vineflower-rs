@@ -297,11 +297,11 @@ impl BlockProcessor<'_> {
                 } else {
                     FunctionType::Add
                 };
-                let value = self.new_expr(
-                    ExprKind::Function {
-                        op,
-                        operands: vec![input, magnitude],
-                    },
+                let value = Expr::function(
+                    &mut self.cx.ir,
+                    self.counters,
+                    op,
+                    vec![input, magnitude],
                     offsets.clone(),
                 );
                 self.assign(var, value, offsets);
@@ -573,7 +573,8 @@ impl BlockProcessor<'_> {
         offsets: Option<BytecodeOffsets>,
     ) -> io::Result<()> {
         let operands = take_operands(&mut self.data.stack, arity)?;
-        self.push_kind(ExprKind::Function { op, operands }, offsets, None);
+        let expr = Expr::function(&mut self.cx.ir, self.counters, op, operands, offsets);
+        self.push(expr, None);
         Ok(())
     }
 
@@ -593,7 +594,7 @@ impl BlockProcessor<'_> {
                 if let Some(kind) = implicit {
                     operands.push(Expr::new(ir, counters, kind, None));
                 }
-                Expr::new(ir, counters, ExprKind::Function { op, operands }, offsets)
+                Expr::function(ir, counters, op, operands, offsets)
             },
         );
         self.data.expressions.push(branch);

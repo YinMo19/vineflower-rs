@@ -7,7 +7,7 @@ use crate::decompiler::ir::ExprId;
 use crate::engine::Cx;
 use crate::types::{CodeType, VarType};
 
-use super::Expr;
+use super::{Expr, ExprKind};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FunctionType {
@@ -43,6 +43,11 @@ pub enum FunctionType {
     Cast,
     InstanceOf,
     ArrayLength,
+    Imm,
+    Mmi,
+    Ipp,
+    Ppi,
+    Ternary,
     Lcmp,
     Fcmpl,
     Fcmpg,
@@ -54,6 +59,8 @@ pub enum FunctionType {
     Ge,
     Gt,
     Le,
+    BoolAnd,
+    BoolOr,
 }
 
 impl FunctionType {
@@ -61,12 +68,22 @@ impl FunctionType {
         use FunctionType::*;
         match self {
             BitNot | BoolNot | Neg | I2l | I2f | I2d | L2i | L2f | L2d | F2i | F2l | F2d | D2i
-            | D2l | D2f | I2b | I2c | I2s | ArrayLength => 1,
+            | D2l | D2f | I2b | I2c | I2s | ArrayLength | Imm | Mmi | Ipp | Ppi => 1,
+            Ternary => 3,
             _ => 2,
         }
     }
 
-    pub(super) fn expr_type(self, cx: &Cx, operands: &[ExprId]) -> VarType {
+    pub const fn is_inc_dec(self) -> bool {
+        matches!(self, Self::Imm | Self::Mmi | Self::Ipp | Self::Ppi)
+    }
+
+    pub(super) fn expr_type(
+        self,
+        cx: &Cx,
+        operands: &[ExprId],
+        implicit_type: Option<&VarType>,
+    ) -> VarType {
         use FunctionType::*;
         let operand_type = |index: usize| Expr::expr_type(cx, operands[index]);
         match self {
@@ -80,7 +97,10 @@ impl FunctionType {
             // Vineflower's temporary compare operations have boolean expression
             // type even though the JVM comparison instructions produce an int.
             Lcmp | Fcmpl | Fcmpg | Dcmpl | Dcmpg | Eq | Ne | Lt | Ge | Gt | Le | InstanceOf
-            | BoolNot => VarType::VARTYPE_BOOLEAN,
+            | BoolNot | BoolAnd | BoolOr => VarType::VARTYPE_BOOLEAN,
+            Imm | Mmi | Ipp | Ppi => implicit_type
+                .expect("Missing increment or decrement expression type")
+                .clone(),
             Shl | Shr | Ushr | BitNot | Neg => max_numeric_type(&[operand_type(0)]),
             Add | Sub | Mul | Div | Rem => max_numeric_type(&[operand_type(0), operand_type(1)]),
             And | Or | Xor => {
@@ -93,6 +113,20 @@ impl FunctionType {
                 }
             }
             Cast => operand_type(1),
+            Ternary => {
+                let supertype = VarType::join(cx, &operand_type(1), &operand_type(2))
+                    .expect("No common supertype for ternary expression");
+                if operands[1..=2]
+                    .iter()
+                    .all(|&operand| matches!(cx.ir[operand].kind, ExprKind::Constant { .. }))
+                    && supertype.ty != CodeType::Boolean
+                    && VarType::VARTYPE_INT.higher_equal_in_lattice_than(cx, &supertype)
+                {
+                    VarType::VARTYPE_INT
+                } else {
+                    supertype
+                }
+            }
         }
     }
 }

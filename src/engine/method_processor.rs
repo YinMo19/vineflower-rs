@@ -1,7 +1,7 @@
 // Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Method stages of `MethodProcessor.codeToJava` through expression lifting.
+//! Method stages of `MethodProcessor.codeToJava` through stack simplification.
 //!
 //! The language-independent stages end immediately before upstream dispatches
 //! to a language's CFG passes. Java then prepares exception regions for
@@ -241,6 +241,18 @@ pub struct ExpressionMethod {
     pub root: StatId,
     pub descriptor: Arc<MethodDescriptor>,
     pub synthetic_semaphores: IndexSet<i32>,
+}
+
+impl ExpressionMethod {
+    pub fn simplify_stack_vars(&mut self, cx: &mut Cx, class: &StructClass) {
+        crate::decompiler::stack::simplify_stack_vars(
+            cx,
+            &mut self.flow.counters,
+            self.root,
+            class,
+            &Default::default(),
+        );
+    }
 }
 
 impl RecoveredMethod {

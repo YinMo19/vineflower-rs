@@ -6,6 +6,7 @@
 pub mod attr;
 pub mod consts;
 pub mod context_unit;
+pub(crate) mod matcher;
 pub mod struct_class;
 pub mod struct_context;
 pub mod struct_field;

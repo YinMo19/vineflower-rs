@@ -55,6 +55,12 @@ impl VersionMap {
         self.domain_mut(key).remove(&key)
     }
 
+    pub(crate) fn retain(&mut self, mut keep: impl FnMut(i32, &mut Versions) -> bool) {
+        for domain in [&mut self.fields, &mut self.stacks, &mut self.locals] {
+            domain.retain(|&key, versions| keep(key, versions));
+        }
+    }
+
     pub fn set_current(&mut self, var: i32, version: i32) {
         let mut set = self.factory.create_empty_set();
         set.add(version);
@@ -182,11 +188,49 @@ impl VarMapHolder {
         &mut self.if_true
     }
 
-    pub fn to_normal(&mut self) -> &mut VersionMap {
+    pub fn merge_branches(&mut self) -> &mut VersionMap {
         if let Some(if_false) = self.if_false.take() {
             self.if_true.union(&if_false);
         }
         &mut self.if_true
+    }
+
+    /// Keep one outcome in this holder as a normal map and move the other
+    /// outcome to the caller. Only an unsplit condition needs a copy.
+    pub fn take_alternative(&mut self, keep_true: bool) -> VersionMap {
+        let if_false = self.if_false.take().unwrap_or_else(|| self.if_true.clone());
+        if keep_true {
+            if_false
+        } else {
+            std::mem::replace(&mut self.if_true, if_false)
+        }
+    }
+
+    pub fn merge_outcome(&mut self, when_true: bool, other: &VersionMap) {
+        if other.is_empty() {
+            return;
+        }
+        let if_false = self.if_false.get_or_insert_with(|| self.if_true.clone());
+        if when_true {
+            self.if_true.union(other);
+        } else {
+            if_false.union(other);
+        }
+    }
+
+    /// Combine the two arms of a conditional expression, retaining their
+    /// distinct true and false outputs when either arm produced a split.
+    pub fn merge_ternary(&mut self, mut then_arm: Self) {
+        if !self.is_normal() {
+            self.merge_outcome(true, then_arm.if_true());
+            self.merge_outcome(false, then_arm.if_false());
+        } else if then_arm.is_normal() {
+            self.if_true.union(&then_arm.if_true);
+        } else {
+            then_arm.merge_outcome(true, &self.if_true);
+            then_arm.merge_outcome(false, &self.if_true);
+            *self = then_arm;
+        }
     }
 
     pub fn swap(&mut self) {

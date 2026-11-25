@@ -26,8 +26,53 @@ impl<A: VersionAnalysis> Transfer<'_, A> {
                 self.process(ir, *condition, maps);
             }
             ExprKind::Function {
+                op: FunctionType::Ternary,
+                operands,
+                ..
+            } => {
+                let [test, then_arm, else_arm] = operands[..] else {
+                    unreachable!()
+                };
+                self.process(ir, test, maps);
+                let mut then_maps = VarMapHolder::normal(maps.take_alternative(false));
+                self.process(ir, then_arm, &mut then_maps);
+                self.process(ir, else_arm, maps);
+                maps.merge_ternary(then_maps);
+            }
+            ExprKind::Function {
+                op: op @ (FunctionType::BoolAnd | FunctionType::BoolOr),
+                operands,
+                ..
+            } => {
+                let [left, right] = operands[..] else {
+                    unreachable!()
+                };
+                let evaluate_on_true = *op == FunctionType::BoolAnd;
+                self.process(ir, left, maps);
+                let skipped = maps.take_alternative(evaluate_on_true);
+                self.process(ir, right, maps);
+                maps.merge_outcome(!evaluate_on_true, &skipped);
+            }
+            ExprKind::Function {
+                op: FunctionType::Ppi | FunctionType::Ipp | FunctionType::Mmi | FunctionType::Imm,
+                operands,
+                ..
+            } => {
+                let value = operands[0];
+                self.process(ir, value, maps);
+                match ir[value].kind {
+                    ExprKind::Variable(_) => {
+                        let phantom = self.analysis.phantom(variable(ir, value));
+                        maps.normal_mut().set_current(phantom.var, phantom.version);
+                    }
+                    ExprKind::Field(_) => maps.normal_mut().clear_fields(),
+                    _ => {}
+                }
+            }
+            ExprKind::Function {
                 op: FunctionType::BoolNot,
                 operands,
+                ..
             } => {
                 self.process(ir, operands[0], maps);
                 maps.swap();
@@ -35,9 +80,10 @@ impl<A: VersionAnalysis> Transfer<'_, A> {
             ExprKind::Function {
                 op: FunctionType::InstanceOf,
                 operands,
+                ..
             } => {
                 self.process(ir, operands[0], maps);
-                maps.to_normal();
+                maps.merge_branches();
             }
             ExprKind::Field(field) => {
                 if let Some(instance) = field.instance {
@@ -52,7 +98,7 @@ impl<A: VersionAnalysis> Transfer<'_, A> {
                 let children: Vec<_> = Expr::children(ir, id).collect();
                 for child in children {
                     self.process(ir, child, maps);
-                    maps.to_normal();
+                    maps.merge_branches();
                 }
                 if A::TRACK_FIELDS && dirty_fields {
                     maps.normal_mut().clear_fields();
@@ -73,13 +119,13 @@ impl<A: VersionAnalysis> Transfer<'_, A> {
             ExprKind::Variable(_) if compound => {
                 self.process(ir, left, maps);
                 self.process(ir, right, maps);
-                let normal = maps.to_normal();
+                let normal = maps.merge_branches();
                 let phantom = self.analysis.phantom(variable(ir, left));
                 normal.set_current(phantom.var, phantom.version);
             }
             ExprKind::Variable(_) => {
                 self.process(ir, right, maps);
-                self.assign(ir, left, maps.to_normal());
+                self.assign(ir, left, maps.merge_branches());
                 if A::TRACK_DIRECT_ASSIGNMENTS {
                     let right_version = match &ir[right].kind {
                         ExprKind::Variable(_) => Some(variable(ir, right)),
@@ -102,7 +148,7 @@ impl<A: VersionAnalysis> Transfer<'_, A> {
                     "Left side of assignment must have a normal variable map"
                 );
                 self.process(ir, right, maps);
-                let normal = maps.to_normal();
+                let normal = maps.merge_branches();
                 if writes_field {
                     normal.clear_fields();
                 }

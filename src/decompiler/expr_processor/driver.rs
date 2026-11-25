@@ -194,11 +194,13 @@ fn negate_if_copy(cx: &mut Cx, counters: &mut CounterContainer, head: ExprId) ->
         unreachable!()
     };
     let bytecode = cx.ir[condition].bytecode.clone();
-    let negation = ExprKind::Function {
-        op: FunctionType::BoolNot,
-        operands: vec![condition],
-    };
-    let condition = Expr::new(&mut cx.ir, counters, negation, bytecode);
+    let condition = Expr::function(
+        &mut cx.ir,
+        counters,
+        FunctionType::BoolNot,
+        vec![condition],
+        bytecode,
+    );
     cx.ir[copy].kind = ExprKind::If { condition };
     copy
 }

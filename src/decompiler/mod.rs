@@ -10,5 +10,6 @@ pub mod finally;
 pub mod flow;
 pub mod ir;
 pub mod sforms;
+pub mod stack;
 pub mod stats;
 pub mod vars;

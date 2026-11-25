@@ -148,7 +148,7 @@ impl FlowState {
             } else {
                 for index in 0..ir[node.exprents].len() {
                     let expr = ir[node.exprents][index];
-                    maps.to_normal();
+                    maps.merge_branches();
                     transfer.process(ir, expr, &mut maps);
                 }
             }

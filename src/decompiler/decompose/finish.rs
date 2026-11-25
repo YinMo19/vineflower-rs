@@ -121,7 +121,7 @@ pub(crate) fn condense_sequences(cx: &mut Cx, counters: &mut CounterContainer, m
     }
 }
 
-fn first_successor(ir: &Ir, stat: StatId) -> Option<EdgeId> {
+pub(super) fn first_successor(ir: &Ir, stat: StatId) -> Option<EdgeId> {
     stat.get_successor_edges(ir, STATEDGE_ALL).first().copied()
 }
 
@@ -292,7 +292,7 @@ fn first_expression_list(ir: &Ir, mut stat: StatId) -> Option<ExprListId> {
     }
 }
 
-fn destroy_and_flatten_statement(
+pub(crate) fn destroy_and_flatten_statement(
     cx: &mut Cx,
     counters: &mut CounterContainer,
     parent: StatId,

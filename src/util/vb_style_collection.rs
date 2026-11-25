@@ -186,6 +186,14 @@ impl<E, K: Hash + Eq + Clone> VBStyleCollection<E, K> {
         self.map.get(key).map(|&index| &mut self.elements[index])
     }
 
+    pub fn index_of_key<Q>(&self, key: &Q) -> Option<usize>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.map.get(key).copied()
+    }
+
     /// The position of the element stored under `key`, which must be present.
     pub fn get_index_by_key<Q>(&self, key: &Q) -> usize
     where

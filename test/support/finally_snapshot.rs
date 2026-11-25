@@ -36,7 +36,7 @@ pub fn run(
         recovered.synthetic_semaphores.iter().sorted().join(","),
         graph_snapshot(&cx.ir, &recovered.structured.flow.graph),
         super::structure_snapshot(
-            &cx.ir,
+            cx,
             recovered.structured.root,
             &recovered.structured.flow.counters
         ),
@@ -47,7 +47,7 @@ pub fn run(
         let StatementKind::Root { content_flags, .. } = &cx.ir[method.root].kind else {
             unreachable!();
         };
-        let structure = super::structure_snapshot(&cx.ir, method.root, &method.flow.counters);
+        let structure = super::structure_snapshot(cx, method.root, &method.flow.counters);
         let expressions =
             super::expression_snapshot::snapshot(cx, method.root, &method.flow.counters);
         Ok::<_, std::io::Error>(format!(

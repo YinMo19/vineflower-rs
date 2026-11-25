@@ -31,6 +31,7 @@ define_index_type! {
 pub struct ClassNodes {
     arena: IndexVec<ClassNodeId, ClassNode>,
     names: FxHashMap<ArcStr, ClassNodeId>,
+    wrapper_orders: FxHashMap<ClassNodeId, Vec<ClassNodeId>>,
 }
 
 impl ClassNodes {
@@ -50,6 +51,23 @@ impl ClassNodes {
 
     pub fn iter(&self) -> impl Iterator<Item = (&ArcStr, &ClassNode)> {
         self.names.iter().map(|(name, &id)| (name, &self[id]))
+    }
+
+    /// Non-lambda wrappers in the order they finish initialization for a root.
+    pub fn wrapper_order(&self, root: ClassNodeId) -> &[ClassNodeId] {
+        self.wrapper_orders.get(&root).map_or(&[], Vec::as_slice)
+    }
+
+    pub(super) fn set_wrapper_order(&mut self, root: ClassNodeId, order: Vec<ClassNodeId>) {
+        self.wrapper_orders.insert(root, order);
+    }
+
+    /// Lambda nodes share the class wrapper of their nearest non-lambda owner.
+    pub(crate) fn wrapper_owner(&self, mut node: ClassNodeId) -> Option<ClassNodeId> {
+        while self[node].kind == ClassKind::Lambda {
+            node = self[node].parent?;
+        }
+        Some(node)
     }
 
     pub fn sort_nested(&mut self, owner: ClassNodeId) {
@@ -109,6 +127,8 @@ pub struct ClassNode {
     pub nested: Vec<ClassNodeId>,
     pub anonymous_type: Option<VarType>,
     pub lambda: Option<LambdaInformation>,
+    /// ClassWrapper members consumed by source-level rewrites.
+    pub hidden_members: FxHashSet<String>,
 }
 
 pub struct LambdaInformation {
@@ -146,6 +166,7 @@ impl ClassNode {
             nested: Vec::new(),
             anonymous_type: None,
             lambda: None,
+            hidden_members: Default::default(),
         }
     }
 }

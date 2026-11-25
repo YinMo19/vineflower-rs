@@ -3,15 +3,16 @@
 
 //! `modules.decompiler.exps`: the typed expressions produced by bytecode lifting.
 
+mod bytecode;
 mod function;
+mod operations;
 mod traversal;
 
-use std::ops::Range;
 use std::sync::Arc;
 
 use arcstr::ArcStr;
 
-pub use self::function::FunctionType;
+pub use self::{bytecode::BytecodeOffsets, function::FunctionType};
 pub use crate::structs::consts::ConstantValue;
 
 use crate::code::instruction::Instruction;
@@ -26,24 +27,6 @@ use crate::types::{CodeType, FieldDescriptor, GenericType, MethodDescriptor, Var
 
 /// `VarExprent.STACK_BASE`.
 pub const STACK_BASE: i32 = 10_000;
-
-/// All byte positions occupied by one decoded instruction.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BytecodeOffsets(Range<u32>);
-
-impl BytecodeOffsets {
-    /// Missing offsets belong to synthesized instructions. Otherwise each byte
-    /// of the instruction contributes its position to `Exprent.bytecode`.
-    pub fn for_instruction(offset: i32, length: i32) -> Option<Self> {
-        let start = u32::try_from(offset).ok()?;
-        let length = u32::try_from(length).expect("Negative instruction length");
-        Some(Self(start..start + length))
-    }
-
-    pub fn iter(&self) -> Range<u32> {
-        self.0.clone()
-    }
-}
 
 #[derive(Debug)]
 pub struct Expr {
@@ -76,12 +59,14 @@ pub enum ExprKind {
     Function {
         op: FunctionType,
         operands: Vec<ExprId>,
+        implicit_type: Option<Box<VarType>>,
     },
     New {
         new_type: VarType,
         dimensions: Box<[ExprId]>,
         constructor: Option<ExprId>,
         array_elements: Box<[ExprId]>,
+        direct_array_init: bool,
         anonymous: bool,
         lambda: bool,
         method_reference: bool,
@@ -113,6 +98,7 @@ pub struct Variable {
     pub version: i32,
     pub stack: bool,
     pub catch_temp: bool,
+    pub effectively_final: bool,
     pub backing_instruction: Option<Arc<Instruction>>,
     pub lvt: Option<Arc<LocalVariable>>,
 }
@@ -125,6 +111,7 @@ impl Variable {
             version: 0,
             stack: false,
             catch_temp: false,
+            effectively_final: false,
             backing_instruction: None,
             lvt: None,
         }
@@ -280,6 +267,25 @@ impl Expr {
         })
     }
 
+    pub fn function(
+        ir: &mut Ir,
+        counters: &mut CounterContainer,
+        op: FunctionType,
+        operands: Vec<ExprId>,
+        bytecode: Option<BytecodeOffsets>,
+    ) -> ExprId {
+        Self::new(
+            ir,
+            counters,
+            ExprKind::Function {
+                op,
+                operands,
+                implicit_type: None,
+            },
+            bytecode,
+        )
+    }
+
     pub fn int_constant(value: i32, bool_permitted: bool) -> ExprKind {
         let var_type = match value {
             0 | 1 if bool_permitted => VarType::VARTYPE_BOOLEAN,
@@ -384,6 +390,7 @@ impl Expr {
                 dimensions: dimensions.into_boxed_slice(),
                 constructor: None,
                 array_elements: Box::new([]),
+                direct_array_init: false,
                 anonymous,
                 lambda,
                 method_reference,
@@ -414,7 +421,11 @@ impl Expr {
             }
             ExprKind::Field(field) => field.descriptor.ty.clone(),
             ExprKind::Invocation(invocation) => invocation.descriptor.ret.clone(),
-            ExprKind::Function { op, operands } => op.expr_type(cx, operands),
+            ExprKind::Function {
+                op,
+                operands,
+                implicit_type,
+            } => op.expr_type(cx, operands, implicit_type.as_deref()),
             ExprKind::New {
                 new_type,
                 anonymous,

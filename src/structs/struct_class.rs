@@ -34,7 +34,7 @@ use super::consts::{ConstantPool, PrimitiveConstant};
 use super::struct_field::{StructField, StructRecordComponent};
 use super::struct_member::{Attributes, StructMember, read_attributes};
 use super::struct_method::StructMethod;
-use crate::code::BytecodeVersion;
+use crate::code::{BytecodeVersion, MethodProperties};
 use crate::engine::{Cx, Options};
 use crate::renamer::pool_interceptor::PoolInterceptor;
 use crate::types::{GenericClassDescriptor, GenericsMap, SharedSignature, VarType, generic_main};
@@ -61,6 +61,7 @@ pub struct StructClass {
     signature: Option<Arc<SharedSignature<GenericClassDescriptor>>>,
     pub pool: ConstantPool,
     generic_hierarchy: OnceLock<Arc<GenericHierarchy>>,
+    method_properties: OnceLock<Box<[MethodProperties]>>,
 }
 
 impl StructClass {
@@ -148,6 +149,7 @@ impl StructClass {
             signature,
             pool,
             generic_hierarchy: OnceLock::new(),
+            method_properties: OnceLock::new(),
         })
     }
 
@@ -158,6 +160,18 @@ impl StructClass {
     pub fn get_field(&self, name: &str, descriptor: &str) -> Option<&Arc<StructField>> {
         self.fields
             .get_with_key(make_unique_key(name, descriptor).as_str())
+    }
+
+    /// Bytecode properties computed in declaration order before method simplification.
+    pub fn method_properties(&self, key: &str) -> Option<&MethodProperties> {
+        let index = self.methods.index_of_key(key)?;
+        let entries = self.method_properties.get_or_init(|| {
+            self.methods
+                .iter()
+                .map(|method| MethodProperties::analyze(Arc::clone(method), self))
+                .collect()
+        });
+        Some(&entries[index])
     }
 
     /// `getMethod(key)`, for a key made by `make_unique_key`.

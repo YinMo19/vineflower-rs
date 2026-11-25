@@ -1,6 +1,6 @@
 # Testing the current port
 
-The active method pipeline runs through finally recovery, synchronized-handler removal and expression lifting. Intermediate entry points expose statement decomposition and the SSA and SSAU passes used during finally recovery. Run the checks against the checked-in class files with
+The active method pipeline runs through finally recovery, expression lifting and stack-variable simplification. Intermediate entry points expose statement decomposition and the SSA and SSAU passes used during finally recovery and inlining. Run the checks against the checked-in class files with
 
 ```sh
 cargo test --locked --test control_flow --test structured_flow
@@ -20,9 +20,13 @@ The expression comparison calls `ExprProcessor.processStatement` on each parsed 
 
 Root preparation is also compared after lambda discovery and implicit import registration. The snapshot numbers node objects by identity within a root and checks both its child lists and the name lookup, including duplicate names, nested lambdas, target method handles, method references and errors reported by Java.
 
+The class checks also compare the bytecode-derived assertion field and synthetic method-reference flag for each declared method.
+
 The sparse-analysis comparison runs SSA, instruction reassignment, version reset, SSAU and a second reset on the same expressions as Java. It compares reaching definitions at joins, read counts, instruction identity, and the SSAU graph including live variables, field versions, phantom nodes, direct assignments and protected ranges.
 
 The finally comparison runs both the default and forced-semaphore paths, starting from identical CFGs with the original instruction aliases. It checks the recovered graph, semaphore locals and tree, then runs the post-finally cleanup and compares the lifted expressions. Upstream uses an identity-hashed set of incoming blocks when redirecting edges during area removal. A difference confined to their order is reported separately and requires matching multiplicities and identical later stages. Method-level failures are compared at the operation which rejected the input.
+
+The stack comparison prepares the owning classes with the inputs from their compilation group. From identical CFGs it compares the tree and expressions at two points, after the first set of local rewrites reaches a fixed point and after the entire stack-variable pass. The snapshots include expression identity, evaluation order, bytecode offsets, inferred and stored types, debug locals, array-initializer and capture flags. It runs with the upstream defaults, with cross-stack simplification disabled, and with ternary conditions in `if` disabled.
 
 ## End-to-end source and CLI suite
 
