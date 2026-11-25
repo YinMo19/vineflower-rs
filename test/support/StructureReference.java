@@ -79,6 +79,8 @@ class StructureReference {
         case 19 -> StackSnapshot.Check.EXIT_ENTRY;
         case 20 -> StackSnapshot.Check.EXIT_CONDENSATION;
         case 21 -> StackSnapshot.Check.MAIN_LOOP_END;
+        case 22 -> StackSnapshot.Check.POST_SWITCHES;
+        case 23 -> StackSnapshot.Check.AFTER_MAIN;
         default -> null;
       };
       StackSnapshot.Context stackContext = stackCheck == null ? null

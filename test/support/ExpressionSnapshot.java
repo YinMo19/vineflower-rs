@@ -25,7 +25,7 @@ import org.jetbrains.java.decompiler.struct.gen.generics.GenericMethodDescriptor
 import org.jetbrains.java.decompiler.struct.gen.generics.GenericType;
 
 class ExpressionSnapshot {
-  enum Detail { BASE, LOOP_HEADERS, SECONDARY_FUNCTIONS, INTERSECTION_CASTS, SWITCHES, RESOURCES }
+  enum Detail { BASE, LOOP_HEADERS, SECONDARY_FUNCTIONS, INTERSECTION_CASTS, SWITCHES, RESOURCES, AFTER_MAIN }
 
   private static final Field ARRAY_HARD_TYPE = field(ArrayExprent.class, "hardType");
   private static final Field VARIABLE_TYPE = field(VarExprent.class, "varType");
@@ -34,6 +34,7 @@ class ExpressionSnapshot {
   private static final Field FIELD_CONDY = field(FieldExprent.class, "wasCondy");
   private static final Field FIELD_QUALIFIED = field(FieldExprent.class, "forceQualified");
   private static final Field INVOCATION_LAZY_CONDY = field(InvocationExprent.class, "wasLazyCondy");
+  private static final Field INVOCATION_IGNORE_BOXING = field(InvocationExprent.class, "canIgnoreBoxing");
   private static final Field FUNCTION_IMPLICIT_TYPE = field(FunctionExprent.class, "implicitType");
   private static final Field SWITCH_FALLTHROUGH = field(SwitchExprent.class, "fallthrough");
   private static final Field SWITCH_STANDALONE = field(SwitchExprent.class, "standalone");
@@ -99,11 +100,13 @@ class ExpressionSnapshot {
         fields.add("head" + statement.id + "=" + expressions(sync.getHeadexprentList()));
       } else if (statement instanceof CatchStatement caught) {
         fields.add("catch" + statement.id + "=" + expressions(caught.getVars()));
-        if (detail == Detail.RESOURCES) {
+        if (detail.ordinal() >= Detail.RESOURCES.ordinal()) {
           fields.add("resources" + statement.id + "=" + expressions(caught.getResources()));
         }
       } else if (statement instanceof CatchAllStatement caught) {
         fields.add("catch" + statement.id + "=" + expressions(caught.getVars()) + "|" + expression(caught.getMonitor()));
+      } else if (detail == Detail.AFTER_MAIN && statement instanceof DummyExitStatement exit) {
+        fields.add("exit-offsets" + statement.id + "=" + offsets(exit.bytecode));
       }
       for (int i = statement.getStats().size() - 1; i >= 0; i--) {
         pending.addFirst(statement.getStats().get(i));
@@ -178,7 +181,13 @@ class ExpressionSnapshot {
         expressions(invocation.getLstParameters()), constant(invocation.getBootstrapMethod()),
         arguments == null ? "~" : arguments.stream().map(ExpressionSnapshot::constant).collect(Collectors.joining("/")),
         invocation.isSyntheticNullCheck(), read(INVOCATION_LAZY_CONDY, invocation));
-      return detail.ordinal() >= Detail.SECONDARY_FUNCTIONS.ordinal() ? fields + "|" + invocation.shouldForceBoxing() : fields;
+      if (detail.ordinal() >= Detail.SECONDARY_FUNCTIONS.ordinal()) {
+        fields += "|" + invocation.shouldForceBoxing();
+      }
+      if (detail == Detail.AFTER_MAIN) {
+        fields += "|" + read(INVOCATION_IGNORE_BOXING, invocation);
+      }
+      return fields;
     }
     if (e instanceof FunctionExprent function) {
       String fields = parts(function.getFuncType().name(), expressions(function.getLstOperands()),

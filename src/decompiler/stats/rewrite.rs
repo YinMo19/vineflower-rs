@@ -47,7 +47,8 @@ impl StatId {
             for &edge in ir[stat].all_successors() {
                 let e = &ir[edge];
                 if region.contains(&e.destination)
-                    || (!allow_exit && matches!(ir[e.destination].kind, StatementKind::DummyExit))
+                    || (!allow_exit
+                        && matches!(ir[e.destination].kind, StatementKind::DummyExit { .. }))
                 {
                     continue;
                 }

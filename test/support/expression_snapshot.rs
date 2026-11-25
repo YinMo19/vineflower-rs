@@ -24,6 +24,7 @@ pub enum Detail {
     IntersectionCasts,
     Switches,
     Resources,
+    AfterMain,
 }
 
 pub fn snapshot(cx: &Cx, root: StatId, counters: &CounterContainer) -> String {
@@ -127,6 +128,12 @@ pub fn snapshot_details(
                     snapshot.expressions(vars),
                     snapshot.expression(*monitor)
                 ));
+            }
+            StatementKind::DummyExit { bytecode } if detail >= Detail::AfterMain => {
+                let offsets = bytecode
+                    .as_ref()
+                    .map_or_else(|| "~".to_owned(), |set| set.iter().join(","));
+                fields.push(format!("exit-offsets{id}={offsets}"));
             }
             _ => {}
         }
@@ -287,6 +294,9 @@ impl Snapshot<'_> {
                 );
                 if self.detail >= Detail::SecondaryFunctions {
                     write!(operands, "|{}", invocation.force_boxing).unwrap();
+                }
+                if self.detail >= Detail::AfterMain {
+                    write!(operands, "|{}", invocation.can_ignore_boxing).unwrap();
                 }
                 ("INVOCATION", operands)
             }

@@ -62,7 +62,7 @@ fn lift_closures(ir: &mut Ir, stat: StatId) {
 }
 
 fn lift_break_closure(ir: &mut Ir, edge: EdgeId, destination: StatId) {
-    if matches!(ir[destination].kind, StatementKind::DummyExit) {
+    if matches!(ir[destination].kind, StatementKind::DummyExit { .. }) {
         return;
     }
     let Some(parent) = ir[destination].parent else {
@@ -156,10 +156,12 @@ pub(crate) fn is_direct_path(ir: &Ir, mut stat: StatId, end: StatId) -> bool {
         }
 
         let Some(parent) = ir[stat].parent else {
-            return matches!(ir[end].kind, StatementKind::DummyExit);
+            return matches!(ir[end].kind, StatementKind::DummyExit { .. });
         };
         match &ir[parent].kind {
-            StatementKind::Root { .. } => return matches!(ir[end].kind, StatementKind::DummyExit),
+            StatementKind::Root { .. } => {
+                return matches!(ir[end].kind, StatementKind::DummyExit { .. });
+            }
             StatementKind::Do(_) => return end == parent,
             StatementKind::Switch(switch) => {
                 for cases in switch.cases.windows(2) {

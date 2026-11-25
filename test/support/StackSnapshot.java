@@ -29,6 +29,7 @@ import org.jetbrains.java.decompiler.main.extern.IFernflowerLogger;
 import org.jetbrains.java.decompiler.main.extern.IFernflowerPreferences;
 import org.jetbrains.java.decompiler.main.rels.ClassWrapper;
 import org.jetbrains.java.decompiler.main.rels.LambdaProcessor;
+import org.jetbrains.java.decompiler.main.rels.MethodWrapper;
 import org.jetbrains.java.decompiler.modules.code.MethodPropertiesProcessor;
 import org.jetbrains.java.decompiler.modules.decompiler.AssertProcessor;
 import org.jetbrains.java.decompiler.modules.decompiler.ClearStructHelper;
@@ -51,7 +52,9 @@ import org.jetbrains.java.decompiler.modules.decompiler.SimplifyExprentsHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.StackVarsProcessor;
 import org.jetbrains.java.decompiler.modules.decompiler.StatEdge;
 import org.jetbrains.java.decompiler.modules.decompiler.SwitchExpressionHelper;
+import org.jetbrains.java.decompiler.modules.decompiler.SwitchHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.SwitchPatternMatchProcessor;
+import org.jetbrains.java.decompiler.modules.decompiler.SynchronizedHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.TryHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.decompose.DomHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.sforms.SSAConstructorSparseEx;
@@ -69,7 +72,7 @@ class StackSnapshot {
   enum Check {
     STACK, INCREMENTS, PRE_MAIN, LOOP_ELIMINATION, LOOP_ENHANCEMENT, LOOP_MERGE, MAIN_LOOP_LABELS,
     SECONDARY_FUNCTIONS, PATTERN_MATCHING_ENTRY, IF_PATTERNS, SWITCH_ENTRY, SWITCH_PASSES, TRY_ENTRY,
-    TRY_RESOURCES, INLINE_BLOCKS, LATE_LOOP_PASSES, EXIT_ENTRY, EXIT_CONDENSATION, MAIN_LOOP_END;
+    TRY_RESOURCES, INLINE_BLOCKS, LATE_LOOP_PASSES, EXIT_ENTRY, EXIT_CONDENSATION, MAIN_LOOP_END, POST_SWITCHES, AFTER_MAIN;
 
     boolean usesLoopHeaders() {
       return this == LOOP_ENHANCEMENT || this == LOOP_MERGE || identifiesLabels();
@@ -100,13 +103,18 @@ class StackSnapshot {
     }
 
     boolean condensesExits() {
-      return this == EXIT_CONDENSATION || this == MAIN_LOOP_END;
+      return this == EXIT_CONDENSATION || this == MAIN_LOOP_END || publishesWrappers();
+    }
+
+    boolean publishesWrappers() {
+      return this == POST_SWITCHES || this == AFTER_MAIN;
     }
 
     ExpressionSnapshot.Detail expressionDetail() {
       return switch (this) {
+        case AFTER_MAIN -> ExpressionSnapshot.Detail.AFTER_MAIN;
         case SWITCH_PASSES, TRY_ENTRY -> ExpressionSnapshot.Detail.SWITCHES;
-        case TRY_RESOURCES, INLINE_BLOCKS, LATE_LOOP_PASSES, EXIT_ENTRY, EXIT_CONDENSATION, MAIN_LOOP_END
+        case TRY_RESOURCES, INLINE_BLOCKS, LATE_LOOP_PASSES, EXIT_ENTRY, EXIT_CONDENSATION, MAIN_LOOP_END, POST_SWITCHES
           -> ExpressionSnapshot.Detail.RESOURCES;
         case PATTERN_MATCHING_ENTRY, IF_PATTERNS, SWITCH_ENTRY -> ExpressionSnapshot.Detail.INTERSECTION_CASTS;
         case SECONDARY_FUNCTIONS -> ExpressionSnapshot.Detail.SECONDARY_FUNCTIONS;
@@ -201,6 +209,28 @@ class StackSnapshot {
       return wrappers.computeIfAbsent(node, StackSnapshot::wrapper);
     }
 
+    private ClassWrapper selectPublishedWrapper(ClassNode node, RootScope scope) {
+      if (current != node) {
+        if (current != null) {
+          throw new AssertionError("Class callbacks ended early " + current.classStruct.qualifiedName);
+        }
+        for (var earlier : scope.wrapperOrder()) {
+          if (earlier == node) {
+            break;
+          }
+          if (earlier.getWrapper() == null) {
+            // No-code declarations have no transferred CFG callback.
+            publishWrapper(earlier, wrappers.computeIfAbsent(earlier, StackSnapshot::wrapper));
+          }
+        }
+        if (node.getWrapper() != null) {
+          throw new AssertionError("Measured class is already published " + node.classStruct.qualifiedName);
+        }
+        current = node;
+      }
+      return wrappers.computeIfAbsent(node, StackSnapshot::wrapper);
+    }
+
     String run(DataInputStream input, Options options, String classname,
                String name, String descriptor) throws IOException {
       select(options);
@@ -213,9 +243,12 @@ class StackSnapshot {
       var cl = node.classStruct;
       var method = Objects.requireNonNull(cl.getMethod(name, descriptor));
 
+      var wrapper = check.publishesWrappers()
+        ? scope.error() == null ? selectPublishedWrapper(node, scope) : wrapper(node)
+        : selectWrapper(node, scope);
       DecompilerContext.setProperty(DecompilerContext.CURRENT_CLASS, cl);
       DecompilerContext.setProperty(DecompilerContext.CURRENT_CLASS_NODE, node);
-      DecompilerContext.setProperty(DecompilerContext.CURRENT_CLASS_WRAPPER, selectWrapper(node, scope));
+      DecompilerContext.setProperty(DecompilerContext.CURRENT_CLASS_WRAPPER, wrapper);
 
       method.expandData(cl);
       try {
@@ -234,8 +267,13 @@ class StackSnapshot {
         var hidden = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_CLASS_WRAPPER).getHiddenMembers();
         var initialHidden = Set.copyOf(hidden);
         String first = stage(firstGraph, scope.imports(), cl, method, initialHidden, true, check);
-        hidden.clear();
-        hidden.addAll(initialHidden);
+        if (!check.publishesWrappers()) {
+          hidden.clear();
+          hidden.addAll(initialHidden);
+        } else if (wrapper.getMethods().size() == cl.getMethods().stream().filter(StructMethod::containsCode).count()) {
+          publishWrapper(node, wrapper);
+          current = null;
+        }
         if (settledGraph == null || "rejected=parsing failure!".equals(first)) {
           return first;
         }
@@ -244,6 +282,36 @@ class StackSnapshot {
         method.releaseResources();
       }
     }
+  }
+
+  private static void publishWrapper(ClassNode node, ClassWrapper wrapper) {
+    var methods = new ArrayList<MethodWrapper>();
+    for (var method : node.classStruct.getMethods()) {
+      var result = wrapper.getMethodWrapper(method.getName(), method.getDescriptor());
+      if (result == null) {
+        if (method.containsCode()) {
+          throw new AssertionError("Missing completed callback " + node.classStruct.qualifiedName + "." + method.getName()
+            + " " + method.getDescriptor());
+        }
+        var vars = new VarProcessor(method, MethodDescriptor.parseDescriptor(method, null));
+        result = new MethodWrapper(null, vars, method, node.classStruct, new CounterContainer());
+      }
+      methods.add(result);
+    }
+    wrapper.getMethods().clear();
+    for (var result : methods) {
+      wrapper.getMethods().addWithKey(result, InterpreterUtil.makeUniqueKey(
+        result.methodStruct.getName(), result.methodStruct.getDescriptor()));
+    }
+    setWrapper(node, wrapper);
+  }
+
+  private static void completeMethod(RootStatement root, StructClass cl, StructMethod method, VarProcessor vars,
+                                     CounterContainer counters, Throwable error) {
+    var wrapper = DecompilerContext.getContextProperty(DecompilerContext.CURRENT_CLASS_WRAPPER);
+    var result = new MethodWrapper(root, vars, method, cl, counters);
+    result.decompileError = error;
+    wrapper.getMethods().addWithKey(result, InterpreterUtil.makeUniqueKey(method.getName(), method.getDescriptor()));
   }
 
   private static final Method ADD_NAMES = processorMethod("addClassNameToImport", ClassNode.class, ImportCollector.class);
@@ -308,7 +376,7 @@ class StackSnapshot {
 
   private static String stage(ControlFlowGraph graph, ImportCollector imports, StructClass cl, StructMethod method,
                               Set<String> initialHidden, boolean first, Check check) {
-    DecompilerContext.startClass(new ImportCollector(imports));
+    DecompilerContext.startClass(check.publishesWrappers() ? imports : new ImportCollector(imports));
     var descriptor = MethodDescriptor.parseDescriptor(method, null);
     var vars = new VarProcessor(method, descriptor);
     DecompilerContext.startMethod(vars);
@@ -498,9 +566,39 @@ class StackSnapshot {
           }
           break;
         }
+        if (check.publishesWrappers()) {
+          operation = "simplify-switches";
+          boolean simplified = root.hasSwitch() && SwitchHelper.simplifySwitches(root, method, root);
+          if (simplified) {
+            SequenceHelper.condenseSequences(root);
+            operation = "rebuild-switch-expressions";
+            if (SwitchExpressionHelper.hasSwitchExpressions(root) && SwitchExpressionHelper.processSwitchExpressions(root)) {
+              operation = "simplify-stack";
+              StackVarsProcessor.simplifyStackVars(root, method, cl);
+              operation = "set-var-versions";
+              vars.setVarVersions(root);
+            }
+          }
+          details = ";post-switches=" + simplified;
+        }
+        if (check == Check.AFTER_MAIN) {
+          operation = "adjust-return-type";
+          ExitHelper.adjustReturnType(root, descriptor);
+          operation = "remove-redundant-returns";
+          ExitHelper.removeRedundantReturns(root);
+          operation = "identify-secondary";
+          SecondaryFunctionsHelper.identifySecondaryFunctions(root, vars);
+          operation = "clean-monitors";
+          SynchronizedHelper.cleanSynchronizedVar(root);
+          operation = "insert-monitor-sinks";
+          SynchronizedHelper.insertSink(root, vars, root);
+        }
         operation = "snapshot";
         var state = snapshot(root, counters, vars, initialHidden, check, details)
           + "\t" + DirectGraphSnapshot.enhanced(root);
+        if (check.publishesWrappers()) {
+          completeMethod(root, cl, method, vars, counters, null);
+        }
         return movedContinues == null ? state : state + "\tcontinue-moves=" + continueMoves(root, movedContinues);
       } else if (check == Check.LOOP_ELIMINATION) {
         operation = "snapshot";
@@ -544,6 +642,9 @@ class StackSnapshot {
       }
       return snapshot;
     } catch (RuntimeException | AssertionError | StackOverflowError error) {
+      if (check.publishesWrappers()) {
+        completeMethod(null, cl, method, vars, counters, error);
+      }
       if (error.getClass() == RuntimeException.class && "parsing failure!".equals(error.getMessage())) {
         return "rejected=parsing failure!";
       }
@@ -567,6 +668,8 @@ class StackSnapshot {
         case EXIT_ENTRY -> "exit-entry-" + operation + "-";
         case EXIT_CONDENSATION -> "exit-condensation-" + operation + "-";
         case MAIN_LOOP_END -> "main-loop-end-" + operation + "-";
+        case POST_SWITCHES -> "post-switches-" + operation + "-";
+        case AFTER_MAIN -> "after-main-" + operation + "-";
       };
       return failure + StructureReference.failureSnapshot(error);
     }

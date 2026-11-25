@@ -60,7 +60,7 @@ fn extract_loop(ir: &mut Ir, counters: &mut CounterContainer, loop_stat: StatId)
     for &edge in &ir[loop_stat].label_edges {
         let edge = &ir[edge];
         if edge.edge_type == EdgeType::Continue
-            || matches!(ir[edge.destination].kind, StatementKind::DummyExit)
+            || matches!(ir[edge.destination].kind, StatementKind::DummyExit { .. })
         {
             continue;
         }

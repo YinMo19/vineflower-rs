@@ -223,7 +223,7 @@ impl DirectGraphBuilder {
             .iter_enumerated()
             .filter_map(|(id, node)| {
                 (visited.insert(&node.id)
-                    && !matches!(ir[node.stat].kind, StatementKind::DummyExit))
+                    && !matches!(ir[node.stat].kind, StatementKind::DummyExit { .. }))
                 .then_some(id)
             })
             .collect();

@@ -17,7 +17,7 @@ use vineflower_rs::decompiler::stack::simplify_statement;
 use vineflower_rs::decompiler::stats::{ContentFlags, STATEDGE_ALL, StatementKind};
 use vineflower_rs::decompiler::vars::versions::{FinalType, VarVersions};
 use vineflower_rs::engine::class_nodes::{ClassNodeId, load_classes};
-use vineflower_rs::engine::class_processor::prepare_class;
+use vineflower_rs::engine::class_processor::{prepare_class, process_class_methods};
 use vineflower_rs::engine::context_source::{ContextSource, RuntimeImage};
 use vineflower_rs::engine::counter_container::{
     CounterContainer, EXPRESSION_COUNTER, STATEMENT_COUNTER, VAR_COUNTER,
@@ -58,6 +58,8 @@ pub(super) enum Check {
     ExitEntry = 19,
     ExitCondensation = 20,
     MainLoopEnd = 21,
+    PostSwitches = 22,
+    AfterMain = 23,
 }
 
 #[derive(Clone, Copy)]
@@ -319,6 +321,35 @@ const MAIN_LOOP_END_STAGES: &[(&str, &str)] = &[
     ("Direct graph at main loop completion", "graph="),
 ];
 
+const POST_SWITCH_STAGES: &[(&str, &str)] = &[
+    (
+        "Structure and return value after post-main switch simplification",
+        "counters=",
+    ),
+    (
+        "Expressions after post-main switch simplification",
+        "counters=",
+    ),
+    (
+        "Variable versions after post-main switch simplification",
+        "versions=",
+    ),
+    (
+        "Direct graph after post-main switch simplification",
+        "graph=",
+    ),
+];
+
+const AFTER_MAIN_STAGES: &[(&str, &str)] = &[
+    ("Structure before AFTER_MAIN plugins", "counters="),
+    (
+        "Expressions and monitor assignments before AFTER_MAIN plugins",
+        "counters=",
+    ),
+    ("Variable versions before AFTER_MAIN plugins", "versions="),
+    ("Direct graph before AFTER_MAIN plugins", "graph="),
+];
+
 fn loop_iterations(row: &str) -> impl Iterator<Item = &str> {
     row.split('\t')
         .nth(3)
@@ -347,7 +378,9 @@ impl Check {
             | Self::LateLoopPasses
             | Self::ExitEntry
             | Self::ExitCondensation
-            | Self::MainLoopEnd => &[DEFAULT],
+            | Self::MainLoopEnd
+            | Self::PostSwitches
+            | Self::AfterMain => &[DEFAULT],
             Self::SecondaryFunctions => SECONDARY_PROFILES,
         }
     }
@@ -373,6 +406,8 @@ impl Check {
             Self::ExitEntry => EXIT_ENTRY_STAGES,
             Self::ExitCondensation => EXIT_CONDENSATION_STAGES,
             Self::MainLoopEnd => MAIN_LOOP_END_STAGES,
+            Self::PostSwitches => POST_SWITCH_STAGES,
+            Self::AfterMain => AFTER_MAIN_STAGES,
         }
     }
 
@@ -397,6 +432,8 @@ impl Check {
             Self::ExitEntry => "exit-entry",
             Self::ExitCondensation => "exit-condensation",
             Self::MainLoopEnd => "main-loop-end",
+            Self::PostSwitches => "post-switches",
+            Self::AfterMain => "after-main",
         }
     }
 
@@ -436,12 +473,19 @@ impl Check {
                 | Self::ExitEntry
                 | Self::ExitCondensation
                 | Self::MainLoopEnd
+                | Self::PostSwitches
+                | Self::AfterMain
         )
+    }
+
+    fn publishes_wrappers(self) -> bool {
+        matches!(self, Self::PostSwitches | Self::AfterMain)
     }
 
     fn expression_detail(self) -> expression_snapshot::Detail {
         use expression_snapshot::Detail;
         match self {
+            Self::AfterMain => Detail::AfterMain,
             _ if self.recovers_resources() => Detail::Resources,
             _ if self.recovers_switches() => Detail::Switches,
             _ if self.settles_pattern_entry() => Detail::IntersectionCasts,
@@ -631,6 +675,9 @@ struct SwitchCoverage {
     guards: usize,
     switch_expressions: usize,
     yields: usize,
+    post_methods: usize,
+    exit_offsets: usize,
+    boxing_retained: usize,
 }
 
 #[derive(Default)]
@@ -691,7 +738,7 @@ impl ResourceCoverage {
 }
 
 impl SwitchCoverage {
-    fn record(&mut self, row: &str) {
+    fn record(&mut self, check: Check, row: &str) {
         let mut snapshots = row.split('\t');
         let tree = snapshots.next().unwrap();
         let patterns = tree.split(';').any(|field| field == "switch-patterns=true");
@@ -699,6 +746,7 @@ impl SwitchCoverage {
         self.pattern_methods += usize::from(patterns);
         self.expression_methods += usize::from(expressions);
         self.both_methods += usize::from(patterns && expressions);
+        self.post_methods += usize::from(tree.ends_with(";post-switches=true"));
         self.phantom += tree
             .split(';')
             .filter(|field| *field == "phantom=true")
@@ -713,6 +761,14 @@ impl SwitchCoverage {
                 } else if key.starts_with('e') {
                     self.switch_expressions += usize::from(value.starts_with("SWITCH|"));
                     self.yields += usize::from(value.starts_with("YIELD|"));
+                    if check == Check::AfterMain {
+                        self.exit_offsets += usize::from(
+                            key.starts_with("exit-offsets") && value != "~" && !value.is_empty(),
+                        );
+                        self.boxing_retained += usize::from(
+                            value.starts_with("INVOCATION|") && value.ends_with("|false"),
+                        );
+                    }
                 }
             }
         }
@@ -723,6 +779,18 @@ impl SwitchCoverage {
             eprintln!(
                 "{} methods changed during switch pattern recovery, {} during switch expression recovery, and {} during both",
                 self.pattern_methods, self.expression_methods, self.both_methods
+            );
+        }
+        if check.publishes_wrappers() {
+            eprintln!(
+                "{} methods changed during post-main switch simplification.",
+                self.post_methods
+            );
+        }
+        if check == Check::AfterMain {
+            eprintln!(
+                "{} dummy exits carry bytecode offsets and {} invocations retain boxing in writing",
+                self.exit_offsets, self.boxing_retained
             );
         }
         eprintln!(
@@ -977,7 +1045,7 @@ pub(super) fn check(corpus: &Corpus, check: Check) {
                 if_pattern_coverage.record(check, &rust);
             }
             if check.recovers_switches() {
-                switch_coverage.record(&rust);
+                switch_coverage.record(check, &rust);
             }
             if check.recovers_resources() {
                 resource_coverage.record(&rust);
@@ -1131,6 +1199,19 @@ fn write_group(
         |_| true,
         |_, _| None,
     );
+    if check.publishes_wrappers() {
+        write_published_group(
+            input,
+            snapshots,
+            methods,
+            group_index,
+            group,
+            profile,
+            &mut cx,
+            check,
+        );
+        return;
+    }
     let mut prepared = HashMap::new();
     for fixture in group {
         let id = cx.class_nodes.id(&fixture.name).unwrap();
@@ -1154,46 +1235,210 @@ fn write_group(
             let initial = initial_statement_graph(&mut cx, &class, method)
                 .unwrap()
                 .unwrap();
-            write_int(input, i32::try_from(methods.len()).unwrap()).unwrap();
-            write_text(input, fixture.path.to_str().unwrap()).unwrap();
-            write_text(input, &method.name).unwrap();
-            write_text(input, &method.descriptor).unwrap();
-            for flag in [
-                options.force_jsr_inline,
-                options.use_lvt_names,
-                options.decompile_complex_constant_dynamic,
-                options.decompile_finally,
-            ] {
-                write_flag(input, flag).unwrap();
-            }
-            write_count(input, group_index).unwrap();
-            write_flag(input, profile.simplify).unwrap();
-            write_flag(input, profile.ternary).unwrap();
-            write_flag(input, profile.boolean_as_int).unwrap();
-            write_flag(input, profile.assertions).unwrap();
-            if check == Check::SecondaryFunctions {
-                write_flag(input, profile.ternary_constants).unwrap();
-            }
-            write_text(input, &fixture.name).unwrap();
-            write_cfg(input, &cx.ir, &initial.flow.graph).unwrap();
+            write_method_input(
+                input,
+                methods,
+                group_index,
+                fixture,
+                profile,
+                check,
+                &cx,
+                method,
+                &initial,
+            );
 
             let snapshot = match imports {
                 Ok(imports) => describe(&mut cx, id, &class, method, initial, imports, check),
                 Err(error) => format!("class-rejected={}", one_line(error)),
             };
             writeln!(snapshots, "{snapshot}").unwrap();
-            methods.push(format!(
-                "{} {method} simplify-stack={} ternary-in-if={} lvt={} boolean-as-int={} assertions={} ternary-constant-simplification={}",
-                fixture.path.display(),
-                profile.simplify,
-                profile.ternary,
-                profile.lvt,
-                profile.boolean_as_int,
-                profile.assertions,
-                profile.ternary_constants,
-            ));
         }
     }
+}
+
+fn write_method_input(
+    input: &mut impl Write,
+    methods: &mut Vec<String>,
+    group_index: usize,
+    fixture: &Fixture,
+    profile: Profile,
+    check: Check,
+    cx: &Cx,
+    method: &StructMethod,
+    initial: &InitialMethod,
+) {
+    let options = &cx.options;
+    write_int(input, i32::try_from(methods.len()).unwrap()).unwrap();
+    write_text(input, fixture.path.to_str().unwrap()).unwrap();
+    write_text(input, &method.name).unwrap();
+    write_text(input, &method.descriptor).unwrap();
+    for flag in [
+        options.force_jsr_inline,
+        options.use_lvt_names,
+        options.decompile_complex_constant_dynamic,
+        options.decompile_finally,
+    ] {
+        write_flag(input, flag).unwrap();
+    }
+    write_count(input, group_index).unwrap();
+    write_flag(input, profile.simplify).unwrap();
+    write_flag(input, profile.ternary).unwrap();
+    write_flag(input, profile.boolean_as_int).unwrap();
+    write_flag(input, profile.assertions).unwrap();
+    if check == Check::SecondaryFunctions {
+        write_flag(input, profile.ternary_constants).unwrap();
+    }
+    write_text(input, &fixture.name).unwrap();
+    write_cfg(input, &cx.ir, &initial.flow.graph).unwrap();
+    methods.push(format!(
+        "{} {method} simplify-stack={} ternary-in-if={} lvt={} boolean-as-int={} assertions={} ternary-constant-simplification={}",
+        fixture.path.display(),
+        profile.simplify,
+        profile.ternary,
+        profile.lvt,
+        profile.boolean_as_int,
+        profile.assertions,
+        profile.ternary_constants,
+    ));
+}
+
+fn write_published_group(
+    input: &mut impl Write,
+    snapshots: &mut impl Write,
+    methods: &mut Vec<String>,
+    group_index: usize,
+    group: &[Fixture],
+    profile: Profile,
+    cx: &mut Cx,
+    check: Check,
+) {
+    let mut roots = BTreeMap::<ClassNodeId, Vec<&Fixture>>::new();
+    let mut order = Vec::new();
+    let fixtures: HashMap<_, _> = group
+        .iter()
+        .map(|fixture| (fixture.name.as_str(), fixture))
+        .collect();
+    for fixture in group {
+        let mut root = cx.class_nodes.id(&fixture.name).unwrap();
+        while let Some(parent) = cx.class_nodes[root].parent {
+            root = parent;
+        }
+        if !roots.contains_key(&root) {
+            order.push(root);
+        }
+        roots.entry(root).or_default().push(fixture);
+    }
+    for root in order {
+        let count = methods.len();
+        let result = process_class_methods(cx, root, |cx, class, method| {
+            let Some(initial) = initial_statement_graph(cx, class, method)? else {
+                return Ok(None);
+            };
+            let fixture = fixtures[class.qualified_name.as_str()];
+            write_method_input(
+                input,
+                methods,
+                group_index,
+                fixture,
+                profile,
+                check,
+                cx,
+                method,
+                &initial,
+            );
+            let owner = cx.class_nodes.id(&class.qualified_name).unwrap();
+            let operation = Cell::new("structure");
+            let processed = catch_unwind(AssertUnwindSafe(|| {
+                let initial_hidden = cx.class_nodes[owner].hidden_members.clone();
+                let mut method = lift_method(cx, class, initial, &operation)?;
+                operation.set("prepare-main-loop");
+                method.prepare_main_loop(cx, class)?;
+                operation.set("finish-main-loop");
+                method.finish_main_loop(cx, class)?;
+                operation.set("simplify-switches");
+                let simplified = method.simplify_switches(cx, class)?;
+                if check == Check::AfterMain {
+                    operation.set("finish-post-processing");
+                    method.finish_post_processing(cx)?;
+                }
+                operation.set("snapshot");
+                let state = snapshot(
+                    cx,
+                    owner,
+                    &method,
+                    &initial_hidden,
+                    check,
+                    &format!(";post-switches={simplified}"),
+                );
+                let graph = direct_graph_snapshot::enhanced(&mut cx.ir, method.root);
+                writeln!(snapshots, "{state}\t{graph}").unwrap();
+                Ok::<_, io::Error>(method)
+            }));
+            match processed {
+                Ok(Ok(method)) => Ok(Some(method)),
+                Ok(Err(error)) => {
+                    writeln!(
+                        snapshots,
+                        "{}",
+                        io_stage_error(check, operation.get(), &error)
+                    )
+                    .unwrap();
+                    Err(error)
+                }
+                Err(error) => {
+                    let error = panic_text(&*error);
+                    writeln!(
+                        snapshots,
+                        "{}",
+                        stage_error(check, operation.get(), "panic", &error)
+                    )
+                    .unwrap();
+                    Err(io::Error::other(error))
+                }
+            }
+        });
+        if let Err(error) = result {
+            assert_eq!(
+                methods.len(),
+                count,
+                "wrapper processing aborted after a callback"
+            );
+            for fixture in &roots[&root] {
+                let id = cx.class_nodes.id(&fixture.name).unwrap();
+                let class = Arc::clone(&cx.class_nodes[id].class);
+                for method in &class.methods {
+                    let Some(initial) = initial_statement_graph(cx, &class, method).unwrap() else {
+                        continue;
+                    };
+                    write_method_input(
+                        input,
+                        methods,
+                        group_index,
+                        fixture,
+                        profile,
+                        check,
+                        cx,
+                        method,
+                        &initial,
+                    );
+                    writeln!(snapshots, "class-rejected={}", one_line(&error.to_string())).unwrap();
+                }
+            }
+        }
+    }
+}
+
+fn lift_method(
+    cx: &mut Cx,
+    class: &StructClass,
+    initial: InitialMethod,
+    operation: &Cell<&str>,
+) -> io::Result<ExpressionMethod> {
+    let structured = initial.structure(cx)?;
+    operation.set("finally");
+    let recovered = structured.recover_finally(cx, class)?;
+    operation.set("lift");
+    recovered.into_expressions(cx, class)
 }
 
 fn describe(
@@ -1233,11 +1478,7 @@ fn stage(
 ) -> String {
     let operation = Cell::new("structure");
     let result = catch_unwind(AssertUnwindSafe(|| {
-        let structured = initial.structure(cx)?;
-        operation.set("finally");
-        let recovered = structured.recover_finally(cx, class)?;
-        operation.set("lift");
-        let mut method = recovered.into_expressions(cx, class)?;
+        let mut method = lift_method(cx, class, initial, &operation)?;
         operation.set("simplify-stack");
         match (check, first) {
             (Check::Increments, true) => {
@@ -1452,6 +1693,9 @@ fn stage(
                 ) {}
             }
             (Check::Stack, false) => method.simplify_stack_vars(cx, class),
+            (Check::PostSwitches | Check::AfterMain, _) => {
+                unreachable!("Post-main methods run in wrapper order")
+            }
         }
         operation.set("snapshot");
         let mut snapshot = snapshot(cx, owner, &method, initial_hidden, check, "");
@@ -1471,29 +1715,7 @@ fn stage(
     }));
     match result {
         Ok(Ok(snapshot)) => snapshot,
-        Ok(Err(error))
-            if error.kind() == io::ErrorKind::InvalidData
-                && error.to_string() == "parsing failure!" =>
-        {
-            "rejected=parsing failure!".into()
-        }
-        Ok(Err(error))
-            if error.kind() == io::ErrorKind::InvalidData
-                && error.to_string().starts_with("Invalid switch case set") =>
-        {
-            stage_error(
-                check,
-                operation.get(),
-                "invalid-data",
-                &one_line(&error.to_string()),
-            )
-        }
-        Ok(Err(error)) => stage_error(
-            check,
-            operation.get(),
-            "error",
-            &one_line(&error.to_string()),
-        ),
+        Ok(Err(error)) => io_stage_error(check, operation.get(), &error),
         Err(error) => stage_error(check, operation.get(), "panic", &panic_text(&*error)),
     }
 }
@@ -1564,6 +1786,19 @@ fn edge_states(ir: &Ir, root: StatId) -> HashMap<EdgeId, String> {
         .collect()
 }
 
+fn io_stage_error(check: Check, operation: &str, error: &io::Error) -> String {
+    let message = error.to_string();
+    if error.kind() == io::ErrorKind::InvalidData {
+        if message == "parsing failure!" {
+            return "rejected=parsing failure!".into();
+        }
+        if message.starts_with("Invalid switch case set") {
+            return stage_error(check, operation, "invalid-data", &one_line(&message));
+        }
+    }
+    stage_error(check, operation, "error", &one_line(&message))
+}
+
 fn stage_error(check: Check, operation: &str, kind: &str, message: &str) -> String {
     if check == Check::Stack {
         format!("stack-{kind}={message}")
@@ -1579,6 +1814,7 @@ fn same_switch_case_rejection(check: Check, java: &str, rust: &str) -> bool {
         Check::LateLoopPasses => "prepare-late-loops",
         Check::ExitEntry | Check::ExitCondensation => "prepare-exits",
         Check::MainLoopEnd => "finish-main-loop",
+        Check::PostSwitches | Check::AfterMain => "finish-main-loop",
         _ => return false,
     };
     let Some(java) = java.strip_prefix(check.name()) else {

@@ -137,7 +137,7 @@ fn switch_result(ir: &Ir, root: StatId, stat: StatId) -> Option<ExprId> {
         if !first
             .closure
             .is_some_and(|closure| closure == stat || stat.contains_statement_strict(ir, closure))
-            && !matches!(ir[first.destination].kind, StatementKind::DummyExit)
+            && !matches!(ir[first.destination].kind, StatementKind::DummyExit { .. })
         {
             return None;
         }
@@ -152,7 +152,7 @@ fn switch_result(ir: &Ir, root: StatId, stat: StatId) -> Option<ExprId> {
                 continue;
             }
             if (edge.destination != next
-                && !matches!(ir[edge.destination].kind, StatementKind::DummyExit))
+                && !matches!(ir[edge.destination].kind, StatementKind::DummyExit { .. }))
                 || (!edge.explicit && !last)
             {
                 return None;

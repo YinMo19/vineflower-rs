@@ -202,6 +202,7 @@ fn lambda_node(
         nested: Vec::new(),
         anonymous_type: Some(VarType::from_signature_cl(lambda_class, true)),
         lambda: Some(info),
+        wrapper: None,
         hidden_members: Default::default(),
     })
 }

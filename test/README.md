@@ -56,6 +56,8 @@ The late-loop comparison checks do-while recovery and infinite-loop return conde
 
 The late-loop and exit comparisons separately report incoming continue edges moved in a single Java loop-elimination call. Java iterates those edges from an identity-hashed set. A comparison allows reordering only among the observed edges in each batch and only in the same occupied positions. It checks all other edges and snapshot fields exactly.
 
+The post-main switch comparison runs method callbacks in class wrapper initialization order and publishes complete method roots only once a class finishes its callbacks. This lets switch simplification consult the actual graphs of initialized synthetic enum-table holders while the class being measured remains unpublished. The `AFTER_MAIN` comparison also checks return normalization and monitor rewriting, including bytecode offsets on the dummy exit and boxing flags.
+
 ## End-to-end source and CLI suite
 
 The retained `upstream_parity` target covers final source and CLI behavior. It currently requires library and binary entry points that still await migration. Use the explicit stage targets above to test the active implementation. The commands below document the end-to-end gate once those entry points are available.

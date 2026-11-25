@@ -75,7 +75,9 @@ pub enum StatementKind {
         add_error_comment: bool,
         content_flags: ContentFlags,
     },
-    DummyExit,
+    DummyExit {
+        bytecode: Option<crate::decompiler::exps::BytecodeOffsets>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -288,7 +290,8 @@ impl Statement {
 
     pub fn new_dummy_exit(ir: &mut Ir, counters: &mut CounterContainer) -> StatId {
         let id = counters.get_counter_and_increment(STATEMENT_COUNTER);
-        ir.stats.push(Self::new(StatementKind::DummyExit, id))
+        ir.stats
+            .push(Self::new(StatementKind::DummyExit { bytecode: None }, id))
     }
 
     pub fn new_synchronized(

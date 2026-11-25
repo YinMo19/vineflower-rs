@@ -82,7 +82,10 @@ fn initial_statements_keep_method_identity_and_counters() {
         else {
             panic!("expected a root statement for {method}");
         };
-        assert!(matches!(cx.ir[*dummy_exit].kind, StatementKind::DummyExit));
+        assert!(matches!(
+            cx.ir[*dummy_exit].kind,
+            StatementKind::DummyExit { .. }
+        ));
         assert_eq!(cx.ir[root.first.unwrap()].parent, Some(initial.root));
         assert_eq!(
             root.id + 1,

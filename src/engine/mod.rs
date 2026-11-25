@@ -6,6 +6,7 @@
 pub mod bytecode_mapping_tracer;
 pub mod class_nodes;
 pub mod class_processor;
+pub mod class_wrapper;
 pub mod context;
 pub mod context_source;
 pub mod counter_container;

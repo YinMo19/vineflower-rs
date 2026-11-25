@@ -192,13 +192,16 @@ impl StructClass {
     /// Bytecode properties computed in declaration order before method simplification.
     pub fn method_properties(&self, key: &str) -> Option<&MethodProperties> {
         let index = self.methods.index_of_key(key)?;
-        let entries = self.method_properties.get_or_init(|| {
+        Some(&self.prepare_method_properties()[index])
+    }
+
+    pub(crate) fn prepare_method_properties(&self) -> &[MethodProperties] {
+        self.method_properties.get_or_init(|| {
             self.methods
                 .iter()
                 .map(|method| MethodProperties::analyze(Arc::clone(method), self))
                 .collect()
-        });
-        Some(&entries[index])
+        })
     }
 
     /// `getMethod(key)`, for a key made by `make_unique_key`.

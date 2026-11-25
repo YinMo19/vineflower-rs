@@ -488,6 +488,40 @@ impl ExpressionMethod {
         }
     }
 
+    /// Simplify enum and string switches after inlining has finished. A newly
+    /// formed switch expression must go through stack and variable processing.
+    pub fn simplify_switches(&mut self, cx: &mut Cx, class: &StructClass) -> io::Result<bool> {
+        if !self.content_flags(&cx.ir).has_switch
+            || !crate::decompiler::switches::simplify(cx, &mut self.flow.counters, self.root)?
+        {
+            return Ok(false);
+        }
+        condense_sequences(cx, &mut self.flow.counters, self.root);
+        if self.process_switch_expressions(cx)? {
+            self.simplify_stack_vars(cx, class);
+            self.set_var_versions(cx, class)?;
+        }
+        Ok(true)
+    }
+
+    /// Built-in post-processing after switch rewrites, up to AFTER_MAIN.
+    pub fn finish_post_processing(&mut self, cx: &mut Cx) -> io::Result<()> {
+        use crate::decompiler::post_process;
+        let cx = &mut *cx.enter_method(&self.flow.counters);
+        post_process::adjust_returns(&mut cx.ir, self.root, &self.descriptor.ret);
+        post_process::remove_redundant_returns(&mut cx.ir, self.root);
+        self.identify_secondary(cx)?;
+        post_process::clean_monitors(cx, self.root);
+        post_process::insert_monitor_sinks(
+            cx,
+            &mut self.flow.counters,
+            self.root,
+            self.flow.variables,
+            self.root,
+        );
+        Ok(())
+    }
+
     pub fn simplify_string_concat(&mut self, cx: &mut Cx, class: &StructClass) -> io::Result<()> {
         if class.version.has_indy_string_concat() {
             crate::decompiler::concat::simplify(cx, &mut self.flow.counters, self.root)?;
@@ -618,5 +652,19 @@ pub fn main_loop_method(
         return Ok(None);
     };
     result.finish_main_loop(cx, class)?;
+    Ok(Some(result))
+}
+
+/// Process a method through the built-in passes before the Java AFTER_MAIN hook.
+pub fn after_main_method(
+    cx: &mut Cx,
+    class: &StructClass,
+    method: &Arc<StructMethod>,
+) -> io::Result<Option<ExpressionMethod>> {
+    let Some(mut result) = main_loop_method(cx, class, method)? else {
+        return Ok(None);
+    };
+    result.simplify_switches(cx, class)?;
+    result.finish_post_processing(cx)?;
     Ok(Some(result))
 }

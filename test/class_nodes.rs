@@ -20,6 +20,100 @@ use vineflower_rs::types::VarType;
 
 #[test]
 #[ignore = "requires the upstream +local.jar and JDK 17 or later"]
+fn class_wrappers_publish_declared_methods_in_order() {
+    use vineflower_rs::engine::{
+        class_processor::process_class_methods, method_processor::after_main_method,
+    };
+
+    fn dump_cases(cx: &Cx, stat: vineflower_rs::decompiler::ir::StatId, rows: &mut Vec<String>) {
+        use vineflower_rs::decompiler::{
+            exps::{ConstantValue, ExprKind},
+            stats::StatementKind,
+        };
+        if let StatementKind::Switch(switch) = &cx.ir[stat].kind {
+            for case in &switch.cases {
+                for value in &case.values {
+                    let label = match value.map(|id| &cx.ir[id].kind) {
+                        Some(ExprKind::Field(field)) => {
+                            format!("field {}.{}", field.classname.as_ref().unwrap(), field.name)
+                        }
+                        Some(ExprKind::Constant {
+                            value: ConstantValue::String(s),
+                            ..
+                        }) => format!("constant {}", s.as_utf8_lossy()),
+                        Some(ExprKind::Constant {
+                            value: ConstantValue::Integer(n),
+                            ..
+                        }) => format!("constant {n}"),
+                        None => "default".to_owned(),
+                        _ => panic!("Unexpected case label"),
+                    };
+                    rows.push(format!("case\t{label}"));
+                }
+            }
+        }
+        for &child in &cx.ir[stat].stats {
+            dump_cases(cx, child, rows);
+        }
+    }
+
+    let scratch = tempfile::tempdir().unwrap();
+    let corpus = upstream_reference::Corpus::discover();
+    let reference = corpus.run("ClassWrappersReference", &[], scratch.path());
+    let options = Arc::new(Options::default());
+    let mut context = StructContext::new(options.clone(), None);
+    context
+        .add_file(&scratch.path().join("classes"), true)
+        .unwrap();
+    let mut cx = Cx::new(Arc::new(context));
+    cx.class_nodes = load_classes(
+        &cx.struct_context,
+        &options,
+        |_| true,
+        |_| true,
+        |_, _| None,
+    );
+    let root = cx.class_nodes.id("WrapperSubject").unwrap();
+
+    process_class_methods(&mut cx, root, |cx, class, method| {
+        let id = cx.class_nodes.id(&class.qualified_name).unwrap();
+        let order = cx.class_nodes.wrapper_order(root);
+        let current = order.iter().position(|&node| node == id).unwrap();
+        for (index, &node) in order.iter().enumerate() {
+            assert_eq!(cx.class_nodes[node].wrapper.is_some(), index < current);
+        }
+        after_main_method(cx, class, method)
+    })
+    .unwrap();
+
+    let classes: std::collections::BTreeMap<_, _> = cx.class_nodes.iter().collect();
+    let mut rows = Vec::new();
+    for (name, class) in classes {
+        for method in &class.wrapper.as_ref().unwrap().methods {
+            let state = match &method.body {
+                Ok(Some(_)) => "code",
+                Ok(None) => "no-code",
+                Err(_) => "failed",
+            };
+            rows.push(format!(
+                "{name}\t{}\t{}\t{state}",
+                method.method.name, method.method.descriptor
+            ));
+            if let Ok(Some(body)) = &method.body {
+                dump_cases(&cx, body.root, &mut rows);
+            }
+        }
+    }
+    assert!(
+        rows.iter()
+            .any(|row| row == "case\tfield WrapperSubject$Kind.LEFT")
+    );
+    assert!(rows.iter().any(|row| row == "case\tconstant Aa"));
+    assert_eq!(rows, reference.lines().collect::<Vec<_>>());
+}
+
+#[test]
+#[ignore = "requires the upstream +local.jar and JDK 17 or later"]
 fn file_and_archive_registration_matches_upstream() {
     fn context() -> StructContext {
         StructContext::new(Arc::new(Options::default()), None)

@@ -105,6 +105,10 @@ CFG、语句图和 DirectGraph 具有不同的边契约。
 
 主循环在内联完成后才尝试恢复 `do … while` 以及从无限循环提取返回。普通方法可以把符合保护区和标签条件的 break 合并为返回；静态初始化器跳过该步骤。每次成功的改写都回到主循环开头。`main_loop_method` 将方法字节码处理到内置 Java 流程的 `MainLoopEnd`。消除嵌套循环时，Java 将被移走的标签边从身份散列集合逐个追加到外层循环的前驱表，同一批边的内部顺序会随 JVM 运行变化。Rust 保留发现顺序。[晚期循环](src/decompiler/loops/late.rs) · [出口合并](src/decompiler/exits.rs) · [主循环](src/engine/method_processor.rs)
 
+类包装器先按声明顺序分析整张方法表，再依次处理各方法。整个类处理完后，类节点才公布包装器；这决定了枚举 switch 能在何时读取合成映射表。枚举恢复通过已发布方法的真实语句树和按需构建的直接图查找字段赋值。字符串 switch 按原版识别由哈希分派、字符串相等检查、空值路径及第二级 switch 组成的结构，保留同一哈希桶中各字符串的分支。[类包装器](src/engine/class_wrapper.rs) · [枚举恢复](src/decompiler/switches/enums.rs) · [字符串恢复](src/decompiler/switches/strings/mod.rs)
+
+`after_main_method` 接着按方法返回类型调整常量，移除隐式路径末尾的空返回，再处理次级表达式和同步锁。移除返回时将对应字节码位置并入方法的虚拟出口；用装箱调用的结果充当锁时，调用必须保留装箱。该入口抵达 Java 插件钩子 `AFTER_MAIN`，变量声明的位置和名称由此后的阶段确定。[方法处理](src/engine/method_processor.rs) · [返回与同步锁](src/decompiler/post_process.rs)
+
 `RuntimeImage::open` 将模块化 JDK 的每个模块作为独立库登记，按 JRT 的目录遍历和模块描述符顺序提供条目。普通镜像与 ZIP 压缩镜像可由现有 JImage 库读取；该库遇到 compact-cp 压缩时返回 Unsupported。[运行时类路径](src/engine/context_source/runtime.rs)
 
 `StructContext::add_file` 根据文件后缀和 ZIP 结束记录登记目录、归档或单文件。重新载入上下文时再次扫描目录及其子归档。ZIP 保留中央目录顺序和重复条目，按 Java 的规则解释多版本路径。单个 class 文件在预读内部名称和正式解析时使用同一上下文的注解表达式计数器。直接读取缺失资源或目录时，Rust 的 `ContextSource` 返回 `Ok(None)`。Java 的目录源打开这些路径时抛出 I/O 异常，ZIP 源读取缺失条目时抛出空引用异常，读取显式目录条目时返回空流。正常登记按已有条目读取类和资源。[文件登记](src/structs/struct_context.rs)

@@ -193,7 +193,10 @@ fn same_catch_ranges(ir: &Ir, mut from: StatId, to: StatId) -> bool {
 fn no_exit_labels(ir: &Ir, block: StatId, sequence: StatId) -> bool {
     ir[block].all_successors().iter().all(|&edge| {
         ir[edge].edge_type == EdgeType::Regular
-            || matches!(ir[ir[edge].destination].kind, StatementKind::DummyExit)
+            || matches!(
+                ir[ir[edge].destination].kind,
+                StatementKind::DummyExit { .. }
+            )
             || sequence.contains_statement_strict(ir, ir[edge].destination)
     }) && ir[block]
         .stats

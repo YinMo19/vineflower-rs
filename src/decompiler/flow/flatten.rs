@@ -89,7 +89,7 @@ impl<'a> Flatten<'a> {
             StatementKind::Switch(ref switch) => self.flatten_switch(stat, switch.head_exprents),
             StatementKind::If(branches) => self.flatten_if(stat, branches),
             StatementKind::Sequence | StatementKind::Root { .. } => self.flatten_sequence(stat),
-            StatementKind::General { .. } | StatementKind::DummyExit => {
+            StatementKind::General { .. } | StatementKind::DummyExit { .. } => {
                 panic!(
                     "Unexpected statement {} in the direct graph",
                     self.ir[stat].id

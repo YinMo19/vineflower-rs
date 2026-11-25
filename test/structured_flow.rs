@@ -75,7 +75,7 @@ fn structure_retains_statement_and_edge_links() {
                 panic!("expected method root");
             };
             assert!(Arc::ptr_eq(owner, method));
-            assert!(matches!(ir[*dummy_exit].kind, StatementKind::DummyExit));
+            assert!(matches!(ir[*dummy_exit].kind, StatementKind::DummyExit { .. }));
 
             let mut pending = vec![structured.root];
             let mut visited = BTreeSet::new();
@@ -629,6 +629,24 @@ fn main_loop_end_matches_upstream() {
     stack_snapshot::check(
         &upstream_reference::Corpus::discover(),
         stack_snapshot::Check::MainLoopEnd,
+    );
+}
+
+#[test]
+#[ignore = "requires the upstream +local.jar and JDK 17 or later"]
+fn post_main_switches_match_upstream() {
+    stack_snapshot::check(
+        &upstream_reference::Corpus::discover(),
+        stack_snapshot::Check::PostSwitches,
+    );
+}
+
+#[test]
+#[ignore = "requires the upstream +local.jar and JDK 17 or later"]
+fn after_main_matches_upstream() {
+    stack_snapshot::check(
+        &upstream_reference::Corpus::discover(),
+        stack_snapshot::Check::AfterMain,
     );
 }
 
@@ -1259,7 +1277,7 @@ fn kind_name(kind: &StatementKind) -> &'static str {
         StatementKind::CatchAll { .. } => "CATCH_ALL",
         StatementKind::Synchronized { .. } => "SYNCHRONIZED",
         StatementKind::Root { .. } => "ROOT",
-        StatementKind::DummyExit => "DUMMY_EXIT",
+        StatementKind::DummyExit { .. } => "DUMMY_EXIT",
     }
 }
 

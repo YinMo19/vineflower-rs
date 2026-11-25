@@ -170,7 +170,12 @@ fn condense_return(ir: &mut Ir, counters: &mut CounterContainer, stat: StatId) -
     if !last_body
         .get_successor_edges(ir, EdgeType::Break.mask())
         .first()
-        .is_some_and(|&edge| matches!(ir[ir[edge].destination].kind, StatementKind::DummyExit))
+        .is_some_and(|&edge| {
+            matches!(
+                ir[ir[edge].destination].kind,
+                StatementKind::DummyExit { .. }
+            )
+        })
         || !continues_loop(ir, first_body, stat)
     {
         return false;

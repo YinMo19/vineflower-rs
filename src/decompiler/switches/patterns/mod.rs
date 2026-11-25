@@ -8,12 +8,13 @@ mod guards;
 use std::io;
 use std::sync::Arc;
 
+use super::{switch, switch_mut};
 use crate::code::code_constants::CONSTANT_CLASS;
 use crate::decompiler::decompose::finish::condense_sequences;
 use crate::decompiler::exps::{ConstantValue, Expr, ExprKind, FunctionType, InvocationType};
 use crate::decompiler::ir::{ExprId, Ir, StatId, VarProcessorId};
 use crate::decompiler::patterns::record;
-use crate::decompiler::stats::{StatementKind, SwitchStatement, stat_edge::EdgeType};
+use crate::decompiler::stats::{StatementKind, stat_edge::EdgeType};
 use crate::engine::{Cx, counter_container::CounterContainer};
 use crate::structs::consts::PooledConstant;
 use crate::types::VarType;
@@ -471,20 +472,6 @@ fn constant(
     value: ConstantValue,
 ) -> ExprId {
     Expr::new(ir, counters, Expr::constant(ty, value, false), None)
-}
-
-fn switch(ir: &Ir, stat: StatId) -> &SwitchStatement {
-    let StatementKind::Switch(switch) = &ir[stat].kind else {
-        unreachable!("Expected a switch statement");
-    };
-    switch
-}
-
-fn switch_mut(ir: &mut Ir, stat: StatId) -> &mut SwitchStatement {
-    let StatementKind::Switch(switch) = &mut ir[stat].kind else {
-        unreachable!("Expected a switch statement");
-    };
-    switch
 }
 
 fn invalid(message: &'static str) -> io::Error {

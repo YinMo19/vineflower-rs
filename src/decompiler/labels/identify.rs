@@ -182,7 +182,10 @@ fn process_edges_with_next(
                 if is_loop && closure == Some(stat)
                     || is_if
                         && closure.is_some_and(|stat| matches!(ir[stat].kind, StatementKind::Do(_)))
-                        && matches!(ir[ir[edge].destination].kind, StatementKind::DummyExit)
+                        && matches!(
+                            ir[ir[edge].destination].kind,
+                            StatementKind::DummyExit { .. }
+                        )
                 {
                     continue;
                 }
@@ -198,7 +201,7 @@ fn process_edges_with_next(
     } else if outgoing.len() == 1
         && let Some((&target, edges)) = outgoing.first()
         && edges.len() > 1
-        && !matches!(ir[target].kind, StatementKind::DummyExit)
+        && !matches!(ir[target].kind, StatementKind::DummyExit { .. })
     {
         let edge = add_common_successor(ir, stat, edges);
         outgoing.insert(ir[edge].destination, vec![edge]);
@@ -212,7 +215,7 @@ fn process_edges_with_next(
 fn largest_outgoing_group<'a>(ir: &Ir, outgoing: &'a OutgoingEdges) -> Option<&'a [EdgeId]> {
     let mut largest: Option<&[EdgeId]> = None;
     for (&target, edges) in outgoing {
-        if !matches!(ir[target].kind, StatementKind::DummyExit)
+        if !matches!(ir[target].kind, StatementKind::DummyExit { .. })
             && largest.is_none_or(|previous| edges.len() > previous.len())
         {
             largest = Some(edges);

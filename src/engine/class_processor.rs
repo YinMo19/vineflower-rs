@@ -4,12 +4,13 @@
 //! Root-class preparation in `ClassesProcessor.processClass`, before wrapper initialization.
 
 use std::io;
+use std::sync::Arc;
 
 use super::Cx;
 use super::class_nodes::{ClassKind, ClassNodeId, ClassNodes, process_lambdas};
 use super::import_collector::{ImportCollector, short_name};
 use crate::code::code_constants::{ACC_FINAL, ACC_MODULE, ACC_STATIC, ACC_SYNTHETIC, CLINIT_NAME};
-use crate::structs::{StructClass, StructMember};
+use crate::structs::{StructClass, StructMember, StructMethod};
 
 /// Start the root's import scope before discovering lambda classes. Nested
 /// classes share this scope throughout method processing and source writing.
@@ -44,6 +45,20 @@ pub fn prepare_class(cx: &mut Cx, root: ClassNodeId) -> io::Result<()> {
     append_wrapper_order(&cx.class_nodes, root, &mut order);
     cx.class_nodes.set_wrapper_order(root, order);
     Ok(())
+}
+
+/// Process the methods of a compilation unit with the given method pipeline.
+pub fn process_class_methods(
+    cx: &mut Cx,
+    root: ClassNodeId,
+    process: impl FnMut(
+        &mut Cx,
+        &StructClass,
+        &Arc<StructMethod>,
+    ) -> io::Result<Option<super::method_processor::ExpressionMethod>>,
+) -> io::Result<()> {
+    prepare_class(cx, root)?;
+    super::class_wrapper::initialize_wrappers(cx, root, process)
 }
 
 fn append_wrapper_order(classes: &ClassNodes, id: ClassNodeId, order: &mut Vec<ClassNodeId>) {

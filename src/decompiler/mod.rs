@@ -18,6 +18,7 @@ pub mod ir;
 pub(crate) mod labels;
 pub(crate) mod loops;
 pub(crate) mod patterns;
+pub(crate) mod post_process;
 pub(crate) mod resources;
 pub(crate) mod secondary;
 pub mod sforms;

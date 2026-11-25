@@ -127,6 +127,8 @@ pub struct ClassNode {
     pub nested: Vec<ClassNodeId>,
     pub anonymous_type: Option<VarType>,
     pub lambda: Option<LambdaInformation>,
+    /// Published after all declared methods finish processing.
+    pub wrapper: Option<super::class_wrapper::ClassWrapper>,
     /// ClassWrapper members consumed by source-level rewrites.
     pub hidden_members: FxHashSet<String>,
 }
@@ -166,6 +168,7 @@ impl ClassNode {
             nested: Vec::new(),
             anonymous_type: None,
             lambda: None,
+            wrapper: None,
             hidden_members: Default::default(),
         }
     }

@@ -288,6 +288,7 @@ pub struct Invocation {
     pub synthetic_null_check: bool,
     pub was_lazy_condy: bool,
     pub force_boxing: bool,
+    pub can_ignore_boxing: bool,
 }
 
 impl Invocation {
@@ -307,6 +308,7 @@ impl Invocation {
             synthetic_null_check: false,
             was_lazy_condy: false,
             force_boxing: false,
+            can_ignore_boxing: true,
         }
     }
 

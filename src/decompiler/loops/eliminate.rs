@@ -236,7 +236,7 @@ fn collect_edges_leaving(
         let target = ir[edge].destination;
         if target == region
             || region.contains_statement_strict(ir, target)
-            || !allow_exit && matches!(ir[target].kind, StatementKind::DummyExit)
+            || !allow_exit && matches!(ir[target].kind, StatementKind::DummyExit { .. })
             || !ir[edge].explicit && destinations.contains(&target)
         {
             continue;
