@@ -37,6 +37,7 @@ import org.jetbrains.java.decompiler.modules.decompiler.EliminateLoopsHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.ExprProcessor;
 import org.jetbrains.java.decompiler.modules.decompiler.FinallyProcessor;
 import org.jetbrains.java.decompiler.modules.decompiler.IfHelper;
+import org.jetbrains.java.decompiler.modules.decompiler.IfPatternMatchProcessor;
 import org.jetbrains.java.decompiler.modules.decompiler.IntersectionCastProcessor;
 import org.jetbrains.java.decompiler.modules.decompiler.LabelHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.LoopExtractHelper;
@@ -59,19 +60,27 @@ import org.jetbrains.java.decompiler.util.InterpreterUtil;
 class StackSnapshot {
   enum Check {
     STACK, INCREMENTS, PRE_MAIN, LOOP_ELIMINATION, LOOP_ENHANCEMENT, LOOP_MERGE, MAIN_LOOP_LABELS,
-    SECONDARY_FUNCTIONS, PATTERN_MATCHING_ENTRY;
+    SECONDARY_FUNCTIONS, PATTERN_MATCHING_ENTRY, IF_PATTERNS, SWITCH_ENTRY;
 
     boolean usesLoopHeaders() {
       return this == LOOP_ENHANCEMENT || this == LOOP_MERGE || identifiesLabels();
     }
 
     boolean identifiesLabels() {
-      return this == MAIN_LOOP_LABELS || this == SECONDARY_FUNCTIONS || this == PATTERN_MATCHING_ENTRY;
+      return this == MAIN_LOOP_LABELS || this == SECONDARY_FUNCTIONS || settlesPatternEntry();
+    }
+
+    boolean settlesPatternEntry() {
+      return this == PATTERN_MATCHING_ENTRY || matchesIfPatterns();
+    }
+
+    boolean matchesIfPatterns() {
+      return this == IF_PATTERNS || this == SWITCH_ENTRY;
     }
 
     ExpressionSnapshot.Detail expressionDetail() {
       return switch (this) {
-        case PATTERN_MATCHING_ENTRY -> ExpressionSnapshot.Detail.INTERSECTION_CASTS;
+        case PATTERN_MATCHING_ENTRY, IF_PATTERNS, SWITCH_ENTRY -> ExpressionSnapshot.Detail.INTERSECTION_CASTS;
         case SECONDARY_FUNCTIONS -> ExpressionSnapshot.Detail.SECONDARY_FUNCTIONS;
         default -> usesLoopHeaders() ? ExpressionSnapshot.Detail.LOOP_HEADERS : ExpressionSnapshot.Detail.BASE;
       };
@@ -369,7 +378,7 @@ class StackSnapshot {
             operation = "identify-labels";
             LabelHelper.identifyLabels(root);
           }
-          if (check == Check.SECONDARY_FUNCTIONS || check == Check.PATTERN_MATCHING_ENTRY) {
+          if (check == Check.SECONDARY_FUNCTIONS || check.settlesPatternEntry()) {
             operation = "identify-secondary";
             boolean changed = SecondaryFunctionsHelper.identifySecondaryFunctions(root, vars);
             if (check == Check.SECONDARY_FUNCTIONS) {
@@ -382,6 +391,19 @@ class StackSnapshot {
               if (IntersectionCastProcessor.makeIntersectionCasts(root)) {
                 continue;
               }
+            }
+          }
+          if (check.matchesIfPatterns()) {
+            operation = "match-if-patterns";
+            String before = counters.getCounter(CounterContainer.STATEMENT_COUNTER)
+              + "," + counters.getCounter(CounterContainer.EXPRESSION_COUNTER)
+              + "," + counters.getCounter(CounterContainer.VAR_COUNTER);
+            boolean changed = DecompilerContext.getOption(IFernflowerPreferences.PATTERN_MATCHING)
+              && cl.getVersion().hasIfPatternMatching() && IfPatternMatchProcessor.matchInstanceof(root);
+            if (check == Check.IF_PATTERNS) {
+              details = ";pattern-counters-before=" + before + ";if-patterns=" + changed;
+            } else if (changed) {
+              continue;
             }
           }
           break;
@@ -444,6 +466,8 @@ class StackSnapshot {
         case MAIN_LOOP_LABELS -> "main-loop-labels-" + operation + "-";
         case SECONDARY_FUNCTIONS -> "secondary-functions-" + operation + "-";
         case PATTERN_MATCHING_ENTRY -> "pattern-matching-entry-" + operation + "-";
+        case IF_PATTERNS -> "if-patterns-" + operation + "-";
+        case SWITCH_ENTRY -> "switch-entry-" + operation + "-";
       };
       return failure + StructureReference.failureSnapshot(error);
     }

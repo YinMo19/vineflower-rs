@@ -6,7 +6,7 @@
 use crate::decompiler::ir::{ExprId, ExprListId, Ir, StatId};
 use crate::decompiler::stats::{LoopType, StatementKind};
 
-use super::{Expr, ExprKind};
+use super::{Expr, ExprKind, FunctionType};
 
 impl Expr {
     /// The immediate expressions in `Exprent.getAllExprents()` order.
@@ -20,6 +20,7 @@ impl Expr {
             ExprKind::Field(field) => ([field.instance, None], [&[], &[]]),
             ExprKind::Invocation(invoke) => ([invoke.instance, None], [&invoke.parameters, &[]]),
             ExprKind::Function { operands, .. } => ([None, None], [operands, &[]]),
+            ExprKind::Pattern(pattern) => ([None, None], [&pattern.children, &[]]),
             ExprKind::New {
                 new_type,
                 dimensions,
@@ -72,9 +73,82 @@ impl Expr {
             }
         }
     }
+
+    /// The variables defined by a binding, in component order.
+    pub fn pattern_vars(ir: &Ir, pattern: ExprId) -> Vec<ExprId> {
+        let mut variables = Vec::new();
+        Self::append_pattern_vars(ir, pattern, &mut variables);
+        variables
+    }
+
+    fn append_pattern_vars(ir: &Ir, expr: ExprId, variables: &mut Vec<ExprId>) {
+        match &ir[expr].kind {
+            ExprKind::Variable(_) => variables.push(expr),
+            ExprKind::Pattern(pattern) => {
+                for &child in &pattern.children {
+                    Self::append_pattern_vars(ir, child, variables);
+                }
+            }
+            _ => panic!("Illegal input in PatternExprent"),
+        }
+    }
 }
 
 impl StatId {
+    /// `Statement.getImplicitlyDefinedVars`, in declaration and expression order.
+    pub(crate) fn implicitly_defined_vars(self, ir: &Ir) -> Vec<ExprId> {
+        match &ir[self].kind {
+            StatementKind::BasicBlock { .. } => pattern_vars_in(
+                ir,
+                ir[self]
+                    .exprents
+                    .into_iter()
+                    .flat_map(|list| ir[list].iter().copied()),
+            ),
+            StatementKind::If(branch) => {
+                let head = ir[branch.head_exprents.expect("Missing if header")][0];
+                let ExprKind::If { condition } = ir[head].kind else {
+                    unreachable!("If header must be an IfExprent");
+                };
+                pattern_vars_in(ir, [condition])
+            }
+            StatementKind::Do(header) => {
+                let expr = if header.ty == LoopType::ForEach {
+                    Some(header.increment(ir).expect("Foreach iterable is missing"))
+                } else {
+                    header.condition(ir)
+                };
+                pattern_vars_in(ir, expr)
+            }
+            StatementKind::Switch(switch) => pattern_vars_in(
+                ir,
+                switch
+                    .cases
+                    .iter()
+                    .flat_map(|case| case.values.iter().flatten())
+                    .chain(switch.case_guards.iter().flatten())
+                    .copied(),
+            ),
+            StatementKind::Catch {
+                vars, resources, ..
+            } => vars
+                .iter()
+                .copied()
+                .chain(
+                    resources
+                        .iter()
+                        .flat_map(|&list| &ir[list])
+                        .filter_map(|&expr| match ir[expr].kind {
+                            ExprKind::Assignment { left, .. } => Some(left),
+                            _ => None,
+                        }),
+                )
+                .collect(),
+            StatementKind::CatchAll { vars, .. } => vars.clone(),
+            _ => Vec::new(),
+        }
+    }
+
     /// `Statement.getStatExprents`, including compound statement headers and
     /// catch resources. A statement's body is held separately in `exprents`.
     pub fn stat_exprents(self, ir: &Ir) -> Vec<ExprId> {
@@ -119,6 +193,27 @@ impl StatId {
             _ => Vec::new(),
         }
     }
+}
+
+fn pattern_vars_in(ir: &Ir, expressions: impl IntoIterator<Item = ExprId>) -> Vec<ExprId> {
+    let mut variables = Vec::new();
+    let mut descendants = Vec::new();
+    for expr in expressions {
+        Expr::append_exprents(ir, expr, true, &mut descendants);
+        descendants.push(expr);
+        for child in descendants.drain(..) {
+            if let ExprKind::Function {
+                op: FunctionType::InstanceOf,
+                operands,
+                ..
+            } = &ir[child].kind
+                && let Some(&binding) = operands.get(2)
+            {
+                Expr::append_pattern_vars(ir, binding, &mut variables);
+            }
+        }
+    }
+    variables
 }
 
 impl StatId {

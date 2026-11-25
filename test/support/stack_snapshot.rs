@@ -19,6 +19,9 @@ use vineflower_rs::decompiler::vars::versions::{FinalType, VarVersions};
 use vineflower_rs::engine::class_nodes::{ClassNodeId, load_classes};
 use vineflower_rs::engine::class_processor::prepare_class;
 use vineflower_rs::engine::context_source::{ContextSource, RuntimeImage};
+use vineflower_rs::engine::counter_container::{
+    EXPRESSION_COUNTER, STATEMENT_COUNTER, VAR_COUNTER,
+};
 use vineflower_rs::engine::import_collector::ImportCollector;
 use vineflower_rs::engine::method_processor::{
     ExpressionMethod, InitialMethod, initial_statement_graph,
@@ -45,6 +48,8 @@ pub(super) enum Check {
     MainLoopLabels = 9,
     SecondaryFunctions = 10,
     PatternMatchingEntry = 11,
+    IfPatterns = 12,
+    SwitchEntry = 13,
 }
 
 #[derive(Clone, Copy)]
@@ -209,6 +214,26 @@ const PATTERN_MATCHING_ENTRY_STAGES: &[(&str, &str)] = &[
     ("Direct graph before pattern matching", "graph="),
 ];
 
+const IF_PATTERN_STAGES: &[(&str, &str)] = &[
+    (
+        "Structure and return value after instanceof pattern matching",
+        "counters=",
+    ),
+    ("Type and record pattern expressions", "counters="),
+    (
+        "Variable versions after instanceof pattern matching",
+        "versions=",
+    ),
+    ("Direct graph after instanceof pattern matching", "graph="),
+];
+
+const SWITCH_ENTRY_STAGES: &[(&str, &str)] = &[
+    ("Structure before switch processing", "counters="),
+    ("Expressions before switch processing", "counters="),
+    ("Variable versions before switch processing", "versions="),
+    ("Direct graph before switch processing", "graph="),
+];
+
 fn loop_iterations(row: &str) -> impl Iterator<Item = &str> {
     row.split('\t')
         .nth(3)
@@ -227,7 +252,9 @@ impl Check {
             | Self::LoopEnhancement
             | Self::LoopMerge
             | Self::MainLoopLabels
-            | Self::PatternMatchingEntry => &[DEFAULT],
+            | Self::PatternMatchingEntry
+            | Self::IfPatterns
+            | Self::SwitchEntry => &[DEFAULT],
             Self::SecondaryFunctions => SECONDARY_PROFILES,
         }
     }
@@ -243,6 +270,8 @@ impl Check {
             Self::MainLoopLabels => MAIN_LOOP_LABEL_STAGES,
             Self::SecondaryFunctions => SECONDARY_FUNCTION_STAGES,
             Self::PatternMatchingEntry => PATTERN_MATCHING_ENTRY_STAGES,
+            Self::IfPatterns => IF_PATTERN_STAGES,
+            Self::SwitchEntry => SWITCH_ENTRY_STAGES,
         }
     }
 
@@ -257,6 +286,8 @@ impl Check {
             Self::MainLoopLabels => "main-loop-labels",
             Self::SecondaryFunctions => "secondary-functions",
             Self::PatternMatchingEntry => "pattern-matching-entry",
+            Self::IfPatterns => "if-patterns",
+            Self::SwitchEntry => "switch-entry",
         }
     }
 
@@ -267,21 +298,26 @@ impl Check {
                 | Self::LoopMerge
                 | Self::MainLoopLabels
                 | Self::SecondaryFunctions
-                | Self::PatternMatchingEntry
-        )
+        ) || self.settles_pattern_entry()
     }
 
     fn identifies_labels(self) -> bool {
-        matches!(
-            self,
-            Self::MainLoopLabels | Self::SecondaryFunctions | Self::PatternMatchingEntry
-        )
+        matches!(self, Self::MainLoopLabels | Self::SecondaryFunctions)
+            || self.settles_pattern_entry()
+    }
+
+    fn settles_pattern_entry(self) -> bool {
+        self == Self::PatternMatchingEntry || self.matches_if_patterns()
+    }
+
+    fn matches_if_patterns(self) -> bool {
+        matches!(self, Self::IfPatterns | Self::SwitchEntry)
     }
 
     fn expression_detail(self) -> expression_snapshot::Detail {
         use expression_snapshot::Detail;
         match self {
-            Self::PatternMatchingEntry => Detail::IntersectionCasts,
+            _ if self.settles_pattern_entry() => Detail::IntersectionCasts,
             Self::SecondaryFunctions => Detail::SecondaryFunctions,
             _ if self.uses_loop_headers() => Detail::LoopHeaders,
             _ => Detail::Base,
@@ -448,6 +484,73 @@ struct SecondaryComparison {
     counter_changes: usize,
 }
 
+#[derive(Default)]
+struct IfPatternCoverage {
+    changed_methods: usize,
+    methods_with_patterns: usize,
+    matched_conditionals: usize,
+    record_patterns: usize,
+    record_bounds: usize,
+    changed_with_counter_updates: usize,
+    unchanged_with_counter_updates: usize,
+}
+
+impl IfPatternCoverage {
+    fn record(&mut self, check: Check, row: &str) {
+        let mut snapshots = row.split('\t');
+        let tree = snapshots.next().unwrap();
+        if check == Check::IfPatterns {
+            let (tree, result) = tree.rsplit_once(";if-patterns=").unwrap();
+            let (tree, before) = tree.rsplit_once(";pattern-counters-before=").unwrap();
+            let after = split_counters(tree).0.strip_prefix("counters=").unwrap();
+            let changed = result == "true";
+            self.changed_methods += usize::from(changed);
+            self.changed_with_counter_updates += usize::from(changed && before != after);
+            self.unchanged_with_counter_updates += usize::from(!changed && before != after);
+        }
+        let mut matched_conditionals = 0;
+        for field in snapshots.next().unwrap().split(';') {
+            matched_conditionals +=
+                usize::from(field.starts_with("pattern") && field.ends_with("=true"));
+            if field.starts_with('e')
+                && let Some((_, body)) = field.split_once('=')
+                && body.starts_with("PATTERN|")
+            {
+                self.record_patterns += 1;
+                if body
+                    .rsplit_once('|')
+                    .unwrap()
+                    .1
+                    .split('/')
+                    .any(|bound| !bound.is_empty() && bound != "~")
+                {
+                    self.record_bounds += 1;
+                }
+            }
+        }
+        self.matched_conditionals += matched_conditionals;
+        self.methods_with_patterns += usize::from(matched_conditionals > 0);
+    }
+
+    fn report(&self, check: Check) {
+        if check == Check::IfPatterns {
+            eprintln!(
+                "{} methods reported a pattern change. Counters advanced in {} changed methods and {} unchanged methods.",
+                self.changed_methods,
+                self.changed_with_counter_updates,
+                self.unchanged_with_counter_updates
+            );
+        }
+        eprintln!(
+            "{} methods contain {} matched conditionals and {} record patterns, with bound overrides on {} record patterns",
+            self.methods_with_patterns,
+            self.matched_conditionals,
+            self.record_patterns,
+            self.record_bounds
+        );
+    }
+}
+
 impl SecondaryComparison {
     fn record_variant(&mut self, index: usize, variant: &str) {
         let mut baseline = self.baseline[index].split('\t');
@@ -574,6 +677,7 @@ pub(super) fn check(corpus: &Corpus, check: Check) {
     let mut enhancement_coverage = EnhancementCoverage::default();
     let mut secondary_coverage = EnhancementCoverage::default();
     let mut secondary_comparison = SecondaryComparison::default();
+    let mut if_pattern_coverage = IfPatternCoverage::default();
     let methods_per_profile = methods.len() / check.profiles().len();
     for (index, method) in methods.iter().enumerate() {
         let row = java_rows
@@ -616,6 +720,9 @@ pub(super) fn check(corpus: &Corpus, check: Check) {
             secondary_coverage.record(check, method, &rust);
         } else if check.uses_loop_headers() {
             enhancement_coverage.record(check, method, &rust);
+            if check.matches_if_patterns() {
+                if_pattern_coverage.record(check, &rust);
+            }
         } else {
             let stage_size = if check == Check::Stack { 2 } else { 3 };
             let first = rust.split('\t').next().unwrap();
@@ -685,6 +792,9 @@ pub(super) fn check(corpus: &Corpus, check: Check) {
             eprintln!("With default ternary constant simplification");
         }
         enhancement_coverage.report(check);
+        if check.matches_if_patterns() {
+            if_pattern_coverage.report(check);
+        }
         if check == Check::SecondaryFunctions {
             eprintln!("With ternary constant simplification enabled");
             secondary_coverage.report(check);
@@ -880,7 +990,9 @@ fn stage(
                 | Check::LoopMerge
                 | Check::MainLoopLabels
                 | Check::SecondaryFunctions
-                | Check::PatternMatchingEntry,
+                | Check::PatternMatchingEntry
+                | Check::IfPatterns
+                | Check::SwitchEntry,
                 _,
             ) => {
                 loop {
@@ -917,10 +1029,27 @@ fn stage(
                         operation.set("merge-loops");
                         method.merge_loops(cx, class)?;
                         String::new()
-                    } else if check == Check::PatternMatchingEntry {
+                    } else if check == Check::SwitchEntry {
+                        operation.set("prepare-switches");
+                        method.prepare_switches(cx, class)?;
+                        String::new()
+                    } else if check.settles_pattern_entry() {
                         operation.set("prepare-pattern-matching");
                         method.prepare_pattern_matching(cx, class)?;
-                        String::new()
+                        if check == Check::IfPatterns {
+                            operation.set("match-if-patterns");
+                            let counters = &method.flow.counters;
+                            let before = format!(
+                                "{},{},{}",
+                                counters.get_counter(STATEMENT_COUNTER),
+                                counters.get_counter(EXPRESSION_COUNTER),
+                                counters.get_counter(VAR_COUNTER)
+                            );
+                            let changed = method.match_if_patterns(cx, class)?;
+                            format!(";pattern-counters-before={before};if-patterns={changed}")
+                        } else {
+                            String::new()
+                        }
                     } else {
                         operation.set("identify-main-loop-labels");
                         method.identify_main_loop_labels(cx, class)?;

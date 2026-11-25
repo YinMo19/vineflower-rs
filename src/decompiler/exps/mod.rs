@@ -10,6 +10,7 @@ mod increments;
 mod operations;
 mod traversal;
 
+use std::fmt;
 use std::sync::Arc;
 
 use arcstr::ArcStr;
@@ -26,8 +27,10 @@ use crate::decompiler::vars::{var_version_pair::VarVersionPair, versions::VarVer
 use crate::engine::Cx;
 use crate::engine::class_nodes::ClassKind;
 use crate::engine::counter_container::{CounterContainer, EXPRESSION_COUNTER, VAR_COUNTER};
+use crate::structs::StructClass;
 use crate::structs::attr::LocalVariable;
 use crate::structs::consts::{LinkConstant, PooledConstant};
+use crate::types::generic_main;
 use crate::types::{CodeType, FieldDescriptor, GenericType, MethodDescriptor, TypeFamily, VarType};
 
 /// `VarExprent.STACK_BASE`.
@@ -72,6 +75,7 @@ pub enum ExprKind {
         implicit_type: Option<Box<VarType>>,
         needs_cast: bool,
     },
+    Pattern(Box<Pattern>),
     New {
         new_type: VarType,
         dimensions: Box<[ExprId]>,
@@ -100,6 +104,26 @@ pub enum ExprKind {
         value: ExprId,
         case_values: Option<SwitchCaseValues>,
     },
+}
+
+/// A record pattern with bindings in declaration order.
+#[derive(Clone)]
+pub struct Pattern {
+    pub class: Arc<StructClass>,
+    pub var_type: VarType,
+    pub children: Vec<ExprId>,
+    pub bound_types: Vec<Option<VarType>>,
+}
+
+impl fmt::Debug for Pattern {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Pattern")
+            .field("class", &self.class.qualified_name)
+            .field("var_type", &self.var_type)
+            .field("children", &self.children)
+            .field("bound_types", &self.bound_types)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -176,6 +200,21 @@ impl Variable {
         } else {
             self.var_type.clone()
         }
+    }
+
+    /// `VarExprent.getInferredExprType(null)` prefers the local's generic signature.
+    pub(crate) fn inferred_expr_type(&self, cx: &Cx) -> VarType {
+        if let Some(lvt) = &self.lvt {
+            match lvt.get_signature() {
+                Some(signature) => {
+                    if let Some(descriptor) = generic_main::parse_field_signature(signature) {
+                        return descriptor.ty;
+                    }
+                }
+                None => return lvt.get_var_type(),
+            }
+        }
+        self.expr_type(cx)
     }
 }
 
@@ -389,6 +428,35 @@ impl Expr {
         )
     }
 
+    /// Allocate a record pattern after its component expressions have been built.
+    /// Each component is a variable or another record pattern.
+    pub fn record_pattern(
+        ir: &mut Ir,
+        counters: &mut CounterContainer,
+        class: Arc<StructClass>,
+        var_type: VarType,
+        children: Vec<ExprId>,
+    ) -> ExprId {
+        let id = counters.get_counter_and_increment(EXPRESSION_COUNTER);
+        assert!(
+            children
+                .iter()
+                .all(|&expr| matches!(ir[expr].kind, ExprKind::Variable(_) | ExprKind::Pattern(_))),
+            "Illegal input for PatternExprent"
+        );
+        let bound_types = vec![None; children.len()];
+        ir.exprs.push(Self {
+            id,
+            kind: ExprKind::Pattern(Box::new(Pattern {
+                class,
+                var_type,
+                children,
+                bound_types,
+            })),
+            bytecode: None,
+        })
+    }
+
     pub(crate) fn guess_int_type(value: i32, bool_permitted: bool) -> VarType {
         match value {
             0 | 1 if bool_permitted => VarType::VARTYPE_BOOLEAN,
@@ -539,6 +607,7 @@ impl Expr {
                 implicit_type,
                 ..
             } => op.expr_type(cx, operands, implicit_type.as_deref()),
+            ExprKind::Pattern(pattern) => pattern.var_type.clone(),
             ExprKind::New {
                 new_type,
                 anonymous,
@@ -623,6 +692,16 @@ impl Expr {
             } => {
                 copy_entries(cx, counters, operands);
                 *needs_cast = true;
+            }
+            ExprKind::Pattern(pattern) => {
+                copy_entries(cx, counters, &mut pattern.children);
+                return Self::record_pattern(
+                    &mut cx.ir,
+                    counters,
+                    Arc::clone(&pattern.class),
+                    pattern.var_type.clone(),
+                    std::mem::take(&mut pattern.children),
+                );
             }
             ExprKind::New {
                 new_type,

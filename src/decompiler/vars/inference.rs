@@ -70,8 +70,7 @@ fn initialize_variables(
             cx.ir[stat].kind,
             StatementKind::Catch { .. } | StatementKind::CatchAll { .. }
         );
-        let variables: Vec<_> = stat.implicitly_defined_vars(&cx.ir).collect();
-        for expr in variables {
+        for expr in stat.implicitly_defined_vars(&cx.ir) {
             let ExprKind::Variable(var) = &cx.ir[expr].kind else {
                 unreachable!("Implicit variable must be a variable expression");
             };
@@ -84,24 +83,6 @@ fn initialize_variables(
             }
         }
         statements.extend(cx.ir[stat].stats.iter().copied());
-    }
-}
-
-impl StatId {
-    fn implicitly_defined_vars(self, ir: &Ir) -> impl Iterator<Item = ExprId> + '_ {
-        let (vars, resources): (&[ExprId], &[ExprId]) = match &ir[self].kind {
-            StatementKind::Catch {
-                vars, resources, ..
-            } => (vars, resources.map_or(&[], |list| ir[list].as_slice())),
-            StatementKind::CatchAll { vars, .. } => (vars, &[]),
-            _ => (&[], &[]),
-        };
-        vars.iter().copied().chain(resources.iter().filter_map(
-            |&resource| match ir[resource].kind {
-                ExprKind::Assignment { left, .. } => Some(left),
-                _ => None,
-            },
-        ))
     }
 }
 

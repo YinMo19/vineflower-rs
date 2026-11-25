@@ -183,6 +183,12 @@ impl VarMapHolder {
         self.if_false.as_ref().unwrap_or(&self.if_true)
     }
 
+    /// Split a normal map before writing a condition's true outcome.
+    pub(super) fn true_branch_mut(&mut self) -> &mut VersionMap {
+        self.if_false.get_or_insert_with(|| self.if_true.clone());
+        &mut self.if_true
+    }
+
     pub fn normal_mut(&mut self) -> &mut VersionMap {
         assert!(self.is_normal(), "variable map is split");
         &mut self.if_true

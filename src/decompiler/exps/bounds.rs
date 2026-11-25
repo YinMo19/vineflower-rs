@@ -83,6 +83,25 @@ impl Expr {
             ExprKind::SwitchHead { value, case_values } => {
                 switch_bounds(cx, *value, case_values.as_ref(), &mut bounds);
             }
+            ExprKind::Pattern(pattern) => {
+                let components = pattern
+                    .class
+                    .get_record_components()
+                    .expect("Must not be null!");
+                assert_eq!(
+                    components.len(),
+                    pattern.children.len(),
+                    "Record component size and expr list size must be equal!"
+                );
+                for (index, (&child, component)) in
+                    pattern.children.iter().zip(components).enumerate()
+                {
+                    let ty = pattern.bound_types[index]
+                        .clone()
+                        .unwrap_or_else(|| VarType::from_signature(&component.descriptor));
+                    bounds.lower.push((child, ty));
+                }
+            }
             ExprKind::Function {
                 op,
                 operands,

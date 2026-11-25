@@ -289,6 +289,19 @@ impl Snapshot<'_> {
                 }
                 ("FUNCTION", operands)
             }
+            ExprKind::Pattern(pattern) => (
+                "PATTERN",
+                format!(
+                    "{}|{}|{}",
+                    text(Some(&pattern.class.qualified_name)),
+                    self.expressions(&pattern.children),
+                    pattern
+                        .bound_types
+                        .iter()
+                        .map(|bound| var_type(bound.as_ref()))
+                        .join("/")
+                ),
+            ),
             ExprKind::New {
                 new_type,
                 dimensions,

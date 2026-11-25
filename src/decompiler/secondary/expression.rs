@@ -162,10 +162,11 @@ impl Rewrite<'_> {
             && Expr::children(&self.cx.ir, parameter)
                 .chain([parameter])
                 .any(|child| {
-                    matches!(
-                        function(&self.cx.ir, child),
-                        Some((InstanceOf, operands)) if operands.len() > 2
-                    )
+                    matches!(self.cx.ir[child].kind, ExprKind::Pattern(_))
+                        || matches!(
+                            function(&self.cx.ir, child),
+                            Some((InstanceOf, operands)) if operands.len() > 2
+                        )
                 })
         {
             return None;

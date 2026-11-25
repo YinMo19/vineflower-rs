@@ -344,6 +344,10 @@ impl Statement {
         self.edge_view(EdgeDirection::Forward, STATEDGE_ALL)
     }
 
+    pub fn all_predecessors(&self) -> &[EdgeId] {
+        self.edge_view(EdgeDirection::Backward, STATEDGE_ALL)
+    }
+
     pub fn direct_successors(&self) -> &[EdgeId] {
         self.edge_view(EdgeDirection::Forward, STATEDGE_DIRECT_ALL)
     }

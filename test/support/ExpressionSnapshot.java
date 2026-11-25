@@ -175,6 +175,9 @@ class ExpressionSnapshot {
         type((VarType) read(FUNCTION_IMPLICIT_TYPE, function)));
       return detail.ordinal() >= Detail.SECONDARY_FUNCTIONS.ordinal() ? fields + "|" + function.doesCast() : fields;
     }
+    if (e instanceof PatternExprent pattern && pattern.getData() instanceof PatternExprent.PatternData.RecordPatternData record) {
+      return parts(text(record.cl().qualifiedName), expressions(pattern.getExprents()), types(pattern.getBoundTypes()));
+    }
     if (e instanceof NewExprent allocation) {
       return parts(type(allocation.getNewType()), expressions(allocation.getLstDims()),
         expression(allocation.getConstructor()), expressions(allocation.getLstArrayElements()),

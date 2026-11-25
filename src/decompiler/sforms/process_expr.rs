@@ -82,8 +82,16 @@ impl<A: VersionAnalysis> Transfer<'_, A> {
                 operands,
                 ..
             } => {
-                self.process(ir, operands[0], maps);
+                let operand = operands[0];
+                let pattern = (operands.len() == 3).then(|| operands[2]);
+                self.process(ir, operand, maps);
                 maps.merge_branches();
+                if let Some(pattern) = pattern {
+                    let if_true = maps.true_branch_mut();
+                    for variable in Expr::pattern_vars(ir, pattern) {
+                        self.assign(ir, variable, if_true);
+                    }
+                }
             }
             ExprKind::Field(field) => {
                 if let Some(instance) = field.instance {

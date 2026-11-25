@@ -44,6 +44,10 @@ The secondary-function comparison invokes the pass immediately after label ident
 
 The pattern-matching entry comparison runs the outer main-loop prefix from edge cleanup. A secondary-function or intersection-cast change restarts the prefix. The snapshot follows the iteration in which both passes return false and also checks intersection-cast operand order and variable flags.
 
+The `instanceof` pattern comparison starts from that entry and runs one call to the version-gated pattern pass. It checks the return value, counters on entry and exit, matched conditionals, and record patterns with ordered child expressions and optional bound overrides.
+
+The switch-entry comparison restarts at edge cleanup after each successful `instanceof` pattern pass. It compares the settled tree, expressions, variable state, counters, and fresh direct graph immediately before switch processing.
+
 ## End-to-end source and CLI suite
 
 The retained `upstream_parity` target covers final source and CLI behavior. It currently requires library and binary entry points that still await migration. Use the explicit stage targets above to test the active implementation. The commands below document the end-to-end gate once those entry points are available.

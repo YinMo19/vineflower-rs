@@ -97,6 +97,8 @@ CFG、语句图和 DirectGraph 具有不同的边契约。
 
 交叉类型转换检查方法参数的泛型上界和赋值变量在整棵树中的使用位置。合并时将具体类放在接口之前，保留各类型表达式的身份，并标记需要写成 `var` 的局部变量。次级表达式或交叉转换有改动时，`ExpressionMethod::prepare_pattern_matching` 都从边清理重新开始。两者稳定后的树是原版进入 `instanceof` 模式匹配的位置，此时变量声明仍待后续阶段确定。[交叉类型转换](src/decompiler/intersection.rs) · [方法主循环](src/engine/method_processor.rs)
 
+模式恢复先确定布尔条件在各分支上最后一个必定求值的表达式，再检查分支的唯一前驱、源表达式能否重复使用，以及绑定的局部变量在前驱中是否已经赋值。记录模式按组件访问器的顺序恢复嵌套绑定。成功后，`ExpressionMethod::prepare_switches` 从主循环的边清理重新开始；布尔条件的数据流只在匹配成功的路径引入模式变量。[条件模式](src/decompiler/patterns/mod.rs) · [记录解构](src/decompiler/patterns/record.rs) · [条件数据流](src/decompiler/sforms/process_expr.rs)
+
 `RuntimeImage::open` 将模块化 JDK 的每个模块作为独立库登记，按 JRT 的目录遍历和模块描述符顺序提供条目。普通镜像与 ZIP 压缩镜像可由现有 JImage 库读取；该库遇到 compact-cp 压缩时返回 Unsupported。[运行时类路径](src/engine/context_source/runtime.rs)
 
 `StructContext::add_file` 根据文件后缀和 ZIP 结束记录登记目录、归档或单文件。重新载入上下文时再次扫描目录及其子归档。ZIP 保留中央目录顺序和重复条目，按 Java 的规则解释多版本路径。单个 class 文件在预读内部名称和正式解析时使用同一上下文的注解表达式计数器。直接读取缺失资源或目录时，Rust 的 `ContextSource` 返回 `Ok(None)`。Java 的目录源打开这些路径时抛出 I/O 异常，ZIP 源读取缺失条目时抛出空引用异常，读取显式目录条目时返回空流。正常登记按已有条目读取类和资源。[文件登记](src/structs/struct_context.rs)

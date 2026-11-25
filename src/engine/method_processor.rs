@@ -336,6 +336,30 @@ impl ExpressionMethod {
         }
     }
 
+    /// Match instanceof bindings in the class versions supported by MethodProcessor.
+    pub fn match_if_patterns(&mut self, cx: &mut Cx, class: &StructClass) -> io::Result<bool> {
+        if cx.options.pattern_matching && class.version.has_if_pattern_matching() {
+            crate::decompiler::patterns::match_instance_of(
+                cx,
+                &mut self.flow.counters,
+                self.root,
+                class,
+            )
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Restart label and data-flow processing after each successful pattern pass.
+    pub fn prepare_switches(&mut self, cx: &mut Cx, class: &StructClass) -> io::Result<()> {
+        loop {
+            self.prepare_pattern_matching(cx, class)?;
+            if !self.match_if_patterns(cx, class)? {
+                return Ok(());
+            }
+        }
+    }
+
     pub fn simplify_string_concat(&mut self, cx: &mut Cx, class: &StructClass) -> io::Result<()> {
         if class.version.has_indy_string_concat() {
             crate::decompiler::concat::simplify(cx, &mut self.flow.counters, self.root)?;
