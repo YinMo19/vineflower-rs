@@ -42,6 +42,11 @@ pub struct Expr {
 
 #[derive(Clone, Debug)]
 pub enum ExprKind {
+    Assert {
+        /// A missing condition is the representation of `assert false`.
+        condition: Option<ExprId>,
+        message: Option<ExprId>,
+    },
     Constant {
         value: ConstantValue,
         var_type: VarType,
@@ -448,7 +453,7 @@ impl Expr {
         )
     }
 
-    /// `Exprent.getExprType` before type inference and variable versioning.
+    /// `Exprent.getExprType`, including a local's method-specific inferred type.
     pub fn expr_type(cx: &Cx, expr: ExprId) -> VarType {
         match &cx.ir[expr].kind {
             ExprKind::Constant { var_type, .. } => var_type.clone(),
@@ -491,9 +496,10 @@ impl Expr {
                 }
             }
             ExprKind::SwitchHead { value, .. } => Self::expr_type(cx, *value),
-            ExprKind::If { .. } | ExprKind::Exit { .. } | ExprKind::Monitor { .. } => {
-                VarType::VARTYPE_VOID
-            }
+            ExprKind::Assert { .. }
+            | ExprKind::If { .. }
+            | ExprKind::Exit { .. }
+            | ExprKind::Monitor { .. } => VarType::VARTYPE_VOID,
         }
     }
 
@@ -502,9 +508,11 @@ impl Expr {
     /// retain their original values.
     pub fn copy(cx: &mut Cx, counters: &mut CounterContainer, expr: ExprId) -> ExprId {
         let mut kind = cx.ir[expr].kind.clone();
-        let bytecode = cx.ir[expr].bytecode.clone();
+        let mut bytecode = cx.ir[expr].bytecode.clone();
         let mut id = None;
         match &mut kind {
+            // AssertExprent copies its parameter list, retaining the child identities.
+            ExprKind::Assert { .. } => bytecode = None,
             ExprKind::Constant {
                 value,
                 var_type,

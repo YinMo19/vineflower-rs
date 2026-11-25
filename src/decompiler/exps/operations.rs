@@ -162,6 +162,10 @@ impl Expr {
             }
         };
         match &mut ir[parent].kind {
+            ExprKind::Assert { condition, message } => {
+                replace_optional(condition);
+                replace_optional(message);
+            }
             ExprKind::Constant { .. } | ExprKind::Variable(_) => {}
             ExprKind::Assignment { left, right, .. } => {
                 replace(left);

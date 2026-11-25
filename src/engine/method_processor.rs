@@ -1,7 +1,7 @@
 // Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Method stages of `MethodProcessor.codeToJava` through stack simplification.
+//! Method stages of `MethodProcessor.codeToJava` leading up to its main loop.
 //!
 //! The language-independent stages end immediately before upstream dispatches
 //! to a language's CFG passes. Java then prepares exception regions for
@@ -251,6 +251,25 @@ pub struct ExpressionMethod {
 }
 
 impl ExpressionMethod {
+    pub fn simplify_string_concat(&mut self, cx: &mut Cx, class: &StructClass) -> io::Result<()> {
+        if class.version.has_indy_string_concat() {
+            crate::decompiler::concat::simplify(cx, &mut self.flow.counters, self.root)?;
+        }
+        Ok(())
+    }
+
+    pub fn build_assertions(&mut self, cx: &mut Cx, class: &StructClass) -> io::Result<bool> {
+        crate::decompiler::assertions::build(cx, &mut self.flow.counters, self.root, class)
+    }
+
+    /// Native Java passes before the BEFORE_MAIN plugin location.
+    pub fn prepare_main_loop(&mut self, cx: &mut Cx, class: &StructClass) -> io::Result<()> {
+        self.process_increments(cx, class)?;
+        self.simplify_string_concat(cx, class)?;
+        self.build_assertions(cx, class)?;
+        Ok(())
+    }
+
     pub fn set_var_versions(&mut self, cx: &mut Cx, class: &StructClass) -> io::Result<()> {
         crate::decompiler::vars::versions::set_versions(
             cx,
@@ -335,4 +354,17 @@ pub fn expression_method(
         .recover_finally(cx, class)?
         .into_expressions(cx, class)
         .map(Some)
+}
+
+/// Processes a method with code up to the Java BEFORE_MAIN pass location.
+pub fn pre_main_method(
+    cx: &mut Cx,
+    class: &StructClass,
+    method: &Arc<StructMethod>,
+) -> io::Result<Option<ExpressionMethod>> {
+    let Some(mut result) = expression_method(cx, class, method)? else {
+        return Ok(None);
+    };
+    result.prepare_main_loop(cx, class)?;
+    Ok(Some(result))
 }

@@ -61,6 +61,7 @@ pub enum FunctionType {
     Le,
     BoolAnd,
     BoolOr,
+    StrConcat,
 }
 
 impl FunctionType {
@@ -87,6 +88,7 @@ impl FunctionType {
         use FunctionType::*;
         let operand_type = |index: usize| Expr::expr_type(cx, operands[index]);
         match self {
+            StrConcat => VarType::VARTYPE_STRING,
             L2i | F2i | D2i | ArrayLength => VarType::VARTYPE_INT,
             I2l | F2l | D2l => VarType::VARTYPE_LONG,
             I2f | L2f | D2f => VarType::VARTYPE_FLOAT,

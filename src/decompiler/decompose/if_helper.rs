@@ -6,16 +6,15 @@
 use rustc_hash::FxHashSet;
 
 use super::finish::first_successor;
-use crate::code::code_constants::ACC_INTERFACE;
+use crate::decompiler::assertions::assertion_field;
 use crate::decompiler::exps::{Expr, ExprKind, FunctionType};
 use crate::decompiler::ir::{EdgeId, ExprId, Ir, StatId};
 use crate::decompiler::stats::stat_edge::{EdgeType, StatEdge};
 use crate::decompiler::stats::{
     IfStatement, STATEDGE_ALL, STATEDGE_DIRECT_ALL, Statement, StatementKind,
 };
-use crate::engine::class_nodes::ClassKind;
 use crate::engine::{Cx, counter_container::CounterContainer};
-use crate::structs::{StructClass, StructMember};
+use crate::structs::StructClass;
 
 pub fn merge_ifs(
     cx: &mut Cx,
@@ -712,47 +711,7 @@ fn exists_path(ir: &Ir, from: StatId, to: StatId) -> bool {
 }
 
 fn has_assert_field(cx: &Cx, class: &StructClass, expr: ExprId) -> bool {
-    let clinit = "<clinit> ()V";
-    let mut holder = class;
-    let classes = &cx.class_nodes;
-    if class.has_modifier(ACC_INTERFACE)
-        && let Some(current) = classes.id(&class.qualified_name)
-    {
-        let mut root = current;
-        while classes[root].kind != ClassKind::Root {
-            root = classes[root]
-                .parent
-                .expect("Nested class has no enclosing root");
-        }
-        let order = classes.wrapper_order(root);
-        let initialized = order
-            .iter()
-            .position(|&node| node == current)
-            .map_or(&[][..], |index| &order[..index]);
-
-        for &nested in &classes[root].nested {
-            let Some(wrapper) = classes.wrapper_owner(nested) else {
-                continue;
-            };
-            if !initialized.contains(&wrapper) {
-                continue;
-            }
-            let candidate = classes[wrapper].class.as_ref();
-            if candidate.is_synthetic()
-                && candidate
-                    .method_properties(clinit)
-                    .is_some_and(|props| props.assert_field.is_some())
-            {
-                holder = candidate;
-                break;
-            }
-        }
-    }
-
-    let Some(field) = holder
-        .method_properties(clinit)
-        .and_then(|props| props.assert_field.as_ref())
-    else {
+    let Some((holder, field)) = assertion_field(cx, class) else {
         return false;
     };
     Expr::all_exprents(&cx.ir, expr, true, true)

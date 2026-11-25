@@ -111,6 +111,13 @@ impl StatId {
         recognize::on_node_collapse(ir, counters, stat);
     }
 
+    pub fn replace_with(self, ir: &mut Ir, replacement: StatId) {
+        ir[self]
+            .parent
+            .expect("Cannot replace a statement without a parent")
+            .replace_statement(ir, self, replacement);
+    }
+
     pub fn replace_statement(self, ir: &mut Ir, old: StatId, new: StatId) {
         let index = ir[self].stats.get_index_by_key(&ir[old].id);
         for edge in old.get_predecessor_edges(ir, STATEDGE_ALL) {

@@ -57,8 +57,14 @@ class StructureReference {
     new Fernflower(null, Map.of(IFernflowerPreferences.INCLUDE_JAVA_RUNTIME, "0"), IFernflowerLogger.NO_OP);
     try (var input = new DataInputStream(new BufferedInputStream(Files.newInputStream(Path.of(args[0]))))) {
       int phase = input.readUnsignedByte();
-      StackSnapshot.Context stackContext = phase == 3 || phase == 4
-        ? new StackSnapshot.Context(readStackGroups(input), phase == 4) : null;
+      StackSnapshot.Check stackCheck = switch (phase) {
+        case 3 -> StackSnapshot.Check.STACK;
+        case 4 -> StackSnapshot.Check.INCREMENTS;
+        case 5 -> StackSnapshot.Check.PRE_MAIN;
+        default -> null;
+      };
+      StackSnapshot.Context stackContext = stackCheck == null ? null
+        : new StackSnapshot.Context(readStackGroups(input), stackCheck);
       Path previousPath = null;
       Options previousOptions = null;
       StructClass currentClass = null;
@@ -72,8 +78,9 @@ class StructureReference {
           boolean simplify = input.readBoolean();
           boolean ternary = input.readBoolean();
           boolean booleanAsInt = input.readBoolean();
+          boolean assertions = input.readBoolean();
           String classname = readText(input);
-          var stackOptions = new StackSnapshot.Options(group, simplify, ternary, options.useLvtNames(), booleanAsInt);
+          var stackOptions = new StackSnapshot.Options(group, simplify, ternary, options.useLvtNames(), booleanAsInt, assertions);
           String snapshot = stackContext.run(input, stackOptions, classname, name, descriptor, StructureReference::snapshot);
           System.out.println(index + "\t" + snapshot);
           continue;

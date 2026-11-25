@@ -83,7 +83,9 @@ CFG、语句图和 DirectGraph 具有不同的边契约。
 
 [`ExpressionMethod::set_var_versions`](src/decompiler/vars/versions.rs) 重新建立 SSA，把每组连通的 phi 版本归并到最小版本，再按 DirectGraph 普通边的广度优先顺序传播类型上下界。参数、异常变量、调试信息和各类表达式提供约束。只有已有下界上升时才重启本轮。收敛后根据变量槽与版本分配新编号。每个变量持有其方法类型表的句柄，整类处理中可同时查询多个方法里使用相同槽号的变量。
 
-`ExpressionMethod::process_increments` 按上游顺序运行栈简化、类型推断和自增识别。识别成功时，下一轮把新编号经上一轮的映射追溯到原始槽。稳定后才尝试将块末的前缀自增移入后继 if 的条件。后续循环恢复还会引入 `for` 的初始化、条件和增量列表，届时再次执行栈简化需要处理这些列表为空时的循环降级。方法主循环、整类写出与 CLI 的端到端验证仍待接入。
+`ExpressionMethod::process_increments` 按上游顺序运行栈简化、类型推断和自增识别。识别成功时，下一轮把新编号经上一轮的映射追溯到原始槽。稳定后才尝试将块末的前缀自增移入后继 if 的条件。
+
+[`pre_main_method`](src/engine/method_processor.rs) 接着按 class 版本处理字符串拼接，再恢复断言，到达 `BEFORE_MAIN`。拼接识别器从调用和 bootstrap recipe 收集有序操作数，按 UTF-16 单元保留常量片段，再构建左结合的字符串表达式。断言恢复根据类初始化字节码记录的字段识别保护条件，保留条件与消息的求值位置。接口可引用同一根类下已初始化 wrapper 的合成持有类。方法主循环、类级写出和 CLI 的端到端验证仍待接入。[字符串拼接](src/decompiler/concat.rs) · [断言恢复](src/decompiler/assertions.rs)
 
 同步区扩展有一处有意的终止条件。当共享后继的首个前驱来自另一保护区，上游可能反复向已覆盖的区间追加同一块。如果本轮既不会新增覆盖关系、也不会增加异常边或移动指令，Rust 跳过这个候选，继续检查其他区间。
 

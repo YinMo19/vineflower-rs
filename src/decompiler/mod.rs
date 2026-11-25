@@ -3,6 +3,8 @@
 //! Upstream's `modules.decompiler` packages: the statement and expression IR
 //! and the passes that turn a control-flow graph into structured source.
 
+pub(crate) mod assertions;
+pub(crate) mod concat;
 pub mod decompose;
 pub mod expr_processor;
 pub mod exps;

@@ -88,7 +88,8 @@ impl Expr {
             } => {
                 function_bounds(cx, *op, operands, implicit_type.as_deref(), &mut bounds);
             }
-            ExprKind::Constant { .. }
+            ExprKind::Assert { .. }
+            | ExprKind::Constant { .. }
             | ExprKind::Field(_)
             | ExprKind::Exit { .. }
             | ExprKind::Monitor { .. }
@@ -199,6 +200,15 @@ fn function_bounds(
     let first_type = Expr::expr_type(cx, first);
     let second_type = operands.get(1).map(|&second| Expr::expr_type(cx, second));
     match op {
+        StrConcat => {
+            let ty = implicit_type.cloned().unwrap_or(VarType::VARTYPE_STRING);
+            if first_type.type_family == ty.type_family {
+                bounds.lower.push((first, ty.clone()));
+            }
+            if second_type.unwrap().type_family == ty.type_family {
+                bounds.lower.push((operands[1], ty));
+            }
+        }
         Ternary => {
             let supertype = op.expr_type(cx, operands, implicit_type);
             let bottom = VarType::find_family_bottom(supertype.type_family);

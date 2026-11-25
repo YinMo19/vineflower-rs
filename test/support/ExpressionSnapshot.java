@@ -32,6 +32,7 @@ class ExpressionSnapshot {
   private static final Field FIELD_QUALIFIED = field(FieldExprent.class, "forceQualified");
   private static final Field INVOCATION_LAZY_CONDY = field(InvocationExprent.class, "wasLazyCondy");
   private static final Field FUNCTION_IMPLICIT_TYPE = field(FunctionExprent.class, "implicitType");
+  private static final Field ASSERT_PARAMETERS = field(AssertExprent.class, "parameters");
 
   // Record shared nodes once and keep references by the upstream expression ID.
   private final Map<Integer, Exprent> nodes = new TreeMap<>();
@@ -151,6 +152,11 @@ class ExpressionSnapshot {
     if (e instanceof ExitExprent exit) {
       return parts(exit.getExitType().name(), expression(exit.getValue()), type(exit.getRetType()),
         descriptor(exit.getMethodDescriptor()));
+    }
+    if (e instanceof AssertExprent assertion) {
+      List<?> parameters = (List<?>) read(ASSERT_PARAMETERS, assertion);
+      return parts(expression((Exprent) parameters.get(0)),
+        expression(parameters.size() > 1 ? (Exprent) parameters.get(1) : null));
     }
     if (e instanceof MonitorExprent monitor) {
       return parts(monitor.getMonType().name(), expression(monitor.getValue()), monitor.isRemovable());

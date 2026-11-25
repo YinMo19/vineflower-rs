@@ -1,6 +1,6 @@
 # Testing the current port
 
-The active method pipeline runs through finally recovery, expression lifting, stack-variable simplification, variable type inference and increment recovery. Intermediate entry points expose statement decomposition and the SSA and SSAU passes used during finally recovery and inlining. Run the checks against the checked-in class files with
+The active method pipeline runs through finally recovery, expression lifting, stack-variable simplification, variable type inference, increment recovery, string concatenation and assertions. Intermediate entry points expose statement decomposition and the SSA and SSAU passes used during finally recovery and inlining. Run the checks against the checked-in class files with
 
 ```sh
 cargo test --locked --test control_flow --test structured_flow
@@ -29,6 +29,8 @@ The finally comparison runs both the default and forced-semaphore paths, startin
 The stack comparison prepares the owning classes with the inputs from their compilation group. From identical CFGs it compares the tree and expressions at two points, after the first set of local rewrites reaches a fixed point and after the entire stack-variable pass. The snapshots include expression identity, evaluation order, bytecode offsets, effective and stored types, debug locals, array-initializer and capture flags. Both runs start with the same set of hidden class members and compare changes to that set. The comparison runs with the upstream defaults, with cross-stack simplification disabled, and with ternary conditions in `if` disabled.
 
 The variable comparison checks the first assignment of source variable indices and the fixed point after increment recovery. It compares the lower and upper type bounds, explicit null upper bounds, finality, original slot provenance, expression IDs, effective types and counters. The three profiles exercise default behavior, disabled debug variable names and disabled integer treatment of boolean constants. A JDK-free check also queries two constructors sharing an IR arena and slot zero.
+
+The pre-main comparison runs the full increment fixed point, then checks the method after string concatenation and again after assertion recovery. It compares the tree, expressions, variable state, root flags and comments, hidden class members and the return value of assertion recovery. The two profiles use default options and disabled assertions. A checked-in Java 19 class also exercises the public method entry point and the operand order of dynamic string concatenation without a JDK.
 
 ## End-to-end source and CLI suite
 

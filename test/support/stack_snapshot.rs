@@ -13,6 +13,7 @@ use itertools::Itertools;
 use rustc_hash::FxHashSet;
 use vineflower_rs::decompiler::sforms::split_ssa;
 use vineflower_rs::decompiler::stack::simplify_statement;
+use vineflower_rs::decompiler::stats::StatementKind;
 use vineflower_rs::decompiler::vars::versions::{FinalType, VarVersions};
 use vineflower_rs::engine::class_nodes::{ClassNodeId, load_classes};
 use vineflower_rs::engine::class_processor::prepare_class;
@@ -33,6 +34,7 @@ use super::{
 pub(super) enum Check {
     Stack = 3,
     Increments = 4,
+    PreMain = 5,
 }
 
 #[derive(Clone, Copy)]
@@ -41,6 +43,7 @@ struct Profile {
     ternary: bool,
     lvt: bool,
     boolean_as_int: bool,
+    assertions: bool,
 }
 
 const DEFAULT: Profile = Profile {
@@ -48,6 +51,7 @@ const DEFAULT: Profile = Profile {
     ternary: true,
     lvt: true,
     boolean_as_int: true,
+    assertions: true,
 };
 
 const STACK_PROFILES: &[Profile] = &[
@@ -74,6 +78,14 @@ const INCREMENT_PROFILES: &[Profile] = &[
     },
 ];
 
+const PRE_MAIN_PROFILES: &[Profile] = &[
+    DEFAULT,
+    Profile {
+        assertions: false,
+        ..DEFAULT
+    },
+];
+
 const STACK_STAGES: &[(&str, &str)] = &[
     ("First stack simplification structure", "counters="),
     ("First stack simplification expressions", "counters="),
@@ -90,11 +102,21 @@ const INCREMENT_STAGES: &[(&str, &str)] = &[
     ("Settled variable versions", "versions="),
 ];
 
+const PRE_MAIN_STAGES: &[(&str, &str)] = &[
+    ("Concat structure", "counters="),
+    ("Concat expressions", "counters="),
+    ("Concat variable versions and assertion result", "versions="),
+    ("Before main structure", "counters="),
+    ("Before main expressions", "counters="),
+    ("Before main variable versions", "versions="),
+];
+
 impl Check {
     fn profiles(self) -> &'static [Profile] {
         match self {
             Self::Stack => STACK_PROFILES,
             Self::Increments => INCREMENT_PROFILES,
+            Self::PreMain => PRE_MAIN_PROFILES,
         }
     }
 
@@ -102,6 +124,7 @@ impl Check {
         match self {
             Self::Stack => STACK_STAGES,
             Self::Increments => INCREMENT_STAGES,
+            Self::PreMain => PRE_MAIN_STAGES,
         }
     }
 
@@ -109,6 +132,7 @@ impl Check {
         match self {
             Self::Stack => "stack",
             Self::Increments => "increments",
+            Self::PreMain => "pre-main",
         }
     }
 }
@@ -183,6 +207,8 @@ pub(super) fn check(corpus: &Corpus, check: Check) {
     let mut hidden_changes = [0, 0];
     let mut repeats = 0;
     let mut changed_original = 0;
+    let mut concats = 0;
+    let mut assertion_changes = 0;
     for (index, method) in methods.iter().enumerate() {
         let row = java_rows
             .next()
@@ -228,6 +254,12 @@ pub(super) fn check(corpus: &Corpus, check: Check) {
                     );
                 }
             }
+            if check == Check::PreMain {
+                let mut first = rust.split('\t').skip(1);
+                concats += usize::from(first.next().unwrap().contains("|STR_CONCAT|"));
+                assertion_changes +=
+                    usize::from(first.next().unwrap().ends_with(";assert-changed=true"));
+            }
         }
     }
     assert!(java_rows.next().is_none() && rust_rows.next().is_none());
@@ -257,6 +289,11 @@ pub(super) fn check(corpus: &Corpus, check: Check) {
             "{repeats} first passes scheduled another iteration, with {changed_original} changed original variable maps"
         );
     }
+    if check == Check::PreMain {
+        eprintln!(
+            "{concats} concat checkpoints contain string concatenation; {assertion_changes} assertion passes changed their tree"
+        );
+    }
 }
 
 fn write_group(
@@ -273,6 +310,7 @@ fn write_group(
     options.ternary_in_if = profile.ternary;
     options.use_lvt_names = profile.lvt;
     options.boolean_as_int = profile.boolean_as_int;
+    options.decompile_assert = profile.assertions;
     let options = Arc::new(options);
     let mut context = StructContext::new(Arc::clone(&options), None);
     for fixture in group {
@@ -326,6 +364,7 @@ fn write_group(
             write_flag(input, profile.simplify).unwrap();
             write_flag(input, profile.ternary).unwrap();
             write_flag(input, profile.boolean_as_int).unwrap();
+            write_flag(input, profile.assertions).unwrap();
             write_text(input, &fixture.name).unwrap();
             write_cfg(input, &cx.ir, &initial.flow.graph).unwrap();
 
@@ -335,12 +374,13 @@ fn write_group(
             };
             writeln!(snapshots, "{snapshot}").unwrap();
             methods.push(format!(
-                "{} {method} simplify-stack={} ternary-in-if={} lvt={} boolean-as-int={}",
+                "{} {method} simplify-stack={} ternary-in-if={} lvt={} boolean-as-int={} assertions={}",
                 fixture.path.display(),
                 profile.simplify,
                 profile.ternary,
                 profile.lvt,
-                profile.boolean_as_int
+                profile.boolean_as_int,
+                profile.assertions,
             ));
         }
     }
@@ -389,45 +429,73 @@ fn stage(
         operation.set("lift");
         let mut method = recovered.into_expressions(cx, class)?;
         operation.set("simplify-stack");
-        if check == Check::Increments {
-            if first {
+        match (check, first) {
+            (Check::Increments, true) => {
                 method.simplify_stack_vars(cx, class);
                 operation.set("set-var-versions");
                 method.set_var_versions(cx, class)?;
-            } else {
+            }
+            (Check::Increments, false) | (Check::PreMain, true) => {
                 operation.set("process-increments");
                 method.process_increments(cx, class)?;
+                if check == Check::PreMain {
+                    operation.set("simplify-concat");
+                    method.simplify_string_concat(cx, class)?;
+                }
             }
-        } else if first {
-            let owner = Arc::clone(method.root.method(&cx.ir));
-            let ssa = split_ssa(&mut cx.ir, method.root, &owner);
-            let mut reordered = FxHashSet::default();
-            while simplify_statement(
-                cx,
-                &mut method.flow.counters,
-                method.root,
-                &mut reordered,
-                &ssa,
-                class,
-                true,
-            ) {}
-        } else {
-            method.simplify_stack_vars(cx, class);
+            (Check::PreMain, false) => {
+                operation.set("prepare-main-loop");
+                method.prepare_main_loop(cx, class)?;
+            }
+            (Check::Stack, true) => {
+                let owner = Arc::clone(method.root.method(&cx.ir));
+                let ssa = split_ssa(&mut cx.ir, method.root, &owner);
+                let mut reordered = FxHashSet::default();
+                while simplify_statement(
+                    cx,
+                    &mut method.flow.counters,
+                    method.root,
+                    &mut reordered,
+                    &ssa,
+                    class,
+                    true,
+                ) {}
+            }
+            (Check::Stack, false) => method.simplify_stack_vars(cx, class),
         }
         operation.set("snapshot");
-        let tree = structure_snapshot(cx, method.root, &method.flow.counters);
+        let mut tree = structure_snapshot(cx, method.root, &method.flow.counters);
+        if check == Check::PreMain {
+            let StatementKind::Root { content_flags, .. } = &cx.ir[method.root].kind else {
+                unreachable!()
+            };
+            write!(
+                tree,
+                ";content={},{},{}",
+                content_flags.has_try_catch, content_flags.has_loops, content_flags.has_switch,
+            )
+            .unwrap();
+        }
         let hidden = &cx.class_nodes[owner].hidden_members;
         let all_members = hidden_members(hidden.iter());
         let added = hidden_members(hidden.difference(initial_hidden));
         let expressions = expression_snapshot::snapshot(cx, method.root, &method.flow.counters);
         let mut snapshot =
             format!("{tree};hidden={all_members};hidden-added={added}\t{expressions}");
-        if check == Check::Increments {
+        if check != Check::Stack {
             let versions = variable_snapshot(&cx.ir[method.flow.variables]);
             write!(snapshot, "\t{versions}").unwrap();
-            if first {
+            if check == Check::Increments && first {
                 operation.set("find-increments");
                 write!(snapshot, ";repeat={}", method.find_increments(cx)).unwrap();
+            } else if check == Check::PreMain && first {
+                operation.set("build-assertions");
+                write!(
+                    snapshot,
+                    ";assert-changed={}",
+                    method.build_assertions(cx, class)?
+                )
+                .unwrap();
             }
         }
         Ok::<_, io::Error>(snapshot)
@@ -451,10 +519,10 @@ fn stage(
 }
 
 fn stage_error(check: Check, operation: &str, kind: &str, message: &str) -> String {
-    if check == Check::Increments {
-        format!("increments-{operation}-{kind}={message}")
-    } else {
+    if check == Check::Stack {
         format!("stack-{kind}={message}")
+    } else {
+        format!("{}-{operation}-{kind}={message}", check.name())
     }
 }
 

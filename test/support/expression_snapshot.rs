@@ -268,6 +268,14 @@ impl Snapshot<'_> {
                     descriptor(method_descriptor)
                 ),
             ),
+            ExprKind::Assert { condition, message } => (
+                "ASSERT",
+                format!(
+                    "{}|{}",
+                    self.expression(*condition),
+                    self.expression(*message)
+                ),
+            ),
             ExprKind::Monitor {
                 kind,
                 value,
@@ -318,6 +326,7 @@ fn function_name(op: FunctionType) -> String {
         FunctionType::BoolNot => "BOOL_NOT".into(),
         FunctionType::BoolAnd => "BOOLEAN_AND".into(),
         FunctionType::BoolOr => "BOOLEAN_OR".into(),
+        FunctionType::StrConcat => "STR_CONCAT".into(),
         _ => enum_name(op),
     }
 }

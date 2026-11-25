@@ -264,6 +264,7 @@ impl Rule {
                     (Self::Type(name), kind) => matches!(
                         (*name, kind),
                         ("array", ExprKind::Array { .. })
+                            | ("assert", ExprKind::Assert { .. })
                             | ("assignment", ExprKind::Assignment { .. })
                             | ("constant", ExprKind::Constant { .. })
                             | ("exit", ExprKind::Exit { .. })

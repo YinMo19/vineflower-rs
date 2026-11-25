@@ -272,6 +272,52 @@ fn inferred_receiver_types_follow_their_own_methods() {
 }
 
 #[test]
+fn pre_main_recovers_the_order_of_dynamic_string_concatenation() {
+    use vineflower_rs::decompiler::exps::FunctionType;
+    use vineflower_rs::engine::method_processor::pre_main_method;
+
+    let options = Arc::new(Options::default());
+    let class = parse_class(
+        include_bytes!("upstream/testData/classes/custom/TestStringConcatJ19.class"),
+        &options,
+    )
+    .unwrap();
+    let mut cx = make_context(&options);
+    let descriptor = "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Number;)Ljava/lang/String;";
+    let method = class.get_method("test", descriptor).unwrap();
+    let result = pre_main_method(&mut cx, &class, method).unwrap().unwrap();
+    let head = result.root.get_basic_head(&cx.ir);
+    let [ret] = cx.ir[cx.ir[head].exprents.unwrap()][..] else {
+        panic!("expected one return")
+    };
+    let ExprKind::Exit {
+        value: Some(sum), ..
+    } = cx.ir[ret].kind
+    else {
+        panic!("expected a return value")
+    };
+    let operands = |id: ExprId| match &cx.ir[id].kind {
+        ExprKind::Function {
+            op: FunctionType::StrConcat,
+            operands,
+            ..
+        } => operands.as_slice(),
+        expr => panic!("expected string concatenation, got {expr:?}"),
+    };
+    let &[prefix, last] = operands(sum) else {
+        panic!("expected binary concatenation")
+    };
+    let &[first, second] = operands(prefix) else {
+        panic!("expected binary concatenation")
+    };
+    let slots = [first, second, last].map(|id| match &cx.ir[id].kind {
+        ExprKind::Variable(var) => var.index,
+        expr => panic!("expected a method argument, got {expr:?}"),
+    });
+    assert_eq!(slots, [1, 2, 3]);
+}
+
+#[test]
 fn expression_method_recovers_finally_around_a_synchronized_body() {
     use vineflower_rs::engine::method_processor::expression_method;
 
@@ -350,6 +396,15 @@ fn variable_versions_and_increments_match_upstream() {
     stack_snapshot::check(
         &upstream_reference::Corpus::discover(),
         stack_snapshot::Check::Increments,
+    );
+}
+
+#[test]
+#[ignore = "requires the upstream +local.jar and JDK 17 or later"]
+fn pre_main_matches_upstream() {
+    stack_snapshot::check(
+        &upstream_reference::Corpus::discover(),
+        stack_snapshot::Check::PreMain,
     );
 }
 

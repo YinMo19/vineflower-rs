@@ -13,6 +13,7 @@ impl Expr {
     /// Aliased expressions are yielded at each position where they occur.
     pub fn children(ir: &Ir, expr: ExprId) -> impl Iterator<Item = ExprId> + '_ {
         let (leading, lists): ([Option<ExprId>; 2], [&[ExprId]; 2]) = match &ir[expr].kind {
+            ExprKind::Assert { condition, message } => ([*condition, *message], [&[], &[]]),
             ExprKind::Constant { .. } | ExprKind::Variable(_) => ([None, None], [&[], &[]]),
             ExprKind::Assignment { left, right, .. } => ([Some(*left), Some(*right)], [&[], &[]]),
             ExprKind::Array { array, index, .. } => ([Some(*array), Some(*index)], [&[], &[]]),
