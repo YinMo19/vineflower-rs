@@ -7,6 +7,10 @@
 use std::io;
 use std::sync::Arc;
 
+mod runtime;
+
+pub use runtime::RuntimeImage;
+
 /// The file extension for class files.
 pub const CLASS_SUFFIX: &str = ".class";
 

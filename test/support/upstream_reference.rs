@@ -87,6 +87,23 @@ fn jdk_tool(name: &str) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(name))
 }
 
+#[allow(
+    dead_code,
+    reason = "some stage tests use the runtime library"
+)]
+pub fn jdk_home() -> PathBuf {
+    if let Some(home) = env::var_os("JAVA_HOME") {
+        return PathBuf::from(home);
+    }
+    let output =
+        run(Command::new(jdk_tool("java")).args(["-XshowSettings:properties", "-version"]));
+    String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("java.home = "))
+        .map(PathBuf::from)
+        .expect("Java reported no java.home")
+}
+
 fn run(command: &mut Command) -> Output {
     let output = command
         .output()

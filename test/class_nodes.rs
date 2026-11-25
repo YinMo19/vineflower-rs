@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{fmt::Display, io::Write, sync::Arc};
+use std::{env, fmt::Display, fs, io::Write, path::Path, process::Command, sync::Arc};
 
 #[path = "support/lambda_nodes.rs"]
 mod lambda_nodes;
@@ -11,11 +11,128 @@ use vineflower_rs::decompiler::exps::Expr;
 use vineflower_rs::engine::{
     Cx, Options,
     class_nodes::{ClassKind, ClassNodeId, load_classes},
+    context_source::{ContextSource, RuntimeImage},
     counter_container::CounterContainer,
     import_collector::{ImportCollector, get_short_name_in_class_context},
 };
 use vineflower_rs::structs::{StructContext, single_file_context_source::SingleFileContextSource};
 use vineflower_rs::types::VarType;
+
+#[test]
+#[ignore = "requires a modular JDK 17 or later"]
+fn runtime_image_entries_and_lookup_match_jrt() {
+    let java_home = upstream_reference::jdk_home();
+    let java_tool = |name| {
+        java_home
+            .join("bin")
+            .join(format!("{name}{}", env::consts::EXE_SUFFIX))
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    let reference =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("test/support/RuntimeImageReference.java");
+    let compilation = Command::new(java_tool("javac"))
+        .args(["-d"])
+        .arg(scratch.path())
+        .arg(reference)
+        .output()
+        .unwrap();
+    assert!(
+        compilation.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compilation.stderr)
+    );
+    // Running a separately compiled class keeps the compiler's earlier
+    // resource reads out of the JRT filesystem traversal.
+    let reference = Command::new(java_tool("java"))
+        .arg("-cp")
+        .arg(scratch.path())
+        .arg("RuntimeImageReference")
+        .arg(&java_home)
+        .arg(scratch.path())
+        .output()
+        .unwrap();
+    assert!(
+        reference.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reference.stderr)
+    );
+    let reference = String::from_utf8(reference.stdout).unwrap();
+    let runtime = Arc::new(RuntimeImage::open(&java_home).unwrap());
+    let children = runtime.get_entries();
+    assert!(children.classes.is_empty());
+    assert!(children.directories.is_empty());
+    assert!(children.others.is_empty());
+    assert_eq!(runtime.get_input_stream("module-info.class").unwrap(), None);
+
+    let mut expected = reference.lines();
+    for module in &children.child_contexts {
+        let name = module.get_name();
+        assert_eq!(
+            expected.next(),
+            Some(format!("module\t{}", name.strip_prefix("module ").unwrap()).as_str())
+        );
+        let entries = module.get_entries();
+        assert!(entries.child_contexts.is_empty());
+        for class in entries.classes {
+            assert_eq!(
+                expected.next(),
+                Some(format!("class\t{}", class.path()).as_str())
+            );
+        }
+        for dir in entries.directories {
+            assert_eq!(expected.next(), Some(format!("dir\t{dir}").as_str()));
+        }
+        for entry in entries.others {
+            assert_eq!(
+                expected.next(),
+                Some(format!("other\t{}", entry.path()).as_str())
+            );
+        }
+    }
+    assert_eq!(expected.next(), None);
+
+    let base = &children.child_contexts[0];
+    let resource = base
+        .get_input_stream("java/util/currency.data")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        resource,
+        fs::read(scratch.path().join("currency.data")).unwrap()
+    );
+    assert_eq!(base.get_input_stream("java/util").unwrap(), None);
+    assert_eq!(base.get_input_stream("no-such-resource").unwrap(), None);
+
+    let iterator = "java/util/ListIterator";
+    let own_file = scratch.path().join("ListIterator.class");
+    assert_eq!(
+        base.get_class_bytes(iterator).unwrap().unwrap(),
+        fs::read(&own_file).unwrap()
+    );
+    let options = Arc::new(Options::default());
+    let mut context = StructContext::new(Arc::clone(&options), None);
+    context.add_space(runtime.clone(), false);
+    assert!(!context.get_class(iterator).unwrap().own);
+    assert!(context.instance_of(iterator, "java/util/Iterator"));
+    let descriptor = context.get_class("module-info").unwrap();
+    assert_eq!(
+        descriptor.attributes.module.as_ref().unwrap().module_name,
+        "java.base"
+    );
+
+    let own = Arc::new(SingleFileContextSource::open(&own_file, &options, None).unwrap());
+    for own_first in [true, false] {
+        let mut context = StructContext::new(Arc::clone(&options), None);
+        if own_first {
+            context.add_space(own.clone(), true);
+            context.add_space(runtime.clone(), false);
+        } else {
+            context.add_space(runtime.clone(), false);
+            context.add_space(own.clone(), true);
+        }
+        assert!(context.get_class(iterator).unwrap().own);
+    }
+}
 
 #[test]
 #[ignore = "requires the upstream +local.jar and JDK 17 or later"]
