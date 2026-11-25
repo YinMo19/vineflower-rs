@@ -13,7 +13,7 @@ use itertools::Itertools;
 use vineflower_rs::code::cfg::ControlFlowGraph;
 use vineflower_rs::decompiler::ir::{EdgeId, ExprId, ExprKind, Ir, StatId};
 use vineflower_rs::decompiler::stats::stat_edge::EdgeType;
-use vineflower_rs::decompiler::stats::{LastBasicType, STATEDGE_ALL, StatementKind};
+use vineflower_rs::decompiler::stats::{LastBasicType, LoopType, STATEDGE_ALL, StatementKind};
 use vineflower_rs::engine::counter_container::{
     CounterContainer, EXPRESSION_COUNTER, STATEMENT_COUNTER, VAR_COUNTER,
 };
@@ -334,7 +334,7 @@ fn redundant_loop_elimination_keeps_the_enclosing_loops() {
     let root = result.root;
     let loop_count = |ir: &Ir| {
         structure_statements(ir, root)
-            .filter(|&stat| matches!(ir[stat].kind, StatementKind::Do))
+            .filter(|&stat| matches!(ir[stat].kind, StatementKind::Do(_)))
             .count()
     };
     let before = loop_count(&cx.ir);
@@ -441,6 +441,33 @@ fn edge_cleanup_and_loop_elimination_match_upstream() {
     stack_snapshot::check(
         &upstream_reference::Corpus::discover(),
         stack_snapshot::Check::LoopElimination,
+    );
+}
+
+#[test]
+#[ignore = "requires the upstream +local.jar and JDK 17 or later"]
+fn loop_enhancement_matches_upstream() {
+    stack_snapshot::check(
+        &upstream_reference::Corpus::discover(),
+        stack_snapshot::Check::LoopEnhancement,
+    );
+}
+
+#[test]
+#[ignore = "requires the upstream +local.jar and JDK 17 or later"]
+fn loop_merging_matches_upstream() {
+    stack_snapshot::check(
+        &upstream_reference::Corpus::discover(),
+        stack_snapshot::Check::LoopMerge,
+    );
+}
+
+#[test]
+#[ignore = "requires the upstream +local.jar and JDK 17 or later"]
+fn main_loop_label_identification_matches_upstream() {
+    stack_snapshot::check(
+        &upstream_reference::Corpus::discover(),
+        stack_snapshot::Check::MainLoopLabels,
     );
 }
 
@@ -1003,7 +1030,16 @@ fn structure_snapshot_with_edges(
             StatementKind::Synchronized { body, .. } => {
                 fields.push(format!("monitor={}", ir[*body].id))
             }
-            StatementKind::Do if loop_stage => fields.push("loop=INFINITE".to_owned()),
+            StatementKind::Do(loop_) if loop_stage => {
+                let kind = match loop_.ty {
+                    LoopType::Infinite => "INFINITE",
+                    LoopType::DoWhile => "DO_WHILE",
+                    LoopType::While => "WHILE",
+                    LoopType::For => "FOR",
+                    LoopType::ForEach => "FOR_EACH",
+                };
+                fields.push(format!("loop={kind}"));
+            }
             _ => {}
         }
     }
@@ -1027,7 +1063,7 @@ fn kind_name(kind: &StatementKind) -> &'static str {
         StatementKind::BasicBlock { .. } => "BASIC_BLOCK",
         StatementKind::General { .. } => "GENERAL",
         StatementKind::Sequence => "SEQUENCE",
-        StatementKind::Do => "DO",
+        StatementKind::Do(_) => "DO",
         StatementKind::If(_) => "IF",
         StatementKind::Switch(_) => "SWITCH",
         StatementKind::Catch { .. } => "TRY_CATCH",

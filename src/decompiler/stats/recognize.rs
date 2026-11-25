@@ -16,7 +16,8 @@ use self::dec_helper::{
 use super::EdgeDirection::{Backward, Forward};
 use super::stat_edge::EdgeType;
 use super::{
-    IfStatement, LastBasicType, STATEDGE_DIRECT_ALL, Statement, StatementKind, SwitchStatement,
+    DoStatement, IfStatement, LastBasicType, STATEDGE_DIRECT_ALL, Statement, StatementKind,
+    SwitchStatement,
 };
 use crate::code::InstructionSequence;
 use crate::code::cfg::basic_block::BasicBlock;
@@ -71,13 +72,17 @@ fn detect_do(ir: &mut Ir, counters: &mut CounterContainer, head: StatId) -> Opti
     let is_loop = match regular_successor(ir, head) {
         Some(target) => target == head,
         None => {
-            !matches!(ir[head].kind, StatementKind::Do)
+            !matches!(ir[head].kind, StatementKind::Do(_))
                 && ir[head].continue_set.contains(&head.get_basic_head(ir))
         }
     };
     is_loop.then(|| {
-        ir.stats
-            .push(with_head(ir, counters, StatementKind::Do, head))
+        ir.stats.push(with_head(
+            ir,
+            counters,
+            StatementKind::Do(DoStatement::default()),
+            head,
+        ))
     })
 }
 
@@ -375,7 +380,7 @@ pub(crate) fn get_simple_copy(
             );
             return Statement::new_basic_block(ir, counters, copied);
         }
-        StatementKind::Do => StatementKind::Do,
+        StatementKind::Do(_) => StatementKind::Do(DoStatement::default()),
         StatementKind::Switch(_) => StatementKind::Switch(SwitchStatement::default()),
         StatementKind::If(branches) => StatementKind::If(IfStatement {
             has_else: branches.has_else,

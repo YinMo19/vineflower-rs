@@ -49,7 +49,7 @@ pub enum StatementKind {
     General {
         placeholder: bool,
     },
-    Do,
+    Do(DoStatement),
     Switch(SwitchStatement),
     If(IfStatement),
     Sequence,
@@ -83,6 +83,40 @@ pub struct ContentFlags {
     pub has_try_catch: bool,
     pub has_loops: bool,
     pub has_switch: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LoopType {
+    #[default]
+    Infinite,
+    While,
+    DoWhile,
+    For,
+    ForEach,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DoStatement {
+    pub ty: LoopType,
+    // An unallocated slot and an empty list both represent a null expression.
+    // Once allocated, a list keeps its identity as its expression changes.
+    pub init: Option<ExprListId>,
+    pub condition: Option<ExprListId>,
+    pub increment: Option<ExprListId>,
+}
+
+impl DoStatement {
+    pub fn init(self, ir: &Ir) -> Option<ExprId> {
+        self.init.and_then(|list| ir[list].first().copied())
+    }
+
+    pub fn condition(self, ir: &Ir) -> Option<ExprId> {
+        self.condition.and_then(|list| ir[list].first().copied())
+    }
+
+    pub fn increment(self, ir: &Ir) -> Option<ExprId> {
+        self.increment.and_then(|list| ir[list].first().copied())
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -127,6 +161,7 @@ pub struct Statement {
     pub contains_monitor_exit: bool,
     pub removable_monitorexit: bool,
     pub copied: bool,
+    pub phantom: bool,
     pub continue_set: IndexSet<StatId>,
     pub label_edges: IndexSet<EdgeId>,
     pub exprents: Option<ExprListId>,
@@ -150,6 +185,7 @@ impl Statement {
             contains_monitor_exit: false,
             removable_monitorexit: false,
             copied: false,
+            phantom: false,
             continue_set: IndexSet::new(),
             label_edges: IndexSet::new(),
             exprents: None,
@@ -387,6 +423,53 @@ impl Statement {
 }
 
 impl StatId {
+    pub fn set_loop_type(self, ir: &mut Ir, ty: LoopType) {
+        let StatementKind::Do(loop_stat) = &mut ir.stats[self].kind else {
+            panic!("Only loop statements have a loop type");
+        };
+        loop_stat.ty = ty;
+        if ty != LoopType::Infinite {
+            // Materialize the three lists once the loop has a header.
+            for slot in [
+                &mut loop_stat.init,
+                &mut loop_stat.condition,
+                &mut loop_stat.increment,
+            ] {
+                slot.get_or_insert_with(|| ir.lists.push(Vec::new()));
+            }
+        }
+    }
+
+    pub fn set_loop_init(self, ir: &mut Ir, expr: ExprId) {
+        self.set_loop_exprent(ir, |loop_stat| &mut loop_stat.init, expr);
+    }
+
+    pub fn set_loop_condition(self, ir: &mut Ir, expr: ExprId) {
+        self.set_loop_exprent(ir, |loop_stat| &mut loop_stat.condition, expr);
+    }
+
+    pub fn set_loop_increment(self, ir: &mut Ir, expr: ExprId) {
+        self.set_loop_exprent(ir, |loop_stat| &mut loop_stat.increment, expr);
+    }
+
+    fn set_loop_exprent(
+        self,
+        ir: &mut Ir,
+        slot: impl FnOnce(&mut DoStatement) -> &mut Option<ExprListId>,
+        expr: ExprId,
+    ) {
+        let StatementKind::Do(loop_stat) = &mut ir.stats[self].kind else {
+            panic!("Only loop statements have loop headers");
+        };
+        let list = *slot(loop_stat).get_or_insert_with(|| ir.lists.push(Vec::new()));
+        let list = &mut ir[list];
+        if let Some(first) = list.first_mut() {
+            *first = expr;
+        } else {
+            list.push(expr);
+        }
+    }
+
     pub fn method(self, ir: &Ir) -> &Arc<StructMethod> {
         let StatementKind::Root { method, .. } = &ir[self].kind else {
             unreachable!("Only the root owns the method")
@@ -422,7 +505,7 @@ impl StatId {
                 StatementKind::Catch { .. } | StatementKind::CatchAll { .. } => {
                     content_flags.has_try_catch = true;
                 }
-                StatementKind::Do => content_flags.has_loops = true,
+                StatementKind::Do(_) => content_flags.has_loops = true,
                 StatementKind::Switch(_) => content_flags.has_switch = true,
                 _ => {}
             }
@@ -553,7 +636,7 @@ impl StatId {
         for &edge in ir[self].edge_view(EdgeDirection::Forward, EdgeType::Continue.mask()) {
             continues.insert(ir[edge].destination.get_basic_head(ir));
         }
-        if matches!(ir[self].kind, StatementKind::Do) {
+        if matches!(ir[self].kind, StatementKind::Do(_)) {
             continues.shift_remove(&ir[self].first.unwrap().get_basic_head(ir));
         }
         ir[self].continue_set = continues;

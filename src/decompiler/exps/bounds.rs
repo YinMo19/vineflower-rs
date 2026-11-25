@@ -34,6 +34,8 @@ impl Expr {
             ExprKind::Variable(var) => {
                 if let Some(lvt) = &var.lvt {
                     bounds.lower.push((expr, lvt.get_var_type()));
+                } else if let Some(ty) = &var.bound_type {
+                    bounds.lower.push((expr, ty.as_ref().clone()));
                 }
             }
             ExprKind::Assignment { left, right, .. } => {

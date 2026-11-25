@@ -18,6 +18,7 @@ use vineflower_rs::decompiler::stats::{ContentFlags, STATEDGE_ALL, StatementKind
 use vineflower_rs::decompiler::vars::versions::{FinalType, VarVersions};
 use vineflower_rs::engine::class_nodes::{ClassNodeId, load_classes};
 use vineflower_rs::engine::class_processor::prepare_class;
+use vineflower_rs::engine::context_source::{ContextSource, RuntimeImage};
 use vineflower_rs::engine::import_collector::ImportCollector;
 use vineflower_rs::engine::method_processor::{
     ExpressionMethod, InitialMethod, initial_statement_graph,
@@ -26,11 +27,11 @@ use vineflower_rs::engine::{Cx, Options};
 use vineflower_rs::structs::single_file_context_source::SingleFileContextSource;
 use vineflower_rs::structs::{StructClass, StructContext, StructMethod};
 
-use super::upstream_reference::Corpus;
+use super::upstream_reference::{Corpus, jdk_home};
 use super::{
-    REFERENCE_HELPERS, compare_snapshots, edge_id, expression_snapshot, one_line, panic_text,
-    parse_class, structure_snapshot_with_edges, structure_statements, write_cfg, write_count,
-    write_flag, write_int, write_text,
+    REFERENCE_HELPERS, compare_snapshots, direct_graph_snapshot, edge_id, expression_snapshot,
+    one_line, panic_text, parse_class, structure_snapshot_with_edges, structure_statements,
+    write_cfg, write_count, write_flag, write_int, write_text,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -40,6 +41,9 @@ pub(super) enum Check {
     Increments = 4,
     PreMain = 5,
     LoopElimination = 6,
+    LoopEnhancement = 7,
+    LoopMerge = 8,
+    MainLoopLabels = 9,
 }
 
 #[derive(Clone, Copy)]
@@ -147,6 +151,30 @@ const TERMINAL_LOOP_STAGES: &[(&str, &str)] = &[
     ),
 ];
 
+const LOOP_ENHANCEMENT_STAGES: &[(&str, &str)] = &[
+    ("Enhanced loop structure and return value", "counters="),
+    ("Enhanced loop expressions and headers", "counters="),
+    ("Enhanced loop variable versions", "versions="),
+    ("Direct graph of enhanced loops", "graph="),
+];
+
+const LOOP_MERGE_STAGES: &[(&str, &str)] = &[
+    ("Structure after loop merging", "counters="),
+    ("Loop expressions and headers after merging", "counters="),
+    ("Variable versions after loop merging", "versions="),
+    ("Direct graph after loop merging", "graph="),
+];
+
+const MAIN_LOOP_LABEL_STAGES: &[(&str, &str)] = &[
+    (
+        "Structure and labels after label identification",
+        "counters=",
+    ),
+    ("Expressions after label identification", "counters="),
+    ("Variable versions after label identification", "versions="),
+    ("Direct graph after label identification", "graph="),
+];
+
 fn loop_iterations(row: &str) -> impl Iterator<Item = &str> {
     row.split('\t')
         .nth(3)
@@ -161,7 +189,10 @@ impl Check {
             Self::Stack => STACK_PROFILES,
             Self::Increments => INCREMENT_PROFILES,
             Self::PreMain => PRE_MAIN_PROFILES,
-            Self::LoopElimination => &[DEFAULT],
+            Self::LoopElimination
+            | Self::LoopEnhancement
+            | Self::LoopMerge
+            | Self::MainLoopLabels => &[DEFAULT],
         }
     }
 
@@ -171,6 +202,9 @@ impl Check {
             Self::Increments => INCREMENT_STAGES,
             Self::PreMain => PRE_MAIN_STAGES,
             Self::LoopElimination => LOOP_ELIMINATION_STAGES,
+            Self::LoopEnhancement => LOOP_ENHANCEMENT_STAGES,
+            Self::LoopMerge => LOOP_MERGE_STAGES,
+            Self::MainLoopLabels => MAIN_LOOP_LABEL_STAGES,
         }
     }
 
@@ -180,7 +214,17 @@ impl Check {
             Self::Increments => "increments",
             Self::PreMain => "pre-main",
             Self::LoopElimination => "loop-elimination",
+            Self::LoopEnhancement => "loop-enhancement",
+            Self::LoopMerge => "loop-merge",
+            Self::MainLoopLabels => "main-loop-labels",
         }
+    }
+
+    fn uses_loop_headers(self) -> bool {
+        matches!(
+            self,
+            Self::LoopEnhancement | Self::LoopMerge | Self::MainLoopLabels
+        )
     }
 }
 
@@ -240,6 +284,63 @@ fn loop_ids(tree: &str) -> FxHashSet<&str> {
         .collect()
 }
 
+#[derive(Default)]
+struct EnhancementCoverage {
+    changed_methods: usize,
+    loops: BTreeMap<String, usize>,
+    foreach_sources: BTreeMap<String, usize>,
+    list_iterator: bool,
+}
+
+impl EnhancementCoverage {
+    fn record(&mut self, method: &str, row: &str) {
+        let mut snapshots = row.split('\t');
+        let tree = snapshots.next().unwrap();
+        self.changed_methods += usize::from(tree.ends_with(";enhanced=true"));
+        for kind in tree
+            .split(';')
+            .filter_map(|field| field.strip_prefix("loop="))
+        {
+            *self.loops.entry(kind.to_owned()).or_default() += 1;
+        }
+        for field in snapshots.next().unwrap().split(';') {
+            if let Some((_, kind)) = field
+                .strip_prefix("foreach")
+                .and_then(|entry| entry.split_once('='))
+            {
+                *self.foreach_sources.entry(kind.to_owned()).or_default() += 1;
+                self.list_iterator |= kind == "iterator"
+                    && method.contains("TestListIteratorHierarchy.class print (Ljava/util/List;)V");
+            }
+        }
+    }
+
+    fn report(&self, check: Check) {
+        assert!(
+            self.list_iterator,
+            "the ListIterator fixture must recover a foreach loop"
+        );
+        if check == Check::LoopEnhancement {
+            eprintln!(
+                "{} methods reported a change from loop enhancement",
+                self.changed_methods
+            );
+        }
+        for kind in ["INFINITE", "DO_WHILE", "WHILE", "FOR", "FOR_EACH"] {
+            eprintln!(
+                "{} {kind} loops",
+                self.loops.get(kind).copied().unwrap_or(0)
+            );
+        }
+        for source in ["array", "iterator"] {
+            eprintln!(
+                "{} foreach loops over an {source}",
+                self.foreach_sources.get(source).copied().unwrap_or(0)
+            );
+        }
+    }
+}
+
 struct Fixture {
     path: PathBuf,
     name: String,
@@ -261,7 +362,23 @@ fn class_groups(corpus: &Corpus) -> Vec<Vec<Fixture>> {
 }
 
 pub(super) fn check(corpus: &Corpus, check: Check) {
-    let groups = class_groups(corpus);
+    let mut groups = class_groups(corpus);
+    let runtime = check.uses_loop_headers().then(|| {
+        let name = "TestListIteratorHierarchy";
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("test/smoke/java8")
+            .join(format!("{name}.class"));
+        if !corpus.classes.contains(&path) {
+            groups.push(vec![Fixture {
+                path,
+                name: name.to_owned(),
+            }]);
+        }
+        let home = jdk_home();
+        Arc::new(RuntimeImage::open(&home).unwrap_or_else(|error| {
+            panic!("loading runtime at {}: {error}", home.display());
+        })) as Arc<dyn ContextSource>
+    });
     let mut input = tempfile::NamedTempFile::new().unwrap();
     let mut snapshots = tempfile::tempfile().unwrap();
     let mut methods = Vec::new();
@@ -286,6 +403,7 @@ pub(super) fn check(corpus: &Corpus, check: Check) {
                     group,
                     profile,
                     check,
+                    runtime.as_ref(),
                 );
             }
         }
@@ -313,6 +431,7 @@ pub(super) fn check(corpus: &Corpus, check: Check) {
     let mut concats = 0;
     let mut assertion_changes = 0;
     let mut loop_coverage = LoopCoverage::default();
+    let mut enhancement_coverage = EnhancementCoverage::default();
     for (index, method) in methods.iter().enumerate() {
         let row = java_rows
             .next()
@@ -342,6 +461,8 @@ pub(super) fn check(corpus: &Corpus, check: Check) {
             rejected += 1;
         } else if let Err(diff) = compare_snapshots(java, &rust, stages) {
             errors.push(format!("{method}\n  {diff}"));
+        } else if check.uses_loop_headers() {
+            enhancement_coverage.record(method, &rust);
         } else {
             let stage_size = if check == Check::Stack { 2 } else { 3 };
             let first = rust.split('\t').next().unwrap();
@@ -395,12 +516,21 @@ pub(super) fn check(corpus: &Corpus, check: Check) {
             .collect::<Vec<_>>()
             .join("\n")
     );
+    let stages = if check.uses_loop_headers() {
+        ""
+    } else {
+        "first and settled "
+    };
     eprintln!(
-        "{} exact first and settled {} snapshots and {rejected} matching rejections across {} class files",
+        "{} exact {stages}{} snapshots and {rejected} matching rejections across {} class files",
         methods.len() - rejected,
         check.name(),
-        corpus.classes.len()
+        groups.iter().map(Vec::len).sum::<usize>()
     );
+    if check.uses_loop_headers() {
+        enhancement_coverage.report(check);
+        return;
+    }
     let [first, settled] = hidden_changes;
     eprintln!("{first} first simplifications and {settled} settled runs added hidden members");
     if check == Check::Increments {
@@ -426,6 +556,7 @@ fn write_group(
     group: &[Fixture],
     profile: Profile,
     check: Check,
+    runtime: Option<&Arc<dyn ContextSource>>,
 ) {
     let mut options = Options::default();
     options.simplify_stack = profile.simplify;
@@ -435,6 +566,9 @@ fn write_group(
     options.decompile_assert = profile.assertions;
     let options = Arc::new(options);
     let mut context = StructContext::new(Arc::clone(&options), None);
+    if let Some(runtime) = runtime {
+        context.add_space(Arc::clone(runtime), false);
+    }
     for fixture in group {
         let source = SingleFileContextSource::open(&fixture.path, &options, None).unwrap();
         context.add_space(Arc::new(source), true);
@@ -523,7 +657,7 @@ fn describe(
     cx.class_nodes[owner]
         .hidden_members
         .clone_from(&initial_hidden);
-    if first == "rejected=parsing failure!" {
+    if check.uses_loop_headers() || first == "rejected=parsing failure!" {
         return first;
     }
 
@@ -569,7 +703,13 @@ fn stage(
                 operation.set("prepare-main-loop");
                 method.prepare_main_loop(cx, class)?;
             }
-            (Check::LoopElimination, _) => {
+            (
+                Check::LoopElimination
+                | Check::LoopEnhancement
+                | Check::LoopMerge
+                | Check::MainLoopLabels,
+                _,
+            ) => {
                 loop {
                     operation.set("simplify-stack");
                     method.simplify_stack_vars(cx, class);
@@ -588,9 +728,32 @@ fn stage(
                 method.build_assertions(cx, class)?;
 
                 operation.set("snapshot");
-                let original_edges = first.then(|| edge_states(&cx.ir, method.root));
-                operation.set("clean-up-edges");
-                method.clean_up_edges(cx);
+                let original_edges = (first && check == Check::LoopElimination)
+                    .then(|| edge_states(&cx.ir, method.root));
+                if check != Check::MainLoopLabels {
+                    operation.set("clean-up-edges");
+                    method.clean_up_edges(cx);
+                }
+                if check.uses_loop_headers() {
+                    let details = if check == Check::LoopEnhancement {
+                        operation.set("eliminate-loops");
+                        while method.eliminate_loops(cx, class)? {}
+                        operation.set("enhance-loops");
+                        format!(";enhanced={}", method.enhance_loops(cx)?)
+                    } else if check == Check::LoopMerge {
+                        operation.set("merge-loops");
+                        method.merge_loops(cx, class)?;
+                        String::new()
+                    } else {
+                        operation.set("identify-main-loop-labels");
+                        method.identify_main_loop_labels(cx, class)?;
+                        String::new()
+                    };
+                    operation.set("snapshot");
+                    let result = snapshot(cx, owner, &method, initial_hidden, check, &details);
+                    let graph = direct_graph_snapshot::enhanced(&mut cx.ir, method.root);
+                    return Ok(format!("{result}\t{graph}"));
+                }
                 operation.set("snapshot");
                 if let Some(original_edges) = original_edges {
                     let cleaned_edges = edge_states(&cx.ir, method.root);
@@ -694,13 +857,10 @@ fn snapshot(
     check: Check,
     details: &str,
 ) -> String {
-    let mut tree = structure_snapshot_with_edges(
-        cx,
-        method.root,
-        &method.flow.counters,
-        check == Check::LoopElimination,
-    );
-    if matches!(check, Check::PreMain | Check::LoopElimination) {
+    let loop_stage = check == Check::LoopElimination || check.uses_loop_headers();
+    let mut tree =
+        structure_snapshot_with_edges(cx, method.root, &method.flow.counters, loop_stage);
+    if check == Check::PreMain || loop_stage {
         let content = root_content_flags(cx, method.root);
         write!(
             tree,
@@ -712,7 +872,12 @@ fn snapshot(
     let hidden = &cx.class_nodes[owner].hidden_members;
     let all_members = hidden_members(hidden.iter());
     let added = hidden_members(hidden.difference(initial_hidden));
-    let expressions = expression_snapshot::snapshot(cx, method.root, &method.flow.counters);
+    let expressions = expression_snapshot::snapshot_with_loops(
+        cx,
+        method.root,
+        &method.flow.counters,
+        check.uses_loop_headers(),
+    );
     let mut snapshot =
         format!("{tree};hidden={all_members};hidden-added={added}{details}\t{expressions}");
     if check != Check::Stack {

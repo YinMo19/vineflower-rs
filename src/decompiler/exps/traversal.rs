@@ -4,7 +4,7 @@
 //! Expression order used by the statement and SSA passes.
 
 use crate::decompiler::ir::{ExprId, ExprListId, Ir, StatId};
-use crate::decompiler::stats::StatementKind;
+use crate::decompiler::stats::{LoopType, StatementKind};
 
 use super::{Expr, ExprKind};
 
@@ -80,6 +80,24 @@ impl StatId {
     pub fn stat_exprents(self, ir: &Ir) -> Vec<ExprId> {
         let list = |id: Option<ExprListId>| id.map_or(&[][..], |id| ir[id].as_slice());
         match &ir[self].kind {
+            StatementKind::Do(loop_stat) => match loop_stat.ty {
+                LoopType::Infinite => Vec::new(),
+                LoopType::While | LoopType::DoWhile => {
+                    vec![loop_stat.condition(ir).expect("Loop condition is missing")]
+                }
+                LoopType::For => loop_stat
+                    .init(ir)
+                    .into_iter()
+                    .chain([
+                        loop_stat.condition(ir).expect("Loop condition is missing"),
+                        loop_stat.increment(ir).expect("Loop increment is missing"),
+                    ])
+                    .collect(),
+                LoopType::ForEach => vec![
+                    loop_stat.init(ir).expect("Foreach variable is missing"),
+                    loop_stat.increment(ir).expect("Foreach iterable is missing"),
+                ],
+            },
             StatementKind::If(branch) => list(branch.head_exprents).to_vec(),
             StatementKind::Synchronized { head_exprents, .. } => list(*head_exprents).to_vec(),
             StatementKind::Catch {

@@ -7,7 +7,7 @@ use itertools::Itertools;
 use vineflower_rs::code::instruction::Instruction;
 use vineflower_rs::decompiler::exps::{Expr, ExprKind, FunctionType, SwitchCaseValues};
 use vineflower_rs::decompiler::ir::{ExprId, ExprListId, StatId};
-use vineflower_rs::decompiler::stats::{StatementKind, SwitchCase};
+use vineflower_rs::decompiler::stats::{LoopType, StatementKind, SwitchCase};
 use vineflower_rs::engine::Cx;
 use vineflower_rs::engine::counter_container::{
     CounterContainer, EXPRESSION_COUNTER, STATEMENT_COUNTER, VAR_COUNTER,
@@ -17,6 +17,15 @@ use vineflower_rs::structs::consts::{ConstantValue, LinkConstant, PooledConstant
 use vineflower_rs::types::{MethodDescriptor, VarType};
 
 pub fn snapshot(cx: &Cx, root: StatId, counters: &CounterContainer) -> String {
+    snapshot_with_loops(cx, root, counters, false)
+}
+
+pub fn snapshot_with_loops(
+    cx: &Cx,
+    root: StatId,
+    counters: &CounterContainer,
+    enhanced: bool,
+) -> String {
     let ir = &cx.ir;
     let StatementKind::Root { dummy_exit, .. } = ir[root].kind else {
         unreachable!();
@@ -25,6 +34,7 @@ pub fn snapshot(cx: &Cx, root: StatId, counters: &CounterContainer) -> String {
     let mut snapshot = Snapshot {
         cx,
         nodes: BTreeMap::new(),
+        enhanced,
     };
     let mut fields = vec![format!(
         "counters={},{},{}",
@@ -36,7 +46,30 @@ pub fn snapshot(cx: &Cx, root: StatId, counters: &CounterContainer) -> String {
         let statement = &ir[stat];
         let id = statement.id;
         fields.push(format!("body{id}={}", snapshot.list(statement.exprents)));
+        if enhanced {
+            fields.push(format!(
+                "definitions{id}={}",
+                snapshot.expressions(&statement.var_definitions)
+            ));
+        }
         match &statement.kind {
+            StatementKind::Do(loop_) if enhanced => {
+                fields.push(format!(
+                    "loop{id}={},{},{}",
+                    snapshot.expression(loop_.init(ir)),
+                    snapshot.expression(loop_.condition(ir)),
+                    snapshot.expression(loop_.increment(ir))
+                ));
+                if loop_.ty == LoopType::ForEach {
+                    let source = if Expr::expr_type(cx, loop_.increment(ir).unwrap()).array_dim > 0
+                    {
+                        "array"
+                    } else {
+                        "iterator"
+                    };
+                    fields.push(format!("foreach{id}={source}"));
+                }
+            }
             StatementKind::If(branch) => {
                 fields.push(format!("head{id}={}", snapshot.list(branch.head_exprents)));
                 fields.push(format!("pattern{id}={}", branch.pattern_matched));
@@ -81,6 +114,7 @@ pub fn snapshot(cx: &Cx, root: StatId, counters: &CounterContainer) -> String {
 struct Snapshot<'a> {
     cx: &'a Cx,
     nodes: BTreeMap<i32, (ExprId, String)>,
+    enhanced: bool,
 }
 
 impl Snapshot<'_> {
@@ -133,9 +167,8 @@ impl Snapshot<'_> {
     fn operands(&mut self, kind: &ExprKind) -> (&'static str, String) {
         let ir = &self.cx.ir;
         match kind {
-            ExprKind::Variable(var) => (
-                "VAR",
-                format!(
+            ExprKind::Variable(var) => {
+                let mut operands = format!(
                     "{}|{}|{}|{}|{}|{}|{}|{}",
                     var.index,
                     var.version,
@@ -145,8 +178,12 @@ impl Snapshot<'_> {
                     local_variable(var.lvt.as_deref()),
                     instruction(var.backing_instruction.as_deref()),
                     var.effectively_final
-                ),
-            ),
+                );
+                if self.enhanced {
+                    write!(operands, "|{}", var_type(var.bound_type.as_deref())).unwrap();
+                }
+                ("VAR", operands)
+            }
             ExprKind::Constant {
                 value,
                 bool_permitted,

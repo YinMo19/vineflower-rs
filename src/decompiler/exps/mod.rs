@@ -112,6 +112,8 @@ pub struct Variable {
     pub effectively_final: bool,
     pub backing_instruction: Option<Arc<Instruction>>,
     pub lvt: Option<Arc<LocalVariable>>,
+    /// A lower type bound retained from an assignment removed by loop recovery.
+    pub bound_type: Option<Box<VarType>>,
 }
 
 impl Variable {
@@ -126,6 +128,7 @@ impl Variable {
             effectively_final: false,
             backing_instruction: None,
             lvt: None,
+            bound_type: None,
         }
     }
 
@@ -255,6 +258,22 @@ impl Invocation {
 
     pub fn string_descriptor(&self) -> &str {
         self.descriptor.as_str()
+    }
+
+    /// `InvocationExprent.isUnboxingCall`.
+    pub(crate) fn is_unboxing_call(&self) -> bool {
+        let wrapper = match self.name.as_str() {
+            "booleanValue" => "java/lang/Boolean",
+            "byteValue" => "java/lang/Byte",
+            "shortValue" => "java/lang/Short",
+            "intValue" => "java/lang/Integer",
+            "longValue" => "java/lang/Long",
+            "floatValue" => "java/lang/Float",
+            "doubleValue" => "java/lang/Double",
+            "charValue" => "java/lang/Character",
+            _ => return false,
+        };
+        !self.is_static && self.parameters.is_empty() && self.classname.as_deref() == Some(wrapper)
     }
 }
 
@@ -528,6 +547,7 @@ impl Expr {
             ExprKind::Variable(variable) => {
                 variable.var_type = variable.expr_type(cx);
                 variable.backing_instruction = None;
+                variable.bound_type = None;
                 variable.record_local_type(&mut cx.ir.variable_processors);
             }
             ExprKind::Assignment { left, right, .. } => {

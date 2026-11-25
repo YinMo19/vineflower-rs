@@ -64,6 +64,9 @@ class StructureReference {
         case 4 -> StackSnapshot.Check.INCREMENTS;
         case 5 -> StackSnapshot.Check.PRE_MAIN;
         case 6 -> StackSnapshot.Check.LOOP_ELIMINATION;
+        case 7 -> StackSnapshot.Check.LOOP_ENHANCEMENT;
+        case 8 -> StackSnapshot.Check.LOOP_MERGE;
+        case 9 -> StackSnapshot.Check.MAIN_LOOP_LABELS;
         default -> null;
       };
       StackSnapshot.Context stackContext = stackCheck == null ? null
@@ -369,7 +372,7 @@ class StructureReference {
     return String.join(";", fields);
   }
 
-  private static List<Statement> statements(RootStatement root) {
+  static List<Statement> statements(RootStatement root) {
     List<Statement> result = new ArrayList<>();
     Deque<Statement> pending = new ArrayDeque<>();
     pending.add(root);

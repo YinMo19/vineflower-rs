@@ -31,7 +31,7 @@
 
 类文件、常量池和解码后的指令可以共享。一条指令从全方法序列进入基本块时共享同一个 `Arc<Instruction>`。上游显式克隆指令时创建新的指令对象。字节偏移、指令索引、算法赋予的整数编号和 Rust arena 句柄各自有独立用途。
 
-根类工作上下文 `Cx` 持有 `Ir`。基本块、语句、语句边和共享表达式列表在它们各自的 arena 中有稳定身份。将节点从活跃图中移除时更新图成员和邻接关系，已有句柄仍能引用原对象。不同方法的块编号都可以从 1 开始，方法计数器与该方法的图一起保存。处理嵌套类或晚期访问另一方法时，使用该方法保存的计数器。只依赖图的算法借用 `&Ir` 或 `&mut Ir`，需要类路径、命名或会话选项的调用再借用相应上下文。
+根类工作上下文 `Cx` 持有 `Ir`。基本块、语句、语句边和共享表达式列表在它们各自的 arena 中有稳定身份。将节点从活跃图中移除时更新图成员和邻接关系，已有句柄仍能引用原对象。不同方法的块编号都可以从 1 开始，方法计数器与该方法的图一起保存。首次查找库类时，注解及其各个元素会在当前活动的方法计数器中取得表达式编号。库类缓存由工作上下文共享，同一类只解析一次。离开方法时恢复外层计数器。处理嵌套类或晚期访问另一方法时，使用该方法保存的计数器。只依赖图的算法借用 `&Ir` 或 `&mut Ir`，需要类路径、命名或会话选项的调用再借用相应上下文。
 
 CFG、语句图和 DirectGraph 具有不同的边契约。
 
@@ -63,7 +63,7 @@ CFG、语句图和 DirectGraph 具有不同的边契约。
 
 [结构分解](src/decompiler/decompose/dom_helper.rs) 先识别六种简单语句，再用强连通分量、后支配和扩展后支配挑选单入口子区域。折叠时同步维护有序出入边、标签归属和异常覆盖；可归并节点耗尽时，按上游的条件尝试不可约图拆点和重算候选。分解成功后执行 continue 标签下移、顺序语句压缩和 synchronized 识别。
 
-[DirectGraph](src/decompiler/flow/flatten.rs) 可从这一阶段的结构化语句树建立数据流视图。构图时登记语句对应的普通与 continue 目标，全部直接节点分配完成后连边。try 作用域收集内部节点的异常边；case 节点保留对应分支的表达式。该阶段产生的循环均为初始无限循环类型。不可达的非出口直接节点依照确定的创建顺序前置；上游使用含 JVM 对象身份散列的集合，这一小段遍历顺序可能随运行变化。
+[DirectGraph](src/decompiler/flow/flatten.rs) 可从这一阶段的结构化语句树建立数据流视图。构图时登记语句对应的普通与 continue 目标，全部直接节点分配完成后连边。try 作用域收集内部节点的异常边；case 节点保留对应分支的表达式。结构分解产生的循环初始为无限循环。循环增强以后，普通入口与 continue 入口可能不同。例如计数循环从初始化进入，continue 流向步进表达式；增强 for 从可迭代对象进入，continue 流向循环变量。直接节点与语句共享实际存在的循环头表达式列表，计数循环缺少初始化时，直接图持有单独的空列表。不可达的非出口直接节点依照确定的创建顺序前置；上游使用含 JVM 对象身份散列的集合，这一小段遍历顺序可能随运行变化。
 
 [`StructuredMethod::process_expressions`](src/engine/method_processor.rs) 在当前语句树上运行 [`ExprProcessor`](src/decompiler/expr_processor/driver.rs)。沿直接图的普通边传播操作数栈时，首次到达后继就复制其中的变量表达式；处理 catch 入口时从对应的异常变量重新建立栈。基本块把结果写入表达式列表，随后 if、switch 和 synchronized 从首块取回各自的头表达式。switch 头引用语句持有的分支标签。表达式的 Java 编号按构造和复制的先后顺序分配，与 arena 句柄分开。
 
@@ -87,7 +87,13 @@ CFG、语句图和 DirectGraph 具有不同的边契约。
 
 [`pre_main_method`](src/engine/method_processor.rs) 接着按 class 版本处理字符串拼接，再恢复断言，到达 `BEFORE_MAIN`。拼接识别器从调用和 bootstrap recipe 收集有序操作数，按 UTF-16 单元保留常量片段，再构建左结合的字符串表达式。断言恢复根据类初始化字节码记录的字段识别保护条件，保留条件与消息的求值位置。接口可引用同一根类下已初始化 wrapper 的合成持有类。[字符串拼接](src/decompiler/concat.rs) · [断言恢复](src/decompiler/assertions.rs)
 
-方法主循环的第一步通过 `ExpressionMethod::clean_up_edges` 重置边标志、删除不能直接跳出的 break/continue，并重新确定跳转归属的语句。随后 `eliminate_loops` 按后序查找与外层循环共享基本块入口的无限循环。只有在 break 标签数量和 continue 目标允许时才移除一层，随后压缩 sequence，并按上游在无 SSA 的上下文中重新简化语句。一次调用至多消除一个循环，成功后从合并循环的起点重新遍历。下一阶段是 `MergeHelper.enhanceLoops`，类级写出与 CLI 仍待接入。[边清理](src/decompiler/labels.rs) · [冗余循环](src/decompiler/loops/eliminate.rs)
+方法主循环的第一步通过 `ExpressionMethod::clean_up_edges` 重置边标志、删除不能直接跳出的 break/continue，并重新确定跳转归属的语句。随后 `eliminate_loops` 按后序查找与外层循环共享基本块入口的无限循环。只有在 break 标签数量和 continue 目标允许时才移除一层，随后压缩 sequence，并按上游在无 SSA 的上下文中重新简化语句。一次调用至多消除一个循环，成功后从合并循环的起点重新遍历。[边清理](src/decompiler/labels.rs) · [冗余循环](src/decompiler/loops/eliminate.rs)
+
+循环增强按后序检查入口条件，再依次尝试迭代器、数组和计数循环。识别器检查变量槽、版本、使用位置和异常保护区，成功后将表达式移到循环头并转移字节码范围。迭代器子类型通过已登记的类路径解析。循环抽取移动可离开循环的分支，同时改写对应的边与闭包。抽取成功后，`ExpressionMethod::merge_loops` 回到循环消除；条件合并也会重启这一内层循环。Java 的后测试循环识别发生在外层主循环的后续阶段。[循环增强](src/decompiler/loops/enhance.rs) · [增强 for](src/decompiler/loops/foreach.rs) · [循环抽取](src/decompiler/loops/extract.rs)
+
+`ExpressionMethod::identify_main_loop_labels` 从每轮主循环的边清理开始，运行内层合并、重新简化栈变量并更新变量版本，再依据各分支的下一条语句确定哪些跳转需要显式标签。原版在同样大小的候选边组之间按 JVM 对象身份散列遍历来选择。Rust 对这种平局按发现顺序选择。接下来是次级表达式改写；类级写出与 CLI 仍待接入。[标签识别](src/decompiler/labels/identify.rs)
+
+`RuntimeImage::open` 将模块化 JDK 的每个模块作为独立库登记，按 JRT 的目录遍历和模块描述符顺序提供条目。普通镜像与 ZIP 压缩镜像可由现有 JImage 库读取；该库遇到 compact-cp 压缩时返回 Unsupported。[运行时类路径](src/engine/context_source/runtime.rs)
 
 同步区扩展有一处有意的终止条件。当共享后继的首个前驱来自另一保护区，上游可能反复向已覆盖的区间追加同一块。如果本轮既不会新增覆盖关系、也不会增加异常边或移动指令，Rust 跳过这个候选，继续检查其他区间。
 

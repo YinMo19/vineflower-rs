@@ -27,6 +27,7 @@ import org.jetbrains.java.decompiler.struct.gen.generics.GenericType;
 class ExpressionSnapshot {
   private static final Field ARRAY_HARD_TYPE = field(ArrayExprent.class, "hardType");
   private static final Field VARIABLE_TYPE = field(VarExprent.class, "varType");
+  private static final Field VARIABLE_BOUND = field(VarExprent.class, "boundType");
   private static final Field CONSTANT_CONDY = field(ConstExprent.class, "wasCondy");
   private static final Field FIELD_CONDY = field(FieldExprent.class, "wasCondy");
   private static final Field FIELD_QUALIFIED = field(FieldExprent.class, "forceQualified");
@@ -36,10 +37,19 @@ class ExpressionSnapshot {
 
   // Record shared nodes once and keep references by the upstream expression ID.
   private final Map<Integer, Exprent> nodes = new TreeMap<>();
+  private final boolean enhanced;
+
+  private ExpressionSnapshot(boolean enhanced) {
+    this.enhanced = enhanced;
+  }
 
   static String snapshot(RootStatement root, CounterContainer counters) {
+    return snapshot(root, counters, false);
+  }
+
+  static String snapshot(RootStatement root, CounterContainer counters, boolean enhanced) {
     try {
-      return new ExpressionSnapshot().describe(root, counters);
+      return new ExpressionSnapshot(enhanced).describe(root, counters);
     } catch (RuntimeException | AssertionError | StackOverflowError failure) {
       return "snapshot-error=" + text(failure.toString());
     }
@@ -57,7 +67,17 @@ class ExpressionSnapshot {
     while (!pending.isEmpty()) {
       Statement statement = pending.removeFirst();
       fields.add("body" + statement.id + "=" + expressions(statement.getExprents()));
-      if (statement instanceof IfStatement branch) {
+      if (enhanced) {
+        fields.add("definitions" + statement.id + "=" + expressions(statement.getVarDefinitions()));
+      }
+      if (enhanced && statement instanceof DoStatement loop) {
+        fields.add("loop" + statement.id + "=" + expression(loop.getInitExprent()) + ","
+          + expression(loop.getConditionExprent()) + "," + expression(loop.getIncExprent()));
+        if (loop.getLooptype() == DoStatement.Type.FOR_EACH) {
+          String source = loop.getIncExprent().getExprType().arrayDim > 0 ? "array" : "iterator";
+          fields.add("foreach" + statement.id + "=" + source);
+        }
+      } else if (statement instanceof IfStatement branch) {
         fields.add("head" + statement.id + "=" + expressions(branch.getHeadexprentList()));
         fields.add("pattern" + statement.id + "=" + branch.isPatternMatched());
         fields.add("ppmm" + statement.id + "=" + branch.hasPPMM());
@@ -112,9 +132,10 @@ class ExpressionSnapshot {
 
   private String operands(Exprent e) {
     if (e instanceof VarExprent var) {
-      return parts(var.getIndex(), var.getVersion(), var.isStack(), var.isCatchTempVar(),
+      String fields = parts(var.getIndex(), var.getVersion(), var.isStack(), var.isCatchTempVar(),
         type((VarType) read(VARIABLE_TYPE, var)), lvt(var.getLVT()), instruction(var.getBackingInstr()),
         var.isEffectivelyFinal());
+      return enhanced ? fields + "|" + type((VarType) read(VARIABLE_BOUND, var)) : fields;
     }
     if (e instanceof ConstExprent constant) {
       return parts(value(constant.getValue()), constant.isBoolPermitted(), read(CONSTANT_CONDY, constant));

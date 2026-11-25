@@ -10,7 +10,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::decompiler::decompose::finish::condense_sequences;
 use crate::decompiler::ir::{EdgeId, Ir, StatId};
 use crate::decompiler::stack::simplify_statement_without_ssa;
-use crate::decompiler::stats::{StatementKind, stat_edge::EdgeType};
+use crate::decompiler::stats::{DoStatement, LoopType, StatementKind, stat_edge::EdgeType};
 use crate::engine::{Cx, counter_container::CounterContainer};
 use crate::structs::StructClass;
 
@@ -40,12 +40,18 @@ fn eliminate_one(ir: &mut Ir, stat: StatId) -> bool {
         }
     }
 
-    matches!(ir[stat].kind, StatementKind::Do) && eliminate_redundant(ir, stat)
+    matches!(
+        ir[stat].kind,
+        StatementKind::Do(DoStatement {
+            ty: LoopType::Infinite,
+            ..
+        })
+    ) && eliminate_redundant(ir, stat)
 }
 
 fn eliminate_redundant(ir: &mut Ir, loop_stat: StatId) -> bool {
     let Some(parent_loop) = std::iter::successors(ir[loop_stat].parent, |&stat| ir[stat].parent)
-        .find(|&stat| matches!(ir[stat].kind, StatementKind::Do))
+        .find(|&stat| matches!(ir[stat].kind, StatementKind::Do(_)))
     else {
         return false;
     };
@@ -177,7 +183,7 @@ fn min_break_closure(ir: &Ir, mut closure: StatId, source: StatId) -> StatId {
 fn is_break_labeled(ir: &Ir, mut source: StatId, closure: StatId) -> bool {
     if !matches!(
         ir[closure].kind,
-        StatementKind::Do | StatementKind::Switch(_)
+        StatementKind::Do(_) | StatementKind::Switch(_)
     ) {
         return true;
     }
@@ -192,7 +198,7 @@ fn is_break_labeled(ir: &Ir, mut source: StatId, closure: StatId) -> bool {
         }
         labeled |= matches!(
             ir[source].kind,
-            StatementKind::Do | StatementKind::Switch(_)
+            StatementKind::Do(_) | StatementKind::Switch(_)
         );
     }
 }

@@ -34,6 +34,12 @@ The pre-main comparison runs the full increment fixed point, then checks the met
 
 The loop-entry comparison checks the result of edge cleanup and every call to redundant-loop elimination through its first false return. It compares both ordered adjacency lists, closure membership, edge flags, expressions, counters and variables. A JDK-free test uses the upstream Java 8 nested-loop class to check that one elimination preserves the surrounding loops.
 
+The loop-enhancement comparison runs the same entry passes before one call to the loop-enhancement fixed point. Both implementations load the reference JDK as a library so iterator recognition can use its class hierarchy. The checked-in `TestListIteratorHierarchy` smoke fixture exercises a `listIterator()` loop with a subtype of `Iterator`. The snapshot includes the return value, all three nullable header expressions and their contents, and variable bounds retained from removed foreach assignments. A fresh direct graph checks the entry and continue destinations, ordered edges, and expression-list sharing, including the detached list for a counted loop with no initializer.
+
+The loop-merging comparison starts immediately after edge cleanup and compares the native merge loop at its fixed point. Successful loop elimination, loop extraction, and conditional merging all restart the merge loop. The comparison uses the same staged inputs and snapshots of the statement tree and fresh direct graph as the loop-enhancement gate.
+
+The main-loop label comparison starts at the prepared method and runs edge cleanup, the merge loop, stack simplification, variable versioning, and label identification. It checks the resulting ordered adjacency lists, label closures and flags, expressions, counters, variable versions, and a fresh direct graph.
+
 ## End-to-end source and CLI suite
 
 The retained `upstream_parity` target covers final source and CLI behavior. It currently requires library and binary entry points that still await migration. Use the explicit stage targets above to test the active implementation. The commands below document the end-to-end gate once those entry points are available.

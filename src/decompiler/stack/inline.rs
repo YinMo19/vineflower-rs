@@ -12,7 +12,7 @@ use crate::decompiler::exps::{Expr, ExprKind, FunctionType, MonitorType};
 use crate::decompiler::flow::{DirectEdgeType, DirectGraph, NodeType, flatten::build_direct_graph};
 use crate::decompiler::ir::{ExprId, ExprListId, Ir, StatId};
 use crate::decompiler::sforms::{Ssau, SsauResult};
-use crate::decompiler::stats::StatementKind;
+use crate::decompiler::stats::{LoopType, StatementKind};
 use crate::decompiler::vars::var_version_pair::VarVersionPair as Version;
 use crate::decompiler::vars::version_graph::VarVersionsGraph;
 use crate::engine::{Cx, counter_container::CounterContainer};
@@ -63,7 +63,8 @@ pub(super) fn iterate_statements(
             (!inliner.cx.ir[node.exprents].is_empty()).then_some(node.exprents),
             tail.map(|tail| tail.exprents),
         ];
-        let stat = tail.unwrap_or(node).stat;
+        let processed = tail.unwrap_or(node);
+        let stat = processed.stat;
 
         let mut stage = 0;
         while stage < 2 {
@@ -98,6 +99,21 @@ pub(super) fn iterate_statements(
                 .iter()
                 .map(|&successor| (successor, values.clone())),
         );
+
+        // A cleared header list now represents Java's restored null entry.
+        // A detached init node also reaches this check when it starts empty.
+        let ir = &mut inliner.cx.ir;
+        if matches!(
+            processed.ty,
+            NodeType::Init | NodeType::Condition | NodeType::Increment
+        ) && ir[processed.exprents].is_empty()
+            && let StatementKind::Do(loop_stat) = ir[stat].kind
+            && loop_stat.ty == LoopType::For
+            && loop_stat.init(ir).is_none()
+            && loop_stat.increment(ir).is_none()
+        {
+            stat.set_loop_type(ir, LoopType::While);
+        }
     }
     inliner.apply_locals(&graph);
     changed

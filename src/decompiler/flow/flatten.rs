@@ -9,7 +9,8 @@ use super::{DirectEdgeType, DirectGraph, DirectGraphBuilder, DirectId, NodeType}
 use crate::decompiler::ir::{EdgeId, ExprListId, Ir, StatId};
 use crate::decompiler::stats::stat_edge::EdgeType;
 use crate::decompiler::stats::{
-    IfStatement, LastBasicType, STATEDGE_ALL, STATEDGE_DIRECT_ALL, StatementKind,
+    DoStatement, IfStatement, LastBasicType, LoopType, STATEDGE_ALL, STATEDGE_DIRECT_ALL,
+    StatementKind,
 };
 
 pub fn build_direct_graph(ir: &mut Ir, root: StatId) -> DirectGraph {
@@ -21,9 +22,12 @@ pub fn build_direct_graph(ir: &mut Ir, root: StatId) -> DirectGraph {
     let exit = flatten.create_node(dummy_exit, NodeType::Direct, None);
     flatten.regular_destinations.insert(dummy_exit, exit);
     flatten.resolve_edges();
-    flatten
-        .graph
-        .finish(flatten.ir, first, flatten.regular_destinations)
+    flatten.graph.finish(
+        flatten.ir,
+        first,
+        flatten.regular_destinations,
+        flatten.continue_destinations,
+    )
 }
 
 struct DeferredEdge {
@@ -78,7 +82,7 @@ impl<'a> Flatten<'a> {
             StatementKind::BasicBlock { .. } => self.flatten_basic_block(stat),
             StatementKind::Catch { resources, .. } => self.flatten_try(stat, false, resources),
             StatementKind::CatchAll { is_finally, .. } => self.flatten_try(stat, is_finally, None),
-            StatementKind::Do => self.flatten_infinite_loop(stat),
+            StatementKind::Do(loop_stat) => self.flatten_loop(stat, loop_stat),
             StatementKind::Synchronized { head_exprents, .. } => {
                 self.flatten_synchronized(stat, head_exprents)
             }
@@ -167,7 +171,59 @@ impl<'a> Flatten<'a> {
         node
     }
 
-    fn flatten_infinite_loop(&mut self, stat: StatId) -> DirectId {
+    fn flatten_loop(&mut self, stat: StatId, loop_stat: DoStatement) -> DirectId {
+        if loop_stat.ty == LoopType::Infinite {
+            self.link_infinite_loop_predecessor(stat);
+        }
+
+        let body = self.flatten_statement(self.ir[stat].first.unwrap());
+        let (entry, continue_to, exit_from) = match loop_stat.ty {
+            LoopType::Infinite => {
+                self.regular_destinations.insert(stat, body);
+                self.continue_destinations.insert(stat, body);
+                return body;
+            }
+            LoopType::While | LoopType::DoWhile => {
+                let condition = self.create_node(stat, NodeType::Condition, loop_stat.condition);
+                self.graph.connect(condition, body, DirectEdgeType::Regular);
+                let entry = if loop_stat.ty == LoopType::While {
+                    condition
+                } else {
+                    body
+                };
+                (entry, condition, condition)
+            }
+            LoopType::For => {
+                let init = self.create_node(stat, NodeType::Init, self.nonempty_list(loop_stat.init));
+                let condition = self.create_node(stat, NodeType::Condition, loop_stat.condition);
+                let increment = self.create_node(stat, NodeType::Increment, loop_stat.increment);
+                self.graph.connect(condition, body, DirectEdgeType::Regular);
+                self.graph.connect(init, condition, DirectEdgeType::Regular);
+                self.graph.connect(increment, condition, DirectEdgeType::Regular);
+                (init, increment, condition)
+            }
+            LoopType::ForEach => {
+                let iterable = self.create_node(stat, NodeType::Increment, loop_stat.increment);
+                let variable = self.create_node(stat, NodeType::ForeachVardef, loop_stat.init);
+                self.graph.connect(variable, body, DirectEdgeType::Regular);
+                self.graph.connect(iterable, variable, DirectEdgeType::Regular);
+                (iterable, variable, variable)
+            }
+        };
+
+        self.regular_destinations.insert(stat, entry);
+        self.continue_destinations.insert(stat, continue_to);
+        if loop_stat.ty != LoopType::While {
+            self.handle_loop_end(stat, body);
+        }
+        let successor = self.ir[stat]
+            .first_successor()
+            .expect("Enhanced loop has no successor");
+        self.defer_edge(exit_from, successor);
+        entry
+    }
+
+    fn link_infinite_loop_predecessor(&mut self, stat: StatId) {
         let regular = EdgeType::Regular.mask();
         if let Some(&edge) = stat.get_successor_edges(self.ir, regular).first() {
             let target = self.ir[edge].destination;
@@ -177,11 +233,20 @@ impl<'a> Flatten<'a> {
                 self.add_edge_if_possible(self.ir[predecessor].source, target);
             }
         }
+    }
 
-        let body = self.flatten_statement(self.ir[stat].first.unwrap());
-        self.regular_destinations.insert(stat, body);
-        self.continue_destinations.insert(stat, body);
-        body
+    fn handle_loop_end(&mut self, stat: StatId, body: DirectId) {
+        if !self
+            .deferred_edges
+            .iter()
+            .any(|edge| edge.destination == stat && edge.kind == EdgeType::Continue)
+        {
+            self.deferred_edges.push(DeferredEdge {
+                source: body,
+                destination: stat,
+                kind: EdgeType::Continue,
+            });
+        }
     }
 
     fn flatten_synchronized(

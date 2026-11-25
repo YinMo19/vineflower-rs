@@ -140,6 +140,19 @@ impl FlowState {
                 catchable,
                 reads: &mut self.reads,
             };
+            if ir[node.exprents].is_empty()
+                && let StatementKind::Do(loop_stat) = ir[node.stat].kind
+            {
+                // The FOR init node is detached when the statement's init is
+                // null. Other active headers still contain a null in Java,
+                // which SForms attempts to process as an expression.
+                let active_header = match node.ty {
+                    NodeType::Init => loop_stat.init == Some(node.exprents),
+                    NodeType::Condition | NodeType::Increment | NodeType::ForeachVardef => true,
+                    _ => false,
+                };
+                assert!(!active_header, "Loop header {} has no expression", node.id);
+            }
             if node.ty == NodeType::ForeachVardef
                 && let Some(&var) = ir[node.exprents].first()
                 && matches!(ir[var].kind, ExprKind::Variable(_))

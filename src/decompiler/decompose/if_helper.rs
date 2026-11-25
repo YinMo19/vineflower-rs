@@ -14,6 +14,44 @@ use crate::decompiler::stats::{IfStatement, STATEDGE_ALL, Statement, StatementKi
 use crate::engine::{Cx, counter_container::CounterContainer};
 use crate::structs::StructClass;
 
+/// Keep a single set of reordered conditionals for the whole traversal.
+pub(crate) fn merge_all_ifs(
+    cx: &mut Cx,
+    counters: &mut CounterContainer,
+    root: StatId,
+    class: &StructClass,
+) -> bool {
+    let changed = merge_children(cx, counters, root, class, &mut FxHashSet::default());
+    if changed {
+        super::finish::condense_sequences(cx, counters, root);
+    }
+    changed
+}
+
+fn merge_children(
+    cx: &mut Cx,
+    counters: &mut CounterContainer,
+    stat: StatId,
+    class: &StructClass,
+    reordered: &mut FxHashSet<i32>,
+) -> bool {
+    let mut changed = false;
+    if cx.ir[stat].exprents.is_none() {
+        'scan: loop {
+            for i in 0..cx.ir[stat].stats.len() {
+                let child = cx.ir[stat].stats[i];
+                changed |= merge_children(cx, counters, child, class, reordered);
+                if merge_ifs(cx, counters, child, reordered, class) {
+                    changed = true;
+                    continue 'scan;
+                }
+            }
+            break;
+        }
+    }
+    changed
+}
+
 pub fn merge_ifs(
     cx: &mut Cx,
     counters: &mut CounterContainer,
@@ -659,7 +697,7 @@ fn get_next_statement(ir: &Ir, mut stat: StatId) -> StatId {
         let parent = ir[stat].parent.expect("Statement has no enclosing root");
         match &ir[parent].kind {
             StatementKind::Root { dummy_exit, .. } => return *dummy_exit,
-            StatementKind::Do => return parent,
+            StatementKind::Do(_) => return parent,
             StatementKind::Sequence => {
                 let children = &ir[parent].stats;
                 if *children.get_last() != stat

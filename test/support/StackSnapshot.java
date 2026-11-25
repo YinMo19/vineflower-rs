@@ -36,7 +36,10 @@ import org.jetbrains.java.decompiler.modules.decompiler.ConcatenationHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.EliminateLoopsHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.ExprProcessor;
 import org.jetbrains.java.decompiler.modules.decompiler.FinallyProcessor;
+import org.jetbrains.java.decompiler.modules.decompiler.IfHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.LabelHelper;
+import org.jetbrains.java.decompiler.modules.decompiler.LoopExtractHelper;
+import org.jetbrains.java.decompiler.modules.decompiler.MergeHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.PPandMMHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.SequenceHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.SimplifyExprentsHelper;
@@ -52,7 +55,13 @@ import org.jetbrains.java.decompiler.struct.gen.MethodDescriptor;
 import org.jetbrains.java.decompiler.util.InterpreterUtil;
 
 class StackSnapshot {
-  enum Check { STACK, INCREMENTS, PRE_MAIN, LOOP_ELIMINATION }
+  enum Check {
+    STACK, INCREMENTS, PRE_MAIN, LOOP_ELIMINATION, LOOP_ENHANCEMENT, LOOP_MERGE, MAIN_LOOP_LABELS;
+
+    boolean usesLoopHeaders() {
+      return this == LOOP_ENHANCEMENT || this == LOOP_MERGE || this == MAIN_LOOP_LABELS;
+    }
+  }
 
   record Options(int group, boolean simplify, boolean ternary, boolean lvt, boolean booleanAsInt, boolean assertions) {}
   private record RootScope(ImportCollector imports, List<ClassNode> wrapperOrder, String error) {}
@@ -85,7 +94,7 @@ class StackSnapshot {
       published.clear();
       current = null;
       engine = new Fernflower(new ConsoleFileSaver(null), Map.of(
-        IFernflowerPreferences.INCLUDE_JAVA_RUNTIME, "0",
+        IFernflowerPreferences.INCLUDE_JAVA_RUNTIME, check.usesLoopHeaders() ? "1" : "0",
         IFernflowerPreferences.SIMPLIFY_STACK_SECOND_PASS, next.simplify() ? "1" : "0",
         IFernflowerPreferences.TERNARY_CONDITIONS, next.ternary() ? "1" : "0",
         IFernflowerPreferences.USE_DEBUG_VAR_NAMES, next.lvt() ? "1" : "0",
@@ -156,10 +165,15 @@ class StackSnapshot {
 
       method.expandData(cl);
       try {
-        input.mark(Integer.MAX_VALUE);
+        if (!check.usesLoopHeaders()) {
+          input.mark(Integer.MAX_VALUE);
+        }
         var firstGraph = StructureReference.readGraph(input, method);
-        input.reset();
-        var settledGraph = StructureReference.readGraph(input, method);
+        ControlFlowGraph settledGraph = null;
+        if (!check.usesLoopHeaders()) {
+          input.reset();
+          settledGraph = StructureReference.readGraph(input, method);
+        }
         if (scope.error() != null) {
           return "class-rejected=" + scope.error();
         }
@@ -168,7 +182,7 @@ class StackSnapshot {
         String first = stage(firstGraph, scope.imports(), cl, method, initialHidden, true, check);
         hidden.clear();
         hidden.addAll(initialHidden);
-        if ("rejected=parsing failure!".equals(first)) {
+        if (settledGraph == null || "rejected=parsing failure!".equals(first)) {
           return first;
         }
         return first + "\t" + stage(settledGraph, scope.imports(), cl, method, initialHidden, false, check);
@@ -285,12 +299,12 @@ class StackSnapshot {
           operation = "inline-increments";
           PPandMMHelper.inlinePPIandMMIIf(root);
         }
-        if (check == Check.PRE_MAIN || check == Check.LOOP_ELIMINATION) {
+        if (check == Check.PRE_MAIN || check == Check.LOOP_ELIMINATION || check.usesLoopHeaders()) {
           operation = "simplify-concat";
           if (cl.getVersion().hasIndyStringConcat()) {
             ConcatenationHelper.simplifyStringConcat(root);
           }
-          if (!first || check == Check.LOOP_ELIMINATION) {
+          if (!first || check != Check.PRE_MAIN) {
             operation = "build-assertions";
             AssertProcessor.buildAssertions(root);
           }
@@ -303,7 +317,44 @@ class StackSnapshot {
       } else {
         StackVarsProcessor.simplifyStackVars(root, method, cl);
       }
-      if (check == Check.LOOP_ELIMINATION) {
+      if (check.usesLoopHeaders()) {
+        operation = "clean-up-edges";
+        LabelHelper.cleanUpEdges(root);
+        String details = "";
+        if (check == Check.LOOP_ENHANCEMENT) {
+          operation = "eliminate-loops";
+          if (root.hasLoops()) {
+            while (EliminateLoopsHelper.eliminateLoops(root, cl)) {}
+          }
+          operation = "enhance-loops";
+          details = ";enhanced=" + (root.hasLoops() && MergeHelper.enhanceLoops(root));
+        } else if (root.hasLoops()) {
+          operation = "merge-loops";
+          while (true) {
+            if (EliminateLoopsHelper.eliminateLoops(root, cl)) {
+              continue;
+            }
+            MergeHelper.enhanceLoops(root);
+            if (LoopExtractHelper.extractLoops(root)) {
+              continue;
+            }
+            if (!IfHelper.mergeAllIfs(root)) {
+              break;
+            }
+          }
+        }
+        if (check == Check.MAIN_LOOP_LABELS) {
+          operation = "simplify-stack";
+          StackVarsProcessor.simplifyStackVars(root, method, cl);
+          operation = "set-var-versions";
+          vars.setVarVersions(root);
+          operation = "identify-labels";
+          LabelHelper.identifyLabels(root);
+        }
+        operation = "snapshot";
+        return snapshot(root, counters, vars, initialHidden, check, details)
+          + "\t" + DirectGraphSnapshot.enhanced(root);
+      } else if (check == Check.LOOP_ELIMINATION) {
         operation = "snapshot";
         var originalEdges = first ? StructureReference.edgeStates(root) : Map.of();
         operation = "clean-up-edges";
@@ -353,6 +404,9 @@ class StackSnapshot {
         case INCREMENTS -> "increments-" + operation + "-";
         case PRE_MAIN -> "pre-main-" + operation + "-";
         case LOOP_ELIMINATION -> "loop-elimination-" + operation + "-";
+        case LOOP_ENHANCEMENT -> "loop-enhancement-" + operation + "-";
+        case LOOP_MERGE -> "loop-merge-" + operation + "-";
+        case MAIN_LOOP_LABELS -> "main-loop-labels-" + operation + "-";
       };
       return failure + StructureReference.failureSnapshot(error);
     }
@@ -364,11 +418,12 @@ class StackSnapshot {
     String allMembers = hidden.stream().sorted().map(ExpressionSnapshot::text).collect(Collectors.joining(","));
     String added = hidden.stream().filter(member -> !initialHidden.contains(member)).sorted()
       .map(ExpressionSnapshot::text).collect(Collectors.joining(","));
-    String content = check == Check.PRE_MAIN || check == Check.LOOP_ELIMINATION
+    boolean loopStage = check == Check.LOOP_ELIMINATION || check.usesLoopHeaders();
+    String content = check == Check.PRE_MAIN || loopStage
       ? ";content=" + root.hasTryCatch() + "," + root.hasLoops() + "," + root.hasSwitch() : "";
-    String snapshot = StructureReference.snapshot(root, counters, check == Check.LOOP_ELIMINATION)
+    String snapshot = StructureReference.snapshot(root, counters, loopStage)
       + content + ";hidden=" + allMembers + ";hidden-added=" + added + details
-      + "\t" + ExpressionSnapshot.snapshot(root, counters);
+      + "\t" + ExpressionSnapshot.snapshot(root, counters, check.usesLoopHeaders());
     return check == Check.STACK ? snapshot : snapshot + "\t" + VariableSnapshot.snapshot(vars);
   }
 }

@@ -257,14 +257,18 @@ impl ExpressionMethod {
         crate::decompiler::labels::clean_up_edges(&mut cx.ir, self.root);
     }
 
-    /// One pass of redundant-loop elimination. A change restarts the merge loop.
-    pub fn eliminate_loops(&mut self, cx: &mut Cx, class: &StructClass) -> io::Result<bool> {
+    fn has_loops(&self, ir: &Ir) -> bool {
         let crate::decompiler::stats::StatementKind::Root { content_flags, .. } =
-            cx.ir[self.root].kind
+            ir[self.root].kind
         else {
             unreachable!("Expected a method root")
         };
-        if content_flags.has_loops {
+        content_flags.has_loops
+    }
+
+    /// One pass of redundant-loop elimination. A change restarts the merge loop.
+    pub fn eliminate_loops(&mut self, cx: &mut Cx, class: &StructClass) -> io::Result<bool> {
+        if self.has_loops(&cx.ir) {
             crate::decompiler::loops::eliminate::eliminate(
                 cx,
                 &mut self.flow.counters,
@@ -274,6 +278,33 @@ impl ExpressionMethod {
         } else {
             Ok(false)
         }
+    }
+
+    /// Recover while, counted for and enhanced for loops to a fixed point.
+    pub fn enhance_loops(&mut self, cx: &mut Cx) -> io::Result<bool> {
+        if self.has_loops(&cx.ir) {
+            crate::decompiler::loops::enhance::enhance(cx, &mut self.flow.counters, self.root)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Run the native loop passes through MethodProcessor's MergeLoopEnd.
+    pub fn merge_loops(&mut self, cx: &mut Cx, class: &StructClass) -> io::Result<()> {
+        if self.has_loops(&cx.ir) {
+            crate::decompiler::loops::merge(cx, &mut self.flow.counters, self.root, class)?;
+        }
+        Ok(())
+    }
+
+    /// First part of each Java main-loop iteration, through IdentifyLabels.
+    pub fn identify_main_loop_labels(&mut self, cx: &mut Cx, class: &StructClass) -> io::Result<()> {
+        self.clean_up_edges(cx);
+        self.merge_loops(cx, class)?;
+        self.simplify_stack_vars(cx, class);
+        self.set_var_versions(cx, class)?;
+        crate::decompiler::labels::identify_labels(&mut cx.ir, self.root);
+        Ok(())
     }
 
     pub fn simplify_string_concat(&mut self, cx: &mut Cx, class: &StructClass) -> io::Result<()> {

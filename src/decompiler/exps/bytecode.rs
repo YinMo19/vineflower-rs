@@ -8,8 +8,9 @@ use std::sync::Arc;
 
 use itertools::Itertools;
 
-use super::Expr;
+use super::{Expr, ExprKind, SwitchCaseValues};
 use crate::decompiler::ir::{ExprId, Ir};
+use crate::decompiler::stats::StatementKind;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BytecodeOffsets(OffsetRanges);
@@ -94,6 +95,61 @@ impl Expr {
         match &mut ir[dst].bytecode {
             Some(existing) => existing.union(src),
             bytecode @ None => *bytecode = Some(src.clone()),
+        }
+    }
+
+    /// `src.getBytecodeRange(dst.bytecode)` only updates an existing set.
+    pub(crate) fn add_bytecode_range(ir: &mut Ir, dst: ExprId, src: ExprId) {
+        if let Some(mut offsets) = ir[dst].bytecode.clone() {
+            Self::measure_bytecode(ir, src, &mut offsets);
+            ir[dst].bytecode = Some(offsets);
+        }
+    }
+
+    fn measure_bytecode(ir: &Ir, expr: ExprId, offsets: &mut BytecodeOffsets) {
+        match &ir[expr].kind {
+            ExprKind::New {
+                array_elements,
+                dimensions,
+                constructor,
+                ..
+            } => {
+                // NewExprent includes the constructor's own offsets in its range.
+                for &child in array_elements.iter().chain(dimensions).chain(constructor) {
+                    Self::measure_bytecode(ir, child, offsets);
+                }
+            }
+            ExprKind::SwitchHead { value, case_values } => {
+                match case_values {
+                    Some(SwitchCaseValues::Statement(stat)) => {
+                        let StatementKind::Switch(switch) = &ir[*stat].kind else {
+                            unreachable!("Switch header case values belong to a switch statement");
+                        };
+                        for &label in switch
+                            .cases
+                            .iter()
+                            .flat_map(|case| case.values.iter().flatten())
+                        {
+                            Self::measure_bytecode(ir, label, offsets);
+                        }
+                    }
+                    Some(SwitchCaseValues::Copied(cases)) => {
+                        for &label in cases.iter().flatten().flatten() {
+                            Self::measure_bytecode(ir, label, offsets);
+                        }
+                    }
+                    None => {}
+                }
+                Self::measure_bytecode(ir, *value, offsets);
+            }
+            _ => {
+                for child in Self::children(ir, expr) {
+                    Self::measure_bytecode(ir, child, offsets);
+                }
+            }
+        }
+        if let Some(bytecode) = &ir[expr].bytecode {
+            offsets.union(bytecode);
         }
     }
 }

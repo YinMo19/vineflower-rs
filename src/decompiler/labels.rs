@@ -3,11 +3,14 @@
 
 //! Normalizes statement edges and their label closures.
 
+mod identify;
+pub(crate) use identify::identify_labels;
+
 use indexmap::IndexSet;
 
 use crate::decompiler::ir::{EdgeId, Ir, StatId};
 use crate::decompiler::stats::stat_edge::EdgeType;
-use crate::decompiler::stats::{IfStatement, STATEDGE_ALL, StatementKind};
+use crate::decompiler::stats::{IfStatement, LoopType, STATEDGE_ALL, StatementKind};
 
 pub(crate) fn clean_up_edges(ir: &mut Ir, root: StatId) {
     reset_all_edges(ir, root);
@@ -33,15 +36,14 @@ fn remove_non_immediate_edges(ir: &mut Ir, stat: StatId) {
         remove_non_immediate_edges(ir, ir[stat].stats[index]);
     }
 
-    // A one-armed if has an implicit else successor. All current loops are infinite.
-    let has_basic_successor = matches!(
-        ir[stat].kind,
+    let has_basic_successor = match ir[stat].kind {
         StatementKind::BasicBlock { .. }
-            | StatementKind::If(IfStatement {
-                has_else: false,
-                ..
-            })
-    );
+        | StatementKind::If(IfStatement {
+            has_else: false, ..
+        }) => true,
+        StatementKind::Do(loop_stat) => loop_stat.ty != LoopType::Infinite,
+        _ => false,
+    };
     if !has_basic_successor {
         let mask = EdgeType::Continue.mask() | EdgeType::Break.mask();
         for edge in stat.get_successor_edges(ir, mask) {
@@ -100,9 +102,19 @@ pub(crate) fn low_continue_labels(ir: &mut Ir, root: StatId) {
 }
 
 fn lower_continue_labels(ir: &mut Ir, stat: StatId, edges: &mut IndexSet<EdgeId>) {
-    // Every Do statement currently has the initial infinite loop type.
-    edges.extend(stat.get_predecessor_edges(ir, EdgeType::Continue.mask()));
-    if matches!(ir[stat].kind, StatementKind::Do) {
+    let lower = match ir[stat].kind {
+        StatementKind::Do(loop_stat) => match loop_stat.ty {
+            LoopType::Infinite => true,
+            LoopType::While => loop_stat.condition(ir).is_none(),
+            LoopType::For => loop_stat.increment(ir).is_none(),
+            LoopType::DoWhile | LoopType::ForEach => false,
+        },
+        _ => true,
+    };
+    if lower {
+        edges.extend(stat.get_predecessor_edges(ir, EdgeType::Continue.mask()));
+    }
+    if lower && matches!(ir[stat].kind, StatementKind::Do(_)) {
         for &edge in edges.iter() {
             if stat.contains_statement_strict(ir, ir[edge].source) {
                 edge.change_destination(ir, stat);
@@ -121,7 +133,7 @@ fn lower_continue_labels(ir: &mut Ir, stat: StatId, edges: &mut IndexSet<EdgeId>
     }
 }
 
-fn low_closures(ir: &mut Ir, stat: StatId) {
+pub(crate) fn low_closures(ir: &mut Ir, stat: StatId) {
     let labels: Vec<_> = ir[stat].label_edges.iter().copied().collect();
     for edge in labels {
         if ir[edge].edge_type != EdgeType::Break {
@@ -156,7 +168,7 @@ pub(crate) fn is_direct_path(ir: &Ir, mut stat: StatId, end: StatId) -> bool {
         };
         match &ir[parent].kind {
             StatementKind::Root { .. } => return matches!(ir[end].kind, StatementKind::DummyExit),
-            StatementKind::Do => return end == parent,
+            StatementKind::Do(_) => return end == parent,
             StatementKind::Switch(switch) => {
                 for cases in switch.cases.windows(2) {
                     if cases[0].statement == stat {

@@ -86,6 +86,7 @@ pub struct DirectGraph {
     pub first: DirectId,
     pub neg_if_branch: FxHashMap<DirectId, DirectId>,
     destinations: FxHashMap<StatId, DirectId>,
+    continue_destinations: FxHashMap<StatId, DirectId>,
 }
 
 impl DirectGraph {
@@ -104,6 +105,11 @@ impl DirectGraph {
 
     pub fn direct_node(&self, stat: StatId) -> Option<DirectId> {
         self.destinations.get(&stat).copied()
+    }
+
+    /// The direct node reached by a continue targeting this statement.
+    pub fn continue_node(&self, stat: StatId) -> Option<DirectId> {
+        self.continue_destinations.get(&stat).copied()
     }
 
     /// The node order of `DirectGraph.iterateExprents`. The ordered regular
@@ -193,6 +199,7 @@ impl DirectGraphBuilder {
         ir: &Ir,
         first: DirectId,
         destinations: FxHashMap<StatId, DirectId>,
+        continue_destinations: FxHashMap<StatId, DirectId>,
     ) -> DirectGraph {
         let mut visited = FxHashSet::default();
         visited.insert(&self[first].id);
@@ -229,6 +236,7 @@ impl DirectGraphBuilder {
             extra_nodes,
             neg_if_branch: self.neg_if_branch,
             destinations,
+            continue_destinations,
         }
     }
 }

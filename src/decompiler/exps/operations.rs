@@ -3,14 +3,67 @@
 
 //! Equality, use flags, and child replacement of expression objects.
 
-use crate::decompiler::ir::{ExprId, Ir};
+use crate::decompiler::ir::{ExprId, Ir, StatId};
+use crate::decompiler::vars::var_version_pair::VarVersionPair;
 use crate::engine::Cx;
 
-use super::{Expr, ExprKind};
+use super::{Expr, ExprKind, Variable};
 
 impl Expr {
     pub const MULTIPLE_USES: u8 = 1;
     pub const SIDE_EFFECTS_FREE: u8 = 2;
+
+    pub(crate) fn variable(ir: &Ir, expr: ExprId) -> Option<&Variable> {
+        match &ir[expr].kind {
+            ExprKind::Variable(var) => Some(var),
+            _ => None,
+        }
+    }
+
+    /// `MergeHelper.containsVar` compares the index irrespective of SSA version.
+    pub(crate) fn contains_var_index(ir: &Ir, tree: ExprId, index: i32) -> bool {
+        any_variable(ir, tree, &|_, var| var.index == index)
+    }
+
+    /// `Exprent.containsVar` matches both the index and SSA version.
+    pub(crate) fn contains_var(ir: &Ir, tree: ExprId, pair: VarVersionPair) -> bool {
+        any_variable(ir, tree, &|_, var| var.pair() == pair)
+    }
+
+    /// `VarExprent.isVarReferenced(Exprent, ...)`. Exceptions use expression
+    /// identity, whereas other references are matched by index and version.
+    pub(crate) fn is_var_referenced(
+        ir: &Ir,
+        var: ExprId,
+        tree: ExprId,
+        whitelist: &[ExprId],
+    ) -> bool {
+        let pair = Self::variable(ir, var)
+            .expect("Expected a variable expression")
+            .pair();
+        any_variable(ir, tree, &|expr, other| {
+            expr != var && !whitelist.contains(&expr) && other.pair() == pair
+        })
+    }
+
+    /// `VarExprent.isVarReferenced(Statement, ...)`.
+    pub(crate) fn is_var_referenced_in_stat(
+        ir: &Ir,
+        var: ExprId,
+        stat: StatId,
+        whitelist: &[ExprId],
+    ) -> bool {
+        let referenced = |expr| Self::is_var_referenced(ir, var, expr, whitelist);
+        if let Some(list) = ir[stat].exprents {
+            return ir[list].iter().copied().any(referenced);
+        }
+
+        ir[stat]
+            .stats
+            .iter()
+            .any(|&child| Self::is_var_referenced_in_stat(ir, var, child, whitelist))
+            || stat.stat_exprents(ir).into_iter().any(referenced)
+    }
 
     /// Java `Exprent.equals`, including each subclass's semantic fields.
     pub fn equals(cx: &Cx, left: ExprId, right: ExprId) -> bool {
@@ -228,6 +281,11 @@ impl Expr {
             _ => 0,
         }
     }
+}
+
+fn any_variable(ir: &Ir, tree: ExprId, matches: &impl Fn(ExprId, &Variable) -> bool) -> bool {
+    Expr::variable(ir, tree).is_some_and(|var| matches(tree, var))
+        || Expr::children(ir, tree).any(|child| any_variable(ir, child, matches))
 }
 
 fn equal_optional(cx: &Cx, left: Option<ExprId>, right: Option<ExprId>) -> bool {

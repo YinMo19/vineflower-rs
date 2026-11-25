@@ -23,6 +23,7 @@ pub use maps::{VersionMap, Versions};
 pub use reassign::{InstructionRewrites, reassign_ssa, reset_versions};
 pub use ssa::Ssa;
 pub use ssau::Ssau;
+pub(crate) use ssau::first_protected_range;
 
 pub struct VariableVersions<A> {
     pub graph: DirectGraph,

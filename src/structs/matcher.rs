@@ -242,7 +242,7 @@ impl Rule {
                     Self::Type(name) => matches!(
                         (*name, &stat.kind),
                         ("if", StatementKind::If(_))
-                            | ("do", StatementKind::Do)
+                            | ("do", StatementKind::Do(_))
                             | ("switch", StatementKind::Switch(_))
                             | ("trycatch", StatementKind::Catch { .. })
                             | ("basicblock", StatementKind::BasicBlock { .. })
