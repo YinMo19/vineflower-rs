@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::fs::File;
+use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::{env, fs, io};
 
 pub struct Corpus {
@@ -39,7 +41,20 @@ impl Corpus {
         Self { classes, jar }
     }
 
+    #[allow(
+        dead_code,
+        reason = "only the smaller parity tests read all snapshots at once"
+    )]
     pub fn run(&self, main: &str, helpers: &[&str], input: &Path) -> String {
+        let mut output = tempfile::tempfile().unwrap();
+        self.run_to(main, helpers, input, &output);
+        output.rewind().unwrap();
+        let mut text = String::new();
+        output.read_to_string(&mut text).unwrap();
+        text
+    }
+
+    pub fn run_to(&self, main: &str, helpers: &[&str], input: &Path, output: &File) {
         let classes = tempfile::tempdir().unwrap();
         let sources = Path::new(env!("CARGO_MANIFEST_DIR")).join("test/support");
         let mut compiler = Command::new(jdk_tool("javac"));
@@ -55,12 +70,12 @@ impl Corpus {
         }
         run(&mut compiler);
         let classpath = env::join_paths([classes.path(), self.jar.as_path()]).unwrap();
-        let output = run(Command::new(jdk_tool("java"))
+        run(Command::new(jdk_tool("java"))
             .arg("-classpath")
             .arg(classpath)
             .arg(main)
-            .arg(input));
-        String::from_utf8(output.stdout).unwrap()
+            .arg(input)
+            .stdout(Stdio::from(output.try_clone().unwrap())));
     }
 }
 

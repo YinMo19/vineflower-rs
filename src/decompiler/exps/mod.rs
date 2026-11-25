@@ -4,6 +4,7 @@
 //! `modules.decompiler.exps`: the typed expressions produced by bytecode lifting.
 
 mod function;
+mod traversal;
 
 use std::ops::Range;
 use std::sync::Arc;

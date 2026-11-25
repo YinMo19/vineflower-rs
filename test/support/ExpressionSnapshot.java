@@ -13,11 +13,8 @@ import java.util.stream.IntStream;
 
 import org.jetbrains.java.decompiler.code.Instruction;
 import org.jetbrains.java.decompiler.main.collectors.CounterContainer;
-import org.jetbrains.java.decompiler.modules.decompiler.ExprProcessor;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.*;
 import org.jetbrains.java.decompiler.modules.decompiler.stats.*;
-import org.jetbrains.java.decompiler.modules.decompiler.vars.VarProcessor;
-import org.jetbrains.java.decompiler.struct.StructClass;
 import org.jetbrains.java.decompiler.struct.attr.StructLocalVariableTableAttribute.LocalVariable;
 import org.jetbrains.java.decompiler.struct.consts.LinkConstant;
 import org.jetbrains.java.decompiler.struct.consts.PooledConstant;
@@ -38,21 +35,15 @@ class ExpressionSnapshot {
   // Record shared nodes once and keep references by the upstream expression ID.
   private final Map<Integer, Exprent> nodes = new TreeMap<>();
 
-  static String lift(RootStatement root, StructClass cl, MethodDescriptor descriptor, VarProcessor vars,
-                     CounterContainer counters) {
+  static String snapshot(RootStatement root, CounterContainer counters) {
     try {
-      new ExprProcessor(descriptor, vars).processStatement(root, cl);
-    } catch (RuntimeException | AssertionError | StackOverflowError failure) {
-      return "lift-error=" + text(failure.toString());
-    }
-    try {
-      return new ExpressionSnapshot().snapshot(root, counters);
+      return new ExpressionSnapshot().describe(root, counters);
     } catch (RuntimeException | AssertionError | StackOverflowError failure) {
       return "snapshot-error=" + text(failure.toString());
     }
   }
 
-  private String snapshot(RootStatement root, CounterContainer counters) {
+  private String describe(RootStatement root, CounterContainer counters) {
     StringJoiner fields = new StringJoiner(";");
     fields.add("counters=" + counters.getCounter(CounterContainer.STATEMENT_COUNTER)
       + "," + counters.getCounter(CounterContainer.EXPRESSION_COUNTER)

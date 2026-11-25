@@ -1,6 +1,6 @@
 # Testing the current port
 
-The active method pipeline reconstructs structured Java statements through the first `DomHelper.parseGraph` call. The resulting method can run the same expression pass that finally recovery uses before SSA. Run the checks against the checked-in class files with
+The active method pipeline reconstructs structured Java statements through the first `DomHelper.parseGraph` call. The resulting method supports expression lifting, SSA, instruction reassignment and SSAU as used by finally recovery. Run the checks against the checked-in class files with
 
 ```sh
 cargo test --locked --test control_flow --test structured_flow
@@ -17,6 +17,8 @@ cargo test --locked --test class_nodes --test control_flow --test structured_flo
 The structured-flow comparison feeds the same prepared CFG to Rust and Java. This isolates statement decomposition from JVM identity hashing during handler allocation. It compares ordered statement trees, typed edges, flags, switch cases, catch variables, method counters and the direct graph. For unreachable direct nodes the comparison checks membership; reachable nodes retain their reverse postorder. An upstream method-level parsing rejection is counted separately and requires the corresponding Rust error.
 
 The expression comparison calls `ExprProcessor.processStatement` on each parsed tree. It compares operand order, expression IDs and types, instruction offsets, local-variable metadata, bootstrap methods and arguments, and sharing of the switch label lists. It covers the default options, forced JSR inlining, disabled debug variable names and complex dynamic constants. The class comparison registers the files on one classpath and checks nested-class relationships, anonymous allocation types, and import resolution with default settings, anonymous-class verification, and inner-class processing disabled.
+
+The sparse-analysis comparison runs SSA, instruction reassignment, version reset, SSAU and a second reset on the same expressions as Java. It compares reaching definitions at joins, read counts, instruction identity, and the SSAU graph including live variables, field versions, phantom nodes, direct assignments and protected ranges.
 
 ## End-to-end source and CLI suite
 

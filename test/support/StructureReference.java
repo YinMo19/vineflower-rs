@@ -29,6 +29,7 @@ import org.jetbrains.java.decompiler.main.collectors.CounterContainer;
 import org.jetbrains.java.decompiler.main.collectors.ImportCollector;
 import org.jetbrains.java.decompiler.main.extern.IFernflowerLogger;
 import org.jetbrains.java.decompiler.main.extern.IFernflowerPreferences;
+import org.jetbrains.java.decompiler.modules.decompiler.ExprProcessor;
 import org.jetbrains.java.decompiler.modules.decompiler.StatEdge;
 import org.jetbrains.java.decompiler.modules.decompiler.decompose.DomHelper;
 import org.jetbrains.java.decompiler.modules.decompiler.exps.ConstExprent;
@@ -53,6 +54,7 @@ class StructureReference {
   public static void main(String[] args) throws IOException {
     new Fernflower(null, Map.of(IFernflowerPreferences.INCLUDE_JAVA_RUNTIME, "0"), IFernflowerLogger.NO_OP);
     try (var input = new DataInputStream(new BufferedInputStream(Files.newInputStream(Path.of(args[0]))))) {
+      boolean checkSsa = input.readBoolean();
       Path previousPath = null;
       Options previousOptions = null;
       StructClass currentClass = null;
@@ -84,13 +86,13 @@ class StructureReference {
           String snapshot;
           try {
             RootStatement root = DomHelper.parseGraph(graph, method, 0);
-            snapshot = snapshot(root, counters) + "\t" + directSnapshot(root)
-              + "\t" + ExpressionSnapshot.lift(root, currentClass, methodDescriptor, varProcessor, counters);
+            snapshot = checkSsa ? "" : snapshot(root, counters) + "\t" + directSnapshot(root) + "\t";
+            snapshot += lift(root, currentClass, method, methodDescriptor, varProcessor, counters, checkSsa);
           } catch (RuntimeException | AssertionError | StackOverflowError failure) {
             if (failure.getClass() == RuntimeException.class && "parsing failure!".equals(failure.getMessage())) {
               snapshot = "rejected=parsing failure!";
             } else {
-              snapshot = failureSnapshot(failure);
+              snapshot = "structure-" + failureSnapshot(failure);
             }
           }
           System.out.println(index + "\t" + snapshot);
@@ -101,19 +103,29 @@ class StructureReference {
     }
   }
 
+  private static String lift(RootStatement root, StructClass cl, StructMethod method, MethodDescriptor descriptor,
+                             VarProcessor vars, CounterContainer counters, boolean checkSsa) {
+    try {
+      new ExprProcessor(descriptor, vars).processStatement(root, cl);
+    } catch (RuntimeException | AssertionError | StackOverflowError failure) {
+      return "lift-" + failureSnapshot(failure);
+    }
+    return checkSsa ? SsaSnapshot.run(root, method, counters) : ExpressionSnapshot.snapshot(root, counters);
+  }
+
   private static String flag(boolean value) {
     return value ? "1" : "0";
   }
 
   private static String directSnapshot(RootStatement root) {
     try {
-      return DirectGraphSnapshot.snapshot(root);
+      return "graph=" + DirectGraphSnapshot.snapshot(root);
     } catch (RuntimeException | AssertionError | StackOverflowError failure) {
       return failureSnapshot(failure);
     }
   }
 
-  private static String failureSnapshot(Throwable failure) {
+  static String failureSnapshot(Throwable failure) {
     return "error=" + failure.toString().replace('\t', ' ').replace('\n', ' ').replace('\r', ' ');
   }
 
@@ -143,6 +155,7 @@ class StructureReference {
     }
 
     Map<Integer, BasicBlock> blocks = new HashMap<>();
+    List<Instruction> instructions = new ArrayList<>();
     blocks.put(exitId, exit);
     int blockCount = input.readInt();
     List<PendingBlock> pending = new ArrayList<>(blockCount);
@@ -158,16 +171,20 @@ class StructureReference {
       pending.add(new PendingBlock(block, readInts(input), readInts(input)));
       int length = input.readInt();
       for (int j = 0; j < length; j++) {
-        int opcode = input.readInt();
-        boolean wide = input.readBoolean();
-        int group = input.readInt();
-        int offset = input.readInt();
-        int size = input.readInt();
-        int[] operands = readInts(input);
-        Instruction instruction = Instruction.create(
-          opcode, wide, group, method.getBytecodeVersion(), operands, offset, size);
-        instruction.initInstruction(sequence);
-        block.getSeq().addInstruction(instruction);
+        int identity = input.readInt();
+        if (identity == instructions.size()) {
+          int opcode = input.readInt();
+          boolean wide = input.readBoolean();
+          int group = input.readInt();
+          int offset = input.readInt();
+          int size = input.readInt();
+          int[] operands = readInts(input);
+          Instruction instruction = Instruction.create(
+            opcode, wide, group, method.getBytecodeVersion(), operands, offset, size);
+          instruction.initInstruction(sequence);
+          instructions.add(instruction);
+        }
+        block.getSeq().addInstruction(instructions.get(identity));
       }
     }
 

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Seek, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 #[path = "support/upstream_reference.rs"]
 mod upstream_reference;
@@ -29,6 +29,8 @@ use vineflower_rs::util::data_input::DataInputFullStream;
 mod direct_graph_snapshot;
 #[path = "support/expression_snapshot.rs"]
 mod expression_snapshot;
+#[path = "support/ssa_snapshot.rs"]
+mod ssa_snapshot;
 
 #[test]
 fn structure_retains_statement_and_edge_links() {
@@ -152,20 +154,33 @@ fn structured_method_lifts_switch_expressions() {
 #[test]
 #[ignore = "requires the upstream +local.jar and JDK 17 or later"]
 fn structured_flow_matches_upstream() {
+    check_flow(false);
+}
+
+#[test]
+#[ignore = "requires the upstream +local.jar and JDK 17 or later"]
+fn ssa_matches_upstream() {
+    check_flow(true);
+}
+
+fn check_flow(check_ssa: bool) {
     let corpus = upstream_reference::Corpus::discover();
     let paths = &corpus.classes;
     let mut transfer = tempfile::NamedTempFile::new().unwrap();
-    let mut snapshots = Vec::new();
+    let mut rust_snapshots = tempfile::tempfile().unwrap();
+    let mut methods = Vec::new();
+    let mut profiles = vec![(false, true, false), (true, true, false)];
+    if !check_ssa {
+        profiles.extend([(false, false, false), (false, true, true)]);
+    }
     {
         let mut transfer = BufWriter::new(transfer.as_file_mut());
+        let mut rust_snapshots = BufWriter::new(&mut rust_snapshots);
+        write_flag(&mut transfer, check_ssa).unwrap();
         for path in paths {
             let bytes = fs::read(path).unwrap();
-            for (force_jsr_inline, use_lvt_names, decompile_complex_constant_dynamic) in [
-                (false, true, false),
-                (true, true, false),
-                (false, false, false),
-                (false, true, true),
-            ] {
+            for &(force_jsr_inline, use_lvt_names, decompile_complex_constant_dynamic) in &profiles
+            {
                 let mut options = Options::default();
                 options.force_jsr_inline = force_jsr_inline;
                 options.use_lvt_names = use_lvt_names;
@@ -181,7 +196,7 @@ fn structured_flow_matches_upstream() {
                     let initial = initial_statement_graph(&mut cx, &class, method)
                         .unwrap()
                         .unwrap();
-                    let record = i32::try_from(snapshots.len()).unwrap();
+                    let record = i32::try_from(methods.len()).unwrap();
                     write_int(&mut transfer, record).unwrap();
                     write_text(&mut transfer, path.to_str().unwrap()).unwrap();
                     write_text(&mut transfer, &method.name).unwrap();
@@ -192,17 +207,30 @@ fn structured_flow_matches_upstream() {
                     write_cfg(&mut transfer, &cx.ir, &initial.flow.graph).unwrap();
 
                     let result = catch_unwind(AssertUnwindSafe(|| initial.structure(&mut cx)));
-                    let (snapshot, direct, expressions) = match result {
+                    let snapshot = match result {
                         Ok(Ok(mut structured)) => {
-                            let statement = structure_snapshot(&cx.ir, &structured);
-                            let direct = catch_unwind(AssertUnwindSafe(|| {
-                                direct_graph_snapshot::snapshot(&mut cx.ir, structured.root)
-                            }))
-                            .unwrap_or_else(|error| format!("panic={}", panic_text(&*error)));
+                            let mut snapshot = String::new();
+                            if !check_ssa {
+                                let statement = structure_snapshot(&cx.ir, &structured);
+                                let direct = catch_unwind(AssertUnwindSafe(|| {
+                                    format!(
+                                        "graph={}",
+                                        direct_graph_snapshot::snapshot(
+                                            &mut cx.ir,
+                                            structured.root
+                                        )
+                                    )
+                                }))
+                                .unwrap_or_else(|error| format!("panic={}", panic_text(&*error)));
+                                snapshot = format!("{statement}\t{direct}\t");
+                            }
                             let lifted = catch_unwind(AssertUnwindSafe(|| {
                                 structured.process_expressions(&mut cx, &class)
                             }));
                             let expressions = match lifted {
+                                Ok(Ok(())) if check_ssa => {
+                                    ssa_snapshot::run(&mut cx.ir, &structured, method)
+                                }
                                 Ok(Ok(())) => catch_unwind(AssertUnwindSafe(|| {
                                     expression_snapshot::snapshot(
                                         &cx,
@@ -213,96 +241,127 @@ fn structured_flow_matches_upstream() {
                                 .unwrap_or_else(|error| {
                                     format!("snapshot-error={}", panic_text(&*error))
                                 }),
-                                Ok(Err(error)) => format!("lift-error={error}"),
+                                Ok(Err(error)) => {
+                                    format!("lift-error={}", one_line(&error.to_string()))
+                                }
                                 Err(error) => format!("lift-panic={}", panic_text(&*error)),
                             };
-                            (statement, Some(direct), Some(expressions))
+                            snapshot.push_str(&expressions);
+                            snapshot
                         }
                         Ok(Err(error))
                             if error.kind() == io::ErrorKind::InvalidData
                                 && error.to_string() == "parsing failure!" =>
                         {
-                            ("rejected=parsing failure!".to_owned(), None, None)
+                            "rejected=parsing failure!".to_owned()
                         }
-                        Ok(Err(error)) => (format!("error={error}"), None, None),
-                        Err(error) => (format!("panic={}", panic_text(&*error)), None, None),
+                        Ok(Err(error)) => {
+                            format!("structure-error={}", one_line(&error.to_string()))
+                        }
+                        Err(error) => format!("structure-panic={}", panic_text(&*error)),
                     };
-                    snapshots.push((
-                        format!(
-                            "{} {method} force-jsr={force_jsr_inline} lvt={use_lvt_names} \
-                             complex-condy={decompile_complex_constant_dynamic}",
-                            path.display()
-                        ),
-                        snapshot,
-                        direct,
-                        expressions,
+                    writeln!(rust_snapshots, "{snapshot}").unwrap();
+                    methods.push(format!(
+                        "{} {method} force-jsr={force_jsr_inline} lvt={use_lvt_names} \
+                         complex-condy={decompile_complex_constant_dynamic}",
+                        path.display()
                     ));
                 }
             }
         }
         write_int(&mut transfer, -1).unwrap();
         transfer.flush().unwrap();
+        rust_snapshots.flush().unwrap();
     }
 
-    let reference = corpus.run(
+    let mut reference = tempfile::tempfile().unwrap();
+    corpus.run_to(
         "StructureReference",
-        &["DirectGraphSnapshot", "ExpressionSnapshot"],
+        &["DirectGraphSnapshot", "ExpressionSnapshot", "SsaSnapshot"],
         transfer.path(),
+        &reference,
     );
+    reference.rewind().unwrap();
+    rust_snapshots.rewind().unwrap();
+    let mut rust_rows = BufReader::new(rust_snapshots).lines();
+    let mut java_rows = BufReader::new(reference).lines();
+    let stages: &[(&str, &str)] = if check_ssa {
+        &[
+            ("SSA splitting", "split="),
+            ("SSA reassignment", "reassigned="),
+            ("SSA version reset", "reset="),
+            ("SSAU splitting", "ssau="),
+            ("SSAU version reset", "ssau-reset="),
+        ]
+    } else {
+        &[
+            ("Structure", "counters="),
+            ("Direct graph", "graph="),
+            ("Expression lifting", "counters="),
+        ]
+    };
     let mut mismatches = Vec::new();
     let mut rejected = 0;
-    let mut rows = reference.lines();
-    for (index, (method, rust, rust_direct, rust_expr)) in snapshots.iter().enumerate() {
-        let (row_id, java) = rows
-            .next()
-            .expect("missing Java result")
-            .split_once('\t')
-            .unwrap();
+    for (index, method) in methods.iter().enumerate() {
+        let row = java_rows.next().expect("missing Java result").unwrap();
+        let (row_id, java) = row.split_once('\t').unwrap();
+        let rust = rust_rows.next().expect("missing Rust result").unwrap();
         assert_eq!(row_id.parse::<usize>().unwrap(), index);
-        let mut columns = java.split('\t');
-        let java = columns.next().unwrap();
-        let java_direct = columns.next();
-        let java_expr = columns.next();
-        assert!(columns.next().is_none(), "unexpected extra Java columns");
         if java == "rejected=parsing failure!" && java == rust {
-            assert!(java_direct.is_none() && java_expr.is_none());
             rejected += 1;
-        } else if java != rust || java.starts_with("error=") {
-            mismatches.push(format!("{method}\n  Structure {}", difference(java, rust)));
-        } else {
-            let mut differences = Vec::new();
-            match (java_direct, rust_direct) {
-                (Some(java), Some(rust)) if java != rust || java.starts_with("error=") => {
-                    differences.push(format!("Direct graph {}", difference(java, rust)));
-                }
-                (None, _) | (_, None) => differences.push("Missing direct graph".into()),
-                _ => {}
-            }
-            match (java_expr, rust_expr) {
-                (Some(java), Some(rust)) if java != rust || !java.starts_with("counters=") => {
-                    differences.push(format!("Expression lifting {}", difference(java, rust)));
-                }
-                (None, _) | (_, None) => differences.push("Missing expression graph".into()),
-                _ => {}
-            }
-            if !differences.is_empty() {
-                mismatches.push(format!("{method}\n  {}", differences.join("\n  ")));
-            }
+        } else if let Some(diff) = compare_snapshots(java, &rust, stages) {
+            mismatches.push(format!("{method}\n  {diff}"));
         }
     }
-    assert!(rows.next().is_none(), "unexpected extra Java results");
+    assert!(java_rows.next().is_none(), "unexpected extra Java results");
+    assert!(rust_rows.next().is_none(), "unexpected extra Rust results");
     assert!(
         mismatches.is_empty(),
         "{} of {} method snapshots differ:\n{}",
         mismatches.len(),
-        snapshots.len(),
+        methods.len(),
         mismatches.iter().take(30).join("\n")
     );
+    let checked = if check_ssa {
+        "SSA splits, reassignments, SSAU splits and version resets"
+    } else {
+        "statement trees, direct graphs and expression snapshots"
+    };
     eprintln!(
-        "{} exact statement trees, direct graphs and expression snapshots, and {rejected} matching decomposition rejections from {} class files",
-        snapshots.len() - rejected,
+        "{} exact {checked}, and {rejected} matching decomposition rejections from {} class files",
+        methods.len() - rejected,
         paths.len()
     );
+}
+
+fn compare_snapshots(java: &str, rust: &str, stages: &[(&str, &str)]) -> Option<String> {
+    let mut java = java.split('\t');
+    let mut rust = rust.split('\t');
+    for &(stage, prefix) in stages {
+        match (java.next(), rust.next()) {
+            (Some(java), Some(rust)) if java == rust && java.starts_with(prefix) => {}
+            (Some(java), Some(rust)) => {
+                let stage = if [java, rust].iter().any(|result| {
+                    result.starts_with("structure-") || result.starts_with("rejected=")
+                }) {
+                    "Structure"
+                } else if [java, rust]
+                    .iter()
+                    .any(|result| result.starts_with("lift-"))
+                {
+                    "Expression lifting"
+                } else {
+                    stage
+                };
+                return Some(format!("{stage} {}", difference(java, rust)));
+            }
+            _ => return Some(format!("Missing {stage}")),
+        }
+    }
+    if java.next().is_some() || rust.next().is_some() {
+        return Some("Unexpected extra stages".into());
+    }
+    None
 }
 
 fn difference(java: &str, rust: &str) -> String {
@@ -323,12 +382,18 @@ fn parse_class(bytes: &[u8], options: &Options) -> io::Result<StructClass> {
     StructClass::create(&mut DataInputFullStream::new(bytes), true, options, None)
 }
 
-fn panic_text(error: &(dyn std::any::Any + Send)) -> &str {
-    error
-        .downcast_ref::<String>()
-        .map(String::as_str)
-        .or_else(|| error.downcast_ref::<&str>().copied())
-        .unwrap_or("unknown panic")
+fn panic_text(error: &(dyn std::any::Any + Send)) -> String {
+    one_line(
+        error
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| error.downcast_ref::<&str>().copied())
+            .unwrap_or("unknown panic"),
+    )
+}
+
+fn one_line(text: &str) -> String {
+    text.replace(['\r', '\n', '\t'], " ")
 }
 
 fn write_cfg(out: &mut impl Write, ir: &Ir, graph: &ControlFlowGraph) -> io::Result<()> {
@@ -341,6 +406,7 @@ fn write_cfg(out: &mut impl Write, ir: &Ir, graph: &ControlFlowGraph) -> io::Res
         write_text(out, comment)?;
     }
     write_count(out, graph.blocks.len())?;
+    let mut instructions = HashMap::new();
     for &block in &graph.blocks {
         let block = &ir[block];
         write_int(out, block.id)?;
@@ -352,6 +418,12 @@ fn write_cfg(out: &mut impl Write, ir: &Ir, graph: &ControlFlowGraph) -> io::Res
         )?;
         write_int(out, block.seq.length())?;
         for instruction in &block.seq {
+            let next = i32::try_from(instructions.len()).unwrap();
+            let identity = *instructions.entry(Arc::as_ptr(instruction)).or_insert(next);
+            write_int(out, identity)?;
+            if identity != next {
+                continue;
+            }
             write_int(out, i32::from(instruction.opcode))?;
             write_flag(out, instruction.wide)?;
             write_int(out, i32::from(instruction.group))?;

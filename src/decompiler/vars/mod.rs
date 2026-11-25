@@ -4,3 +4,4 @@
 //! names and definitions.
 
 pub mod var_version_pair;
+pub mod version_graph;
