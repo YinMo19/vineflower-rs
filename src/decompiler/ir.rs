@@ -21,7 +21,7 @@ use index_vec::{IndexVec, define_index_type};
 
 pub use super::exps::{Expr, ExprKind};
 use super::stats::{Statement, stat_edge::StatEdge};
-use super::vars::versions::VarVersions;
+use super::vars::processor::VarProcessor;
 use crate::code::cfg::basic_block::BasicBlock;
 
 define_index_type! {
@@ -57,7 +57,7 @@ define_index_type! {
 
 #[derive(Default)]
 pub struct Ir {
-    pub variable_processors: IndexVec<VarProcessorId, VarVersions>,
+    pub variable_processors: IndexVec<VarProcessorId, VarProcessor>,
     pub stats: IndexVec<StatId, Statement>,
     pub edges: IndexVec<EdgeId, StatEdge>,
     pub exprs: IndexVec<ExprId, Expr>,
@@ -91,7 +91,7 @@ macro_rules! arena_index {
 }
 
 arena_index! {
-    variable_processors: VarProcessorId => VarVersions,
+    variable_processors: VarProcessorId => VarProcessor,
     stats: StatId => Statement,
     edges: EdgeId => StatEdge,
     exprs: ExprId => Expr,

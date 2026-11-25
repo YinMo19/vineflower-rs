@@ -4,6 +4,7 @@
 //! names and definitions.
 
 mod inference;
+pub mod processor;
 pub mod var_version_pair;
 pub mod version_graph;
 pub mod versions;

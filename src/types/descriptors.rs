@@ -92,6 +92,15 @@ impl MethodDescriptor {
         }
     }
 
+    /// Bytecode local slots of the declared parameters, excluding the receiver.
+    pub fn parameter_slots(&self, is_static: bool) -> impl Iterator<Item = (i32, &VarType)> {
+        self.params.iter().scan(i32::from(!is_static), |slot, ty| {
+            let start = *slot;
+            *slot += ty.stack_size;
+            Some((start, ty))
+        })
+    }
+
     pub fn add_generic_descriptor(&mut self, desc: Arc<SharedSignature<GenericMethodDescriptor>>) {
         self.generic_info = Some(desc);
     }

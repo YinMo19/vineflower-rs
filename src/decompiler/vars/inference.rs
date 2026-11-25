@@ -49,19 +49,19 @@ fn initialize_variables(
     descriptor: &MethodDescriptor,
 ) {
     let is_static = root.method(&cx.ir).has_modifier(ACC_STATIC);
-    let mut slot = 0;
     if !is_static {
         let pair = VarVersionPair::new(0, 1);
         let class_type = VarType::with_value(CodeType::Object, 0, class.qualified_name.clone());
-        cx.ir[owner].lower.insert(pair, class_type.clone());
-        cx.ir[owner].upper.insert(pair, Some(class_type));
-        slot += 1;
+        cx.ir[owner].versions.lower.insert(pair, class_type.clone());
+        cx.ir[owner].versions.upper.insert(pair, Some(class_type));
     }
-    for parameter in &descriptor.params {
+    for (slot, parameter) in descriptor.parameter_slots(is_static) {
         let pair = VarVersionPair::new(slot, 1);
-        cx.ir[owner].lower.insert(pair, parameter.clone());
-        cx.ir[owner].upper.insert(pair, Some(parameter.clone()));
-        slot += parameter.stack_size;
+        cx.ir[owner].versions.lower.insert(pair, parameter.clone());
+        cx.ir[owner]
+            .versions
+            .upper
+            .insert(pair, Some(parameter.clone()));
     }
 
     let mut statements = VecDeque::from([root]);
@@ -76,10 +76,10 @@ fn initialize_variables(
             };
             let pair = VarVersionPair::new(var.index, 1);
             let ty = Expr::expr_type(cx, expr);
-            cx.ir[owner].lower.insert(pair, ty);
+            cx.ir[owner].versions.lower.insert(pair, ty);
             if catch {
                 let ty = Expr::expr_type(cx, expr);
-                cx.ir[owner].upper.insert(pair, Some(ty));
+                cx.ir[owner].versions.upper.insert(pair, Some(ty));
             }
         }
         statements.extend(cx.ir[stat].stats.iter().copied());
@@ -143,7 +143,7 @@ fn check_expression(
     {
         let pair = VarVersionPair::new(cx.ir[expr].id, -1);
         let var_type = var_type.clone();
-        cx.ir[owner].lower.entry(pair).or_insert(var_type);
+        cx.ir[owner].versions.lower.entry(pair).or_insert(var_type);
     }
 
     let bounds = Expr::type_bounds(cx, expr)?;
@@ -225,7 +225,7 @@ fn raise_lower(
     pair: VarVersionPair,
     ty: VarType,
 ) -> io::Result<bool> {
-    let current = cx.ir[owner].lower.get(&pair);
+    let current = cx.ir[owner].versions.lower.get(&pair);
     let next = match current {
         Some(current) if ty.type_family.is_lesser(current.type_family) => return Ok(false),
         Some(current) if ty.type_family == current.type_family => VarType::join(cx, current, &ty)
@@ -243,7 +243,7 @@ fn raise_lower(
     if let ExprKind::Constant { var_type, .. } = &mut cx.ir[expr].kind {
         *var_type = next.clone();
     }
-    cx.ir[owner].lower.insert(pair, next);
+    cx.ir[owner].versions.lower.insert(pair, next);
     Ok(restart)
 }
 
@@ -253,7 +253,11 @@ fn apply_upper(
     pair: VarVersionPair,
     ty: VarType,
 ) -> io::Result<()> {
-    let current = cx.ir[owner].upper.get(&pair).and_then(Option::as_ref);
+    let current = cx.ir[owner]
+        .versions
+        .upper
+        .get(&pair)
+        .and_then(Option::as_ref);
     let next = match current {
         Some(current) if ty.type_family == current.type_family => VarType::meet(cx, current, &ty)
             .ok_or_else(|| {
@@ -265,6 +269,6 @@ fn apply_upper(
         // Both a higher and a lower family replace the previous upper bound.
         _ => ty,
     };
-    cx.ir[owner].upper.insert(pair, Some(next));
+    cx.ir[owner].versions.upper.insert(pair, Some(next));
     Ok(())
 }

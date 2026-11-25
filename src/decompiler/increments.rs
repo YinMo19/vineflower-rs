@@ -127,7 +127,7 @@ fn same_target(cx: &Cx, owner: VarProcessorId, left: ExprId, operand: ExprId) ->
     let Some(right_var) = variable_pair(&cx.ir, operand) else {
         return false;
     };
-    let original = &cx.ir[owner].original;
+    let original = &cx.ir[owner].versions.original;
     // Java compares the Integer objects returned by getVarOriginalIndex.
     // Equal values outside the default Integer cache are boxed independently.
     match (original.get(&left_var.var), original.get(&right_var.var)) {

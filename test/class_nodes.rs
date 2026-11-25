@@ -101,6 +101,23 @@ fn class_wrappers_publish_declared_methods_in_order() {
             ));
             if let Ok(Some(body)) = &method.body {
                 dump_cases(&cx, body.root, &mut rows);
+            } else if let Ok(None) = &method.body {
+                let variables = &cx.ir[method.variables];
+                for pair in &variables.params {
+                    rows.push(format!(
+                        "param\t{}\t{}\t{}",
+                        pair.var,
+                        variables
+                            .names
+                            .get(pair)
+                            .and_then(Option::as_deref)
+                            .unwrap_or("null"),
+                        variables
+                            .this_vars
+                            .get(pair)
+                            .map_or("-", |name| name.as_str()),
+                    ));
+                }
             }
         }
     }

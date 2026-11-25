@@ -99,7 +99,7 @@ pub(crate) fn set_versions(
 ) -> io::Result<()> {
     let cx = &mut *cx.enter_method(counters);
     let previous = std::mem::replace(
-        &mut cx.ir[owner],
+        &mut cx.ir[owner].versions,
         VarVersions {
             initialized: true,
             ..VarVersions::default()
@@ -122,9 +122,9 @@ pub(crate) fn set_versions(
     }
 
     super::inference::calculate(cx, counters, root, &expressions, owner, class, descriptor)?;
-    cx.ir[owner].eliminate_non_java_types();
-    let indices = cx.ir[owner].assign_indices(counters);
-    let types = &cx.ir.variable_processors[owner];
+    cx.ir[owner].versions.eliminate_non_java_types();
+    let indices = cx.ir[owner].versions.assign_indices(counters);
+    let types = &cx.ir.variable_processors[owner].versions;
     for id in expressions {
         let expr = &mut cx.ir.exprs[id];
         match &mut expr.kind {
@@ -142,7 +142,7 @@ pub(crate) fn set_versions(
             _ => {}
         }
     }
-    for pair in cx.ir[owner].original.values_mut() {
+    for pair in cx.ir[owner].versions.original.values_mut() {
         if let Some(&old) = previous.get(&pair.var) {
             *pair = old;
         }

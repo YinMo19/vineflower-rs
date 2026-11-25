@@ -1757,7 +1757,7 @@ fn snapshot(
     let mut snapshot =
         format!("{tree};hidden={all_members};hidden-added={added}{details}\t{expressions}");
     if check != Check::Stack {
-        let versions = variable_snapshot(&cx.ir[method.flow.variables]);
+        let versions = variable_snapshot(&cx.ir[method.flow.variables].versions);
         write!(snapshot, "\t{versions}").unwrap();
     }
     snapshot

@@ -170,6 +170,7 @@ pub(crate) fn insert_monitor_sinks(
             let index = counters.get_counter_and_increment(VAR_COUNTER);
             let var = Variable::in_method(index, VarType::VARTYPE_OBJECT, owner);
             cx.ir[owner]
+                .versions
                 .lower
                 .insert(var.pair(), VarType::VARTYPE_OBJECT);
             let local = Expr::new(&mut cx.ir, counters, ExprKind::Variable(var), None);

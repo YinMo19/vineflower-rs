@@ -320,7 +320,7 @@ impl Rewrite<'_> {
         );
         let against = self.constant(ty.clone(), zero);
         let equal = self.build(Eq, [assignment, against], None);
-        let versions = &mut self.cx.ir[self.owner];
+        let versions = &mut self.cx.ir[self.owner].versions;
         if versions.initialized {
             versions.lower.insert(VarVersionPair::new(slot, 0), ty);
         }

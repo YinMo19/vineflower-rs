@@ -72,7 +72,8 @@ pub(super) fn assertion_field<'a>(
             let Some(wrapper) = classes.wrapper_owner(nested) else {
                 continue;
             };
-            if !initialized.contains(&wrapper) {
+            let published = classes[wrapper].wrapper.is_some();
+            if !published && (cx.current_method.is_some() || !initialized.contains(&wrapper)) {
                 continue;
             }
             let holder = classes[wrapper].class.as_ref();

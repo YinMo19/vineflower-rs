@@ -23,7 +23,7 @@ pub use crate::structs::consts::ConstantValue;
 use crate::code::instruction::Instruction;
 use crate::decompiler::ir::{ExprId, Ir, StatId, VarProcessorId};
 use crate::decompiler::stats::StatementKind;
-use crate::decompiler::vars::{var_version_pair::VarVersionPair, versions::VarVersions};
+use crate::decompiler::vars::{processor::VarProcessor, var_version_pair::VarVersionPair};
 use crate::engine::Cx;
 use crate::engine::class_nodes::ClassKind;
 use crate::engine::counter_container::{CounterContainer, EXPRESSION_COUNTER, VAR_COUNTER};
@@ -143,6 +143,7 @@ pub struct Variable {
     pub var_type: VarType,
     pub version: i32,
     pub stack: bool,
+    pub definition: bool,
     pub catch_temp: bool,
     pub intersection_type: bool,
     pub effectively_final: bool,
@@ -160,6 +161,7 @@ impl Variable {
             var_type,
             version: 0,
             stack: false,
+            definition: false,
             catch_temp: false,
             intersection_type: false,
             effectively_final: false,
@@ -186,12 +188,13 @@ impl Variable {
     }
 
     /// VarExprent.setLVT also seeds its method's active type processor.
-    fn record_local_type(&self, processors: &mut IndexVec<VarProcessorId, VarVersions>) {
+    fn record_local_type(&self, processors: &mut IndexVec<VarProcessorId, VarProcessor>) {
         if let Some(owner) = self.processor
-            && processors[owner].initialized
+            && processors[owner].versions.initialized
             && let Some(lvt) = &self.lvt
         {
             processors[owner]
+                .versions
                 .lower
                 .insert(self.pair(), lvt.get_var_type());
         }
@@ -202,11 +205,25 @@ impl Variable {
             && let Some(lvt) = &self.lvt
         {
             lvt.get_var_type()
-        } else if self.var_type.ty == CodeType::Unknown
-            && let Some(owner) = self.processor
-            && let Some(ty) = cx.ir[owner].lower.get(&self.pair())
-        {
-            ty.clone()
+        } else if self.var_type.ty != CodeType::Unknown {
+            self.var_type.clone()
+        } else if let Some(owner) = self.processor {
+            let pair = self.pair();
+            let processor = &cx.ir[owner];
+            let inferred = processor.versions.lower.get(&pair);
+            if let Some(name) = processor.this_vars.get(&pair) {
+                if let Some(signature) = cx
+                    .classes()
+                    .get_class(name)
+                    .and_then(|class| class.signature())
+                {
+                    return signature.generic_type.clone();
+                }
+                if inferred.is_none() {
+                    return VarType::with_value(CodeType::Object, 0, name.clone());
+                }
+            }
+            inferred.cloned().unwrap_or_else(|| self.var_type.clone())
         } else {
             self.var_type.clone()
         }

@@ -11,10 +11,10 @@ use super::class_nodes::ClassNodes;
 use super::counter_container::{CounterContainer, ExpressionIds};
 use super::import_collector::ImportCollector;
 use super::options::Options;
-use crate::decompiler::ir::Ir;
+use crate::decompiler::ir::{Ir, VarProcessorId};
 use crate::renamer::pool_interceptor::PoolInterceptor;
-use crate::structs::StructContext;
 use crate::structs::struct_context::ClassResolver;
+use crate::structs::{StructContext, StructMethod};
 
 /// Everything a translated function may consult or update while classes are
 /// being decompiled by one worker.
@@ -23,6 +23,7 @@ pub struct Cx {
     pub options: Arc<Options>,
     /// `DecompilerContext.getStructContext()`.
     pub struct_context: Arc<StructContext>,
+    pub(crate) current_method: Option<(Arc<StructMethod>, VarProcessorId)>,
     pub(crate) expression_ids: ExpressionIds,
     /// `DecompilerContext.getPoolInterceptor()`.
     pub pool_interceptor: Option<Arc<PoolInterceptor>>,
@@ -42,6 +43,7 @@ impl Cx {
         Self {
             options: Arc::clone(struct_context.options()),
             pool_interceptor: struct_context.pool_interceptor().cloned(),
+            current_method: None,
             expression_ids: struct_context.metadata_ids().clone(),
             struct_context,
             class_nodes: ClassNodes::default(),

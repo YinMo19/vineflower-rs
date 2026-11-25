@@ -37,8 +37,9 @@ class ClassWrappersReference {
     var classes = Files.createDirectory(scratch.resolve("classes"));
     var source = Files.writeString(scratch.resolve("WrapperSubject.java"), """
       abstract class WrapperSubject {
+        int var0, var0x, var1;
         enum Kind { LEFT, RIGHT, CENTER }
-        static class Member { native long external(int key); }
+        static class Member { static native long external(long key, double weight, int flags); }
         int text(String s) {
           return switch (s) {
             case "Aa" -> 1;
@@ -75,6 +76,12 @@ class ClassWrappersReference {
         System.out.println(node.classStruct.qualifiedName + "\t" + method.methodStruct.getName()
           + "\t" + method.methodStruct.getDescriptor() + "\t" + state);
         if (method.root != null) dumpCases(method.root);
+        if (state.equals("no-code")) {
+          for (var param : method.varproc.getParams()) {
+            System.out.println("param\t" + param.var + "\t" + method.varproc.getVarName(param)
+              + "\t" + method.varproc.getThisVars().getOrDefault(param, "-"));
+          }
+        }
       }
     }
   }
