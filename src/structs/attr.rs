@@ -4,10 +4,7 @@
 //! `struct.attr`: the class-file attributes the decompiler understands. Each
 //! type's `read` is upstream's `initContent`.
 //!
-//! Upstream parses annotations straight into expression objects. Expressions
-//! belong to the class being decompiled here, so an annotation is loaded as
-//! plain data ([`AnnotationData`], [`ElementValue`]) holding exactly what
-//! upstream's constructors receive, and becomes an expression when written.
+//! Annotations retain their expression IDs and the data used to write them.
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -18,10 +15,11 @@ use arcstr::ArcStr;
 
 use super::consts::{ConstantPool, ConstantValue, LinkConstant, PooledConstant};
 use super::struct_field::StructRecordComponent;
-use super::struct_member::{self, Attributes};
+use super::struct_member::{self, Attributes, ClassReadContext};
 use crate::code::BytecodeVersion;
 use crate::decompiler::vars::var_version_pair::VarVersionPair;
 use crate::engine::Options;
+use crate::engine::counter_container::ExpressionIds;
 use crate::types::{CodeType, FieldDescriptor, VarType};
 use crate::util::data_input::DataInputFullStream;
 use crate::util::jhash::JHashMap;
@@ -81,6 +79,23 @@ impl StructCodeAttribute {
         version: BytecodeVersion,
         options: &Options,
     ) -> io::Result<Self> {
+        Self::read_with_context(
+            data,
+            pool,
+            version,
+            ClassReadContext {
+                options,
+                ids: &ExpressionIds::default(),
+            },
+        )
+    }
+
+    pub(super) fn read_with_context(
+        data: Input<'_, '_>,
+        pool: &ConstantPool,
+        version: BytecodeVersion,
+        context: ClassReadContext<'_>,
+    ) -> io::Result<Self> {
         // Pre-java oak class files have a u1 max stack, u1 max locals, and a u2 code length
         let predates_java = version.predates_java();
         data.discard(if predates_java { 1 } else { 2 })?;
@@ -108,8 +123,8 @@ impl StructCodeAttribute {
         Ok(Self {
             local_variables,
             code_and_exception_data,
-            code_attributes: Box::new(struct_member::read_attributes(
-                data, pool, true, version, options,
+            code_attributes: Box::new(struct_member::read_attributes_with_context(
+                data, pool, true, version, context,
             )?),
         })
     }
@@ -596,10 +611,29 @@ impl StructRecordAttribute {
         version: BytecodeVersion,
         options: &Options,
     ) -> io::Result<Self> {
+        Self::read_with_context(
+            data,
+            pool,
+            version,
+            ClassReadContext {
+                options,
+                ids: &ExpressionIds::default(),
+            },
+        )
+    }
+
+    pub(super) fn read_with_context(
+        data: Input<'_, '_>,
+        pool: &ConstantPool,
+        version: BytecodeVersion,
+        context: ClassReadContext<'_>,
+    ) -> io::Result<Self> {
         let component_count = data.read_unsigned_short()?;
         Ok(Self {
             components: read_list(component_count, || {
-                StructRecordComponent::create_record_component(data, pool, version, options)
+                StructRecordComponent::create_record_component_with_context(
+                    data, pool, version, context,
+                )
             })?,
         })
     }
@@ -640,9 +674,16 @@ impl StructNestHostAttribute {
 /// `new AnnotationExprent(className, names, values)`.
 #[derive(Clone, Debug)]
 pub struct AnnotationData {
+    pub id: i32,
     pub class_name: ArcStr,
     pub par_names: Vec<ArcStr>,
-    pub par_values: Vec<ElementValue>,
+    pub par_values: Vec<AnnotationElement>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AnnotationElement {
+    pub id: i32,
+    pub value: ElementValue,
 }
 
 /// An annotation element value, as far as `parseAnnotationElement` decodes
@@ -657,7 +698,7 @@ pub enum ElementValue {
     /// `new ConstExprent(VarType.VARTYPE_CLASS, value, null)`.
     Class(ArcStr),
     /// A `NewExprent` with a direct array initializer of these elements.
-    Array(Vec<ElementValue>),
+    Array(Vec<AnnotationElement>),
     Annotation(AnnotationData),
     /// `new ConstExprent(type, value, null)`.
     Const {
@@ -669,12 +710,28 @@ pub enum ElementValue {
 impl AnnotationData {
     /// `StructAnnotationAttribute.parseAnnotations`.
     pub fn read_list(data: Input<'_, '_>, pool: &ConstantPool) -> io::Result<Vec<AnnotationData>> {
+        Self::read_list_with_ids(data, pool, &ExpressionIds::default())
+    }
+
+    fn read_list_with_ids(
+        data: Input<'_, '_>,
+        pool: &ConstantPool,
+        ids: &ExpressionIds,
+    ) -> io::Result<Vec<AnnotationData>> {
         let len = data.read_unsigned_short()?;
-        read_list(len, || Self::read(data, pool))
+        read_list(len, || Self::read_with_ids(data, pool, ids))
     }
 
     /// `StructAnnotationAttribute.parseAnnotation`.
     pub fn read(data: Input<'_, '_>, pool: &ConstantPool) -> io::Result<AnnotationData> {
+        Self::read_with_ids(data, pool, &ExpressionIds::default())
+    }
+
+    fn read_with_ids(
+        data: Input<'_, '_>,
+        pool: &ConstantPool,
+        ids: &ExpressionIds,
+    ) -> io::Result<AnnotationData> {
         let class_name = string_at(pool, data.read_unsigned_short()?);
 
         let len = data.read_unsigned_short()?;
@@ -682,11 +739,13 @@ impl AnnotationData {
         let mut par_values = Vec::with_capacity(len as usize);
         for _ in 0..len {
             par_names.push(string_at(pool, data.read_unsigned_short()?));
-            par_values.push(ElementValue::read(data, pool)?);
+            par_values.push(AnnotationElement::read(data, pool, ids)?);
         }
 
+        let class_name = VarType::from_signature(&class_name).value.unwrap();
         Ok(AnnotationData {
-            class_name: VarType::from_signature(&class_name).value.unwrap(),
+            id: ids.next(),
+            class_name,
             par_names,
             par_values,
         })
@@ -696,9 +755,15 @@ impl AnnotationData {
 impl ElementValue {
     /// `StructAnnotationAttribute.parseAnnotationElement`.
     pub fn read(data: Input<'_, '_>, pool: &ConstantPool) -> io::Result<ElementValue> {
+        AnnotationElement::read(data, pool, &ExpressionIds::default()).map(|element| element.value)
+    }
+}
+
+impl AnnotationElement {
+    fn read(data: Input<'_, '_>, pool: &ConstantPool, ids: &ExpressionIds) -> io::Result<Self> {
         let tag = data.read_unsigned_byte()? as u8;
 
-        Ok(match tag {
+        let value = match tag {
             // enum constant
             b'e' => {
                 let class_name = string_at(pool, data.read_unsigned_short()?);
@@ -729,10 +794,10 @@ impl ElementValue {
             // array
             b'[' => {
                 let len = data.read_unsigned_short()?;
-                ElementValue::Array(read_list(len, || Self::read(data, pool))?)
+                ElementValue::Array(read_list(len, || Self::read(data, pool, ids))?)
             }
             // annotation
-            b'@' => ElementValue::Annotation(AnnotationData::read(data, pool)?),
+            b'@' => ElementValue::Annotation(AnnotationData::read_with_ids(data, pool, ids)?),
             _ => {
                 let cn = pool
                     .get_primitive_constant(data.read_unsigned_short()?)
@@ -754,7 +819,14 @@ impl ElementValue {
                     value: cn.value,
                 }
             }
-        })
+        };
+        // A nested annotation is already an expression, with the ID
+        // allocated after its own parameter values were read.
+        let id = match &value {
+            ElementValue::Annotation(annotation) => annotation.id,
+            _ => ids.next(),
+        };
+        Ok(Self { id, value })
     }
 }
 
@@ -765,8 +837,16 @@ pub struct StructAnnotationAttribute {
 
 impl StructAnnotationAttribute {
     pub fn read(data: Input<'_, '_>, pool: &ConstantPool) -> io::Result<Self> {
+        Self::read_with_ids(data, pool, &ExpressionIds::default())
+    }
+
+    pub(super) fn read_with_ids(
+        data: Input<'_, '_>,
+        pool: &ConstantPool,
+        ids: &ExpressionIds,
+    ) -> io::Result<Self> {
         Ok(Self {
-            annotations: AnnotationData::read_list(data, pool)?,
+            annotations: AnnotationData::read_list_with_ids(data, pool, ids)?,
         })
     }
 }
@@ -778,22 +858,40 @@ pub struct StructAnnotationParameterAttribute {
 
 impl StructAnnotationParameterAttribute {
     pub fn read(data: Input<'_, '_>, pool: &ConstantPool) -> io::Result<Self> {
+        Self::read_with_ids(data, pool, &ExpressionIds::default())
+    }
+
+    pub(super) fn read_with_ids(
+        data: Input<'_, '_>,
+        pool: &ConstantPool,
+        ids: &ExpressionIds,
+    ) -> io::Result<Self> {
         let len = data.read_unsigned_byte()?;
         Ok(Self {
-            param_annotations: read_list(len, || AnnotationData::read_list(data, pool))?,
+            param_annotations: read_list(len, || {
+                AnnotationData::read_list_with_ids(data, pool, ids)
+            })?,
         })
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct StructAnnDefaultAttribute {
-    pub default_value: ElementValue,
+    pub default_value: AnnotationElement,
 }
 
 impl StructAnnDefaultAttribute {
     pub fn read(data: Input<'_, '_>, pool: &ConstantPool) -> io::Result<Self> {
+        Self::read_with_ids(data, pool, &ExpressionIds::default())
+    }
+
+    pub(super) fn read_with_ids(
+        data: Input<'_, '_>,
+        pool: &ConstantPool,
+        ids: &ExpressionIds,
+    ) -> io::Result<Self> {
         Ok(Self {
-            default_value: ElementValue::read(data, pool)?,
+            default_value: AnnotationElement::read(data, pool, ids)?,
         })
     }
 }
@@ -866,7 +964,7 @@ impl TypeAnnotationData {
     pub const TYPE_ARG_CONSTRUCTOR_REF: i32 = 0x4A;
     pub const TYPE_ARG_METHOD_REF: i32 = 0x4B;
 
-    fn read(data: Input<'_, '_>, pool: &ConstantPool) -> io::Result<Self> {
+    fn read(data: Input<'_, '_>, pool: &ConstantPool, ids: &ExpressionIds) -> io::Result<Self> {
         let target_type = data.read_unsigned_byte()?;
         let mut target = target_type << 24;
 
@@ -909,7 +1007,7 @@ impl TypeAnnotationData {
         Ok(Self {
             target,
             path,
-            annotation: AnnotationData::read(data, pool)?,
+            annotation: AnnotationData::read_with_ids(data, pool, ids)?,
         })
     }
 
@@ -933,9 +1031,17 @@ pub struct StructTypeAnnotationAttribute {
 
 impl StructTypeAnnotationAttribute {
     pub fn read(data: Input<'_, '_>, pool: &ConstantPool) -> io::Result<Self> {
+        Self::read_with_ids(data, pool, &ExpressionIds::default())
+    }
+
+    pub(super) fn read_with_ids(
+        data: Input<'_, '_>,
+        pool: &ConstantPool,
+        ids: &ExpressionIds,
+    ) -> io::Result<Self> {
         let len = data.read_unsigned_short()?;
         Ok(Self {
-            annotations: read_list(len, || TypeAnnotationData::read(data, pool))?,
+            annotations: read_list(len, || TypeAnnotationData::read(data, pool, ids))?,
         })
     }
 }

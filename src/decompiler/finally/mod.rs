@@ -55,6 +55,7 @@ impl FinallyProcessor {
         class: &StructClass,
         method: &mut StructuredMethod,
     ) -> io::Result<bool> {
+        let cx = &mut *cx.enter_method(&method.flow.counters);
         let root = method.root;
         let mut pending = vec![root];
         while let Some(stat) = pending.pop() {

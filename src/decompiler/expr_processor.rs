@@ -28,7 +28,7 @@ pub fn get_cast_type_name(cx: &mut Cx, ty: &VarType) -> String {
             let mut dotted = name.replace('/', ".");
             if name.contains('$')
                 && !cx
-                    .struct_context
+                    .classes()
                     .get_class(name)
                     .is_some_and(|class| class.own)
             {

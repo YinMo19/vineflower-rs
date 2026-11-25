@@ -24,6 +24,7 @@ pub(crate) fn build(
     root: StatId,
     class: &StructClass,
 ) -> io::Result<bool> {
+    let cx = &mut *cx.enter_method(counters);
     if !cx.options.decompile_assert {
         return Ok(false);
     }

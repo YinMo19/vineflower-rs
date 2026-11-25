@@ -26,9 +26,12 @@ use std::sync::Arc;
 use arcstr::ArcStr;
 
 use super::consts::{self, ConstantPool, PooledConstant};
-use super::struct_member::{Attributes, StructMember, read_attributes};
+use super::struct_member::{
+    Attributes, ClassReadContext, StructMember, read_attributes_with_context,
+};
 use crate::code::BytecodeVersion;
 use crate::engine::Options;
+use crate::engine::counter_container::ExpressionIds;
 use crate::types::{GenericFieldDescriptor, SharedSignature, generic_main};
 use crate::util::data_input::DataInputFullStream;
 
@@ -52,15 +55,41 @@ impl StructField {
         version: BytecodeVersion,
         options: &Options,
     ) -> io::Result<StructField> {
+        Self::create_with_context(
+            input,
+            pool,
+            cl_qualified_name,
+            version,
+            ClassReadContext {
+                options,
+                ids: &ExpressionIds::default(),
+            },
+        )
+    }
+
+    pub(super) fn create_with_context(
+        input: &mut DataInputFullStream<'_>,
+        pool: &ConstantPool,
+        cl_qualified_name: &str,
+        version: BytecodeVersion,
+        context: ClassReadContext<'_>,
+    ) -> io::Result<StructField> {
         let access_flags = input.read_unsigned_short()?;
         let name_index = input.read_unsigned_short()?;
         let descriptor_index = input.read_unsigned_short()?;
 
         let (name, descriptor) =
             pool.get_class_element(consts::FIELD, cl_qualified_name, name_index, descriptor_index);
-        let attributes = read_attributes(input, pool, true, version, options)?;
+        let attributes = read_attributes_with_context(input, pool, true, version, context)?;
 
-        Ok(Self::new(access_flags, attributes, name, descriptor, version, options))
+        Ok(Self::new(
+            access_flags,
+            attributes,
+            name,
+            descriptor,
+            version,
+            context.options,
+        ))
     }
 
     /// `StructRecordComponent.create`.
@@ -69,6 +98,23 @@ impl StructField {
         pool: &ConstantPool,
         version: BytecodeVersion,
         options: &Options,
+    ) -> io::Result<StructRecordComponent> {
+        Self::create_record_component_with_context(
+            input,
+            pool,
+            version,
+            ClassReadContext {
+                options,
+                ids: &ExpressionIds::default(),
+            },
+        )
+    }
+
+    pub(super) fn create_record_component_with_context(
+        input: &mut DataInputFullStream<'_>,
+        pool: &ConstantPool,
+        version: BytecodeVersion,
+        context: ClassReadContext<'_>,
     ) -> io::Result<StructRecordComponent> {
         let name_index = input.read_unsigned_short()?;
         let descriptor_index = input.read_unsigned_short()?;
@@ -79,9 +125,16 @@ impl StructField {
         };
         let name = string_at(name_index);
         let descriptor = string_at(descriptor_index);
-        let attributes = read_attributes(input, pool, true, version, options)?;
+        let attributes = read_attributes_with_context(input, pool, true, version, context)?;
 
-        Ok(Self::new(0, attributes, name, descriptor, version, options))
+        Ok(Self::new(
+            0,
+            attributes,
+            name,
+            descriptor,
+            version,
+            context.options,
+        ))
     }
 
     fn new(

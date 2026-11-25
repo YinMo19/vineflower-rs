@@ -16,6 +16,7 @@ pub(crate) fn find(
     root: StatId,
     owner: VarProcessorId,
 ) -> bool {
+    let cx = &mut *cx.enter_method(counters);
     let graph = build_direct_graph(&mut cx.ir, root);
     let mut finder = Finder {
         cx,

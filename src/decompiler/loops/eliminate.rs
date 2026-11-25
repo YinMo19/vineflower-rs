@@ -20,6 +20,7 @@ pub(crate) fn eliminate(
     root: StatId,
     class: &StructClass,
 ) -> io::Result<bool> {
+    let cx = &mut *cx.enter_method(counters);
     if !eliminate_one(&mut cx.ir, root) {
         return Ok(false);
     }

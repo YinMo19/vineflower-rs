@@ -97,6 +97,7 @@ pub(crate) fn set_versions(
     class: &StructClass,
     descriptor: &MethodDescriptor,
 ) -> io::Result<()> {
+    let cx = &mut *cx.enter_method(counters);
     let previous = std::mem::replace(
         &mut cx.ir[owner],
         VarVersions {

@@ -16,6 +16,7 @@ use super::consts::ConstantPool;
 use crate::code::BytecodeVersion;
 use crate::code::code_constants::ACC_SYNTHETIC;
 use crate::engine::Options;
+use crate::engine::counter_container::ExpressionIds;
 use crate::util::data_input::DataInputFullStream;
 
 macro_rules! attributes {
@@ -78,6 +79,12 @@ pub trait StructMember {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct ClassReadContext<'a> {
+    pub options: &'a Options,
+    pub ids: &'a ExpressionIds,
+}
+
 /// `StructMember.readAttributes`: an attribute table. As upstream, each
 /// attribute is read straight from the stream, whatever length it declares;
 /// only the attributes that are not read are skipped by their length.
@@ -88,7 +95,27 @@ pub fn read_attributes(
     version: BytecodeVersion,
     options: &Options,
 ) -> io::Result<Attributes> {
+    read_attributes_with_context(
+        input,
+        pool,
+        read_code,
+        version,
+        ClassReadContext {
+            options,
+            ids: &ExpressionIds::default(),
+        },
+    )
+}
+
+pub(super) fn read_attributes_with_context(
+    input: &mut DataInputFullStream<'_>,
+    pool: &ConstantPool,
+    read_code: bool,
+    version: BytecodeVersion,
+    context: ClassReadContext<'_>,
+) -> io::Result<Attributes> {
     let mut attributes = Attributes::default();
+    let ids = context.ids;
 
     let length = input.read_unsigned_short()?;
     for _ in 0..length {
@@ -102,7 +129,9 @@ pub fn read_attributes(
 
         match name.as_str() {
             "Code" if read_code => {
-                attributes.code = Some(StructCodeAttribute::read(input, pool, version, options)?);
+                attributes.code = Some(StructCodeAttribute::read_with_context(
+                    input, pool, version, context,
+                )?);
             }
             "InnerClasses" => {
                 attributes.inner_classes = Some(StructInnerClassesAttribute::read(input, pool)?);
@@ -114,7 +143,8 @@ pub fn read_attributes(
                 attributes.signature = Some(StructGenericSignatureAttribute::read(input, pool)?);
             }
             "AnnotationDefault" => {
-                attributes.annotation_default = Some(StructAnnDefaultAttribute::read(input, pool)?);
+                attributes.annotation_default =
+                    Some(StructAnnDefaultAttribute::read_with_ids(input, pool, ids)?);
             }
             "Exceptions" => {
                 attributes.exceptions = Some(StructExceptionsAttribute::read(input)?);
@@ -125,27 +155,31 @@ pub fn read_attributes(
             }
             "RuntimeVisibleAnnotations" => {
                 attributes.runtime_visible_annotations =
-                    Some(StructAnnotationAttribute::read(input, pool)?);
+                    Some(StructAnnotationAttribute::read_with_ids(input, pool, ids)?);
             }
             "RuntimeInvisibleAnnotations" => {
                 attributes.runtime_invisible_annotations =
-                    Some(StructAnnotationAttribute::read(input, pool)?);
+                    Some(StructAnnotationAttribute::read_with_ids(input, pool, ids)?);
             }
             "RuntimeVisibleParameterAnnotations" => {
-                attributes.runtime_visible_parameter_annotations =
-                    Some(StructAnnotationParameterAttribute::read(input, pool)?);
+                attributes.runtime_visible_parameter_annotations = Some(
+                    StructAnnotationParameterAttribute::read_with_ids(input, pool, ids)?,
+                );
             }
             "RuntimeInvisibleParameterAnnotations" => {
-                attributes.runtime_invisible_parameter_annotations =
-                    Some(StructAnnotationParameterAttribute::read(input, pool)?);
+                attributes.runtime_invisible_parameter_annotations = Some(
+                    StructAnnotationParameterAttribute::read_with_ids(input, pool, ids)?,
+                );
             }
             "RuntimeVisibleTypeAnnotations" => {
-                attributes.runtime_visible_type_annotations =
-                    Some(StructTypeAnnotationAttribute::read(input, pool)?);
+                attributes.runtime_visible_type_annotations = Some(
+                    StructTypeAnnotationAttribute::read_with_ids(input, pool, ids)?,
+                );
             }
             "RuntimeInvisibleTypeAnnotations" => {
-                attributes.runtime_invisible_type_annotations =
-                    Some(StructTypeAnnotationAttribute::read(input, pool)?);
+                attributes.runtime_invisible_type_annotations = Some(
+                    StructTypeAnnotationAttribute::read_with_ids(input, pool, ids)?,
+                );
             }
             "LocalVariableTable" => {
                 // merge all variable tables
@@ -178,8 +212,9 @@ pub fn read_attributes(
             }
             "Module" => attributes.module = Some(StructModuleAttribute::read(input, pool)?),
             "Record" => {
-                attributes.record =
-                    Some(StructRecordAttribute::read(input, pool, version, options)?);
+                attributes.record = Some(StructRecordAttribute::read_with_context(
+                    input, pool, version, context,
+                )?);
             }
             "PermittedSubclasses" => {
                 attributes.permitted_subclasses =

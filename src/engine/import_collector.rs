@@ -10,7 +10,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::Cx;
 use super::class_nodes::{ClassKind, ClassNode, ClassNodes};
-use crate::structs::{StructClass, StructContext};
+use crate::structs::{StructClass, StructContext, struct_context::ClassResolver};
 
 type InnerNames = FxHashMap<ArcStr, String>;
 
@@ -106,7 +106,7 @@ impl ImportCollector {
 
     fn resolve(
         &mut self,
-        context: &StructContext,
+        context: ClassResolver<'_>,
         nodes: &ClassNodes,
         current: Option<&str>,
         input: &str,
@@ -244,7 +244,7 @@ pub fn short_name(cx: &mut Cx, full_name: &str, imported: bool) -> Option<String
             .map_or(name, |node| node.class.qualified_name.as_str())
     });
     cx.imports.resolve(
-        &cx.struct_context,
+        cx.struct_context.resolving_with(&cx.expression_ids),
         &cx.class_nodes,
         current,
         full_name,

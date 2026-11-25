@@ -468,7 +468,7 @@ impl VarType {
         }
 
         if from.ty == CodeType::Object && from.ty == to.ty {
-            if !cx.struct_context.instance_of(from.name(), to.name()) {
+            if !cx.classes().instance_of(from.name(), to.name()) {
                 return false;
             }
         } else if from != to {
@@ -508,7 +508,7 @@ impl VarType {
 
             let f = match f {
                 None => {
-                    let cls = cx.struct_context.get_class(from.name()).unwrap();
+                    let cls = cx.classes().get_class(from.name()).unwrap();
                     let bounds = cls.signature().unwrap().fbounds[i][0].clone();
                     if bounds == VarType::VARTYPE_OBJECT {
                         return false;
@@ -523,13 +523,13 @@ impl VarType {
             let f_wild = f.wildcard();
 
             if t_wild == G::WILDCARD_EXTENDS {
-                if f_wild == G::WILDCARD_SUPER || !cx.struct_context.instance_of(f.name(), t.name())
+                if f_wild == G::WILDCARD_SUPER || !cx.classes().instance_of(f.name(), t.name())
                 {
                     return false;
                 }
             } else if t_wild == G::WILDCARD_SUPER {
                 if f_wild == G::WILDCARD_EXTENDS
-                    || !cx.struct_context.instance_of(t.name(), f.name())
+                    || !cx.classes().instance_of(t.name(), f.name())
                 {
                     return false;
                 }
@@ -592,7 +592,7 @@ impl VarType {
     // find the generic class type descriptor.
     // Returns null if there is a failure at any point.
     pub fn find_base_type(&self, cx: &Cx) -> Option<VarType> {
-        let cl = cx.struct_context.get_class(self.name())?;
+        let cl = cx.classes().get_class(self.name())?;
         Some(cl.signature()?.generic_type.clone())
     }
 
@@ -665,7 +665,7 @@ impl VarType {
             let parent = match self.parent() {
                 Some(parent) if parent.is_generic() => Some(parent.clone()),
                 _ => cx
-                    .struct_context
+                    .classes()
                     .get_class(other_parent.name())
                     .map(|cls| cls.signature().unwrap().generic_type.clone()),
             };
@@ -694,7 +694,7 @@ impl VarType {
         derived_type: &VarType,
         super_type: &VarType,
     ) -> VarType {
-        let class_of = |ty: &VarType| cx.struct_context.get_class(ty.value.as_deref()?);
+        let class_of = |ty: &VarType| cx.classes().get_class(ty.value.as_deref()?);
         let (Some(dcls), Some(scls)) = (class_of(derived_type), class_of(super_type)) else {
             return derived_type.clone();
         };

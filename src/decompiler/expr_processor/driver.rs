@@ -29,6 +29,7 @@ pub fn process_statement(
     descriptor: &Arc<MethodDescriptor>,
     owner: VarProcessorId,
 ) -> io::Result<()> {
+    let cx = &mut *cx.enter_method(counters);
     let graph = build_direct_graph(&mut cx.ir, root);
     let mut catch_variables = FxHashMap::default();
     collect_catch_variables(&mut cx.ir, root, &graph, owner, &mut catch_variables)?;

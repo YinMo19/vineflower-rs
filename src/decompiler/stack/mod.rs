@@ -32,6 +32,7 @@ pub fn simplify_stack_vars(
     class: &StructClass,
     options: &StackSimplifyOptions,
 ) {
+    let cx = &mut *cx.enter_method(counters);
     let method = std::sync::Arc::clone(root.method(&cx.ir));
     let mut reordered = FxHashSet::default();
     let mut first = true;
@@ -70,6 +71,7 @@ pub fn simplify_statement(
     class: &StructClass,
     first: bool,
 ) -> bool {
+    let cx = &mut *cx.enter_method(counters);
     simplify_statement_with_optional_ssa(cx, counters, stat, reordered, Some(ssa), class, first)
         .expect("SSA is available to simplify stack variables")
 }

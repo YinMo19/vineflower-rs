@@ -200,6 +200,7 @@ impl StructuredMethod {
 }
 
 fn structure_root(cx: &mut Cx, counters: &mut CounterContainer, root: StatId) -> io::Result<()> {
+    let cx = &mut *cx.enter_method(counters);
     if !process_statement(&mut cx.ir, counters, root, cx.options.try_loop_fix) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

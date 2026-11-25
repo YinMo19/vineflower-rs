@@ -8,7 +8,7 @@
 //! Saving the decompiled classes (`saveContext`) is the driver's part and
 //! lives with it.
 
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use arcstr::ArcStr;
 use rustc_hash::FxHashMap;
@@ -17,19 +17,29 @@ use super::context_unit::ContextUnit;
 use super::struct_class::StructClass;
 use crate::engine::Options;
 use crate::engine::context_source::ContextSource;
+use crate::engine::counter_container::ExpressionIds;
 use crate::renamer::pool_interceptor::PoolInterceptor;
 use crate::types::generic_main;
 use crate::util::java_str;
 
+type LoadedClass = Arc<OnceLock<Option<Arc<StructClass>>>>;
+
+/// The same class path can serve several method workers. The worker that
+/// first resolves a library class supplies the IDs for its annotations.
+#[derive(Clone, Copy)]
+pub(crate) struct ClassResolver<'a> {
+    context: &'a StructContext,
+    ids: &'a ExpressionIds,
+}
+
 pub struct StructContext {
+    metadata_ids: ExpressionIds,
     options: Arc<Options>,
     interceptor: Option<Arc<PoolInterceptor>>,
     units: Vec<Arc<ContextUnit>>,
     lazy_units: Vec<Arc<ContextUnit>>,
     /// Every class asked for so far; `None` for a name no unit has.
-    classes: RwLock<FxHashMap<ArcStr, Option<Arc<StructClass>>>>,
-    /// original -> corrected
-    badly_placed_classes: Mutex<FxHashMap<ArcStr, ArcStr>>,
+    classes: RwLock<FxHashMap<ArcStr, LoadedClass>>,
     units_by_class_name: RwLock<FxHashMap<ArcStr, Arc<ContextUnit>>>,
     abstract_names: FxHashMap<String, Vec<String>>,
 }
@@ -37,15 +47,19 @@ pub struct StructContext {
 impl StructContext {
     pub fn new(options: Arc<Options>, interceptor: Option<Arc<PoolInterceptor>>) -> Self {
         Self {
+            metadata_ids: ExpressionIds::default(),
             options,
             interceptor,
             units: Vec::new(),
             lazy_units: Vec::new(),
             classes: RwLock::default(),
-            badly_placed_classes: Mutex::default(),
             units_by_class_name: RwLock::default(),
             abstract_names: FxHashMap::default(),
         }
+    }
+
+    pub(crate) fn metadata_ids(&self) -> &ExpressionIds {
+        &self.metadata_ids
     }
 
     pub(crate) fn options(&self) -> &Arc<Options> {
@@ -56,68 +70,16 @@ impl StructContext {
         self.interceptor.as_ref()
     }
 
+    pub(crate) fn resolving_with<'a>(&'a self, ids: &'a ExpressionIds) -> ClassResolver<'a> {
+        ClassResolver { context: self, ids }
+    }
+
+    pub(crate) fn resolver(&self) -> ClassResolver<'_> {
+        self.resolving_with(&self.metadata_ids)
+    }
+
     pub fn get_class(&self, name: &str) -> Option<Arc<StructClass>> {
-        let cached = self.classes.read().unwrap().get(name).cloned();
-        let ret = match cached {
-            Some(class) => class,
-            None => {
-                let loaded = self.load_class(name);
-                self.classes
-                    .write()
-                    .unwrap()
-                    .entry(name.into())
-                    .or_insert(loaded)
-                    .clone()
-            }
-        }?;
-
-        // Correct the class location
-        let corrected_name = self.badly_placed_classes.lock().unwrap().remove(name);
-        if let Some(corrected_name) = corrected_name {
-            let mut classes = self.classes.write().unwrap();
-            classes.insert(corrected_name, Some(Arc::clone(&ret)));
-            classes.remove(name);
-        }
-
-        Some(ret)
-    }
-
-    /// Loads a class from the context unit known to have it, or else from
-    /// the first lazy unit that has it.
-    fn load_class(&self, key: &str) -> Option<Arc<StructClass>> {
-        let unit_for_class = self.units_by_class_name.read().unwrap().get(key).cloned();
-        unit_for_class
-            .iter()
-            .chain(&self.lazy_units)
-            .find_map(|unit| self.try_load_class(unit, key))
-    }
-
-    fn try_load_class(&self, unit_for_class: &Arc<ContextUnit>, key: &str) -> Option<Arc<StructClass>> {
-        log::info!("Loading Class: {key} from {}", unit_for_class.get_name());
-        match unit_for_class.try_load_class(key, &self.options, self.interceptor.clone()) {
-            Ok(clazz) => {
-                let clazz = Arc::new(clazz?);
-                if key != clazz.qualified_name {
-                    // also place the class in the right key if it's wrong
-                    self.units_by_class_name
-                        .write()
-                        .unwrap()
-                        .insert(clazz.qualified_name.clone(), Arc::clone(unit_for_class));
-                    self.badly_placed_classes
-                        .lock()
-                        .unwrap()
-                        .insert(key.into(), clazz.qualified_name.clone());
-                }
-                Some(clazz)
-            }
-            Err(error) => {
-                log::error!(
-                    "Failed to read class {key} from {}: {error}",
-                    unit_for_class.get_name()
-                );
-                None
-            }
-        }
+        self.resolver().get_class(name)
     }
 
     pub fn has_class(&self, name: &str) -> bool {
@@ -206,6 +168,130 @@ impl StructContext {
         }
     }
 
+    pub fn instance_of(&self, valclass: &str, refclass: &str) -> bool {
+        self.resolver().instance_of(valclass, refclass)
+    }
+
+    pub fn find_common_ancestor(&self, class_a: &str, class_b: &str) -> Option<Arc<StructClass>> {
+        self.resolver().find_common_ancestor(class_a, class_b)
+    }
+
+    pub fn load_abstract_metadata(&mut self, string: &str) {
+        for line in java_str::split(string, "\n") {
+            let pts = java_str::split(line, " ");
+            //class method desc [args...]
+            if pts.len() < 4 {
+                continue;
+            }
+
+            let desc = generic_main::parse_method_signature(pts[2]).unwrap();
+            let mut params = Vec::new();
+            for (x, param) in pts[3..].iter().enumerate() {
+                for _ in 0..desc.parameter_types[x].stack_size {
+                    params.push((*param).to_owned());
+                }
+            }
+
+            self.abstract_names
+                .insert(format!("{} {} {}", pts[0], pts[1], pts[2]), params);
+        }
+    }
+
+    pub fn rename_abstract_parameter<'a>(
+        &'a self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+        index: i32,
+        default: &'a str,
+    ) -> &'a str {
+        self.abstract_names
+            .get(&format!("{class_name} {method_name} {descriptor}"))
+            .and_then(|params| params.get(index as usize))
+            .map_or(default, String::as_str)
+    }
+
+    pub fn get_units(&self) -> &[Arc<ContextUnit>] {
+        &self.units
+    }
+}
+
+impl ClassResolver<'_> {
+    pub(crate) fn get_class(&self, name: &str) -> Option<Arc<StructClass>> {
+        let classes = &self.context.classes;
+        let cached = classes.read().unwrap().get(name).cloned();
+        let entry = cached.unwrap_or_else(|| {
+            classes
+                .write()
+                .unwrap()
+                .entry(name.into())
+                .or_default()
+                .clone()
+        });
+        let class = entry.get_or_init(|| self.load_class(name)).clone()?;
+        if class.qualified_name != name {
+            let mut classes = classes.write().unwrap();
+            if classes
+                .get(name)
+                .is_some_and(|slot| Arc::ptr_eq(slot, &entry))
+            {
+                classes.remove(name);
+                classes.insert(class.qualified_name.clone(), entry);
+            }
+        }
+        Some(class)
+    }
+
+    /// Loads a class from the context unit known to have it, or else from
+    /// the first lazy unit that has it.
+    fn load_class(&self, key: &str) -> Option<Arc<StructClass>> {
+        let unit_for_class = self
+            .context
+            .units_by_class_name
+            .read()
+            .unwrap()
+            .get(key)
+            .cloned();
+        unit_for_class
+            .iter()
+            .chain(&self.context.lazy_units)
+            .find_map(|unit| self.try_load_class(unit, key))
+    }
+
+    fn try_load_class(
+        &self,
+        unit_for_class: &Arc<ContextUnit>,
+        key: &str,
+    ) -> Option<Arc<StructClass>> {
+        log::info!("Loading Class: {key} from {}", unit_for_class.get_name());
+        match unit_for_class.try_load_class_with_ids(
+            key,
+            &self.context.options,
+            self.context.interceptor.clone(),
+            self.ids,
+        ) {
+            Ok(clazz) => {
+                let clazz = Arc::new(clazz?);
+                if key != clazz.qualified_name {
+                    // also place the class in the right key if it's wrong
+                    self.context
+                        .units_by_class_name
+                        .write()
+                        .unwrap()
+                        .insert(clazz.qualified_name.clone(), Arc::clone(unit_for_class));
+                }
+                Some(clazz)
+            }
+            Err(error) => {
+                log::error!(
+                    "Failed to read class {key} from {}: {error}",
+                    unit_for_class.get_name()
+                );
+                None
+            }
+        }
+    }
+
     /// Whether `valclass` is, extends or implements `refclass`.
     pub fn instance_of(&self, valclass: &str, refclass: &str) -> bool {
         if valclass == refclass {
@@ -248,7 +334,10 @@ impl StructContext {
         // Don't return if the returned class is Object, otherwise we may miss out on other
         // opportunities to do better. The returned type is essentially arbitrary; extended
         // superclasses are preferred before interfaces.
-        let super_class = a.super_class.iter().map(|super_class| super_class.get_string().clone());
+        let super_class = a
+            .super_class
+            .iter()
+            .map(|super_class| super_class.get_string().clone());
         let interfaces = a.interfaces.iter().map(|&iface| {
             let iface = a.pool.get_primitive_constant(iface).unwrap();
             iface.get_string().clone()
@@ -257,44 +346,5 @@ impl StructContext {
             .chain(interfaces)
             .filter_map(|supertype| self.find_common_ancestor(&supertype, class_b))
             .find(|cl| cl.qualified_name != "java/lang/Object")
-    }
-
-    pub fn load_abstract_metadata(&mut self, string: &str) {
-        for line in java_str::split(string, "\n") {
-            let pts = java_str::split(line, " ");
-            //class method desc [args...]
-            if pts.len() < 4 {
-                continue;
-            }
-
-            let desc = generic_main::parse_method_signature(pts[2]).unwrap();
-            let mut params = Vec::new();
-            for (x, param) in pts[3..].iter().enumerate() {
-                for _ in 0..desc.parameter_types[x].stack_size {
-                    params.push((*param).to_owned());
-                }
-            }
-
-            self.abstract_names
-                .insert(format!("{} {} {}", pts[0], pts[1], pts[2]), params);
-        }
-    }
-
-    pub fn rename_abstract_parameter<'a>(
-        &'a self,
-        class_name: &str,
-        method_name: &str,
-        descriptor: &str,
-        index: i32,
-        default: &'a str,
-    ) -> &'a str {
-        self.abstract_names
-            .get(&format!("{class_name} {method_name} {descriptor}"))
-            .and_then(|params| params.get(index as usize))
-            .map_or(default, String::as_str)
-    }
-
-    pub fn get_units(&self) -> &[Arc<ContextUnit>] {
-        &self.units
     }
 }

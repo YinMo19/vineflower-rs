@@ -26,6 +26,7 @@ pub(crate) fn simplify(
     counters: &mut CounterContainer,
     root: StatId,
 ) -> io::Result<()> {
+    let cx = &mut *cx.enter_method(counters);
     simplify_statement(cx, counters, root, root)
 }
 

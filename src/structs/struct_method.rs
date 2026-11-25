@@ -27,10 +27,13 @@ use arcstr::ArcStr;
 use super::attr::StructLocalVariableTableAttribute;
 use super::consts::{self, ConstantPool};
 use super::struct_class::StructClass;
-use super::struct_member::{Attributes, StructMember, read_attributes};
+use super::struct_member::{
+    Attributes, ClassReadContext, StructMember, read_attributes_with_context,
+};
 use crate::code::bytecode_parser::parse_bytecode;
 use crate::code::{BytecodeVersion, FullInstructionSequence};
 use crate::engine::Options;
+use crate::engine::counter_container::ExpressionIds;
 use crate::types::{GenericMethodDescriptor, SharedSignature, generic_main};
 use crate::util::data_input::DataInputFullStream;
 
@@ -56,6 +59,27 @@ impl StructMethod {
         own: bool,
         options: &Options,
     ) -> io::Result<StructMethod> {
+        Self::create_with_context(
+            input,
+            pool,
+            cl_qualified_name,
+            bytecode_version,
+            own,
+            ClassReadContext {
+                options,
+                ids: &ExpressionIds::default(),
+            },
+        )
+    }
+
+    pub(super) fn create_with_context(
+        input: &mut DataInputFullStream<'_>,
+        pool: &ConstantPool,
+        cl_qualified_name: &ArcStr,
+        bytecode_version: BytecodeVersion,
+        own: bool,
+        context: ClassReadContext<'_>,
+    ) -> io::Result<StructMethod> {
         let access_flags = input.read_unsigned_short()?;
         let name_index = input.read_unsigned_short()?;
         let descriptor_index = input.read_unsigned_short()?;
@@ -66,7 +90,8 @@ impl StructMethod {
             name_index,
             descriptor_index,
         );
-        let mut attributes = read_attributes(input, pool, own, bytecode_version, options)?;
+        let mut attributes =
+            read_attributes_with_context(input, pool, own, bytecode_version, context)?;
         let code = attributes.code.take().map(|code| {
             attributes.put_all(*code.code_attributes);
             (code.local_variables, code.code_and_exception_data)
@@ -75,7 +100,7 @@ impl StructMethod {
         let signature = attributes
             .signature
             .as_ref()
-            .filter(|_| options.decompile_generics)
+            .filter(|_| context.options.decompile_generics)
             .and_then(|attr| generic_main::parse_method_signature(&attr.signature))
             .map(SharedSignature::new);
 

@@ -32,9 +32,12 @@ use rustc_hash::FxHashSet;
 
 use super::consts::{ConstantPool, PrimitiveConstant};
 use super::struct_field::{StructField, StructRecordComponent};
-use super::struct_member::{Attributes, StructMember, read_attributes};
+use super::struct_member::{
+    Attributes, ClassReadContext, StructMember, read_attributes_with_context,
+};
 use super::struct_method::StructMethod;
 use crate::code::{BytecodeVersion, MethodProperties};
+use crate::engine::counter_container::ExpressionIds;
 use crate::engine::{Cx, Options};
 use crate::renamer::pool_interceptor::PoolInterceptor;
 use crate::types::{GenericClassDescriptor, GenericsMap, SharedSignature, VarType, generic_main};
@@ -71,6 +74,17 @@ impl StructClass {
         options: &Options,
         interceptor: Option<Arc<PoolInterceptor>>,
     ) -> io::Result<StructClass> {
+        Self::create_with_ids(input, own, options, interceptor, &ExpressionIds::default())
+    }
+
+    pub(super) fn create_with_ids(
+        input: &mut DataInputFullStream<'_>,
+        own: bool,
+        options: &Options,
+        interceptor: Option<Arc<PoolInterceptor>>,
+        ids: &ExpressionIds,
+    ) -> io::Result<StructClass> {
+        let context = ClassReadContext { options, ids };
         input.discard(4)?;
         let minor_version = input.read_unsigned_short()?;
         let major_version = input.read_unsigned_short()?;
@@ -105,7 +119,13 @@ impl StructClass {
         let length = input.read_unsigned_short()?;
         let mut fields = VBStyleCollection::with_capacity(length as usize);
         for _ in 0..length {
-            let field = StructField::create(input, &pool, &qualified_name, bytecode_version, options)?;
+            let field = StructField::create_with_context(
+                input,
+                &pool,
+                &qualified_name,
+                bytecode_version,
+                context,
+            )?;
             let key = make_unique_key(&field.name, &field.descriptor);
             fields.add_with_key(Arc::new(field), key);
         }
@@ -113,8 +133,14 @@ impl StructClass {
         let length = input.read_unsigned_short()?;
         let mut methods = VBStyleCollection::with_capacity(length as usize);
         for _ in 0..length {
-            let method =
-                StructMethod::create(input, &pool, &qualified_name, bytecode_version, own, options)?;
+            let method = StructMethod::create_with_context(
+                input,
+                &pool,
+                &qualified_name,
+                bytecode_version,
+                own,
+                context,
+            )?;
             let key = make_unique_key(&method.name, &method.descriptor);
             if methods.contains_key(&key) {
                 log::warn!(
@@ -126,7 +152,8 @@ impl StructClass {
             methods.add_with_key(Arc::new(method), key);
         }
 
-        let attributes = read_attributes(input, &pool, true, bytecode_version, options)?;
+        let attributes =
+            read_attributes_with_context(input, &pool, true, bytecode_version, context)?;
 
         let signature = attributes
             .signature
@@ -198,7 +225,7 @@ impl StructClass {
         super_name
             .into_iter()
             .chain(&self.interface_names)
-            .filter_map(|supertype| cx.struct_context.get_class(supertype))
+            .filter_map(|supertype| cx.classes().get_class(supertype))
             .find_map(|cls| cls.get_method_recursive(cx, name, descriptor))
     }
 
@@ -280,7 +307,7 @@ impl StructClass {
                 let Some(cls) = intf
                     .value
                     .as_deref()
-                    .and_then(|name| cx.struct_context.get_class(name))
+                    .and_then(|name| cx.classes().get_class(name))
                 else {
                     continue;
                 };
@@ -293,13 +320,13 @@ impl StructClass {
             if visited.contains(&Some(intf.clone())) {
                 continue;
             }
-            if let Some(cls) = cx.struct_context.get_class(intf) {
+            if let Some(cls) = cx.classes().get_class(intf) {
                 put_all(&mut ret, &cls.get_all_generics(cx));
             }
         }
 
         if let Some(super_class) = &self.super_class
-            && let Some(cls) = cx.struct_context.get_class(super_class.get_string())
+            && let Some(cls) = cx.classes().get_class(super_class.get_string())
         {
             let sig = cls.get_generic_map(signature.as_ref().map(|signature| &signature.superclass));
             if sig.is_empty() {

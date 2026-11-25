@@ -303,3 +303,104 @@ fn method_properties_match_upstream() {
         actual.len()
     );
 }
+
+#[test]
+#[ignore = "requires the upstream +local.jar and JDK 17 or later"]
+fn annotation_expression_ids_match_upstream() {
+    use vineflower_rs::structs::attr::{AnnotationData, AnnotationElement, ElementValue};
+    use vineflower_rs::structs::{Attributes, StructClass};
+    use vineflower_rs::util::data_input::DataInputFullStream;
+
+    fn collect_annotation(annotation: &AnnotationData, ids: &mut Vec<i32>) {
+        for parameter in &annotation.par_values {
+            collect_element(parameter, ids);
+        }
+        ids.push(annotation.id);
+    }
+
+    fn collect_element(element: &AnnotationElement, ids: &mut Vec<i32>) {
+        match &element.value {
+            ElementValue::Annotation(annotation) => {
+                assert_eq!(element.id, annotation.id);
+                collect_annotation(annotation, ids);
+                return;
+            }
+            ElementValue::Array(children) => {
+                for child in children {
+                    collect_element(child, ids);
+                }
+            }
+            _ => {}
+        }
+        ids.push(element.id);
+    }
+
+    fn collect(attrs: &Attributes, ids: &mut Vec<i32>) {
+        for attribute in [
+            &attrs.runtime_visible_annotations,
+            &attrs.runtime_invisible_annotations,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for annotation in &attribute.annotations {
+                collect_annotation(annotation, ids);
+            }
+        }
+        for attribute in [
+            &attrs.runtime_visible_type_annotations,
+            &attrs.runtime_invisible_type_annotations,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for annotation in &attribute.annotations {
+                collect_annotation(&annotation.annotation, ids);
+            }
+        }
+        for attribute in [
+            &attrs.runtime_visible_parameter_annotations,
+            &attrs.runtime_invisible_parameter_annotations,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for annotation in attribute.param_annotations.iter().flatten() {
+                collect_annotation(annotation, ids);
+            }
+        }
+        if let Some(default) = &attrs.annotation_default {
+            collect_element(&default.default_value, ids);
+        }
+    }
+
+    let scratch = tempfile::tempdir().unwrap();
+    let corpus = upstream_reference::Corpus::discover();
+    let expected = corpus.run("AnnotationIdsReference", &[], scratch.path());
+    let actual: Vec<_> = ["IdDecor", "AnnotationIdFixture"]
+        .into_iter()
+        .map(|name| {
+            let bytes = fs::read(scratch.path().join(format!("{name}.class"))).unwrap();
+            let class = StructClass::create(
+                &mut DataInputFullStream::new(&bytes),
+                true,
+                &Options::default(),
+                None,
+            )
+            .unwrap();
+            let mut ids = Vec::new();
+            for field in &class.fields {
+                collect(&field.attributes, &mut ids);
+            }
+            for method in &class.methods {
+                collect(&method.attributes, &mut ids);
+            }
+            collect(&class.attributes, &mut ids);
+            for component in class.get_record_components().into_iter().flatten() {
+                collect(&component.attributes, &mut ids);
+            }
+            format!("{ids:?}")
+        })
+        .collect();
+    assert_eq!(actual, expected.lines().collect::<Vec<_>>());
+}

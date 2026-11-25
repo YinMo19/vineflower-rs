@@ -503,7 +503,7 @@ impl VarType {
                 check_base
                     && other.ty == Object
                     && other.value != self.value
-                    && cx.struct_context.instance_of(other.name(), self.name())
+                    && cx.classes().instance_of(other.name(), self.name())
             }
             _ => false,
         }
@@ -604,7 +604,7 @@ impl VarType {
                     // TODO: can make an intersection type?
                     return Some(
                         match cx
-                            .struct_context
+                            .classes()
                             .find_common_ancestor(type1.name(), type2.name())
                         {
                             Some(cl) => Self::from_signature_cl(&cl.qualified_name, true),

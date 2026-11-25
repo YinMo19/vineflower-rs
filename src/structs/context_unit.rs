@@ -13,6 +13,7 @@ use std::sync::Arc;
 use super::struct_class::StructClass;
 use crate::engine::Options;
 use crate::engine::context_source::{ContextSource, Entry};
+use crate::engine::counter_container::ExpressionIds;
 use crate::renamer::pool_interceptor::PoolInterceptor;
 use crate::util::data_input::DataInputFullStream;
 
@@ -89,14 +90,25 @@ impl ContextUnit {
         options: &Options,
         interceptor: Option<Arc<PoolInterceptor>>,
     ) -> io::Result<Option<StructClass>> {
+        self.try_load_class_with_ids(class_name, options, interceptor, &ExpressionIds::default())
+    }
+
+    pub(crate) fn try_load_class_with_ids(
+        &self,
+        class_name: &str,
+        options: &Options,
+        interceptor: Option<Arc<PoolInterceptor>>,
+        ids: &ExpressionIds,
+    ) -> io::Result<Option<StructClass>> {
         let Some(data) = self.get_class_bytes(class_name)? else {
             return Ok(None);
         };
-        StructClass::create(
+        StructClass::create_with_ids(
             &mut DataInputFullStream::new(&data),
             self.own,
             options,
             interceptor,
+            ids,
         )
         .map(Some)
     }
