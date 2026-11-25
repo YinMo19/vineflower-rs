@@ -10,20 +10,27 @@ autotests = false
 test = false
 doctest = false
 
-[[bin]]
-name = "vineflower-rs"
-test = false
-
 [[test]]
 name = "upstream_parity"
 path = "test/upstream_parity.rs"
 
+[[test]]
+name = "control_flow"
+path = "test/control_flow.rs"
+
 [dependencies]
-cesu8 = "1.1"
+arcstr = "1.2.0"
+bit-set = "0.11.1"
 clap = { version = "4.6", features = ["derive"] }
+index_vec = "0.1.4"
+indexmap = "2"
+itertools = "0.15.0"
 jimage-rs = "0.0.5"
+la-arena = "0.3.1"
+log = "0.4.35"
 num-integer = "0.1"
 prost = "0.14"
+rustc-hash = "2"
 tempfile = "3"
 thiserror = "2"
 unicode-general-category = "1"
