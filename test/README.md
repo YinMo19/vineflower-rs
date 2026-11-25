@@ -1,18 +1,20 @@
 # Testing the current port
 
-The active method pipeline ends at the initial Java statement graph. Run the checks against the checked-in class files with:
+The active method pipeline reconstructs structured Java statements through the first `DomHelper.parseGraph` call. Run the checks against the checked-in class files with
 
 ```sh
-cargo test --locked --test control_flow
+cargo test --locked --test control_flow --test structured_flow
 ```
 
-With JDK 17 or later, a matching upstream checkout with its built `build/libs/*+local.jar`, and compiled fixture classes, the following command also compares the three CFG stages with the Java implementation:
+With JDK 17 or later, a matching upstream checkout with its built `build/libs/*+local.jar`, and compiled fixture classes, the following command also compares the three CFG stages, statement ordering and postdominators, and the structured method and direct graphs with the Java implementation.
 
 ```sh
-cargo test --locked --test control_flow -- --include-ignored --nocapture
+cargo test --locked --test control_flow --test structured_flow -- --include-ignored --nocapture
 ```
 
 `VINEFLOWER_UPSTREAM` defaults to `../vineflower`. `VINEFLOWER_RS_CLASS_ROOT` can point to a directory of compiled classes or an upstream checkout containing `testData/classes`. The comparison runs the default and forced-JSR configurations. It reports differences confined to the numbering of new handlers and the order of disjoint, newly split ranges separately from exact matches. The comparison uses ordered successors in every stage. Protected-block membership and incoming exit edges are compared in order on construction and as multisets after cleanup.
+
+The structured-flow comparison feeds the same prepared CFG to Rust and Java. This isolates statement decomposition from JVM identity hashing during handler allocation. It compares ordered statement trees, typed edges, flags, switch cases, catch variables, method counters and the direct graph. For unreachable direct nodes the comparison checks membership; reachable nodes retain their reverse postorder. An upstream method-level parsing rejection is counted separately and requires the corresponding Rust error.
 
 ## Historical source and CLI parity suite
 

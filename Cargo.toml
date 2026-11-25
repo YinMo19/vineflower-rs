@@ -18,6 +18,10 @@ path = "test/upstream_parity.rs"
 name = "control_flow"
 path = "test/control_flow.rs"
 
+[[test]]
+name = "structured_flow"
+path = "test/structured_flow.rs"
+
 [dependencies]
 arcstr = "1.2.0"
 bit-set = "0.11.1"

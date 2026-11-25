@@ -1,7 +1,7 @@
 // Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The control-flow stages of `MethodProcessor.codeToJava`.
+//! CFG and statement decomposition stages of `MethodProcessor.codeToJava`.
 //!
 //! The language-independent stages end immediately before upstream dispatches
 //! to a language's CFG passes. Java then prepares exception regions for
@@ -13,7 +13,10 @@ use std::sync::Arc;
 use crate::code::{
     cfg::ControlFlowGraph, dead_code_helper as dead, exception_deobfuscator as exceptions,
 };
-use crate::decompiler::decompose::dom_helper::graph_to_statement;
+use crate::decompiler::decompose::{
+    dom_helper::{graph_to_statement, process_statement},
+    finish::finish as finish_statement_graph,
+};
 use crate::decompiler::ir::{Ir, StatId};
 use crate::engine::{
     Cx, Options,
@@ -129,4 +132,42 @@ pub fn initial_statement_graph(
     );
     cx.ir[root].add_graph_comments(&flow.graph);
     Ok(Some(InitialMethod { flow, root }))
+}
+
+/// A Java method after the structure recognition and cleanup in DomHelper.parseGraph.
+/// The CFG is retained because finally recovery can change it and require a new tree.
+pub struct StructuredMethod {
+    pub flow: MethodGraph,
+    pub root: StatId,
+}
+
+impl InitialMethod {
+    pub fn structure(mut self, cx: &mut Cx) -> io::Result<StructuredMethod> {
+        if !process_statement(
+            &mut cx.ir,
+            &mut self.flow.counters,
+            self.root,
+            cx.options.try_loop_fix,
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "parsing failure!",
+            ));
+        }
+        finish_statement_graph(&mut cx.ir, &mut self.flow.counters, self.root);
+        Ok(StructuredMethod {
+            flow: self.flow,
+            root: self.root,
+        })
+    }
+}
+
+pub fn structured_statement_graph(
+    cx: &mut Cx,
+    class: &StructClass,
+    method: &Arc<StructMethod>,
+) -> io::Result<Option<StructuredMethod>> {
+    initial_statement_graph(cx, class, method)?
+        .map(|method| method.structure(cx))
+        .transpose()
 }

@@ -69,6 +69,11 @@ impl<N: Copy + Eq + Hash> GenericDominatorEngine<N> {
         }
     }
 
+    /// Immediate dominators indexed by position in the input reverse postorder.
+    pub(super) fn immediate_dominator_positions(&self) -> &[usize] {
+        &self.parents
+    }
+
     pub fn is_dominator(&self, node: N, dom: N) -> bool {
         if node == dom {
             return true;

@@ -2,6 +2,7 @@
 
 import java.io.IOException;
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -20,12 +21,19 @@ import org.jetbrains.java.decompiler.main.extern.IFernflowerLogger;
 import org.jetbrains.java.decompiler.main.extern.IFernflowerPreferences;
 import org.jetbrains.java.decompiler.modules.code.DeadCodeHelper;
 import org.jetbrains.java.decompiler.modules.code.ExceptionDeobfuscator;
+import org.jetbrains.java.decompiler.modules.decompiler.decompose.DomHelper;
+import org.jetbrains.java.decompiler.modules.decompiler.decompose.FastExtendedPostdominanceHelper;
+import org.jetbrains.java.decompiler.modules.decompiler.decompose.StrongConnectivityHelper;
+import org.jetbrains.java.decompiler.modules.decompiler.stats.GeneralStatement;
+import org.jetbrains.java.decompiler.modules.decompiler.stats.RootStatement;
+import org.jetbrains.java.decompiler.modules.decompiler.stats.Statement;
 import org.jetbrains.java.decompiler.struct.StructClass;
 import org.jetbrains.java.decompiler.struct.StructMethod;
 import org.jetbrains.java.decompiler.util.DataInputFullStream;
 
 class ControlFlowReference {
   private static final Field SUBROUTINES = subroutinesField();
+  private static final Method GRAPH_TO_STATEMENT = graphToStatementMethod();
   private record HandlerOrderBoundary(int lastBlockId, int orderedRangeCount) { }
 
   public static void main(String[] args) throws IOException {
@@ -76,6 +84,10 @@ class ControlFlowReference {
         HandlerOrderBoundary boundary = prepareJavaGraph(graph, method);
         emit(methodKey, stage, "handler-order-boundary=" + boundary.lastBlockId() + "," + boundary.orderedRangeCount()
           + ";" + snapshot(graph, false));
+
+        stage = "postdominance";
+        RootStatement root = (RootStatement) GRAPH_TO_STATEMENT.invoke(null, graph, method);
+        emit(methodKey, stage, postdominanceSnapshot(root.getFirst()));
       } catch (Exception | AssertionError | StackOverflowError failure) {
         emitFailure(methodKey, stage, failure);
       } finally {
@@ -164,6 +176,42 @@ class ControlFlowReference {
     } catch (ReflectiveOperationException failure) {
       throw new ExceptionInInitializerError(failure);
     }
+  }
+
+  private static Method graphToStatementMethod() {
+    try {
+      Method method = DomHelper.class.getDeclaredMethod("graphToStatement", ControlFlowGraph.class, StructMethod.class);
+      method.setAccessible(true);
+      return method;
+    } catch (ReflectiveOperationException failure) {
+      throw new ExceptionInInitializerError(failure);
+    }
+  }
+
+  private static String postdominanceSnapshot(Statement statement) {
+    if (!(statement instanceof GeneralStatement general)) {
+      return "basic=" + statement.id;
+    }
+    StrongConnectivityHelper connectivity = new StrongConnectivityHelper(general);
+    var postdominators = DomHelper.calcPostDominators(general);
+    var extended = new FastExtendedPostdominanceHelper().getExtendedPostdominators(general);
+    return "rpo=" + statementIds(general.getReversePostOrderList())
+      + ";post-rpo=" + statementIds(general.getPostReversePostOrderList())
+      + ";components=" + connectivity.getComponents().stream()
+        .map(ControlFlowReference::statementIds).collect(Collectors.joining("/"))
+      + ";post=" + IntStream.range(0, postdominators.size())
+        .mapToObj(index -> postdominators.getKey(index) + ":" + joinIds(postdominators.get(index)))
+        .collect(Collectors.joining("/"))
+      + ";extended=" + extended.entrySet().stream()
+        .map(entry -> entry.getKey() + ":" + joinIds(entry.getValue())).collect(Collectors.joining("/"));
+  }
+
+  private static String statementIds(List<Statement> statements) {
+    return statements.stream().map(statement -> Integer.toString(statement.id)).collect(Collectors.joining(","));
+  }
+
+  private static String joinIds(Iterable<Integer> ids) {
+    return StreamSupport.stream(ids.spliterator(), false).map(Object::toString).collect(Collectors.joining(","));
   }
 
   private static String ids(List<BasicBlock> blocks) {

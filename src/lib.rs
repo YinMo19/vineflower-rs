@@ -1,8 +1,8 @@
 //! A Rust port of the Vineflower Java decompiler (upstream 1.12.0).
 //!
 //! The port follows upstream's algorithms, iteration orders and method-local
-//! counters. The current Java method entry reaches the initial statement
-//! graph via [`engine::method_processor::initial_statement_graph`].
+//! counters. [`engine::method_processor::structured_statement_graph`] reconstructs
+//! method structure through the first upstream `DomHelper.parseGraph` call.
 //!
 //! # Where things are
 //!

@@ -5,14 +5,20 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Write as _};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
+#[path = "support/upstream_reference.rs"]
+mod upstream_reference;
 use std::sync::Arc;
 
 use itertools::Itertools;
 
 use vineflower_rs::code::cfg::ControlFlowGraph;
-use vineflower_rs::decompiler::ir::{BlockId, Ir};
+use vineflower_rs::decompiler::decompose::dom_helper::graph_to_statement;
+use vineflower_rs::decompiler::decompose::extended_postdominance::extended_postdominators;
+use vineflower_rs::decompiler::decompose::statement_order::{
+    calc_post_dominators, components, post_reverse_post_order, reverse_post_order,
+};
+use vineflower_rs::decompiler::ir::{BlockId, Ir, StatId};
 use vineflower_rs::decompiler::stats::StatementKind;
 use vineflower_rs::engine::counter_container::{STATEMENT_COUNTER, VAR_COUNTER};
 use vineflower_rs::engine::method_processor::{DecodedMethod, initial_statement_graph};
@@ -209,69 +215,14 @@ fn check_graph(label: &str, ir: &Ir, graph: &ControlFlowGraph, connected_exit: b
 #[test]
 #[ignore = "requires the upstream +local.jar and JDK 17 or later"]
 fn control_flow_matches_upstream() {
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let upstream = std::env::var_os("VINEFLOWER_UPSTREAM")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| workspace.join("../vineflower"));
-    let class_root = std::env::var_os("VINEFLOWER_RS_CLASS_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| upstream.join("testData/classes"));
-    let checkout_classes = class_root.join("testData/classes");
-    let class_root = if checkout_classes.is_dir() {
-        checkout_classes
-    } else {
-        class_root
-    };
-    let libs = upstream.join("build/libs");
-    let jar = fs::read_dir(&libs)
-        .unwrap_or_else(|error| panic!("reading {}: {error}", libs.display()))
-        .map(|entry| entry.unwrap().path())
-        .filter(|path| {
-            path.file_name()
-                .unwrap()
-                .to_string_lossy()
-                .ends_with("+local.jar")
-        })
-        .sorted()
-        .next()
-        .unwrap_or_else(|| panic!("no *+local.jar in {}", libs.display()));
-    let java = std::env::var_os("JAVA_HOME")
-        .map(|home| {
-            PathBuf::from(home)
-                .join("bin")
-                .join(format!("java{}", std::env::consts::EXE_SUFFIX))
-        })
-        .unwrap_or_else(|| PathBuf::from("java"));
-    let mut class_paths = Vec::new();
-    collect_class_paths(&class_root, &mut class_paths)
-        .unwrap_or_else(|error| panic!("reading {}: {error}", class_root.display()));
-    class_paths.sort_unstable();
-    assert!(
-        !class_paths.is_empty(),
-        "no classes in {}",
-        class_root.display()
-    );
-
+    let corpus = upstream_reference::Corpus::discover();
+    let class_paths = &corpus.classes;
     let mut class_list = tempfile::NamedTempFile::new().unwrap();
-    for class_path in &class_paths {
+    for class_path in class_paths {
         writeln!(class_list, "{}", class_path.display()).unwrap();
     }
     class_list.flush().unwrap();
-    let output = Command::new(java)
-        .arg("--class-path")
-        .arg(jar)
-        .arg(workspace.join("test/support/ControlFlowReference.java"))
-        .arg(class_list.path())
-        .output()
-        .expect("start the Java CFG reference with a JDK 17+ java executable");
-    assert!(
-        output.status.success(),
-        "Java CFG reference exited {}\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let reference = String::from_utf8(output.stdout).unwrap();
+    let reference = corpus.run("ControlFlowReference", &[], class_list.path());
     let mut expected = BTreeMap::new();
     for line in reference.lines() {
         let (key, snapshot) = line.rsplit_once('\t').unwrap();
@@ -280,7 +231,7 @@ fn control_flow_matches_upstream() {
             "duplicate Java record {key}"
         );
     }
-    let actual = rust_snapshots(&class_paths);
+    let actual = rust_snapshots(class_paths);
     let keys: BTreeSet<_> = expected
         .keys()
         .copied()
@@ -290,6 +241,10 @@ fn control_flow_matches_upstream() {
     let mut exact = 0;
     let mut equivalent = 0;
     let mut reordered_splits = 0;
+    let mut postdominance = 0;
+    let mut basic_roots = 0;
+    let mut remapped_methods = BTreeSet::new();
+    let mut remapped_postdominance = 0;
     let mut failures = 0;
     for key in keys {
         let java = expected.get(key).copied();
@@ -306,12 +261,22 @@ fn control_flow_matches_upstream() {
             ))
         });
         let java = boundary.map(|(_, _, snapshot)| snapshot).or(java);
-        if java.is_some_and(|snapshot| snapshot.starts_with("error="))
+        let dominance_method = key.strip_suffix("\tpostdominance");
+        if dominance_method.is_none()
+            && java.is_some_and(|snapshot| snapshot.starts_with("error="))
             && rust.is_some_and(|snapshot| snapshot.starts_with("error="))
         {
             failures += 1;
-        } else if java == rust {
-            if !key.ends_with("\tload") {
+        } else if java == rust
+            && let Some(snapshot) = java.filter(|value| !value.starts_with("error="))
+        {
+            if dominance_method.is_some() {
+                if snapshot.starts_with("basic=") {
+                    basic_roots += 1;
+                } else {
+                    postdominance += 1;
+                }
+            } else if !key.ends_with("\tload") {
                 exact += 1;
             }
         } else if let Some((last_id, _, java)) = boundary
@@ -319,11 +284,20 @@ fn control_flow_matches_upstream() {
             && matching_new_handlers(java, rust, last_id, None)
         {
             equivalent += 1;
+            remapped_methods.insert(key.strip_suffix("\tjava").unwrap());
         } else if let Some((last_id, range_count, java)) = boundary
             && let Some(rust) = rust.filter(|value| !value.starts_with("error="))
             && matching_new_handlers(java, rust, last_id, Some(range_count))
         {
             reordered_splits += 1;
+            remapped_methods.insert(key.strip_suffix("\tjava").unwrap());
+        } else if dominance_method.is_some_and(|method| remapped_methods.contains(method))
+            && java.is_some_and(|snapshot| !snapshot.starts_with("error="))
+            && rust.is_some_and(|snapshot| !snapshot.starts_with("error="))
+        {
+            // The preceding Java CFG comparison established a difference in the
+            // input block order or IDs. Both dominance computations must succeed.
+            remapped_postdominance += 1;
         } else {
             let (index, method) = key.split_once('\t').unwrap();
             let class = &class_paths[index.parse::<usize>().unwrap()];
@@ -335,29 +309,15 @@ fn control_flow_matches_upstream() {
         "{} class files, default and forced-JSR: {exact} exact CFG snapshots, {equivalent} equivalent after mapping new handler IDs, {reordered_splits} equivalent after also ordering disjoint split ranges, {failures} matched failure stages.",
         class_paths.len(),
     );
+    eprintln!(
+        "{postdominance} exact postdominance snapshots, {basic_roots} matched single-block roots, and {remapped_postdominance} pairs with equivalent CFGs and different inputs to postdominance."
+    );
     assert!(
         mismatches.is_empty(),
-        "{} CFG mismatches:\n{}",
+        "{} control-flow mismatches:\n{}",
         mismatches.len(),
         mismatches.iter().take(30).join("\n")
     );
-}
-
-fn collect_class_paths(root: &Path, paths: &mut Vec<PathBuf>) -> io::Result<()> {
-    if root.is_dir() {
-        for entry in fs::read_dir(root)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_symlink() {
-                collect_class_paths(&entry.path(), paths)?;
-            }
-        }
-    } else if root
-        .extension()
-        .is_some_and(|extension| extension == "class")
-    {
-        paths.push(root.canonicalize()?);
-    }
-    Ok(())
 }
 
 fn parse_class(bytes: &[u8], options: &Options) -> io::Result<StructClass> {
@@ -399,10 +359,22 @@ fn rust_snapshots(paths: &[PathBuf]) -> BTreeMap<String, String> {
                     let snapshot = snapshot(&ir, &common.flow.graph, false);
                     Ok((common, snapshot))
                 });
-                if let Some(common) = common {
-                    record_stage(&mut records, format!("{key}\tjava"), || {
-                        let graph = common.prepare_java_graph(&mut ir, &options);
-                        Ok(((), snapshot(&ir, &graph.graph, false)))
+                if let Some(common) = common
+                    && let Some(mut flow) =
+                        record_stage(&mut records, format!("{key}\tjava"), || {
+                            let flow = common.prepare_java_graph(&mut ir, &options);
+                            let snapshot = snapshot(&ir, &flow.graph, false);
+                            Ok((flow, snapshot))
+                        })
+                {
+                    record_stage(&mut records, format!("{key}\tpostdominance"), || {
+                        let root = graph_to_statement(
+                            &mut ir,
+                            &mut flow.counters,
+                            &flow.graph,
+                            Arc::clone(method),
+                        );
+                        Ok(((), postdominance_snapshot(&ir, ir[root].first.unwrap())))
                     });
                 }
             }
@@ -522,6 +494,31 @@ fn snapshot(ir: &Ir, graph: &ControlFlowGraph, constructed: bool) -> String {
         write!(result, ";subroutines={subroutines}").unwrap();
     }
     result
+}
+
+fn postdominance_snapshot(ir: &Ir, statement: StatId) -> String {
+    if !matches!(ir[statement].kind, StatementKind::General { .. }) {
+        return format!("basic={}", ir[statement].id);
+    }
+    let ids = |statements: &[StatId]| statements.iter().map(|&stat| ir[stat].id).join(",");
+    let rpo = ids(&reverse_post_order(ir, statement));
+    let post_rpo = ids(&post_reverse_post_order(ir, statement));
+    let components = components(ir, statement)
+        .iter()
+        .map(|component| ids(component))
+        .join("/");
+    let postdominators = calc_post_dominators(ir, statement);
+    let post = postdominators
+        .lst_keys()
+        .iter()
+        .zip(postdominators.iter())
+        .map(|(head, posts)| format!("{}:{}", head.unwrap(), posts.iter().join(",")))
+        .join("/");
+    let extended = extended_postdominators(ir, statement)
+        .iter()
+        .map(|(head, posts)| format!("{head}:{}", posts.iter().join(",")))
+        .join("/");
+    format!("rpo={rpo};post-rpo={post_rpo};components={components};post={post};extended={extended}")
 }
 
 fn matching_new_handlers(
@@ -686,5 +683,5 @@ fn describe_difference(java: Option<&str>, rust: Option<&str>) -> String {
             field => return format!("after {block:?}, Java vs Rust {field:?}"),
         }
     }
-    unreachable!()
+    format!("both reported {java:?}")
 }

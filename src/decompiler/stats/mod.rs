@@ -1,18 +1,22 @@
 // Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Initial variants of `modules.decompiler.stats.Statement` and the
+//! `modules.decompiler.stats.Statement` variants and the
 //! operations shared by statements in a control-flow graph.
 
+pub mod recognize;
+pub mod rewrite;
 pub mod stat_edge;
 
 use std::sync::Arc;
 
+use arcstr::ArcStr;
 use indexmap::IndexSet;
 use rustc_hash::FxHashMap;
 
 use self::stat_edge::EdgeType;
 use crate::code::cfg::ControlFlowGraph;
+use crate::code::cfg::basic_block::BasicBlock;
 use crate::code::code_constants::{
     GROUP_JUMP, GROUP_SWITCH, OPC_ATHROW, OPC_GOTO, OPC_MONITORENTER, OPC_MONITOREXIT,
 };
@@ -42,7 +46,28 @@ pub enum StatementKind {
     BasicBlock {
         block: BlockId,
     },
-    General,
+    General {
+        placeholder: bool,
+    },
+    Do,
+    Switch(SwitchStatement),
+    If(IfStatement),
+    Sequence,
+    Catch {
+        exceptions: Vec<Vec<ArcStr>>,
+        vars: Vec<ExprId>,
+        resources: Option<ExprListId>,
+    },
+    CatchAll {
+        handler: Option<StatId>,
+        is_finally: bool,
+        monitor: Option<ExprId>,
+        vars: Vec<ExprId>,
+    },
+    Synchronized {
+        body: StatId,
+        head_exprents: Option<ExprListId>,
+    },
     Root {
         method: Arc<StructMethod>,
         dummy_exit: StatId,
@@ -50,6 +75,31 @@ pub enum StatementKind {
         add_error_comment: bool,
     },
     DummyExit,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct IfStatement {
+    pub has_else: bool,
+    pub negated: bool,
+    pub if_stat: Option<StatId>,
+    pub else_stat: Option<StatId>,
+    pub if_edge: Option<EdgeId>,
+    pub else_edge: Option<EdgeId>,
+    pub head_exprents: Option<ExprListId>,
+}
+
+#[derive(Default)]
+pub struct SwitchStatement {
+    pub default_edge: Option<EdgeId>,
+    pub cases: Vec<SwitchCase>,
+    pub head_exprents: Option<ExprListId>,
+}
+
+pub struct SwitchCase {
+    pub statement: StatId,
+    pub edges: Vec<EdgeId>,
+    /// Parallel to `edges`. The default label has no expression.
+    pub values: Vec<Option<ExprId>>,
 }
 
 pub struct Statement {
@@ -63,6 +113,8 @@ pub struct Statement {
     pub is_monitor_enter: bool,
     pub is_last_athrow: bool,
     pub contains_monitor_exit: bool,
+    pub removable_monitorexit: bool,
+    pub copied: bool,
     pub continue_set: IndexSet<StatId>,
     pub label_edges: IndexSet<EdgeId>,
     pub exprents: Option<ExprListId>,
@@ -84,6 +136,8 @@ impl Statement {
             is_monitor_enter: false,
             is_last_athrow: false,
             contains_monitor_exit: false,
+            removable_monitorexit: false,
+            copied: false,
             continue_set: IndexSet::new(),
             label_edges: IndexSet::new(),
             exprents: None,
@@ -113,6 +167,29 @@ impl Statement {
         stat
     }
 
+    pub fn new_empty_basic_block(ir: &mut Ir, counters: &mut CounterContainer) -> StatId {
+        let id = counters.get_counter_and_increment(STATEMENT_COUNTER);
+        let block = BasicBlock::new(ir, id);
+        let stat = Self::new_basic_block(ir, counters, block);
+        ir[stat].exprents = Some(ir.new_list(Vec::new()));
+        stat
+    }
+
+    pub fn new_sequence(
+        ir: &mut Ir,
+        counters: &mut CounterContainer,
+        children: &[StatId],
+    ) -> StatId {
+        let id = counters.get_counter_and_increment(STATEMENT_COUNTER);
+        let mut statement = Self::new(StatementKind::Sequence, id);
+        statement.first = Some(children[0]);
+        statement.last_basic_type = ir[*children.last().unwrap()].last_basic_type;
+        for &child in children {
+            statement.stats.add_with_key(child, ir[child].id);
+        }
+        ir.stats.push(statement)
+    }
+
     pub fn new_general(
         ir: &mut Ir,
         counters: &mut CounterContainer,
@@ -121,7 +198,7 @@ impl Statement {
         post: Option<StatId>,
     ) -> StatId {
         let id = counters.get_counter_and_increment(STATEMENT_COUNTER);
-        let mut statement = Self::new(StatementKind::General, id);
+        let mut statement = Self::new(StatementKind::General { placeholder: false }, id);
         statement.first = Some(head);
         statement.post = post;
         statement.stats.add_with_key(head, ir[head].id);
@@ -163,6 +240,35 @@ impl Statement {
     pub fn new_dummy_exit(ir: &mut Ir, counters: &mut CounterContainer) -> StatId {
         let id = counters.get_counter_and_increment(STATEMENT_COUNTER);
         ir.stats.push(Self::new(StatementKind::DummyExit, id))
+    }
+
+    pub fn new_synchronized(
+        ir: &mut Ir,
+        counters: &mut CounterContainer,
+        head: StatId,
+        body: StatId,
+        handler: StatId,
+    ) -> StatId {
+        let id = counters.get_counter_and_increment(STATEMENT_COUNTER);
+        let mut statement = Self::new(
+            StatementKind::Synchronized {
+                body,
+                head_exprents: None,
+            },
+            id,
+        );
+        statement.first = Some(head);
+        for child in [head, body, handler] {
+            statement.stats.add_with_key(child, ir[child].id);
+        }
+        if let Some(&edge) = ir[body]
+            .edge_view(EdgeDirection::Forward, STATEDGE_DIRECT_ALL)
+            .first()
+            && ir[edge].edge_type == EdgeType::Regular
+        {
+            statement.post = Some(ir[edge].destination);
+        }
+        ir.stats.push(statement)
     }
 
     fn edge_index(&self, direction: EdgeDirection) -> &FxHashMap<u32, Vec<EdgeId>> {
@@ -229,6 +335,17 @@ impl Statement {
 }
 
 impl StatId {
+    pub fn is_placeholder(self, ir: &Ir) -> bool {
+        matches!(ir[self].kind, StatementKind::General { placeholder: true })
+    }
+
+    pub fn set_placeholder(self, ir: &mut Ir) {
+        let StatementKind::General { placeholder } = &mut ir[self].kind else {
+            panic!("Only general statements can be placeholders");
+        };
+        *placeholder = true;
+    }
+
     pub fn add_successor(self, ir: &mut Ir, edge: EdgeId) {
         debug_assert_eq!(self, ir[edge].source);
         let destination = ir[edge].destination;
@@ -333,6 +450,9 @@ impl StatId {
         for &edge in ir[self].edge_view(EdgeDirection::Forward, EdgeType::Continue.mask()) {
             continues.insert(ir[edge].destination.get_basic_head(ir));
         }
+        if matches!(ir[self].kind, StatementKind::Do) {
+            continues.shift_remove(&ir[self].first.unwrap().get_basic_head(ir));
+        }
         ir[self].continue_set = continues;
     }
 
@@ -355,8 +475,10 @@ impl StatId {
                     ir[self].is_last_athrow = last_opcode == OPC_ATHROW;
                 }
             }
-            StatementKind::Root { .. } | StatementKind::General => {}
-            StatementKind::DummyExit => {
+            StatementKind::Root { .. }
+            | StatementKind::General { .. }
+            | StatementKind::Synchronized { .. } => {}
+            _ => {
                 ir[self].contains_monitor_exit = ir[self]
                     .stats
                     .iter()
