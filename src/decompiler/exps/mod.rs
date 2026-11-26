@@ -713,7 +713,8 @@ impl Expr {
                 operands,
                 implicit_type,
                 ..
-            } => op.expr_type(cx, operands, implicit_type.as_deref()),
+            } => crate::kotlin::body::function_type(cx, expr)
+                .unwrap_or_else(|| op.expr_type(cx, operands, implicit_type.as_deref())),
             ExprKind::Pattern(pattern) => pattern.var_type.clone(),
             ExprKind::New {
                 new_type,
@@ -747,6 +748,13 @@ impl Expr {
     /// constructor order. Immutable metadata and shared case-label expressions
     /// retain their original values.
     pub fn copy(cx: &mut Cx, counters: &mut CounterContainer, expr: ExprId) -> ExprId {
+        if let Some(copy) = crate::kotlin::body::copy_expression(cx, counters, expr) {
+            return copy;
+        }
+        Self::copy_java(cx, counters, expr)
+    }
+
+    pub(crate) fn copy_java(cx: &mut Cx, counters: &mut CounterContainer, expr: ExprId) -> ExprId {
         let mut kind = cx.ir[expr].kind.clone();
         let mut bytecode = cx.ir[expr].bytecode.clone();
         let mut id = None;
@@ -868,7 +876,7 @@ impl Expr {
     }
 }
 
-fn allocation_flags(cx: &Cx, new_type: &VarType) -> (bool, bool, bool) {
+pub(crate) fn allocation_flags(cx: &Cx, new_type: &VarType) -> (bool, bool, bool) {
     if new_type.ty == CodeType::Object
         && new_type.array_dim == 0
         && let Some(node) = cx.class_nodes.get(new_type.name())

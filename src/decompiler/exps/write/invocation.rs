@@ -446,7 +446,7 @@ pub(super) fn append_invocation_type_arguments(cx: &mut Cx, expr: ExprId, buffer
 }
 
 /// Render the part between the call's parentheses, including its formatting groups.
-pub(super) fn append_param_list(cx: &mut Cx, expr: ExprId, indent: i32) -> io::Result<TextBuffer> {
+pub(crate) fn append_param_list(cx: &mut Cx, expr: ExprId, indent: i32) -> io::Result<TextBuffer> {
     let invoke = call(cx, expr);
     let class = invoke
         .classname

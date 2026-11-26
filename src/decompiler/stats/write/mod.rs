@@ -21,6 +21,9 @@ use crate::util::text_buffer::TextBuffer;
 /// `Statement.toJava`. The caller selects the owning method and attaches
 /// its dummy-exit offsets when writing the complete method body.
 pub fn to_java(cx: &mut Cx, stat: StatId, indent: i32) -> io::Result<TextBuffer> {
+    if crate::kotlin::body::is_kotlin_statement(cx, stat) {
+        return crate::kotlin::body::write_statement(cx, stat, indent);
+    }
     match cx.ir[stat].kind {
         StatementKind::BasicBlock { .. } => basic_block(cx, stat, indent),
         StatementKind::General { .. } => general(cx, stat, indent),
@@ -44,7 +47,7 @@ pub fn to_java(cx: &mut Cx, stat: StatId, indent: i32) -> io::Result<TextBuffer>
     }
 }
 
-pub(super) fn definitions(cx: &mut Cx, stat: StatId, indent: i32) -> io::Result<TextBuffer> {
+pub(crate) fn definitions(cx: &mut Cx, stat: StatId, indent: i32) -> io::Result<TextBuffer> {
     let definitions = cx.ir[stat].var_definitions.clone();
     list_to_java(cx, &definitions, indent)
 }
@@ -91,7 +94,8 @@ pub(super) fn list_to_java(cx: &mut Cx, exprs: &[ExprId], indent: i32) -> io::Re
         ) {
             buf.append("{} // $VF: monitorenter ");
         }
-        if !local_class
+        if !cx.writing_kotlin_body
+            && !local_class
             && !matches!(
                 cx.ir[expr].kind,
                 ExprKind::SwitchHead { .. } | ExprKind::Monitor { .. } | ExprKind::If { .. }
@@ -106,7 +110,7 @@ pub(super) fn list_to_java(cx: &mut Cx, exprs: &[ExprId], indent: i32) -> io::Re
 
 /// `ExprProcessor.jmpWrapper` prints the sole explicit outgoing jump. Empty
 /// bodies receive a semicolon only in the contexts that request one.
-pub(super) fn jump_wrapper(
+pub(crate) fn jump_wrapper(
     cx: &mut Cx,
     stat: StatId,
     indent: i32,
@@ -167,7 +171,7 @@ fn append_label(buffer: &mut TextBuffer, indent: i32, id: i32, suffix: &str) {
         .append_line_separator();
 }
 
-pub(super) fn map_deleted_goto(ir: &Ir, stat: StatId, buf: &mut TextBuffer) {
+pub(crate) fn map_deleted_goto(ir: &Ir, stat: StatId, buf: &mut TextBuffer) {
     if let StatementKind::BasicBlock { block } = ir[stat].kind
         && ir[block].instr_old_offsets.len() > ir[block].size() as usize
     {
@@ -231,7 +235,7 @@ fn sequence(cx: &mut Cx, stat: StatId, indent: i32) -> io::Result<TextBuffer> {
     Ok(buf)
 }
 
-fn required_first(cx: &Cx, stat: StatId) -> io::Result<StatId> {
+pub(crate) fn required_first(cx: &Cx, stat: StatId) -> io::Result<StatId> {
     cx.ir[stat]
         .first
         .ok_or_else(|| invalid("Statement has no first child"))

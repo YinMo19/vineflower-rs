@@ -294,6 +294,7 @@ fn function_bounds(
         Cast => bounds.restrict_to_family(first, second_type.unwrap()),
         BoolNot | BoolAnd | BoolOr | L2i | L2f | L2d | F2i | F2l | F2d | D2i | D2l | D2f
         | ArrayLength | Lcmp | Fcmpl | Fcmpg | Dcmpl | Dcmpg => {}
+        Other => unreachable!("Kotlin functions have no Java type bounds"),
     }
 }
 

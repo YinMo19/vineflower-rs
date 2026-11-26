@@ -7,6 +7,7 @@ mod dec_helper;
 mod switch;
 
 pub(crate) use switch::sort_edges_and_nodes as sort_switch_edges;
+pub(super) use switch::can_sort as can_sort_switch;
 
 use std::sync::Arc;
 

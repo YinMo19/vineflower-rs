@@ -119,7 +119,7 @@ pub(super) fn to_java(cx: &mut Cx, expr: ExprId, indent: i32) -> io::Result<Text
     Ok(buffer)
 }
 
-fn definition_type(cx: &Cx, expr: ExprId, variable: &Variable) -> VarType {
+pub(crate) fn definition_type(cx: &Cx, expr: ExprId, variable: &Variable) -> VarType {
     if cx.options.use_lvt_names
         && variable.lvt.is_none()
         && let Some(owner) = variable.processor

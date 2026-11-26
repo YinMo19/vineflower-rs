@@ -21,9 +21,19 @@ use crate::engine::Cx;
 use crate::types::{CodeType, VarType};
 use crate::util::text_buffer::TextBuffer;
 use casts::{CastOptions, NullCastType, append_casted};
-pub(crate) use functions::precedence;
+pub(crate) use allocation::qualified_instance as qualified_new_instance;
+pub(crate) use functions::{precedence, wrap_operand};
+pub(crate) use invocation::append_param_list;
+pub(crate) use variables::definition_type as variable_definition_type;
 
 pub fn to_java(cx: &mut Cx, expr: ExprId, indent: i32) -> io::Result<TextBuffer> {
+    if let Some(wrapper) = cx.kotlin_expr(expr).cloned() {
+        return crate::kotlin::body::write_expression(cx, expr, indent, wrapper);
+    }
+    java_to_java(cx, expr, indent)
+}
+
+pub(crate) fn java_to_java(cx: &mut Cx, expr: ExprId, indent: i32) -> io::Result<TextBuffer> {
     let mut buf = TextBuffer::new(cx);
     match &cx.ir[expr].kind {
         ExprKind::Function { .. } => return functions::function(cx, expr, indent),

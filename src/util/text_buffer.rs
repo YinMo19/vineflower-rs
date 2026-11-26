@@ -159,6 +159,12 @@ impl TextBuffer {
         self
     }
 
+    /// Append a single Java char, including an isolated surrogate.
+    pub(crate) fn append_utf16_unit(&mut self, unit: u16) -> &mut Self {
+        self.text.push(unit);
+        self
+    }
+
     /// `append(int)`.
     pub fn append_int(&mut self, value: i32) -> &mut Self {
         self.append(&value.to_string())

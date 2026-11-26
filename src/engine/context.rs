@@ -32,6 +32,8 @@ pub struct Cx {
     pub javadoc: Option<Arc<dyn super::class_writer::javadoc::JavadocProvider>>,
     /// Object identities shared by methods and nested classes in this root class.
     pub ir: Ir,
+    pub(crate) writing_kotlin_body: bool,
+    pub(crate) kotlin_body: Option<Box<crate::kotlin::body::KotlinBody>>,
     /// ClassesProcessor.mapRootClasses in this root-class worker.
     pub class_nodes: ClassNodes,
     /// Kotlin attributes shared across this decompilation session.
@@ -75,6 +77,8 @@ impl Cx {
             imports: ImportCollector::default(),
             source_mapper: Default::default(),
             ir: Ir::default(),
+            writing_kotlin_body: false,
+            kotlin_body: None,
         }
     }
 

@@ -62,6 +62,7 @@ pub enum FunctionType {
     BoolAnd,
     BoolOr,
     StrConcat,
+    Other,
 }
 
 impl FunctionType {
@@ -71,6 +72,7 @@ impl FunctionType {
             BitNot | BoolNot | Neg | I2l | I2f | I2d | L2i | L2f | L2d | F2i | F2l | F2d | D2i
             | D2l | D2f | I2b | I2c | I2s | ArrayLength | Imm | Mmi | Ipp | Ppi => 1,
             Ternary => 3,
+            Other => 0,
             _ => 2,
         }
     }
@@ -108,6 +110,7 @@ impl FunctionType {
         let operand_type = |index: usize| Expr::expr_type(cx, operands[index]);
         match self {
             StrConcat => VarType::VARTYPE_STRING,
+            Other => unreachable!("Missing Kotlin function type"),
             ArrayLength => VarType::VARTYPE_INT,
             I2l | I2f | I2d | L2i | L2f | L2d | F2i | F2l | F2d | D2i | D2l | D2f
             | I2b | I2c | I2s => self.simple_cast_type().unwrap(),

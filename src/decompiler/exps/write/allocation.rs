@@ -276,7 +276,7 @@ fn write_enclosing(
     }
 }
 
-pub(super) fn qualified_instance(
+pub(crate) fn qualified_instance(
     cx: &mut Cx,
     owner: &str,
     first: Option<ExprId>,

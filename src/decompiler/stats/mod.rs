@@ -135,7 +135,7 @@ pub struct IfStatement {
     pub head_exprents: Option<ExprListId>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct SwitchStatement {
     pub scoped_case_statements: rustc_hash::FxHashSet<StatId>,
     pub default_edge: Option<EdgeId>,
@@ -148,6 +148,13 @@ pub struct SwitchStatement {
 }
 
 impl SwitchStatement {
+    pub(crate) fn case_values_mut(&mut self) -> impl Iterator<Item = &mut [Option<ExprId>]> {
+        self.cases
+            .iter_mut()
+            .map(|case| case.values.as_mut_slice())
+            .chain(self.trailing_case_values.iter_mut().map(Vec::as_mut_slice))
+    }
+
     pub fn case_values(&self) -> impl Iterator<Item = &[Option<ExprId>]> {
         self.cases
             .iter()
@@ -172,6 +179,7 @@ impl SwitchStatement {
     }
 }
 
+#[derive(Clone)]
 pub struct SwitchCase {
     pub statement: StatId,
     pub edges: Vec<EdgeId>,
@@ -728,5 +736,91 @@ impl StatId {
                     ir[self].stats.iter().any(|&stat| ir[stat].is_last_athrow);
             }
         }
+    }
+}
+
+impl StatId {
+    /// Install a Kotlin subclass with the fields copied by its constructor.
+    /// The original remains in the arena for references the JVM constructors
+    /// leave alone, such as the parent held by an already wrapped child.
+    pub(crate) fn replace_with_kotlin(
+        self,
+        ir: &mut Ir,
+        counters: &mut CounterContainer,
+    ) -> Option<StatId> {
+        let copy_list = |ir: &mut Ir, list: Option<ExprListId>| {
+            list.map(|list| ir.new_list(ir[list].clone()))
+        };
+        let kind = match &ir[self].kind {
+            StatementKind::Sequence => StatementKind::Sequence,
+            StatementKind::Do(data) => {
+                let mut data = *data;
+                data.init = copy_list(ir, data.init);
+                data.condition = copy_list(ir, data.condition);
+                data.increment = copy_list(ir, data.increment);
+                StatementKind::Do(data)
+            }
+            StatementKind::If(data) => {
+                let mut data = *data;
+                data.head_exprents = copy_list(ir, data.head_exprents);
+                StatementKind::If(data)
+            }
+            StatementKind::Switch(data) => {
+                let mut data = data.clone();
+                data.scoped_case_statements.clear();
+                data.head_exprents = copy_list(ir, data.head_exprents);
+                StatementKind::Switch(data)
+            }
+            StatementKind::Catch {
+                exceptions,
+                vars,
+                resources,
+            } => {
+                let (exceptions, vars, resources) = (exceptions.clone(), vars.clone(), *resources);
+                StatementKind::Catch {
+                    exceptions,
+                    vars,
+                    resources: copy_list(ir, resources),
+                }
+            }
+            _ => return None,
+        };
+        let original = &ir[self];
+        let mut replacement =
+            Statement::new(kind, counters.get_counter_and_increment(STATEMENT_COUNTER));
+        replacement.stats = original.stats.clone();
+        replacement.first = original.first;
+        replacement.parent = original.parent;
+        replacement.exprents = original.exprents;
+        replacement.label_edges = original.label_edges.clone();
+        replacement.var_definitions = original.var_definitions.clone();
+        replacement.post = original.post;
+        replacement.last_basic_type = original.last_basic_type;
+        replacement.is_monitor_enter = original.is_monitor_enter;
+        replacement.contains_monitor_exit = original.contains_monitor_exit;
+        replacement.is_last_athrow = original.is_last_athrow && !original.contains_monitor_exit;
+        replacement.continue_set = original.continue_set.clone();
+        replacement.phantom = matches!(replacement.kind, StatementKind::Switch(_)) && original.phantom;
+        let replacement = ir.stats.push(replacement);
+
+        if let StatementKind::Switch(switch) = &ir[replacement].kind {
+            let head = switch.head_exprents;
+            let share_cases = !recognize::can_sort_switch(ir, replacement);
+            recognize::init_simple_copy(ir, counters, replacement);
+            if share_cases
+                && let Some(expr) = head.and_then(|list| ir[list].first().copied())
+                && let crate::decompiler::exps::ExprKind::SwitchHead {
+                    case_values: Some(crate::decompiler::exps::SwitchCaseValues::Statement(owner)),
+                    ..
+                } = &mut ir[expr].kind
+                && *owner == self
+            {
+                // Both switches copy the outer table of case lists. The head
+                // still sees the original inner lists when sorting is skipped.
+                *owner = replacement;
+            }
+        }
+        self.replace_with(ir, replacement);
+        Some(replacement)
     }
 }

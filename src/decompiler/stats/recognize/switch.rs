@@ -60,11 +60,11 @@ struct CaseGroup {
 
 /// Sort switch cases and turn direct exits into case bodies. The graph's
 /// successor order defines bytecode label indices, with the default moved last.
-pub(crate) fn sort_edges_and_nodes(ir: &mut Ir, counters: &mut CounterContainer, switch: StatId) {
+pub(in crate::decompiler::stats) fn can_sort(ir: &Ir, switch: StatId) -> bool {
     let StatementKind::Switch(data) = &ir[switch].kind else {
         unreachable!();
     };
-    if data
+    !data
         .cases
         .iter()
         .flat_map(|case| &case.values)
@@ -73,8 +73,11 @@ pub(crate) fn sort_edges_and_nodes(ir: &mut Ir, counters: &mut CounterContainer,
                 !matches!(&ir[expr].kind, ExprKind::Constant { var_type, .. } if var_type.ty != CodeType::Null)
             })
         })
-        || data.case_guards.iter().any(Option::is_some)
-    {
+        && !data.case_guards.iter().any(Option::is_some)
+}
+
+pub(crate) fn sort_edges_and_nodes(ir: &mut Ir, counters: &mut CounterContainer, switch: StatId) {
+    if !can_sort(ir, switch) {
         return;
     }
 

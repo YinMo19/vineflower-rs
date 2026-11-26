@@ -52,6 +52,7 @@ impl FunctionType {
             Fcmpg => (-1, "__fcmpg__"),
             Dcmpl => (-1, "__dcmpl__"),
             Dcmpg => (-1, "__dcmpg__"),
+            Other => unreachable!("Kotlin function has no Java syntax"),
         }
     }
 
@@ -59,7 +60,7 @@ impl FunctionType {
         self.java_syntax().1
     }
 
-    pub(super) fn java_precedence(self) -> i32 {
+    pub(crate) fn java_precedence(self) -> i32 {
         self.java_syntax().0
     }
 
@@ -73,6 +74,9 @@ impl FunctionType {
 }
 
 pub(crate) fn precedence(cx: &mut Cx, expr: ExprId) -> io::Result<i32> {
+    if let Some(value) = crate::kotlin::body::precedence(cx, expr) {
+        return Ok(value);
+    }
     let expr = &cx.ir[expr];
     Ok(match &expr.kind {
         ExprKind::Constant {
@@ -110,6 +114,9 @@ pub(super) fn function(cx: &mut Cx, expr: ExprId, indent: i32) -> io::Result<Tex
         unreachable!("Expected a function expression")
     };
     let (op, operands, needs_cast) = (*op, operands.clone(), *needs_cast);
+    if op == Other {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Missing Kotlin function renderer"));
+    }
     let operator = op.java_operator();
     let mut buf = TextBuffer::new(cx);
     literal::add_offsets(&mut buf, cx.ir[expr].bytecode.as_ref());
@@ -245,7 +252,7 @@ pub(super) fn function(cx: &mut Cx, expr: ExprId, indent: i32) -> io::Result<Tex
                 buf.append_buffer(&to_java(cx, operand, indent)?);
             }
         }
-        Add | Sub | Mul | Div | And | Or | Xor | Rem | Shl | Shr | Ushr => unreachable!(),
+        Add | Sub | Mul | Div | And | Or | Xor | Rem | Shl | Shr | Ushr | Other => unreachable!(),
     }
     Ok(buf)
 }
@@ -279,7 +286,7 @@ fn bit_mask(cx: &Cx, expr: ExprId, buf: &mut TextBuffer) {
     }
 }
 
-fn wrap_operand(
+pub(crate) fn wrap_operand(
     cx: &mut Cx,
     function: ExprId,
     operand: ExprId,
