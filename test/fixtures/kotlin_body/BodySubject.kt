@@ -16,6 +16,14 @@ class BodySubject {
         for (i in 1..a) { result += i }
         return result
     }
+    fun firstIndex(a: IntArray, value: Int): Int {
+        var i = 0
+        while (i < a.size) {
+            if (a[i] == value) return i
+            i++
+        }
+        return -1
+    }
     fun iterate(a: IntArray): Int {
         var result = 0
         for (i in a) { result += i }

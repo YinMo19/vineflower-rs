@@ -102,44 +102,48 @@ fn counted_loop(
     let mut result = TextBuffer::new(cx);
     result.append_indent(indent);
 
-    if let Some(range) = range(cx, loop_)? {
-        if range.ascending && is_zero(cx, range.start) {
-            result
-                .append("repeat(")
-                .append_buffer(&write::to_java(cx, range.end, 0)?)
-                .append(") ");
-            if labeled {
-                label(cx, stat, &mut result).append_char('@');
-            }
-            result.append_char('{');
-            let var = Expr::variable(&cx.ir, range.variable).expect("Kotlin range variable");
-            if variable_name(cx, var) != "it" {
+    match classify_counted_loop(cx, loop_) {
+        CountedLoop::UnresolvedBound => return Ok(result),
+        CountedLoop::General => {}
+        CountedLoop::Range(range) => {
+            if range.ascending && is_zero(cx, range.start) {
                 result
-                    .append_char(' ')
+                    .append("repeat(")
+                    .append_buffer(&write::to_java(cx, range.end, 0)?)
+                    .append(") ");
+                if labeled {
+                    label(cx, stat, &mut result).append_char('@');
+                }
+                result.append_char('{');
+                let var = Expr::variable(&cx.ir, range.variable).expect("Kotlin range variable");
+                if variable_name(cx, var) != "it" {
+                    result
+                        .append_char(' ')
+                        .append_buffer(&write::to_java(cx, range.variable, indent)?)
+                        .append(" ->");
+                }
+                result.append_line_separator();
+            } else {
+                if labeled {
+                    label(cx, stat, &mut result).append("@ ");
+                }
+                result
+                    .append("for (")
                     .append_buffer(&write::to_java(cx, range.variable, indent)?)
-                    .append(" ->");
-            }
-            result.append_line_separator();
-        } else {
-            if labeled {
-                label(cx, stat, &mut result).append("@ ");
+                    .append(" in ")
+                    .append_buffer(&write::to_java(cx, range.start, 0)?)
+                    .append(if range.ascending { ".." } else { " downTo " })
+                    .append_buffer(&write::to_java(cx, range.end, 0)?)
+                    .append(") {")
+                    .append_line_separator();
             }
             result
-                .append("for (")
-                .append_buffer(&write::to_java(cx, range.variable, indent)?)
-                .append(" in ")
-                .append_buffer(&write::to_java(cx, range.start, 0)?)
-                .append(if range.ascending { ".." } else { " downTo " })
-                .append_buffer(&write::to_java(cx, range.end, 0)?)
-                .append(") {")
+                .append_buffer(&jump_wrapper(cx, body, indent + 1, false)?)
+                .append_indent(indent)
+                .append_char('}')
                 .append_line_separator();
+            return Ok(result);
         }
-        result
-            .append_buffer(&jump_wrapper(cx, body, indent + 1, false)?)
-            .append_indent(indent)
-            .append_char('}')
-            .append_line_separator();
-        return Ok(result);
     }
 
     let init = loop_
@@ -197,10 +201,18 @@ struct Range {
     ascending: bool,
 }
 
-fn range(cx: &mut Cx, loop_: DoStatement) -> io::Result<Option<Range>> {
+enum CountedLoop {
+    General,
+    Range(Range),
+    /// KDoStatement breaks out of its labeled resugar block after matching
+    /// the loop header if neither operand supplies a supported range bound.
+    UnresolvedBound,
+}
+
+fn classify_counted_loop(cx: &mut Cx, loop_: DoStatement) -> CountedLoop {
     use FunctionType::*;
     let Some(init) = loop_.init(&cx.ir) else {
-        return Ok(None);
+        return CountedLoop::General;
     };
     let ExprKind::Assignment {
         left: variable,
@@ -208,7 +220,7 @@ fn range(cx: &mut Cx, loop_: DoStatement) -> io::Result<Option<Range>> {
         ..
     } = cx.ir[init].kind
     else {
-        return Ok(None);
+        return CountedLoop::General;
     };
     let ty = Expr::expr_type(cx, variable);
     if Expr::variable(&cx.ir, variable).is_none()
@@ -218,25 +230,25 @@ fn range(cx: &mut Cx, loop_: DoStatement) -> io::Result<Option<Range>> {
                 CodeType::Int | CodeType::Byte | CodeType::Short | CodeType::Char | CodeType::Long
             ))
     {
-        return Ok(None);
+        return CountedLoop::General;
     }
     let Some(increment) = loop_.increment(&cx.ir) else {
-        return Ok(None);
+        return CountedLoop::General;
     };
     let ExprKind::Function { op, .. } = cx.ir[increment].kind else {
-        return Ok(None);
+        return CountedLoop::General;
     };
     if !op.is_inc_dec() {
-        return Ok(None);
+        return CountedLoop::General;
     }
     let Some(condition) = loop_.condition(&cx.ir) else {
-        return Ok(None);
+        return CountedLoop::General;
     };
     let ExprKind::Function {
         op: Lt, operands, ..
     } = &cx.ir[condition].kind
     else {
-        return Ok(None);
+        return CountedLoop::General;
     };
     let (lhs, rhs) = (operands[0], operands[1]);
     let mut counters = ambient_counters(cx);
@@ -290,17 +302,17 @@ fn range(cx: &mut Cx, loop_: DoStatement) -> io::Result<Option<Range>> {
     } else if Expr::equals(cx, variable, rhs) && Expr::variable(&cx.ir, lhs).is_some() {
         passes::wrap_variable(cx, &mut counters, lhs, None)
     } else {
-        return Ok(None);
+        return CountedLoop::UnresolvedBound;
     };
     if let ExprKind::Constant { var_type, .. } = &mut cx.ir[start].kind {
         *var_type = ty;
     }
-    Ok(Some(Range {
+    CountedLoop::Range(Range {
         variable,
         start,
         end,
         ascending,
-    }))
+    })
 }
 
 fn is_zero(cx: &Cx, expr: ExprId) -> bool {
