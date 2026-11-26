@@ -17,6 +17,7 @@ use crate::kotlin::metadata::{NameResolver, proto::jvm::JvmMethodSignature};
 mod functions;
 mod properties;
 
+pub(crate) use functions::search_for_method;
 pub(super) use functions::{constructors, functions};
 pub(super) use properties::properties;
 

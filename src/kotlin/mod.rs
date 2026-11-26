@@ -5,6 +5,7 @@
 pub mod body;
 pub mod declarations;
 pub mod imports;
+pub mod member_writer;
 pub mod members;
 pub mod metadata;
 pub mod passes;
@@ -56,4 +57,17 @@ pub fn identifier(name: &str) -> Cow<'_, str> {
     } else {
         quoted.into()
     }
+}
+
+/// MethodProcessor's Kotlin LanguageSpec runs its CFG, method and final AST passes in order.
+pub(crate) fn code_to_kotlin(
+    cx: &mut crate::engine::Cx,
+    class: &crate::structs::StructClass,
+    method: &std::sync::Arc<crate::structs::StructMethod>,
+) -> std::io::Result<Option<crate::engine::method_processor::ExpressionMethod>> {
+    let Some(mut result) = passes::defined_method(cx, class, method)? else {
+        return Ok(None);
+    };
+    body::prepare(cx, &mut result)?;
+    Ok(Some(result))
 }

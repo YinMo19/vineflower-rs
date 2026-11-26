@@ -15,19 +15,7 @@ use crate::util::{java_str::utf16_len, text_buffer::TextBuffer};
 /// Write a prepared Kotlin body under the owning method's writer context.
 /// Inherited statement printers share the Kotlin writer's semicolon policy.
 pub fn statement(cx: &mut Cx, root: StatId, indent: i32) -> io::Result<TextBuffer> {
-    struct Scope<'a> {
-        cx: &'a mut Cx,
-        previous: bool,
-    }
-    impl Drop for Scope<'_> {
-        fn drop(&mut self) {
-            self.cx.writing_kotlin_body = self.previous;
-        }
-    }
-
-    let previous = std::mem::replace(&mut cx.writing_kotlin_body, true);
-    let scope = Scope { cx, previous };
-    stat::to_java(scope.cx, root, indent)
+    stat::to_java(cx, root, indent)
 }
 
 pub(crate) fn is_kotlin_statement(cx: &Cx, stat: StatId) -> bool {

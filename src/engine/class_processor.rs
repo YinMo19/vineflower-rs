@@ -70,12 +70,25 @@ pub fn initialize_java_wrappers(cx: &mut Cx, root: ClassNodeId) -> io::Result<()
     process_class_methods(cx, root, super::method_processor::code_to_java)
 }
 
-/// Run the built-in Java processing for a root class and its nested classes.
+/// Run the selected language pipeline for all wrappers belonging to a compilation unit.
 pub fn process_class(cx: &mut Cx, root: ClassNodeId) -> io::Result<()> {
     if cx.class_nodes[root].kind != ClassKind::Root {
         return Ok(());
     }
-    initialize_java_wrappers(cx, root)?;
+    prepare_class(cx, root)?;
+    let class = cx.class_nodes[root].class.clone();
+    if class.is_synthetic() && cx.class_nodes[root].simple_name.as_deref() == Some("package-info")
+        || class.has_modifier(ACC_MODULE) && class.attributes.module.is_some()
+    {
+        return Ok(());
+    }
+    let kotlin = crate::kotlin::members::select_language(cx, &class);
+    let process = if kotlin {
+        crate::kotlin::code_to_kotlin
+    } else {
+        super::method_processor::code_to_java
+    };
+    super::class_wrapper::initialize_wrappers(cx, root, process)?;
     if cx.class_nodes[root].wrapper.is_some() {
         super::nested::process_class(cx, root)?;
         super::nested::propagate_member_access(cx, root)?;
@@ -128,7 +141,13 @@ pub fn write_class(cx: &mut Cx, class: &StructClass, output: &mut TextBuffer) ->
     }
     let result = (|| {
         let mut body = TextBuffer::new(cx);
-        super::class_writer::write_class(cx, root, &mut body, 0)?;
+        let root_class = cx.class_nodes[root].class.clone();
+        let kotlin = crate::kotlin::members::select_language(cx, &root_class);
+        if kotlin {
+            crate::kotlin::writer::write_class(cx, root, &mut body, 0)?;
+        } else {
+            super::class_writer::write_class(cx, root, &mut body, 0)?;
+        }
         body.reformat();
         for ((owner, key), mut tracer) in body.get_tracers() {
             let Some(key) = key else { continue };
@@ -139,15 +158,19 @@ pub fn write_class(cx: &mut Cx, class: &StructClass, output: &mut TextBuffer) ->
                 cx.source_mapper.add_tracer(&owner, &key, &mut tracer);
             }
         }
-        if let Some((package, _)) = class.qualified_name.rsplit_once('/') {
-            output
-                .append("package ")
-                .append(&package.replace('/', "."))
-                .append_char(';')
-                .append_line_separator()
-                .append_line_separator();
+        if kotlin {
+            crate::kotlin::writer::write_header(cx, class, output)?;
+        } else {
+            if let Some((package, _)) = class.qualified_name.rsplit_once('/') {
+                output
+                    .append("package ")
+                    .append(&package.replace('/', "."))
+                    .append_char(';')
+                    .append_line_separator()
+                    .append_line_separator();
+            }
+            write_imports(cx, output, true);
         }
-        write_imports(cx, output, true);
         let header_lines = output.count_lines();
         output.append_buffer(&body);
         if cx.options.bytecode_source_mapping {

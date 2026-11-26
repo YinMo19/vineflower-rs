@@ -102,6 +102,7 @@ pub(super) fn initialize_wrappers(
     order.into_iter().try_for_each(|node| {
         cx.with_class_node(node, |cx| {
             let class = Arc::clone(&cx.class_nodes[node].class);
+            cx.current_class = Some(Arc::clone(&class));
             class.prepare_method_properties();
             let methods = class
                 .methods
@@ -118,7 +119,7 @@ pub(super) fn initialize_wrappers(
     })
 }
 
-pub(super) fn catch_method_failure<T>(process: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+pub(crate) fn catch_method_failure<T>(process: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
     catch_unwind(AssertUnwindSafe(process)).unwrap_or_else(|payload| {
         let reason = payload
             .downcast_ref::<String>()
@@ -227,6 +228,10 @@ pub(crate) struct MethodSlot {
 }
 
 impl MethodSlot {
+    pub(crate) fn at(node: ClassNodeId, index: usize) -> Self {
+        Self { node, index }
+    }
+
     pub(crate) fn by_key(cx: &Cx, node: ClassNodeId, key: &str) -> Option<Self> {
         let node = cx.class_nodes.wrapper_owner(node)?;
         let class = &cx.class_nodes[node];
@@ -235,8 +240,33 @@ impl MethodSlot {
         Some(Self { node, index })
     }
 
+    /// Temporarily select a method without changing the writing class.
+    pub(crate) fn with_current<T>(self, cx: &mut Cx, write: impl FnOnce(&mut Cx) -> T) -> T {
+        struct Scope<'a> {
+            cx: &'a mut Cx,
+            previous: Option<MethodSlot>,
+        }
+
+        impl Drop for Scope<'_> {
+            fn drop(&mut self) {
+                self.cx.current_method_wrapper = self.previous;
+            }
+        }
+
+        let previous = cx.current_method_wrapper.replace(self);
+        write(Scope { cx, previous }.cx)
+    }
+
     pub(crate) fn get(self, cx: &Cx) -> &MethodWrapper {
         &cx.class_nodes[self.node].wrapper.as_ref().unwrap().methods[self.index]
+    }
+
+    pub(crate) fn record_write_error(self, cx: &mut Cx, error: io::Error) {
+        self.get_mut(cx).write_error = Some(error);
+    }
+
+    pub(crate) fn index(self) -> usize {
+        self.index
     }
 
     pub(super) fn get_mut(self, cx: &mut Cx) -> &mut MethodWrapper {
@@ -264,7 +294,11 @@ impl Cx {
             .get(slot.index)
     }
 
-    pub(crate) fn method_wrapper_by_key(&self, node: ClassNodeId, key: &str) -> Option<&MethodWrapper> {
+    pub(crate) fn method_wrapper_by_key(
+        &self,
+        node: ClassNodeId,
+        key: &str,
+    ) -> Option<&MethodWrapper> {
         MethodSlot::by_key(self, node, key).map(|slot| slot.get(self))
     }
 
@@ -307,7 +341,7 @@ impl Cx {
             .collect()
     }
 
-    pub(super) fn wrapper_graph(&mut self, method: MethodSlot) -> &DirectGraph {
+    pub(crate) fn wrapper_graph(&mut self, method: MethodSlot) -> &DirectGraph {
         let wrapper = self.class_nodes[method.node]
             .wrapper
             .as_mut()

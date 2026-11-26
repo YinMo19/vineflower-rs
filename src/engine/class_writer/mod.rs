@@ -9,8 +9,8 @@ pub(crate) mod type_annotations;
 
 mod class;
 mod class_references14;
-mod comments;
-mod declaration;
+pub(crate) mod comments;
+pub(crate) mod declaration;
 mod enums;
 mod fields;
 mod initializers;
@@ -18,14 +18,19 @@ pub mod javadoc;
 mod lambda;
 mod late_methods;
 mod method_errors;
-pub(crate) use method_errors::{write_class_error, write_exception};
+pub(crate) use method_errors::{
+    dump_method_error, exception_details, write_class_error, write_exception,
+};
 mod method_parameters;
 mod methods;
 mod record_components;
+pub(crate) use records::is_hidden_record_method;
 mod records;
 
 pub use class::write_class;
 pub use declaration::write_class_definition;
+pub(crate) use declaration::append_deprecation;
+pub(crate) use methods::{append_wrapper_comments, declared_exceptions, signature as method_generic_signature};
 pub(crate) use lambda::write_lambda;
 
 use super::{
@@ -60,21 +65,8 @@ pub fn with_method_for_writing<T>(
                 "missing method wrapper for writing",
             )
         })?;
-    cx.with_class_node(node, |cx| {
-        struct MethodScope<'a> {
-            cx: &'a mut Cx,
-            previous: Option<MethodSlot>,
-        }
-        impl Drop for MethodScope<'_> {
-            fn drop(&mut self) {
-                self.cx.current_method_wrapper = self.previous;
-            }
-        }
-        let previous = cx
-            .current_method_wrapper
-            .replace(MethodSlot { node: owner, index });
-        write(MethodScope { cx, previous }.cx)
-    })
+    let slot = MethodSlot { node: owner, index };
+    cx.with_class_node(node, |cx| slot.with_current(cx, write))
 }
 
 /// Run the built-in Java passes at ClassWriter.invokeProcessors. The class and
@@ -91,6 +83,22 @@ pub fn prepare_class_for_writing(cx: &mut Cx, node: ClassNodeId) -> io::Result<(
 
 fn prepare(cx: &mut Cx, node: ClassNodeId) -> io::Result<()> {
     late_methods::process(cx, node)?;
+    prepare_initializers_and_enums(cx, node)?;
+    for index in 0..cx.class_nodes[node].class.methods.len() {
+        let slot = MethodSlot { node, index };
+        late_methods::reset_method(cx, slot);
+        records::fixup_canonical_constructor(cx, slot);
+        let method = slot.get(cx);
+        if let Some(root) = method.root() {
+            let (variables, method) = (method.variables, method.method.clone());
+            crate::decompiler::vars::processor::rerun_clashing(cx, root, variables, &method)?;
+        }
+    }
+    Ok(())
+}
+
+/// The initializer, class-reference and enum passes shared by the Java and Kotlin writers.
+pub(crate) fn prepare_initializers_and_enums(cx: &mut Cx, node: ClassNodeId) -> io::Result<()> {
     initializers::extract(cx, node)?;
     initializers::hide_initializers(cx, node);
     let class = &cx.class_nodes[node];
@@ -102,16 +110,6 @@ fn prepare(cx: &mut Cx, node: ClassNodeId) -> io::Result<()> {
     }
     if cx.class_nodes[node].class.has_modifier(ACC_ENUM) && cx.options.decompile_enums {
         enums::clear_enum(cx, node)?;
-    }
-    for index in 0..cx.class_nodes[node].class.methods.len() {
-        let slot = MethodSlot { node, index };
-        late_methods::reset_method(cx, slot);
-        records::fixup_canonical_constructor(cx, slot);
-        let method = slot.get(cx);
-        if let Some(root) = method.root() {
-            let (variables, method) = (method.variables, method.method.clone());
-            crate::decompiler::vars::processor::rerun_clashing(cx, root, variables, &method)?;
-        }
     }
     Ok(())
 }

@@ -55,6 +55,16 @@ pub(crate) fn definitions(cx: &mut Cx, stat: StatId, indent: i32) -> io::Result<
 /// `ExprProcessor.listToJava`, with variable definitions ordered within each
 /// contiguous run as in `Exprent.sortIndexed`.
 pub(super) fn list_to_java(cx: &mut Cx, exprs: &[ExprId], indent: i32) -> io::Result<TextBuffer> {
+    if exprs.is_empty() {
+        return Ok(TextBuffer::new(cx));
+    }
+    // ExprProcessor selects the language for the ambient class, which may
+    // be a different wrapper than the class currently being written.
+    let kotlin = cx.options.decompile_kotlin
+        && cx
+            .current_class
+            .clone()
+            .is_some_and(|class| crate::kotlin::members::select_language(cx, &class));
     let mut ordered = exprs.to_vec();
     let definition_index = |expr| {
         Expr::variable(&cx.ir, expr)
@@ -94,7 +104,7 @@ pub(super) fn list_to_java(cx: &mut Cx, exprs: &[ExprId], indent: i32) -> io::Re
         ) {
             buf.append("{} // $VF: monitorenter ");
         }
-        if !cx.writing_kotlin_body
+        if !kotlin
             && !local_class
             && !matches!(
                 cx.ir[expr].kind,

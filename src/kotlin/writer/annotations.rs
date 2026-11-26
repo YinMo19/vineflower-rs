@@ -193,12 +193,8 @@ impl DefaultValue {
     pub fn render(&self, cx: &mut Cx, indent: i32) -> io::Result<TextBuffer> {
         match &self.0 {
             ElementValue::Class(name) => {
-                let ty = VarType::from_signature_cl(name, !name.starts_with('['));
                 let mut buffer = TextBuffer::new(cx);
-                buffer.append_cast_type_name(cx, &ty).append("::class.java");
-                if ty.unboxing_type().is_some() || name == "java/lang/Void" {
-                    buffer.append("ObjectType");
-                }
+                crate::kotlin::body::append_class_literal(cx, &mut buffer, name);
                 Ok(buffer)
             }
             ElementValue::Annotation(annotation) => render_wrapped(cx, annotation, indent, None),
@@ -238,13 +234,25 @@ pub fn append(
     member: &impl StructMember,
     target: i32,
 ) -> io::Result<()> {
+    append_except(cx, buf, indent, member, target, |_| false)
+}
+
+pub(super) fn append_except(
+    cx: &mut Cx,
+    buf: &mut TextBuffer,
+    indent: i32,
+    member: &impl StructMember,
+    target: i32,
+    mut removed: impl FnMut(&AnnotationData) -> bool,
+) -> io::Result<()> {
     let attrs = member.attributes();
     let mut filter = FxHashSet::default();
     for annotation in java::declaration_annotations(attrs).filter(|a| {
-        !matches!(
-            a.class_name.as_str(),
-            "kotlin/Metadata" | NOT_NULL | NULLABLE | "kotlin/jvm/JvmStatic"
-        )
+        !removed(a)
+            && !matches!(
+                a.class_name.as_str(),
+                "kotlin/Metadata" | NOT_NULL | NULLABLE | "kotlin/jvm/JvmStatic"
+            )
     }) {
         let text = render(cx, annotation, indent, None)?.convert_to_string_and_allow_data_discard();
         buf.append(&text);

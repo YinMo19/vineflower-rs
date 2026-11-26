@@ -151,6 +151,14 @@ CFG、语句图和 DirectGraph 具有不同的边契约。
 
 断言 IR 允许顶层条件为空，用来表达 `assert false`。上游递归剥离断言字段时还可能把空引用写进 `&&` 的操作数。Rust 的二元表达式要求两个有效操作数，遇到后一种形状会在断言恢复阶段返回方法级错误。当前真实 class 对照尚未触发这条路径。
 
+## Kotlin 插件
+
+同一个输入单元可以含有 Java 和 Kotlin 根类。CLI 默认装载 Kotlin 插件，库调用方通过 `Options::decompile_kotlin` 选择是否装载。入口按原版在选输出扩展名、处理根类和写出类时调用语言选择器。Kotlin 插件读取 JVM 注解中的 `kotlin.Metadata`。单独开启元数据导出时，解析出的成员关系也可供库调用查询。名称解析保留 JVM 的字符串表、UTF-16 范围和预定义名字。编译好的 protobuf 类型随 Rust 项目提交，普通构建无需安装 Kotlin 编译器或 protoc。[语言入口](src/kotlin/mod.rs) · [元数据](src/kotlin/metadata/mod.rs) · [模式生成工具](tools/kotlin-schema)
+
+编译单元共享一份成员表。属性的字段、getter 和 setter 引用同一声明，companion 的静态入口保留原始 JVM 方法身份。解析中途失败时，先前已关联的成员仍可供后续查找。Kotlin 方法沿原插件顺序复用 JVM 指令解码、CFG、finally 和变量分析，再替换对应的语句与表达式。语言专属信息附着在 arena 的实际节点上，子表达式在普通写出入口也能分派到正确的语言实现。[成员绑定](src/kotlin/members/mod.rs) · [方法流水线](src/kotlin/passes/mod.rs) · [表达式与语句](src/kotlin/body/mod.rs)
+
+类级写出先抽取初始化器，处理 enum 与 companion，再写主构造器、属性、函数和嵌套类。主构造器已消费的 super 调用从后续块里移除。默认实参读取真实 JVM 桥方法的位掩码，注解构造器则读取成员的 `AnnotationDefault`。正文与字段初始化器保留字节码位置，复用 `TextBuffer` 完成排版、token 归属和源码行映射。类头在正文确定所有导入后生成。表达式列表写出时，上游再次根据最后初始化的包装器所属类选择语言。这个类与当前写出节点分别存于根类会话，嵌套类元数据的加载时机与分号规则都依赖这一区别。[类写出](src/kotlin/writer/class.rs) · [成员写出](src/kotlin/member_writer/mod.rs) · [文件头](src/kotlin/writer/header.rs)
+
 ## 核对实现
 
 真实输入的检查点依次为解码序列、原始 CFG、共同清理后的 CFG、Java 异常整理后的 CFG、初始语句图、结构分解、数据流和最终源码。中间结果应按其自身的语义比较。例如 switch 目标比较有序列表，异常表比较区间、处理器和捕获类型，源码比较沿用上游的换行及外侧空白规则。

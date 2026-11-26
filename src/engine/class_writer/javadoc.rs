@@ -33,7 +33,7 @@ pub trait JavadocProvider: Send + Sync {
     }
 }
 
-pub(super) fn append(buffer: &mut TextBuffer, style: JavadocStyle, text: &str, indent: i32) {
+pub(crate) fn append(buffer: &mut TextBuffer, style: JavadocStyle, text: &str, indent: i32) {
     let (prefix, delimited) = match style {
         JavadocStyle::Html => (" * ", true),
         JavadocStyle::Markdown => ("/// ", false),

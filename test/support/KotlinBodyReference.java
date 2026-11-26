@@ -20,6 +20,7 @@ import org.vineflower.kotlin.KotlinImportCollector;
 public final class KotlinBodyReference {
   public static void main(String[] args) throws Exception {
     var fixture = Files.readAllLines(Path.of(args[0]));
+    String selected = fixture.size() > 4 ? fixture.get(4) : null;
     var opts = Map.<String, Object>of(
       "thread-count", "1",
       "new-line-separator", "1",
@@ -27,17 +28,28 @@ public final class KotlinBodyReference {
       "__unit_test_mode__", "1",
       "keep-literals", "1",
       "preferred-line-length", "60",
-      "kt-collapse-string-concat", fixture.get(3)
+      "kt-collapse-string-concat", fixture.get(3),
+      "decompile-inner", selected == null ? "1" : "0"
     );
     Fernflower engine = new Fernflower(null, opts, IFernflowerLogger.NO_OP);
     engine.addSource(new File(fixture.get(0)));
     engine.addLibrary(new File(fixture.get(1)));
     var processor = DecompilerContext.getClassProcessor();
     processor.loadClasses(null);
-    for (var node : new TreeMap<>(processor.getMapRootClasses()).values()) {
+    var nodes = new TreeMap<>(processor.getMapRootClasses()).values();
+    if (selected != null) {
+      for (var node : nodes) {
+        if (node.type == ClassNode.Type.ROOT) processor.processClass(node.classStruct);
+      }
+    }
+    for (var node : nodes) {
       if (node.type != ClassNode.Type.ROOT) continue;
       var cls = node.classStruct;
-      processor.processClass(cls);
+      if (selected == null) {
+        processor.processClass(cls);
+      } else if (!selected.equals(cls.qualifiedName)) {
+        continue;
+      }
       DecompilerContext.setProperty(DecompilerContext.CURRENT_CLASS, cls);
       DecompilerContext.setProperty(DecompilerContext.CURRENT_CLASS_NODE, node);
       DecompilerContext.setImportCollector(new KotlinImportCollector(new ImportCollector(node)));

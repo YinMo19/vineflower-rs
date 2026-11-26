@@ -14,7 +14,7 @@ use super::options::Options;
 use crate::decompiler::ir::{Ir, VarProcessorId};
 use crate::renamer::pool_interceptor::PoolInterceptor;
 use crate::structs::struct_context::ClassResolver;
-use crate::structs::{StructContext, StructMethod};
+use crate::structs::{StructClass, StructContext, StructMethod};
 
 /// Everything a translated function may consult or update while classes are
 /// being decompiled by one worker.
@@ -32,12 +32,13 @@ pub struct Cx {
     pub javadoc: Option<Arc<dyn super::class_writer::javadoc::JavadocProvider>>,
     /// Object identities shared by methods and nested classes in this root class.
     pub ir: Ir,
-    pub(crate) writing_kotlin_body: bool,
     pub(crate) kotlin_body: Option<Box<crate::kotlin::body::KotlinBody>>,
     /// ClassesProcessor.mapRootClasses in this root-class worker.
     pub class_nodes: ClassNodes,
     /// Kotlin attributes shared across this decompilation session.
     pub(crate) kotlin_members: Option<Box<crate::kotlin::members::KotlinMembers>>,
+    /// CURRENT_CLASS remains the last initialized wrapper during source writing.
+    pub(crate) current_class: Option<Arc<StructClass>>,
     /// ClassNode currently used for import shadowing.
     pub current_class_node: Option<arcstr::ArcStr>,
     /// Lambda call sites can share their declaring class and even their
@@ -53,6 +54,7 @@ pub(super) struct ClassSession {
     current_method_wrapper: Option<super::class_wrapper::MethodSlot>,
     current_method: Option<(Arc<StructMethod>, VarProcessorId)>,
     expression_ids: ExpressionIds,
+    current_class: Option<Arc<StructClass>>,
     current_class_node: Option<arcstr::ArcStr>,
     current_node_id: Option<super::class_nodes::ClassNodeId>,
     imports: ImportCollector,
@@ -72,12 +74,12 @@ impl Cx {
             struct_context,
             class_nodes: ClassNodes::default(),
             kotlin_members: None,
+            current_class: None,
             current_class_node: None,
             current_node_id: None,
             imports: ImportCollector::default(),
             source_mapper: Default::default(),
             ir: Ir::default(),
-            writing_kotlin_body: false,
             kotlin_body: None,
         }
     }
@@ -88,6 +90,7 @@ impl Cx {
             current_method_wrapper: self.current_method_wrapper.take(),
             current_method: self.current_method.take(),
             expression_ids: std::mem::take(&mut self.expression_ids),
+            current_class: self.current_class.take(),
             current_class_node: self.current_class_node.take(),
             current_node_id: self.current_node_id.take(),
             imports: std::mem::take(&mut self.imports),
@@ -99,6 +102,7 @@ impl Cx {
         self.current_method_wrapper = session.current_method_wrapper;
         self.current_method = session.current_method;
         self.expression_ids = session.expression_ids;
+        self.current_class = session.current_class;
         self.current_class_node = session.current_class_node;
         self.current_node_id = session.current_node_id;
         self.imports = session.imports;

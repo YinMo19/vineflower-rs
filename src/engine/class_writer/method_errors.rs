@@ -31,6 +31,18 @@ pub(super) fn dump_error(
     wrapper: &MethodWrapper,
     indent: i32,
 ) {
+    dump_method_error(cx, buffer, owner, wrapper, indent, true);
+}
+
+/// The Java bytecode listing includes exception handlers after the instructions.
+pub(crate) fn dump_method_error(
+    cx: &Cx,
+    buffer: &mut TextBuffer,
+    owner: &StructClass,
+    wrapper: &MethodWrapper,
+    indent: i32,
+    include_handlers: bool,
+) {
     let mut lines = vec!["$VF: Couldn't be decompiled".to_owned()];
     if cx.options.dump_exception_on_error {
         lines.extend(error_comment(&cx.options.error_message).map(str::to_owned));
@@ -43,9 +55,9 @@ pub(super) fn dump_error(
     }
     if cx.options.dump_bytecode_on_error {
         lines.push("Bytecode:".to_owned());
-        if let Err(error) =
-            catch_method_failure(|| collect_bytecode(owner, &wrapper.method, &mut lines))
-        {
+        if let Err(error) = catch_method_failure(|| {
+            collect_bytecode(owner, &wrapper.method, &mut lines, include_handlers)
+        }) {
             lines.push("Error collecting bytecode:".to_owned());
             append_error_lines(&mut lines, &error);
         }
@@ -58,14 +70,18 @@ pub(super) fn dump_error(
 pub(crate) fn write_exception(cx: &Cx, buffer: &mut TextBuffer, error: &dyn Error) {
     append_error_comment(buffer, "$VF: Couldn't be decompiled", 0);
     if cx.options.dump_exception_on_error {
-        let mut lines: Vec<_> = error_comment(&cx.options.error_message)
-            .map(str::to_owned)
-            .collect();
-        append_error_lines(&mut lines, error);
-        for line in lines {
+        for line in exception_details(cx, error) {
             append_error_comment(buffer, &line, 0);
         }
     }
+}
+
+pub(crate) fn exception_details(cx: &Cx, error: &dyn Error) -> Vec<String> {
+    let mut lines: Vec<_> = error_comment(&cx.options.error_message)
+        .map(str::to_owned)
+        .collect();
+    append_error_lines(&mut lines, error);
+    lines
 }
 
 pub(crate) fn write_class_error(cx: &Cx, buffer: &mut TextBuffer, error: &dyn Error) {
@@ -74,11 +90,7 @@ pub(crate) fn write_class_error(cx: &Cx, buffer: &mut TextBuffer, error: &dyn Er
         .append_line_separator()
         .append("$VF: Unable to decompile class")
         .append_line_separator();
-    let mut lines: Vec<_> = error_comment(&cx.options.error_message)
-        .map(str::to_owned)
-        .collect();
-    append_error_lines(&mut lines, error);
-    for line in lines {
+    for line in exception_details(cx, error) {
         buffer.append(&line).append_line_separator();
     }
     buffer.append("*/");
@@ -105,6 +117,7 @@ fn collect_bytecode(
     owner: &StructClass,
     method: &StructMethod,
     lines: &mut Vec<String>,
+    include_handlers: bool,
 ) -> io::Result<()> {
     let instructions = method
         .expand_data(owner)?
@@ -170,6 +183,9 @@ fn collect_bytecode(
             }
         }
         lines.push(line);
+    }
+    if !include_handlers {
+        return Ok(());
     }
     for handler in &instructions.exception_table.handlers {
         lines.push(format!(

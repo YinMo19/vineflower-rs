@@ -32,7 +32,7 @@ pub(super) fn has_annotations(method: &StructMethod) -> bool {
 }
 
 /// `RecordHelper.isHiddenRecordMethod`.
-pub(super) fn is_hidden_record_method(
+pub(crate) fn is_hidden_record_method(
     cx: &Cx,
     class: &StructClass,
     method: &StructMethod,

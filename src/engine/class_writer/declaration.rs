@@ -258,7 +258,7 @@ pub(super) fn append_modifiers(buffer: &mut TextBuffer, flags: i32) {
     }
 }
 
-pub(super) fn append_deprecation(buffer: &mut TextBuffer, attrs: &Attributes, indent: i32) {
+pub(crate) fn append_deprecation(buffer: &mut TextBuffer, attrs: &Attributes, indent: i32) {
     if attrs.deprecated.is_some()
         && !annotations::declaration_annotations(attrs)
             .any(|a| a.class_name == "java/lang/Deprecated")
@@ -288,7 +288,7 @@ fn inherits_sealed(cx: &Cx, class: &StructClass) -> bool {
         .any(|parent| parent.attributes.permitted_subclasses.is_some())
 }
 
-fn verify_class_signature(
+pub(crate) fn verify_class_signature(
     cx: &Cx,
     class: &StructClass,
     supertype: Option<&VarType>,

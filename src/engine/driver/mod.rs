@@ -149,17 +149,6 @@ impl Decompiler {
                 }
             },
         );
-        if options.decompile_kotlin
-            && options.kt_enable
-            && let Some((name, _)) = nodes
-                .iter()
-                .find(|(_, node)| node.kind == ClassKind::Root && has_kotlin_metadata(&node.class))
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!("Kotlin source writing is unavailable for {name}"),
-            ));
-        }
         let context = Arc::new(self.context);
         let mut cx = Cx::new(Arc::clone(&context));
         cx.class_nodes = nodes;
@@ -174,7 +163,7 @@ impl Decompiler {
                 .transpose()?;
 
             drop(cx.take_class_session());
-            let mut classes = unit_classes(&cx, unit, &layout);
+            let mut classes = unit_classes(&mut cx, unit, &layout);
             for pending in &mut classes {
                 log::info!("Preprocessing class {}", pending.class.qualified_name);
                 let processed = catch_method_failure(|| process_class(&mut cx, pending.node));
@@ -215,12 +204,13 @@ struct PendingClass {
     error: Option<io::Error>,
 }
 
-fn unit_classes(cx: &Cx, unit: &ContextUnit, layout: &OutputLayout) -> Vec<PendingClass> {
+fn unit_classes(cx: &mut Cx, unit: &ContextUnit, layout: &OutputLayout) -> Vec<PendingClass> {
     let mut seen = FxHashSet::default();
     unit.class_entries
         .iter()
         .filter_map(|entry| {
             let class = cx.struct_context.get_class(entry)?;
+            let kotlin = crate::kotlin::members::select_language(cx, &class);
             let node = cx.class_nodes.id(&class.qualified_name)?;
             if cx.class_nodes[node].kind != ClassKind::Root {
                 return None;
@@ -249,7 +239,7 @@ fn unit_classes(cx: &Cx, unit: &ContextUnit, layout: &OutputLayout) -> Vec<Pendi
             if matches!(layout, OutputLayout::SingleFile) {
                 name = basename(&name).to_owned();
             }
-            name.push_str(".java");
+            name.push_str(if kotlin { ".kt" } else { ".java" });
             Some(PendingClass {
                 class,
                 entry_name: name,
@@ -352,15 +342,4 @@ impl ClassFilter {
         };
         self.included.as_ref().is_none_or(matches) && !self.excluded.as_ref().is_some_and(matches)
     }
-}
-
-fn has_kotlin_metadata(class: &StructClass) -> bool {
-    [
-        &class.attributes.runtime_visible_annotations,
-        &class.attributes.runtime_invisible_annotations,
-    ]
-    .into_iter()
-    .flatten()
-    .flat_map(|attribute| &attribute.annotations)
-    .any(|annotation| annotation.class_name == "kotlin/Metadata")
 }

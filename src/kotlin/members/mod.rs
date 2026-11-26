@@ -25,6 +25,7 @@ use super::{
 mod bind;
 mod objects;
 
+pub(crate) use bind::search_for_method;
 pub use objects::process_objects;
 
 #[derive(Clone)]
@@ -142,6 +143,7 @@ pub struct KotlinMembers {
 struct ClassAttributes {
     element: Option<ClassElement>,
     primary_constructor: Option<Arc<KConstructor>>,
+    removed_repeatables: usize,
     companion_fields: Vec<Arc<StructField>>,
     companion_accessors: Vec<Arc<StructMethod>>,
 }
@@ -267,6 +269,35 @@ impl KotlinMembers {
 
 fn state(cx: &mut Cx) -> &mut KotlinMembers {
     cx.kotlin_members.get_or_insert_with(Box::default)
+}
+
+/// KotlinWriter removes the first visible Java repeatable marker from the class
+/// before writing an annotation definition. Keep the mutation in this session.
+pub(crate) fn remove_repeatable(
+    cx: &mut Cx,
+    class: &Arc<StructClass>,
+) -> io::Result<(usize, Option<ArcStr>)> {
+    use crate::structs::attr::ElementValue;
+    let annotations = class
+        .attributes
+        .runtime_visible_annotations
+        .as_ref()
+        .ok_or_else(|| invalid_data("Kotlin annotation class has no visible annotations"))?;
+    let attrs = state(cx).classes.get_mut(class);
+    let Some(next) = annotations
+        .annotations
+        .iter()
+        .filter(|a| a.class_name == "java/lang/annotation/Repeatable")
+        .nth(attrs.removed_repeatables)
+    else {
+        return Ok((attrs.removed_repeatables, None));
+    };
+    let Some(ElementValue::Class(container)) = next.par_values.first().map(|value| &value.value)
+    else {
+        return Err(invalid_data("Repeatable container is not a class literal"));
+    };
+    attrs.removed_repeatables += 1;
+    Ok((attrs.removed_repeatables, Some(container.clone())))
 }
 
 /// KotlinChooser.isLanguage binds selected annotations even in export-only

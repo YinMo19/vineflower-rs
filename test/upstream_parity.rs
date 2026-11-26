@@ -204,6 +204,53 @@ fn upstream_source_goldens_without_jdk() {
 }
 
 #[test]
+fn mixed_java_and_kotlin_compilation_unit_uses_each_language_writer() {
+    let mut options = without_runtime();
+    options.decompile_kotlin = true;
+    options.bytecode_source_mapping = true;
+    options.dump_original_lines = true;
+    options.unit_test_mode = true;
+    let mut decompiler = Decompiler::new(options).unwrap();
+    add_smoke_classes(
+        &mut decompiler,
+        &[
+            (
+                "pkg/TestParams",
+                include_bytes!("smoke/kt/TestParams.class"),
+            ),
+            (
+                "pkg/TestSimpleWhile",
+                include_bytes!("smoke/java8/TestSimpleWhile.class"),
+            ),
+        ],
+    )
+    .unwrap();
+    let sources = decompiler.decompile().unwrap();
+    assert_eq!(sources.len(), 2);
+    for (entry, reference) in [
+        (
+            "pkg/TestParams.kt",
+            "plugins/kotlin/testData/results/pkg/TestParams.dec",
+        ),
+        (
+            "pkg/TestSimpleWhile.java",
+            "testData/results/pkg/TestSimpleWhile.dec",
+        ),
+    ] {
+        let class = sources
+            .iter()
+            .find(|class| class.entry_name == entry)
+            .unwrap();
+        let expected = read_normalized(&fixture_root().join(reference)).unwrap();
+        assert_eq!(
+            normalized(class.source.as_bytes(), false),
+            expected,
+            "{entry}"
+        );
+    }
+}
+
+#[test]
 fn upstream_javadoc_and_selected_nested_method() {
     let goldens = fixture_root().join("testData/results/pkg");
     for (name, bytes, style) in [

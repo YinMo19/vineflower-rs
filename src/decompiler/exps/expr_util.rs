@@ -41,7 +41,7 @@ pub(crate) fn synthetic_parameters_mask(
                 format!(
                     "Constructor {}.<init>{} not found",
                     class_node.class.qualified_name,
-                    call.descriptor.as_str()
+                    call.string_descriptor()
                 ),
             ));
         }

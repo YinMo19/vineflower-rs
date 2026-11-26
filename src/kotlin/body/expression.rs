@@ -74,18 +74,13 @@ fn constant(
     else {
         unreachable!()
     };
-    if *var_type == VarType::VARTYPE_CLASS {
-        if let ConstantValue::String(name) = value {
-            let name = name.as_utf8_lossy();
-            let ty = VarType::from_signature_cl(name, !name.starts_with('['));
-            let boxed = primitive_box(name);
-            let mut result = mapped_buffer(cx, expr);
-            result.append_cast_type_name(cx, &ty).append("::class.java");
-            if boxed {
-                result.append("ObjectType");
-            }
-            return Ok(result);
-        }
+    if *var_type == VarType::VARTYPE_CLASS
+        && let ConstantValue::String(name) = value
+    {
+        let name = name.as_utf8_lossy().clone();
+        let mut result = mapped_buffer(cx, expr);
+        append_class_literal(cx, &mut result, &name);
+        return Ok(result);
     }
     if matches!(value, ConstantValue::Null) && *var_type != VarType::VARTYPE_NULL {
         let ty = var_type.clone();
@@ -106,6 +101,15 @@ fn constant(
         return Ok(result);
     }
     write::java_to_java(cx, expr, indent)
+}
+
+/// KConstExprent.toJava on a JVM class literal, including boxed primitive handles.
+pub(crate) fn append_class_literal(cx: &mut Cx, buffer: &mut TextBuffer, name: &str) {
+    let ty = VarType::from_signature_cl(name, !name.starts_with('['));
+    buffer.append_cast_type_name(cx, &ty).append("::class.java");
+    if primitive_box(name) {
+        buffer.append("ObjectType");
+    }
 }
 
 fn primitive_box(class: &str) -> bool {
@@ -225,6 +229,9 @@ fn field(cx: &mut Cx, expr: ExprId, indent: i32) -> io::Result<TextBuffer> {
             .append(&kotlin_type(cx, Some(&ty), true)?)
             .append("::class.javaPrimitiveType");
         return Ok(result);
+    }
+    if let Some(value) = crate::kotlin::writer::field_expression(cx, expr, indent)? {
+        return Ok(value);
     }
     write::java_to_java(cx, expr, indent)
 }

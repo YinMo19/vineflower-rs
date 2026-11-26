@@ -94,21 +94,30 @@ pub(in crate::kotlin::members) fn functions(
             .iter()
             .map(|ty| KType::from_proto(Some(ty), names))
             .collect::<io::Result<Vec<_>>>()?;
-        let defaults = function_defaults(
-            cx,
+        let descriptor = default_descriptor(
             class,
-            companion_parent,
             &method,
-            &name,
             &parameters,
             &type_parameters,
             receiver_type.as_ref(),
             &return_type,
         );
+        let defaults = default_arguments(
+            cx,
+            class,
+            companion_parent,
+            format!("{name}$default").into(),
+            descriptor.into(),
+        );
         let known_override = !matches!(
             flags::VISIBILITY.get(flags),
             Some(Visibility::Private | Visibility::PrivateToThis | Visibility::Local)
-        ) && known_override(cx, class, &method);
+        ) && search_for_method(
+            cx,
+            class,
+            &method.name,
+            &MethodDescriptor::parse_descriptor(&method.descriptor),
+        );
         let contract = function
             .contract
             .as_ref()
@@ -141,17 +150,14 @@ pub(in crate::kotlin::members) fn functions(
     Ok(())
 }
 
-fn function_defaults(
-    cx: &mut Cx,
+fn default_descriptor(
     class: &StructClass,
-    companion_parent: Option<&StructClass>,
     method: &StructMethod,
-    name: &str,
     parameters: &[KParameter],
     type_parameters: &[KTypeParameter],
     receiver_type: Option<&KType>,
     return_type: &KType,
-) -> DefaultArguments {
+) -> String {
     let mut descriptor = "(".to_owned();
     if !method.has_modifier(ACC_STATIC) {
         write!(descriptor, "L{};", class.qualified_name).unwrap();
@@ -177,13 +183,7 @@ fn function_defaults(
     }
     append_masks(&mut descriptor, parameters.len());
     write!(descriptor, "Ljava/lang/Object;){return_type}").unwrap();
-    default_arguments(
-        cx,
-        class,
-        companion_parent,
-        format!("{name}$default").into(),
-        descriptor.into(),
-    )
+    descriptor
 }
 
 pub(in crate::kotlin::members) fn constructors(
@@ -260,11 +260,15 @@ fn append_masks(descriptor: &mut String, parameters: usize) {
     descriptor.extend(std::iter::repeat_n('I', parameters / 32 + 1));
 }
 
-fn known_override(cx: &Cx, class: &StructClass, method: &StructMethod) -> bool {
-    let descriptor = MethodDescriptor::parse_descriptor(&method.descriptor);
+pub(crate) fn search_for_method(
+    cx: &Cx,
+    class: &StructClass,
+    name: &str,
+    descriptor: &MethodDescriptor,
+) -> bool {
     let mut visited = FxHashSet::default();
     visited.insert(class.qualified_name.clone());
-    search_parents(cx, class, &method.name, &descriptor, &mut visited)
+    search_parents(cx, class, name, descriptor, &mut visited)
 }
 
 fn search_parents(

@@ -20,6 +20,8 @@ mod identifier_rename;
 mod invocation_writer;
 #[path = "support/kotlin_annotations.rs"]
 mod kotlin_annotations;
+#[path = "support/kotlin_fallback.rs"]
+mod kotlin_fallback;
 #[path = "support/kotlin_members.rs"]
 mod kotlin_members;
 #[path = "support/kotlin_metadata.rs"]

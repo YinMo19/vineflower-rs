@@ -145,7 +145,7 @@ pub fn set_unsigned_type(cx: &mut Cx, expr: ExprId, ty: CodeType) {
     }
 }
 
-pub(crate) use expression::{precedence, write_expression};
+pub(crate) use expression::{append_class_literal, precedence, write_expression};
 pub(crate) use passes::copy_expression;
 
 pub use statement::statement;

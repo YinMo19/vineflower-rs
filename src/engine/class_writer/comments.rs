@@ -10,13 +10,13 @@ use crate::engine::{Cx, import_collector::java_class_name};
 use crate::types::{FieldDescriptor, MethodDescriptor, VarType};
 use crate::util::text_buffer::TextBuffer;
 
-pub(super) enum RenameKind {
+pub(crate) enum RenameKind {
     Class,
     Field,
     Method,
 }
 
-pub(super) fn append_rename_comment(
+pub(crate) fn append_rename_comment(
     cx: &mut Cx,
     buffer: &mut TextBuffer,
     old_name: Option<&str>,
@@ -77,7 +77,7 @@ fn display_type(cx: &mut Cx, ty: &VarType) -> String {
     }
 }
 
-pub(super) fn append_comment(buffer: &mut TextBuffer, comment: &str, indent: i32) {
+pub(crate) fn append_comment(buffer: &mut TextBuffer, comment: &str, indent: i32) {
     buffer
         .append_indent(indent)
         .append("// $VF: ")
@@ -85,6 +85,6 @@ pub(super) fn append_comment(buffer: &mut TextBuffer, comment: &str, indent: i32
         .append_line_separator();
 }
 
-pub(super) fn error_comment(message: &str) -> impl Iterator<Item = &str> {
+pub(crate) fn error_comment(message: &str) -> impl Iterator<Item = &str> {
     message.split('\n').filter(|line| !line.is_empty())
 }

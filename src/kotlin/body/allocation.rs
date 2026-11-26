@@ -17,6 +17,9 @@ pub(super) fn allocation(
     indent: i32,
     in_annotation: bool,
 ) -> io::Result<TextBuffer> {
+    if let Some(value) = crate::kotlin::writer::allocation_expression(cx, expr, indent)? {
+        return Ok(value);
+    }
     let ExprKind::New {
         new_type,
         dimensions,

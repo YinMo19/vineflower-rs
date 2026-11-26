@@ -306,7 +306,7 @@ fn write_in_method(
                     method.descriptor,
                     class.qualified_name
                 );
-                slot.get_mut(cx).write_error = Some(error);
+                slot.record_write_error(cx, error);
             }
         }
     }
@@ -320,7 +320,7 @@ fn write_in_method(
     Ok(!hide)
 }
 
-fn append_wrapper_comments(cx: &mut Cx, slot: MethodSlot, buffer: &mut TextBuffer, indent: i32) {
+pub(crate) fn append_wrapper_comments(cx: &mut Cx, slot: MethodSlot, buffer: &mut TextBuffer, indent: i32) {
     let wrapper = slot.get(cx);
     if !((cx.options.decompiler_comments && wrapper.add_error_comment)
         || wrapper.comment_lines.is_some())
@@ -390,7 +390,7 @@ fn search_for_method(
             .any(|parent| search_for_method(cx, &parent, name, desc, true))
 }
 
-fn signature(
+pub(crate) fn signature(
     cx: &Cx,
     node: ClassNodeId,
     method: &StructMethod,
@@ -510,7 +510,7 @@ fn generic_context(cx: &Cx, node: ClassNodeId) -> GenericsChecker {
     checker
 }
 
-fn declared_exceptions(class: &StructClass, method: &StructMethod) -> Vec<VarType> {
+pub(crate) fn declared_exceptions(class: &StructClass, method: &StructMethod) -> Vec<VarType> {
     method
         .attributes
         .exceptions

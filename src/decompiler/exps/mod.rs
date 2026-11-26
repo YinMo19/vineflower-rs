@@ -342,6 +342,8 @@ pub struct Invocation {
     pub is_static: bool,
     pub instance: Option<ExprId>,
     pub descriptor: Arc<MethodDescriptor>,
+    /// InvocationExprent can change the descriptor spelling independently of its parsed types.
+    pub(crate) descriptor_text: Option<ArcStr>,
     pub dynamic_class_suffix: Option<ArcStr>,
     pub parameters: Vec<ExprId>,
     pub bootstrap_method: Option<LinkConstant>,
@@ -378,6 +380,7 @@ impl Invocation {
             is_static: false,
             instance: None,
             descriptor,
+            descriptor_text: None,
             dynamic_class_suffix: None,
             parameters: Vec::new(),
             bootstrap_method: None,
@@ -391,7 +394,9 @@ impl Invocation {
     }
 
     pub fn string_descriptor(&self) -> &str {
-        self.descriptor.as_str()
+        self.descriptor_text
+            .as_deref()
+            .unwrap_or_else(|| self.descriptor.as_str())
     }
 
     /// `InvocationExprent.isBoxingCall`.
