@@ -10,9 +10,9 @@ mod function;
 pub(crate) mod generic_inference;
 mod increments;
 pub mod literal;
-pub mod write;
 mod operations;
 mod traversal;
+pub mod write;
 
 use std::fmt;
 use std::sync::Arc;
@@ -582,16 +582,7 @@ impl Expr {
         if var_type == VarType::VARTYPE_CLASS
             && let ConstantValue::String(name) = &value
         {
-            let name = name.as_utf8_lossy();
-            let argument = VarType::from_signature_cl(name, !name.starts_with('['));
-            var_type = VarType::generic(
-                var_type.ty,
-                var_type.array_dim,
-                var_type.value,
-                None,
-                vec![Some(argument)],
-                GenericType::WILDCARD_NO,
-            );
+            var_type = Self::class_literal_type(name.as_utf8_lossy());
         }
         ExprKind::Constant {
             value,
@@ -599,6 +590,20 @@ impl Expr {
             bool_permitted: false,
             was_condy,
         }
+    }
+
+    /// ConstExprent gives a class literal the expression type Class<T>.
+    pub(crate) fn class_literal_type(name: &str) -> VarType {
+        let class = VarType::VARTYPE_CLASS;
+        let argument = VarType::from_signature_cl(name, !name.starts_with('['));
+        VarType::generic(
+            class.ty,
+            class.array_dim,
+            class.value,
+            None,
+            vec![Some(argument)],
+            GenericType::WILDCARD_NO,
+        )
     }
 
     pub fn new_int_constant(

@@ -7,7 +7,7 @@ use std::io;
 
 use rustc_hash::FxHashSet;
 
-use crate::decompiler::exps::literal;
+use crate::decompiler::exps::{Expr, literal};
 use crate::engine::Cx;
 use crate::engine::import_collector::{get_short_name, java_class_name};
 use crate::structs::attr::{AnnotationData, AnnotationElement, ElementValue, TypeAnnotationData};
@@ -146,7 +146,7 @@ pub(super) fn render(
             if let Some(descriptor) = declared {
                 buffer.append_method(name, false, owner, name, &descriptor);
             } else {
-                let descriptor = format!("(){}", element_type(value));
+                let descriptor = format!("(){}", element_type(value).to_generic_string(cx));
                 buffer.append_method(name, false, owner, name, &descriptor);
             }
             buffer.append(" = ");
@@ -209,7 +209,7 @@ fn render_array(
     let mut buffer = TextBuffer::new(cx);
     buffer.append_char('{');
     if let Some(first) = elements.first() {
-        let expected = element_type(&first.value).resize_array_dim(0);
+        let expected = annotation_array_type(Some(first)).decrease_array_dim();
         buffer
             .push_newline_group(indent, 2)
             .append_possible_newline()
@@ -263,12 +263,20 @@ fn append_array_element(
 fn element_type(value: &ElementValue) -> VarType {
     match value {
         ElementValue::EnumConstant { descriptor, .. } => descriptor.ty.clone(),
-        ElementValue::Class(_) => VarType::VARTYPE_CLASS,
+        ElementValue::Class(name) => Expr::class_literal_type(name),
         ElementValue::Annotation(_) => VarType::VARTYPE_VOID,
-        ElementValue::Array(elements) => elements
-            .first()
-            .map_or(VarType::VARTYPE_OBJECT, |first| element_type(&first.value))
-            .resize_array_dim(1),
+        ElementValue::Array(elements) => annotation_array_type(elements.first()),
         ElementValue::Const { ty, .. } => ty.clone(),
     }
+}
+
+// StructAnnotationAttribute builds the array type from the first element's
+// erased component, even when that element is itself a class literal.
+fn annotation_array_type(first: Option<&AnnotationElement>) -> VarType {
+    let component = first.map_or(VarType::VARTYPE_OBJECT, |first| element_type(&first.value));
+    VarType::with_value(
+        component.ty,
+        1,
+        component.value.expect("Missing annotation component type"),
+    )
 }

@@ -15,10 +15,9 @@ use crate::decompiler::ir::{ExprId, Ir, StatId, VarProcessorId};
 use crate::decompiler::sforms::{reset_versions, try_split_ssau};
 use crate::decompiler::stats::StatementKind;
 use crate::decompiler::vars::var_version_pair::VarVersionPair as Version;
-use crate::decompiler::vars::versions::FinalType;
 use crate::engine::Cx;
 use crate::structs::StructMethod;
-use crate::types::{CodeType, MethodDescriptor, TypeFamily, VarType, generic_main};
+use crate::types::{CodeType, MethodDescriptor, TypeFamily, VarType};
 
 type Scope = FxHashMap<Option<i32>, Version>;
 type Denylist = FxHashMap<Version, Version>;
@@ -67,7 +66,7 @@ pub(super) fn merge(
     if let Some(old_sources) = old_sources
         && let Some(new_sources) = variable_sources(&mut pass.cx.ir, root, method)
     {
-        pass.compare_sources(&old_sources, &new_sources);
+        pass.compare_sources(&old_sources, &new_sources)?;
     }
     Ok(())
 }
@@ -403,12 +402,12 @@ impl Merge<'_> {
         instance_of(self.cx, subtype, supertype).then(|| subtype.clone())
     }
 
-    fn compare_sources(&mut self, old: &Sources, new: &Sources) {
+    fn compare_sources(&mut self, old: &Sources, new: &Sources) -> io::Result<()> {
         // Java's diagnostics iterate identity-hashed objects. Graph allocation
         // order gives the same checks stable ordering here.
         for (&expr, sources) in old {
             if new.get(&expr) != Some(sources) {
-                let var = diagnostic_variable(self.cx, expr);
+                let var = diagnostic_variable(self.cx, expr)?;
                 self.cx.ir[self.root].add_comment(
                     &format!("$VF: Variable merging failed for merge {var}. Code has semantic differences!"),
                     false,
@@ -417,11 +416,12 @@ impl Merge<'_> {
         }
         for &expr in new.keys() {
             if !old.contains_key(&expr) {
-                let var = diagnostic_variable(self.cx, expr);
+                let var = diagnostic_variable(self.cx, expr)?;
                 self.cx.ir[self.root]
                     .add_comment(&format!("$VF: Variable merging added a var? {var}"), false);
             }
         }
+        Ok(())
     }
 }
 
@@ -582,50 +582,16 @@ fn collect_variables(ir: &Ir, stat: StatId, lookup: &mut FxHashMap<Version, Expr
     }
 }
 
-fn diagnostic_variable(cx: &mut Cx, expr: ExprId) -> String {
-    let var = Expr::variable(&cx.ir, expr)
-        .expect("Expected a variable")
-        .clone();
+fn diagnostic_variable(cx: &mut Cx, expr: ExprId) -> io::Result<String> {
+    let var = Expr::variable(&cx.ir, expr).expect("Expected a variable");
     let pair = var.pair();
-    let processor = var.processor.map(|owner| &cx.ir[owner]);
-    let fallback = || {
-        if pair.version == 0 {
-            format!("var{}", pair.var)
-        } else {
-            format!("var{}_{}", pair.var, pair.version)
-        }
-    };
-    let local = var.lvt.as_ref().filter(|_| cx.options.use_lvt_names);
-    let name = local
-        .map(|local| local.get_name().as_ref())
-        .or_else(|| {
-            processor.and_then(|processor| processor.names.get(&pair).and_then(Option::as_deref))
-        })
-        .map_or_else(fallback, str::to_owned);
-    if !var.definition {
-        return name;
-    }
-
-    let explicit_final = processor.is_some_and(|processor| {
-        processor.versions.final_vars.get(&pair) == Some(&FinalType::ExplicitFinal)
-    });
-    let ty = if let Some(mut signature) = local
-        .filter(|_| cx.options.decompile_generics)
-        .and_then(|var| var.get_signature())
-        .and_then(|signature| generic_main::parse_field_signature(signature))
-    {
-        signature.verify_loosely(cx, &var.expr_type(cx));
-        signature.ty
-    } else {
-        var.expr_type(cx)
-    };
-    let locked = cx.imports.set_write_locked(true);
-    let ty = if var.intersection_type {
-        "var".to_owned()
-    } else {
-        crate::decompiler::expr_processor::get_cast_type_name(cx, &ty)
-    };
-    cx.imports.set_write_locked(locked);
-    let prefix = if explicit_final { "final " } else { "" };
-    format!("{prefix}{ty} {name}")
+    let definition = if var.definition { " Def" } else { "" };
+    let rendered =
+        cx.with_locked_imports(|cx| crate::decompiler::exps::write::to_java(cx, expr, 0))?;
+    let source = rendered.convert_to_string_and_allow_data_discard();
+    Ok(format!(
+        "VarExprent[{},{version}{definition}]: {{{source}}}",
+        pair.var,
+        version = pair.version
+    ))
 }
