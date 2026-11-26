@@ -9,6 +9,7 @@ pub mod members;
 pub mod metadata;
 pub mod passes;
 pub mod types;
+pub mod writer;
 
 use std::borrow::Cow;
 

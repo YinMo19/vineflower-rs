@@ -18,7 +18,7 @@ use crate::util::text_buffer::TextBuffer;
 
 use super::type_annotations;
 
-pub(super) fn declaration_annotations(attrs: &Attributes) -> impl Iterator<Item = &AnnotationData> {
+pub(crate) fn declaration_annotations(attrs: &Attributes) -> impl Iterator<Item = &AnnotationData> {
     [
         &attrs.runtime_visible_annotations,
         &attrs.runtime_invisible_annotations,
@@ -28,7 +28,7 @@ pub(super) fn declaration_annotations(attrs: &Attributes) -> impl Iterator<Item 
     .flat_map(|attribute| &attribute.annotations)
 }
 
-pub(super) fn parameter_annotations(
+pub(crate) fn parameter_annotations(
     attrs: &Attributes,
     parameter: usize,
 ) -> impl Iterator<Item = &AnnotationData> {
@@ -114,7 +114,7 @@ fn finish_annotation(buffer: &mut TextBuffer, indent: i32) {
     }
 }
 
-pub(super) fn render(
+pub(crate) fn render(
     cx: &mut Cx,
     annotation: &AnnotationData,
     indent: i32,
@@ -172,7 +172,7 @@ pub(super) fn render(
     Ok(buffer)
 }
 
-pub(super) fn render_element(
+pub(crate) fn render_element(
     cx: &mut Cx,
     value: &ElementValue,
     indent: i32,

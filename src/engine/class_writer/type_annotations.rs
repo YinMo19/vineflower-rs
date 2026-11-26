@@ -18,7 +18,7 @@ use crate::structs::struct_member::Attributes;
 use crate::types::{CodeType, GenericType, VarType};
 use crate::util::text_buffer::TextBuffer;
 
-pub(super) fn for_target(
+pub(crate) fn for_target(
     attrs: &Attributes,
     target_type: i32,
     index: i32,

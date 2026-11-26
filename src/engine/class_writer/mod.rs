@@ -3,7 +3,7 @@
 
 //! Native Java source writing after class and method processing.
 
-pub(super) mod annotations;
+pub(crate) mod annotations;
 pub(super) mod metadata;
 pub(crate) mod type_annotations;
 

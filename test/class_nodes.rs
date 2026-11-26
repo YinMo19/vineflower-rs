@@ -2,54 +2,56 @@
 
 use std::{env, fmt::Display, fs, io::Write, path::Path, process::Command, sync::Arc};
 
-#[path = "support/literals.rs"]
-mod literals;
-#[path = "support/generic_chains.rs"]
-mod generic_chains;
-#[path = "support/writer_enum_records.rs"]
-mod writer_enum_records;
-#[path = "support/method_writer.rs"]
-mod method_writer;
+#[path = "support/class_declarations.rs"]
+mod class_declarations;
+#[path = "support/class_initializers.rs"]
+mod class_initializers;
 #[path = "support/compilation_unit.rs"]
 mod compilation_unit;
+#[path = "support/function_writer.rs"]
+mod function_writer;
+#[path = "support/generic_chains.rs"]
+mod generic_chains;
+#[path = "support/idea_not_null.rs"]
+mod idea_not_null;
 #[path = "support/identifier_rename.rs"]
 mod identifier_rename;
+#[path = "support/invocation_writer.rs"]
+mod invocation_writer;
+#[path = "support/kotlin_annotations.rs"]
+mod kotlin_annotations;
 #[path = "support/kotlin_members.rs"]
 mod kotlin_members;
 #[path = "support/kotlin_metadata.rs"]
 mod kotlin_metadata;
 #[path = "support/kotlin_types.rs"]
 mod kotlin_types;
-#[path = "support/idea_not_null.rs"]
-mod idea_not_null;
-#[path = "support/function_writer.rs"]
-mod function_writer;
-#[path = "support/invocation_writer.rs"]
-mod invocation_writer;
-#[path = "support/statement_writer.rs"]
-mod statement_writer;
-#[path = "support/class_initializers.rs"]
-mod class_initializers;
+#[path = "support/lambda_nodes.rs"]
+mod lambda_nodes;
+#[path = "support/literals.rs"]
+mod literals;
+#[path = "support/local_class_declarations.rs"]
+mod local_class_declarations;
+#[path = "support/metadata_writer.rs"]
+mod metadata_writer;
+#[path = "support/method_writer.rs"]
+mod method_writer;
 #[path = "support/nested_classes.rs"]
 mod nested_classes;
 #[path = "support/nested_member_access.rs"]
 mod nested_member_access;
-#[path = "support/lambda_nodes.rs"]
-mod lambda_nodes;
 #[path = "support/oddities.rs"]
 mod oddities;
-#[path = "support/metadata_writer.rs"]
-mod metadata_writer;
-#[path = "support/local_class_declarations.rs"]
-mod local_class_declarations;
-#[path = "support/writer_snapshot.rs"]
-mod writer_snapshot;
-#[path = "support/class_declarations.rs"]
-mod class_declarations;
+#[path = "support/statement_writer.rs"]
+mod statement_writer;
 #[path = "support/type_annotations.rs"]
 mod type_annotations;
 #[path = "support/upstream_reference.rs"]
 mod upstream_reference;
+#[path = "support/writer_enum_records.rs"]
+mod writer_enum_records;
+#[path = "support/writer_snapshot.rs"]
+mod writer_snapshot;
 
 use vineflower_rs::decompiler::exps::Expr;
 use vineflower_rs::engine::{
@@ -729,8 +731,11 @@ fn variable_names_and_debug_tables_match_published_method_wrappers() {
         class_processor::process_class_methods, method_processor::defined_method,
     };
     let scratch = tempfile::tempdir().unwrap();
-    let reference =
-        upstream_reference::Corpus::discover().run("VariableNamesReference", &["WrapperStages"], scratch.path());
+    let reference = upstream_reference::Corpus::discover().run(
+        "VariableNamesReference",
+        &["WrapperStages"],
+        scratch.path(),
+    );
     let mut rows = Vec::new();
     for provider in ["identity", "jad", "tiny"] {
         for debug in [false, true] {
