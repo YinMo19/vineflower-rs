@@ -130,11 +130,11 @@ pub(super) fn initialize_wrappers(
             let class = Arc::clone(&cx.class_nodes[node].class);
             cx.current_class = Some(Arc::clone(&class));
             class.prepare_method_properties();
-            let methods = class
-                .methods
-                .iter()
-                .map(|method| process_method(cx, &class, method, &mut process))
-                .collect::<io::Result<_>>()?;
+            // Each declared method gets a slot, including methods without Code.
+            let mut methods = Vec::with_capacity(class.methods.len());
+            for method in &class.methods {
+                methods.push(process_method(cx, &class, method, &mut process)?);
+            }
             cx.class_nodes[node].wrapper = Some(ClassWrapper {
                 methods,
                 static_field_initializers: VBStyleCollection::new(),
