@@ -8,8 +8,9 @@ pub mod flatten;
 use crate::decompiler::ir::{Expr, ExprId, ExprListId, Ir, IrNode, StatId};
 use crate::decompiler::stats::StatementKind;
 use arcstr::ArcStr;
-use index_vec::{IndexVec, define_index_type};
+use index_vec::{IndexBox, IndexVec, define_index_type};
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 use std::collections::VecDeque;
 use std::ops::Index;
 
@@ -57,6 +58,16 @@ pub enum DirectEdgeType {
     Exception,
 }
 
+impl DirectEdgeType {
+    fn successor_slot(self) -> usize {
+        self as usize
+    }
+
+    fn predecessor_slot(self) -> usize {
+        2 + self as usize
+    }
+}
+
 pub struct DirectNode {
     pub id: ArcStr,
     pub ty: NodeType,
@@ -64,21 +75,45 @@ pub struct DirectNode {
     pub block: Option<StatId>,
     pub exprents: ExprListId,
     pub try_finally: Option<DirectId>,
-    successors: [Vec<DirectId>; 2],
-    predecessors: [Vec<DirectId>; 2],
+    // Regular successors, exceptional successors, regular predecessors, and
+    // exceptional predecessors occupy consecutive ranges in this buffer.
+    edges: SmallVec<[DirectId; 4]>,
+    edge_ends: [usize; 3],
 }
 
 impl DirectNode {
     pub fn successors(&self, kind: DirectEdgeType) -> &[DirectId] {
-        &self.successors[kind as usize]
+        self.edge_list(kind.successor_slot())
     }
+
     pub fn predecessors(&self, kind: DirectEdgeType) -> &[DirectId] {
-        &self.predecessors[kind as usize]
+        self.edge_list(kind.predecessor_slot())
+    }
+
+    fn edge_range(&self, slot: usize) -> std::ops::Range<usize> {
+        let start = self.edge_ends[..slot].last().copied().unwrap_or(0);
+        let end = self
+            .edge_ends
+            .get(slot)
+            .copied()
+            .unwrap_or(self.edges.len());
+        start..end
+    }
+
+    fn edge_list(&self, slot: usize) -> &[DirectId] {
+        &self.edges[self.edge_range(slot)]
+    }
+
+    fn add_edge(&mut self, slot: usize, node: DirectId) {
+        self.edges.insert(self.edge_range(slot).end, node);
+        for end in &mut self.edge_ends[slot..] {
+            *end += 1;
+        }
     }
 }
 
 pub struct DirectGraph {
-    nodes: IndexVec<DirectId, DirectNode>,
+    nodes: IndexBox<DirectId, [DirectNode]>,
     /// Upstream's `nodes` after sortReversePostOrder, including non-exit
     /// unreachable nodes prepended for SSA. Handles remain stable across sorting.
     pub order: Vec<DirectId>,
@@ -93,7 +128,7 @@ impl DirectGraph {
     pub(crate) fn visit_ir_roots(&self, visit: &mut impl FnMut(IrNode)) {
         // Cached graphs can own lists with no corresponding statement list.
         // Include exception-only nodes and nodes omitted from traversal order.
-        for node in &self.nodes {
+        for node in self.nodes.iter() {
             visit(node.stat.into());
             if let Some(block) = node.block {
                 visit(block.into());
@@ -189,27 +224,25 @@ impl DirectGraphBuilder {
             block,
             exprents: exprents.unwrap_or_else(|| ir.new_list(Vec::new())),
             try_finally,
-            successors: Default::default(),
-            predecessors: Default::default(),
+            edges: SmallVec::new(),
+            edge_ends: [0; 3],
         })
     }
 
     pub fn connect(&mut self, source: DirectId, dest: DirectId, kind: DirectEdgeType) {
         // DirectNode.equals compares the generated name and node kind. Names
         // include the kind suffix, including when two allocations represent it.
-        if !self[source]
-            .successors(kind)
-            .iter()
-            .any(|&succ| self[succ].id == self[dest].id)
-        {
-            self.nodes[source].successors[kind as usize].push(dest);
-        }
-        if !self[dest]
-            .predecessors(kind)
-            .iter()
-            .any(|&pred| self[pred].id == self[source].id)
-        {
-            self.nodes[dest].predecessors[kind as usize].push(source);
+        for (node, neighbor, slot) in [
+            (source, dest, kind.successor_slot()),
+            (dest, source, kind.predecessor_slot()),
+        ] {
+            if !self[node]
+                .edge_list(slot)
+                .iter()
+                .any(|&existing| self[existing].id == self[neighbor].id)
+            {
+                self.nodes[node].add_edge(slot, neighbor);
+            }
         }
     }
 
@@ -249,7 +282,7 @@ impl DirectGraphBuilder {
         order.extend(extra_nodes.iter().copied());
         order.reverse();
         DirectGraph {
-            nodes: self.nodes,
+            nodes: self.nodes.into_boxed_slice(),
             first,
             order,
             extra_nodes,

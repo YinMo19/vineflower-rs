@@ -56,6 +56,7 @@ num-integer = "0.1"
 prost = "0.14"
 rawzip = "0.5.3"
 rustc-hash = "2"
+smallvec = { version = "1", features = ["union"] }
 tempfile = "3"
 thiserror = "2"
 unicode-general-category = "1"
