@@ -25,6 +25,8 @@ use vineflower_rs::engine::{Cx, Options};
 use vineflower_rs::structs::{StructClass, StructContext, consts::ConstantValue};
 use vineflower_rs::util::data_input::DataInputFullStream;
 
+#[path = "support/control_flow_snapshot.rs"]
+mod control_flow_snapshot;
 #[path = "support/decimal_literals.rs"]
 mod decimal_literals;
 #[path = "support/direct_graph_snapshot.rs"]
@@ -33,6 +35,8 @@ mod direct_graph_snapshot;
 mod expression_snapshot;
 #[path = "support/finally_snapshot.rs"]
 mod finally_snapshot;
+#[path = "support/kotlin_method_stages.rs"]
+mod kotlin_method_stages;
 #[path = "support/ssa_snapshot.rs"]
 mod ssa_snapshot;
 #[path = "support/stack_snapshot.rs"]
@@ -443,6 +447,12 @@ fn expression_method_recovers_finally_around_a_synchronized_body() {
         // monitorenter plus a catch-all containing monitorexit.
         assert_eq!(synchronized, deinline);
     }
+}
+
+#[test]
+#[ignore = "requires the upstream +local.jar with Kotlin, kt/ktold fixtures and JDK 17 or later"]
+fn kotlin_method_definitions_match_upstream() {
+    kotlin_method_stages::check();
 }
 
 #[test]

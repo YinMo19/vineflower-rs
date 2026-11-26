@@ -63,6 +63,20 @@ impl<'a> DecodedMethod<'a> {
         Self::decode(ir, class, method, None)
     }
 
+    /// Preserve the active method's counters and variable processor.
+    pub(crate) fn from_context(
+        cx: &mut Cx,
+        class: &'a StructClass,
+        method: &'a Arc<StructMethod>,
+    ) -> io::Result<Option<Self>> {
+        let scope = cx
+            .current_method
+            .as_ref()
+            .filter(|(active, _)| Arc::ptr_eq(active, method))
+            .map(|(_, variables)| (*variables, cx.expression_ids.clone()));
+        Self::decode(&mut cx.ir, class, method, scope)
+    }
+
     fn decode(
         ir: &mut Ir,
         class: &'a StructClass,
@@ -107,17 +121,27 @@ impl<'a> DecodedMethod<'a> {
 }
 
 impl CommonMethod<'_> {
-    pub fn prepare_java_graph(mut self, ir: &mut Ir, options: &Options) -> MethodGraph {
+    pub fn prepare_java_graph(self, ir: &mut Ir, options: &Options) -> MethodGraph {
+        self.prepare_exception_graph(ir, options, false)
+    }
+
+    /// Kotlin's CFG schedule always runs the three optional Java cleanups.
+    pub(crate) fn prepare_exception_graph(
+        mut self,
+        ir: &mut Ir,
+        options: &Options,
+        force_cleanup: bool,
+    ) -> MethodGraph {
         let graph = &mut self.flow.graph;
         exceptions::remove_circular_ranges(ir, graph);
         exceptions::restore_pop_ranges(ir, graph);
-        if options.remove_empty_try_catch {
+        if force_cleanup || options.remove_empty_try_catch {
             exceptions::remove_empty_ranges(ir, graph);
         }
-        if options.ensure_synchronized_monitors {
+        if force_cleanup || options.ensure_synchronized_monitors {
             dead::extend_synchronized_range_to_monitorexit(ir, graph);
         }
-        if options.incorporate_returns {
+        if force_cleanup || options.incorporate_returns {
             dead::incorporate_value_returns(ir, graph);
         }
         exceptions::insert_empty_exception_handler_blocks(ir, graph);
@@ -146,21 +170,24 @@ pub fn initial_statement_graph(
     class: &StructClass,
     method: &Arc<StructMethod>,
 ) -> io::Result<Option<InitialMethod>> {
-    let scope = cx
-        .current_method
-        .as_ref()
-        .filter(|(active, _)| Arc::ptr_eq(active, method))
-        .map(|(_, variables)| (*variables, cx.expression_ids.clone()));
-    let Some(decoded) = DecodedMethod::decode(&mut cx.ir, class, method, scope)? else {
+    let Some(decoded) = DecodedMethod::from_context(cx, class, method)? else {
         return Ok(None);
     };
     let common = decoded.prepare_control_flow(&mut cx.ir, &cx.options);
-    let mut flow = common.prepare_java_graph(&mut cx.ir, &cx.options);
-    let root = flow.statement_root(&mut cx.ir, Arc::clone(method));
-    Ok(Some(InitialMethod { flow, root }))
+    let flow = common.prepare_java_graph(&mut cx.ir, &cx.options);
+    Ok(Some(flow.into_initial_tree(&mut cx.ir, method)))
 }
 
 impl MethodGraph {
+    pub(crate) fn into_initial_tree(
+        mut self,
+        ir: &mut Ir,
+        method: &Arc<StructMethod>,
+    ) -> InitialMethod {
+        let root = self.statement_root(ir, Arc::clone(method));
+        InitialMethod { flow: self, root }
+    }
+
     fn statement_root(&mut self, ir: &mut Ir, method: Arc<StructMethod>) -> StatId {
         let root = graph_to_statement(ir, &mut self.counters, &self.graph, method);
         ir[root].add_graph_comments(&self.graph);
@@ -638,6 +665,16 @@ impl ExpressionMethod {
 
     /// The first fixed point in MethodProcessor after expression lifting.
     pub fn process_increments(&mut self, cx: &mut Cx, class: &StructClass) -> io::Result<()> {
+        self.recover_initial_increments(cx, class)?;
+        self.inline_increments_in_conditions(cx);
+        Ok(())
+    }
+
+    pub(crate) fn recover_initial_increments(
+        &mut self,
+        cx: &mut Cx,
+        class: &StructClass,
+    ) -> io::Result<()> {
         loop {
             self.simplify_stack_vars(cx, class);
             self.set_var_versions(cx, class)?;
@@ -645,7 +682,6 @@ impl ExpressionMethod {
                 break;
             }
         }
-        self.inline_increments_in_conditions(cx);
         Ok(())
     }
 
@@ -669,6 +705,15 @@ impl RecoveredMethod {
     ) -> io::Result<ExpressionMethod> {
         let method = &mut self.structured;
         prepare_expressions(cx, &mut method.flow.counters, method.root);
+        self.lift_expressions(cx, class)
+    }
+
+    pub(crate) fn lift_expressions(
+        mut self,
+        cx: &mut Cx,
+        class: &StructClass,
+    ) -> io::Result<ExpressionMethod> {
+        let method = &mut self.structured;
         method.process_expressions(cx, class)?;
         condense_sequences(cx, &mut method.flow.counters, method.root);
         Ok(ExpressionMethod {

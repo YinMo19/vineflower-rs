@@ -18,10 +18,7 @@ pub struct Corpus {
 
 impl Corpus {
     pub fn discover() -> Self {
-        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let upstream = env::var_os("VINEFLOWER_UPSTREAM")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| workspace.join("../vineflower"));
+        let upstream = upstream_root();
         let mut root = env::var_os("VINEFLOWER_RS_CLASS_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| upstream.join("testData/classes"));
@@ -126,6 +123,12 @@ impl Corpus {
             .arg(input)
             .stdout(Stdio::from(output.try_clone().unwrap())));
     }
+}
+
+pub(super) fn upstream_root() -> PathBuf {
+    env::var_os("VINEFLOWER_UPSTREAM")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../vineflower"))
 }
 
 fn jdk_tool(name: &str) -> PathBuf {

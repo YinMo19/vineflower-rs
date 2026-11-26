@@ -129,7 +129,7 @@ class ControlFlowReference {
     return new HandlerOrderBoundary(graph.last_id, orderedRangeCount);
   }
 
-  private static String snapshot(ControlFlowGraph graph, boolean constructed) throws IllegalAccessException {
+  static String snapshot(ControlFlowGraph graph, boolean constructed) throws IllegalAccessException {
     StringBuilder out = new StringBuilder();
     out.append("first=").append(graph.getFirst().id).append(";last=").append(graph.getLast().id);
     out.append(";last-id=").append(graph.last_id);

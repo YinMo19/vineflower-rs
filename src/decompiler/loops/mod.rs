@@ -6,7 +6,7 @@
 mod counted;
 pub(crate) mod eliminate;
 pub(crate) mod enhance;
-mod extract;
+pub(crate) mod extract;
 mod foreach;
 pub(crate) mod late;
 
@@ -20,6 +20,12 @@ use super::ir::{ExprId, ExprKind, ExprListId, Ir, StatId};
 use super::stats::{StatementKind, stat_edge::EdgeType};
 use crate::engine::{Cx, counter_container::CounterContainer};
 use crate::structs::StructClass;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LoopStyle {
+    Java,
+    Kotlin,
+}
 
 /// Native merge loop in MethodProcessor. Extraction restarts at elimination;
 /// enhancement alone lets the remaining passes see the new loop immediately.

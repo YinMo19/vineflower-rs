@@ -29,7 +29,10 @@ pub fn prepare_expressions(cx: &mut Cx, counters: &mut CounterContainer, root: S
     remove_synchronized_handlers(&mut cx.ir, root);
     root.build_content_flags(&mut cx.ir);
     condense_sequences(cx, counters, root);
+    clear_statements(cx, root);
+}
 
+pub(crate) fn clear_statements(cx: &mut Cx, root: StatId) {
     let mut pending = VecDeque::from([root]);
     while let Some(stat) = pending.pop_front() {
         cx.ir[stat].clear_temp_information();
@@ -304,7 +307,7 @@ fn destroy_statement_content(ir: &mut Ir, stat: StatId, remove_self: bool) {
     }
 }
 
-fn remove_synchronized_handlers(ir: &mut Ir, stat: StatId) {
+pub(crate) fn remove_synchronized_handlers(ir: &mut Ir, stat: StatId) {
     for index in 0..ir[stat].stats.len() {
         remove_synchronized_handlers(ir, ir[stat].stats[index]);
     }

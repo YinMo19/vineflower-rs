@@ -6,7 +6,7 @@
 
 use std::io;
 
-use super::{counted::match_for, foreach::match_for_each, inherit_offsets};
+use super::{LoopStyle, counted::match_for, foreach::match_for_each, inherit_offsets};
 use crate::decompiler::decompose::finish::{condense_sequences, destroy_and_flatten_statement};
 use crate::decompiler::exps::Expr;
 use crate::decompiler::ir::{EdgeId, ExprId, ExprKind, Ir, StatId};
@@ -22,12 +22,29 @@ pub(crate) fn enhance(
     counters: &mut CounterContainer,
     root: StatId,
 ) -> io::Result<bool> {
+    enhance_loops(cx, counters, root, LoopStyle::Java)
+}
+
+pub(crate) fn enhance_kotlin(
+    cx: &mut Cx,
+    counters: &mut CounterContainer,
+    root: StatId,
+) -> io::Result<()> {
+    enhance_loops(cx, counters, root, LoopStyle::Kotlin).map(|_| ())
+}
+
+fn enhance_loops(
+    cx: &mut Cx,
+    counters: &mut CounterContainer,
+    root: StatId,
+    style: LoopStyle,
+) -> io::Result<bool> {
     let cx = &mut *cx.enter_method(counters);
     let mut changed = false;
-    while enhance_tree(cx, counters, root, root)? {
+    while enhance_tree(cx, counters, root, root, style)? {
         changed = true;
     }
-    if changed {
+    if changed || style == LoopStyle::Kotlin {
         condense_sequences(cx, counters, root);
     }
     Ok(changed)
@@ -38,12 +55,13 @@ fn enhance_tree(
     counters: &mut CounterContainer,
     root: StatId,
     stat: StatId,
+    style: LoopStyle,
 ) -> io::Result<bool> {
     let mut changed = false;
     let children = cx.ir[stat].stats.to_vec();
     for child in children {
         if cx.ir[child].exprents.is_none() {
-            changed |= enhance_tree(cx, counters, root, child)?;
+            changed |= enhance_tree(cx, counters, root, child, style)?;
         }
     }
     let StatementKind::Do(header) = cx.ir[stat].kind else {
@@ -54,7 +72,7 @@ fn enhance_tree(
         LoopType::While => true,
         _ => false,
     };
-    if can_promote && !match_for_each(cx, root, stat)? {
+    if can_promote && !match_for_each(cx, root, stat, style)? {
         match_for(cx, counters, root, stat);
     }
     let StatementKind::Do(current) = cx.ir[stat].kind else {

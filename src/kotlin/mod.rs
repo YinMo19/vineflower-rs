@@ -3,6 +3,7 @@
 //! The Kotlin language plugin bundled with Vineflower.
 
 pub mod imports;
+pub mod passes;
 pub mod types;
 
 use std::borrow::Cow;

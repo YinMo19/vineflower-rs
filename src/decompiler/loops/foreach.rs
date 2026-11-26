@@ -5,7 +5,9 @@
 
 use std::io;
 
-use super::{inherit_offsets, is_var_used_before, last_direct_data, preceding_data, remove_expr};
+use super::{
+    LoopStyle, inherit_offsets, is_var_used_before, last_direct_data, preceding_data, remove_expr,
+};
 use crate::decompiler::exps::{Expr, ExprKind, FunctionType, Invocation};
 use crate::decompiler::ir::{ExprId, ExprListId, Ir, StatId};
 use crate::decompiler::stats::{DoStatement, LoopType, StatementKind};
@@ -36,9 +38,15 @@ struct ForEach {
     setup: [Option<Assignment>; 2],
     condition: ExprId,
     header: DoStatement,
+    style: LoopStyle,
 }
 
-pub(super) fn match_for_each(cx: &mut Cx, root: StatId, stat: StatId) -> io::Result<bool> {
+pub(super) fn match_for_each(
+    cx: &mut Cx,
+    root: StatId,
+    stat: StatId,
+    style: LoopStyle,
+) -> io::Result<bool> {
     let ir = &cx.ir;
     let StatementKind::Do(header) = ir[stat].kind else {
         unreachable!("Enhanced for loop candidate must be a loop");
@@ -76,6 +84,7 @@ pub(super) fn match_for_each(cx: &mut Cx, root: StatId, stat: StatId) -> io::Res
         setup: [previous.next().flatten(), previous.next().flatten()],
         condition,
         header,
+        style,
     };
     if let Some(iterator) = iterator_call(cx, initial.right) {
         if iterator
@@ -127,7 +136,7 @@ impl ForEach {
         };
         let iterator_index = iterator.index;
         if Expr::is_var_referenced_in_stat(ir, iterator_var, self.stat, &[next_var, has_next_var])
-            || !same_version(ir, iterator_var, next_var)
+            || self.style == LoopStyle::Java && !same_version(ir, iterator_var, next_var)
         {
             return Ok(false);
         }
@@ -142,7 +151,7 @@ impl ForEach {
             return Ok(false);
         }
         if is_var_used_before(&mut cx.ir, root, self.stat, self.element.left)
-            || is_var_used_after(&cx.ir, self.stat, iterator_index)
+            || self.style == LoopStyle::Java && is_var_used_after(&cx.ir, self.stat, iterator_index)
         {
             return Ok(false);
         }
@@ -187,15 +196,20 @@ impl ForEach {
 
     fn match_array(&self, cx: &mut Cx, root: StatId, body: StatId) -> bool {
         let ir = &cx.ir;
-        let Some(length) = self.setup[0] else {
+        let Some(previous) = self.setup[0] else {
             return false;
+        };
+        // Kotlinc initializes the index before evaluating the array length.
+        let (index_init, length) = match self.style {
+            LoopStyle::Java => (self.initial, previous),
+            LoopStyle::Kotlin => (previous, self.initial),
         };
         let ExprKind::Array { array, index, .. } = ir[self.element.right].kind else {
             return false;
         };
         if Expr::variable(ir, self.element.left).is_none()
             || Expr::variable(ir, index).is_none()
-            || !matches!(ir[self.initial.right].kind, ExprKind::Constant { .. })
+            || !matches!(ir[index_init.right].kind, ExprKind::Constant { .. })
             || !matches!(ir[self.condition].kind, ExprKind::Function { .. })
         {
             return false;
@@ -230,32 +244,35 @@ impl ForEach {
         {
             return false;
         }
-        if !same_version(ir, array, length_array)
-            || is_var_used_before(&mut cx.ir, root, self.stat, self.element.left)
-        {
+        let wrong_array = match self.style {
+            LoopStyle::Java => !same_version(ir, array, length_array),
+            LoopStyle::Kotlin => Expr::variable(ir, array).is_none(),
+        };
+        if wrong_array || is_var_used_before(&mut cx.ir, root, self.stat, self.element.left) {
             return false;
         }
 
-        for source in [self.initial.expr, length.expr, increment] {
+        for source in [self.initial.expr, previous.expr, increment] {
             inherit_offsets(&mut cx.ir, length_array, source);
         }
         for source in [self.element.expr, self.initial.expr] {
             inherit_offsets(&mut cx.ir, self.element.left, source);
         }
         self.promote(cx, length_array);
-        remove_expr(cx, self.initial_list, self.initial.expr);
+        remove_expr(cx, self.initial_list, index_init.expr);
         remove_expr(cx, self.initial_list, length.expr);
         remove_expr(cx, self.first_list, self.element.expr);
         remove_expr(cx, last_list, increment);
 
         if let Some(copy) = self.setup[1]
             && same_version(&cx.ir, copy.left, array)
-            && !Expr::is_var_referenced_in_stat(
-                &cx.ir,
-                copy.left,
-                cx.ir[self.stat].parent.expect("Loop has no parent"),
-                &[length_array],
-            )
+            && (self.style == LoopStyle::Kotlin
+                || !Expr::is_var_referenced_in_stat(
+                    &cx.ir,
+                    copy.left,
+                    cx.ir[self.stat].parent.expect("Loop has no parent"),
+                    &[length_array],
+                ))
         {
             remove_expr(cx, self.initial_list, copy.expr);
             inherit_offsets(&mut cx.ir, copy.right, copy.expr);

@@ -12,7 +12,7 @@ use crate::decompiler::stats::{
 };
 use crate::engine::{Cx, counter_container::CounterContainer};
 
-pub(super) fn extract(cx: &mut Cx, counters: &mut CounterContainer, root: StatId) -> bool {
+pub(crate) fn extract(cx: &mut Cx, counters: &mut CounterContainer, root: StatId) -> bool {
     let changed = extract_recursive(&mut cx.ir, counters, root) != Extraction::Unchanged;
     if changed {
         condense_sequences(cx, counters, root);

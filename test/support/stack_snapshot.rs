@@ -2022,7 +2022,7 @@ fn matching_incoming_slots(java: &str, rust: &str, batches: &[Vec<&str>]) -> boo
         .all(|(slot, (left, right))| left == right || reordered.contains(&slot))
 }
 
-fn variable_snapshot(versions: &VarVersions) -> String {
+pub(super) fn variable_snapshot(versions: &VarVersions) -> String {
     let mut fields = String::from("versions=");
     for (pair, ty) in versions
         .lower
@@ -2074,7 +2074,7 @@ fn variable_snapshot(versions: &VarVersions) -> String {
     fields
 }
 
-fn append_definition_metadata(fields: &mut String, processor: &VarProcessor) {
+pub(super) fn append_definition_metadata(fields: &mut String, processor: &VarProcessor) {
     append_variable_bindings(fields, "name", processor.names.iter(), |name| {
         expression_snapshot::text(name.as_deref())
     });
