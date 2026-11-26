@@ -74,6 +74,16 @@ KOTLIN_COMPILER_CLASSPATH="..." KOTLIN_STDLIB="..." cargo test --locked --test k
 
 The body comparison covers both string-concatenation settings, reformatted source, method counters, and bytecode-to-source mappings. The full parity harness runs complete Kotlin compilation units using the original test registrations and class files. Select them with `VINEFLOWER_RS_PARITY_FILTER=kotlin/`.
 
+For an independent library comparison, run the pinned Java CLI on JDK 17 with one worker and the native CLI with one, two and automatic workers. Use `--folder --thread-count=1 --include-runtime=1 --dump-exception-on-error=0 --log-level=WARN`, varying the thread count in the native runs. For coroutines, put `-e=<stdlib.jar>` after those options and before the input and output paths.
+
+| Input | External stdlib | Classes | Emitted source files | Method processing / writing failures |
+| --- | --- | ---: | --- | ---: |
+| kotlinx-coroutines-core-jvm 1.9.0 | 2.0.0 | 826 | 499 Kotlin | 38 / 63 |
+| kotlinx-coroutines-core-jvm 1.10.2 | 2.2.20 | 834 | 505 Kotlin | 38 / 66 |
+| kotlin-stdlib 2.0.0 | | 983 | 640 Kotlin, 32 Java | 0 / 2 |
+
+At `085199a` all nine native output trees matched Java byte for byte, including resources. Both CLIs reported the same affected classes and method signatures at each failure stage. The counts describe decompiler output and diagnostics. The library sources were not recompiled.
+
 ## Java hash collections
 
 The `jhash` target compares insertion, treeification, resizing, and removal order against the actual JDK 17 collections. The class-level hierarchy probe compiles 32 generic interfaces with distinct names that share a Java string hash and compares the declaration order returned by Vineflower's `StructClass.getAllGenerics`.
@@ -107,6 +117,12 @@ cargo test --locked --test upstream_parity full_parity -- --ignored --nocapture 
 Parity fails on any missing JDK, missing fixture, unsupported capability, source/output mismatch or execution error. Each is reported separately. `VINEFLOWER_RS_PARITY_FILTER` optionally selects a substring of case IDs, such as `core/LVT` or `cli/`. No golden gets created or rewritten. Comparison uses only upstream's newline and outer whitespace normalization, with the three upstream alternate goldens explicitly allowed. Upstream's failable rename case remains a failure on mismatch.
 
 At the pinned revision, the original Java CLI and the native CLI produce identical output for the Scala plugin registrations `TestCaseClasses`, `TestObject` and `TestCompanionObject` when given the same classes and options. Both differ from the three stored plugin goldens. The full suite reports those mismatches.
+
+### Independent Java libraries
+
+Guava 33.3.1-jre, ASM 9.8, Gson 2.11.0, Commons Lang 3.16.0 and SLF4J API 1.7.30 produced 1,024 Java files. Run each library separately with `--folder --include-runtime=<JDK-17-home> --include-classpath=0 --dump-exception-on-error=0`. At `085199a`, automatic workers reproduced all 1,024 previous native files. Comparing with the single-worker Java CLI on JDK 17 gave 1,023 byte-identical files. In Guava's `CharMatcher.java`, the JDK 17 Unicode table escapes U+FDFF and the native Unicode table emits it literally.
+
+As a separate compilation check, run JDK 17 `javac --release 17 -encoding UTF-8 -d <classes>` on all 36 ASM sources in relative-path order, from each output directory. Both compiles produced the same 28 errors. The first, at `AnnotationVisitor.java:13`, references the missing synthetic method `stringConcat$0(int)`. Five other diagnostics report duplicate local declarations. The whole library could not be executed from either set of regenerated sources.
 
 ### Compiled inputs
 
@@ -239,3 +255,21 @@ The ordinary release CLI ran each input twice per revision, reversing the execut
 | Complete 26.3 client | auto (14) | 43.580 / 37.455 | 45.520 / 39.365 | 6.815 / 6.728 | 4.064 / 4.067 |
 
 The pinned Java CLI ran once per worker setting on the full client with the same options and `-Xmx6g`. One worker took 42.37 s elapsed and 120.84 s CPU, with 4.440 GiB peak RSS. Automatic took 14.84 s elapsed and 165.30 s CPU, with 6.301 GiB peak RSS. Every full run produced the same 7,301 Java files and 21,495 resources. The two subset layouts also matched their Java output trees and preserved the same native archive entries and line mappings as before.
+
+### First stack simplification on root workers
+
+On the combined 2,831-class input, an instrumented release prepared 25,130 methods with code. The coordinator reused 25,101 graphs through the first stack simplification. The other 29 methods needed the published sibling wrapper for an interface assertion and ran at their original position. Every recorded class lookup still matched at publication in this input.
+
+Two driver tests exercise the boundaries with one, two and automatic workers. `parallel_stack_preparation_preserves_shared_class_access` compares sources and archive line maps with Java for a constant-dynamic import that loads an annotated library and an assertion that reads a sibling wrapper. A damaged class initializer checks the order of native diagnostics. `worker_allocations_observe_lambdas_published_by_an_earlier_unit` compiles and runs a Java program, renames one class in the constant pool to collide with Vineflower's generated lambda name, and runs it again on the JVM. It compares both orders of two multi-root archives against Java. Publishing the lambda first changes which class the decompiler sees at an allocation site and makes the original writer reject the method.
+
+The following pairs use the ordinary release binaries from `b007c8f` and `085199a` on the same M4 Pro, JDK 25.0.2, inputs and directory output options as above. Each entry is the mean of two runs, reversing the order of both revisions and inputs in the second round.
+
+| Input | Workers | Elapsed before / after (s) | CPU before / after (s) | Peak RSS before / after (GiB) | Peak macOS footprint before / after (GiB) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Complete 26.3 client | 1 | 38.300 / 38.755 | 38.230 / 38.580 | 6.698 / 6.642 | 4.051 / 3.926 |
+| Complete 26.3 client | auto (14) | 37.085 / 27.650 | 38.965 / 45.545 | 6.693 / 6.723 | 4.082 / 3.908 |
+| 2,831 classes in one JAR | 1 | 8.370 / 8.420 | 8.355 / 8.400 | 1.022 / 1.008 | 0.783 / 0.784 |
+| 2,831 classes in one JAR | auto (14) | 8.205 / 6.500 | 8.600 / 10.970 | 1.032 / 1.032 | 0.794 / 0.806 |
+| 2,831 classes in five JARs | auto (14) | 8.350 / 5.960 | 8.835 / 10.475 | 0.795 / 0.797 | 0.651 / 0.662 |
+
+All 20 runs matched the pinned Java output trees. Full-client automatic elapsed time fell by 25.4%, with the two new runs taking 27.40 and 27.90 seconds. The Java reference at the same worker setting took 14.84 seconds. Both subset layouts also reproduced the previous native archive entry order, sources and all 1,520 native line mappings at two workers.
