@@ -8,7 +8,10 @@ use std::{env, fs, io};
 
 pub struct Corpus {
     pub classes: Vec<PathBuf>,
-    #[allow(dead_code, reason = "only class-level comparisons register whole compilation groups")]
+    #[allow(
+        dead_code,
+        reason = "only class-level comparisons register whole compilation groups"
+    )]
     pub root: PathBuf,
     jar: PathBuf,
 }
@@ -57,6 +60,46 @@ impl Corpus {
     }
 
     pub fn run_to(&self, main: &str, helpers: &[&str], input: &Path, output: &File) {
+        self.run_with_classpath(main, helpers, input, output, &[]);
+    }
+
+    #[allow(
+        dead_code,
+        reason = "Kotlin oracle references the bundled plugin directly"
+    )]
+    pub fn run_with_kotlin(&self, main: &str, helpers: &[&str], input: &Path) -> String {
+        let jars = tempfile::tempdir().unwrap();
+        let mut archive = zip::ZipArchive::new(File::open(&self.jar).unwrap()).unwrap();
+        let name = archive
+            .file_names()
+            .find(|name| {
+                name.starts_with("META-INF/plugins/vineflower-kotlin") && name.ends_with(".jar")
+            })
+            .expect("The upstream Kotlin plugin is missing from the distribution")
+            .to_owned();
+        let jar = jars.path().join("kotlin.jar");
+        io::copy(
+            &mut archive.by_name(&name).unwrap(),
+            &mut File::create(&jar).unwrap(),
+        )
+        .unwrap();
+        let mut output = tempfile::tempfile().unwrap();
+        self.run_with_classpath(main, helpers, input, &output, &[&jar]);
+        output.rewind().unwrap();
+        let mut text = String::new();
+        output.read_to_string(&mut text).unwrap();
+        text
+    }
+
+    fn run_with_classpath(
+        &self,
+        main: &str,
+        helpers: &[&str],
+        input: &Path,
+        output: &File,
+        extra: &[&Path],
+    ) {
+        let libraries = std::iter::once(self.jar.as_path()).chain(extra.iter().copied());
         let classes = tempfile::tempdir().unwrap();
         let sources = Path::new(env!("CARGO_MANIFEST_DIR")).join("test/support");
         let mut compiler = Command::new(jdk_tool("javac"));
@@ -64,17 +107,21 @@ impl Corpus {
             .arg("-encoding")
             .arg("UTF-8")
             .arg("-classpath")
-            .arg(&self.jar)
+            .arg(env::join_paths(libraries.clone()).unwrap())
             .arg("-d")
             .arg(classes.path());
         for name in std::iter::once(&main).chain(helpers) {
             compiler.arg(sources.join(format!("{name}.java")));
         }
+        if !extra.is_empty() {
+            compiler.arg(sources.join("BundledPluginReference.java"));
+        }
         run(&mut compiler);
-        let classpath = env::join_paths([classes.path(), self.jar.as_path()]).unwrap();
+        let classpath = env::join_paths(std::iter::once(classes.path()).chain(libraries)).unwrap();
         run(Command::new(jdk_tool("java"))
             .arg("-classpath")
             .arg(classpath)
+            .args((!extra.is_empty()).then_some("BundledPluginReference"))
             .arg(main)
             .arg(input)
             .stdout(Stdio::from(output.try_clone().unwrap())));
@@ -89,10 +136,7 @@ fn jdk_tool(name: &str) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(name))
 }
 
-#[allow(
-    dead_code,
-    reason = "some stage tests use the runtime library"
-)]
+#[allow(dead_code, reason = "some stage tests use the runtime library")]
 pub fn jdk_home() -> PathBuf {
     if let Some(home) = env::var_os("JAVA_HOME") {
         return PathBuf::from(home);
