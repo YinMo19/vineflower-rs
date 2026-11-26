@@ -249,7 +249,7 @@ fn control_flow_matches_upstream() {
     let mut reordered_splits = 0;
     let mut postdominance = 0;
     let mut basic_roots = 0;
-    let mut remapped_methods = BTreeSet::new();
+    let mut remapped_methods = BTreeMap::new();
     let mut remapped_postdominance = 0;
     let mut failures = 0;
     for key in keys {
@@ -268,6 +268,24 @@ fn control_flow_matches_upstream() {
         });
         let java = boundary.map(|(_, _, snapshot)| snapshot).or(java);
         let dominance_method = key.strip_suffix("\tpostdominance");
+        let dominance_ids = dominance_method.and_then(|method| remapped_methods.get(method));
+        let normalized = dominance_ids
+            .filter(|(java_ids, rust_ids)| java_ids != rust_ids)
+            .and_then(|(java_ids, rust_ids)| {
+                Some((
+                    normalize_postdominance(
+                        java.filter(|value| !value.starts_with("error="))?,
+                        java_ids,
+                    ),
+                    normalize_postdominance(
+                        rust.filter(|value| !value.starts_with("error="))?,
+                        rust_ids,
+                    ),
+                ))
+            });
+        let (java, rust) = normalized.as_ref().map_or((java, rust), |(java, rust)| {
+            (Some(java.as_str()), Some(rust.as_str()))
+        });
         if dominance_method.is_none()
             && java.is_some_and(|snapshot| snapshot.starts_with("error="))
             && rust.is_some_and(|snapshot| snapshot.starts_with("error="))
@@ -277,7 +295,9 @@ fn control_flow_matches_upstream() {
             && let Some(snapshot) = java.filter(|value| !value.starts_with("error="))
         {
             if dominance_method.is_some() {
-                if snapshot.starts_with("basic=") {
+                if dominance_ids.is_some() {
+                    remapped_postdominance += 1;
+                } else if snapshot.starts_with("basic=") {
                     basic_roots += 1;
                 } else {
                     postdominance += 1;
@@ -285,25 +305,17 @@ fn control_flow_matches_upstream() {
             } else if !key.ends_with("\tload") {
                 exact += 1;
             }
-        } else if let Some((last_id, _, java)) = boundary
-            && let Some(rust) = rust.filter(|value| !value.starts_with("error="))
-            && matching_new_handlers(java, rust, last_id, None)
-        {
-            equivalent += 1;
-            remapped_methods.insert(key.strip_suffix("\tjava").unwrap());
         } else if let Some((last_id, range_count, java)) = boundary
             && let Some(rust) = rust.filter(|value| !value.starts_with("error="))
-            && matching_new_handlers(java, rust, last_id, Some(range_count))
+            && let Some((java_ids, rust_ids, reordered)) =
+                matching_new_handlers(java, rust, last_id, range_count)
         {
-            reordered_splits += 1;
-            remapped_methods.insert(key.strip_suffix("\tjava").unwrap());
-        } else if dominance_method.is_some_and(|method| remapped_methods.contains(method))
-            && java.is_some_and(|snapshot| !snapshot.starts_with("error="))
-            && rust.is_some_and(|snapshot| !snapshot.starts_with("error="))
-        {
-            // The preceding Java CFG comparison established a difference in the
-            // input block order or IDs. Both dominance computations must succeed.
-            remapped_postdominance += 1;
+            if reordered {
+                reordered_splits += 1;
+            } else {
+                equivalent += 1;
+            }
+            remapped_methods.insert(key.strip_suffix("\tjava").unwrap(), (java_ids, rust_ids));
         } else {
             let (index, method) = key.split_once('\t').unwrap();
             let class = &class_paths[index.parse::<usize>().unwrap()];
@@ -316,7 +328,7 @@ fn control_flow_matches_upstream() {
         class_paths.len(),
     );
     eprintln!(
-        "{postdominance} exact postdominance snapshots, {basic_roots} matched single-block roots, and {remapped_postdominance} pairs with equivalent CFGs and different inputs to postdominance."
+        "{postdominance} exact postdominance snapshots, {basic_roots} matched single-block roots, and {remapped_postdominance} postdominance snapshots matched after CFG normalization."
     );
     assert!(
         mismatches.is_empty(),
@@ -439,15 +451,117 @@ fn postdominance_snapshot(ir: &Ir, statement: StatId) -> String {
     format!("rpo={rpo};post-rpo={post_rpo};components={components};post={post};extended={extended}")
 }
 
+type HandlerIds = BTreeMap<i32, i32>;
+
 fn matching_new_handlers(
     java: &str,
     rust: &str,
     last_id: i32,
-    original_range_count: Option<usize>,
-) -> bool {
-    normalize_handler_ids(java, last_id, original_range_count)
-        .zip(normalize_handler_ids(rust, last_id, original_range_count))
-        .is_some_and(|(java, rust)| java == rust)
+    original_range_count: usize,
+) -> Option<(HandlerIds, HandlerIds, bool)> {
+    [None, Some(original_range_count)]
+        .into_iter()
+        .find_map(|range_count| {
+            let (java, java_ids) = normalize_handler_ids(java, last_id, range_count)?;
+            let (rust, rust_ids) = normalize_handler_ids(rust, last_id, range_count)?;
+            (java == rust).then_some((java_ids, rust_ids, range_count.is_some()))
+        })
+}
+
+fn remap_id(id: i32, handler_ids: &HandlerIds) -> i32 {
+    handler_ids.get(&id).copied().unwrap_or(id)
+}
+
+fn parse_ids(list: &str) -> impl Iterator<Item = i32> + '_ {
+    list.split_terminator(',').map(|id| id.parse().unwrap())
+}
+
+fn remap_list<'a>(list: &'a str, handler_ids: &'a HandlerIds) -> impl Iterator<Item = i32> + 'a {
+    parse_ids(list).map(|id| remap_id(id, handler_ids))
+}
+
+fn normalize_postdominance(snapshot: &str, handler_ids: &HandlerIds) -> String {
+    let remap = |id| remap_id(id, handler_ids);
+    if let Some(id) = snapshot.strip_prefix("basic=") {
+        return format!("basic={}", remap(id.parse().unwrap()));
+    }
+    let (rpo, post_rpo, components, post, extended) = snapshot.split(';').collect_tuple().unwrap();
+    let rpo = remap_list(rpo.strip_prefix("rpo=").unwrap(), handler_ids).join(",");
+    let mut post_rpo =
+        remap_list(post_rpo.strip_prefix("post-rpo=").unwrap(), handler_ids).collect_vec();
+    let mut components = components
+        .strip_prefix("components=")
+        .unwrap()
+        .split('/')
+        .map(|component| remap_list(component, handler_ids).collect_vec())
+        .collect_vec();
+    let mut post = parse_post_entries(post.strip_prefix("post=").unwrap())
+        .map(|(head, posts)| (remap(head), remap_list(posts, handler_ids).join(",")))
+        .collect_vec();
+    assert!(
+        post.iter()
+            .map(|(head, _)| *head)
+            .eq(post_rpo.iter().copied()),
+        "ordinary postdominance entries must follow post-reverse postorder"
+    );
+
+    // SCC roots and incoming edges are visited in CFG block order. The order of
+    // adjacent singleton handlers can therefore change in SCCs and backward RPO.
+    let singleton = |component: &[i32]| match component {
+        [id] => Some(*id),
+        _ => None,
+    };
+    let new_singletons: HashSet<_> = components
+        .iter()
+        .filter_map(|component| singleton(component))
+        .filter(|id| handler_ids.contains_key(id))
+        .collect();
+    let new_handler = |id| new_singletons.contains(&id).then_some(id);
+    order_new_handler_runs(&mut components, |component| {
+        singleton(component).and_then(new_handler)
+    });
+    order_new_handler_runs(&mut post_rpo, |&id| new_handler(id));
+    order_new_handler_runs(&mut post, |&(head, _)| new_handler(head));
+
+    // Upstream's integer-keyed HashMap contains sets ordered by statement ID.
+    let extended = parse_post_entries(extended.strip_prefix("extended=").unwrap())
+        .map(|(head, posts)| {
+            let posts = parse_ids(posts).collect_vec();
+            assert!(
+                posts.is_sorted(),
+                "extended postdominators for {head} must follow statement ID order"
+            );
+            (
+                remap(head),
+                posts.into_iter().map(remap).sorted_unstable().join(","),
+            )
+        })
+        .sorted_unstable_by_key(|(head, _)| *head);
+
+    let post_rpo = post_rpo.into_iter().join(",");
+    let components = components
+        .into_iter()
+        .map(|component| component.into_iter().join(","))
+        .join("/");
+    let format_entry = |(head, posts)| format!("{head}:{posts}");
+    let post = post.into_iter().map(format_entry).join("/");
+    let extended = extended.map(format_entry).join("/");
+    format!("rpo={rpo};post-rpo={post_rpo};components={components};post={post};extended={extended}")
+}
+
+fn parse_post_entries(entries: &str) -> impl Iterator<Item = (i32, &str)> {
+    entries.split_terminator('/').map(|entry| {
+        let (head, posts) = entry.split_once(':').unwrap();
+        (head.parse().unwrap(), posts)
+    })
+}
+
+fn order_new_handler_runs<T>(entries: &mut [T], handler_id: impl Fn(&T) -> Option<i32>) {
+    for run in entries
+        .chunk_by_mut(|left, right| handler_id(left).is_some() && handler_id(right).is_some())
+    {
+        run.sort_unstable_by_key(&handler_id);
+    }
 }
 
 // Java's final handler deduplication visits a map keyed by object identity.
@@ -457,7 +571,7 @@ fn normalize_handler_ids(
     snapshot: &str,
     old_last_id: i32,
     original_range_count: Option<usize>,
-) -> Option<String> {
+) -> Option<(String, HandlerIds)> {
     let mut fields: Vec<_> = snapshot.split(';').collect();
     let last_id: i32 = fields[2].strip_prefix("last-id=")?.parse().ok()?;
     if old_last_id >= last_id {
@@ -486,30 +600,22 @@ fn normalize_handler_ids(
         return None;
     }
 
-    let remap = |id: &str| {
-        let id: i32 = id.parse().unwrap();
-        handler_ids.get(&id).copied().unwrap_or(id)
-    };
-    let remap_list = |ids: &str| {
-        ids.split(',')
-            .filter(|id| !id.is_empty())
-            .map(remap)
-            .collect::<Vec<_>>()
-            .into_iter()
-    };
+    let remap = |id: &str| remap_id(id.parse().unwrap(), &handler_ids);
     let rewrite = |field: &str| {
         let (name, value) = field.split_once('=').unwrap();
         let value = match name {
             "first" | "last" | "block" => remap(value).to_string(),
-            "edges" | "exception-edges" | "rpo" => remap_list(value).join(","),
-            "exit-predecessors" | "finally-exits" => remap_list(value).sorted().join(","),
+            "edges" | "exception-edges" | "rpo" => remap_list(value, &handler_ids).join(","),
+            "exit-predecessors" | "finally-exits" => {
+                remap_list(value, &handler_ids).sorted().join(",")
+            }
             "range" => {
                 let (handler, rest) = value.split_once(':').unwrap();
                 let (types, members) = rest.rsplit_once(':').unwrap();
                 format!(
                     "{}:{types}:{}",
                     remap(handler),
-                    remap_list(members).sorted().join(",")
+                    remap_list(members, &handler_ids).sorted().join(",")
                 )
             }
             _ => value.to_owned(),
@@ -539,7 +645,7 @@ fn normalize_handler_ids(
     if !blocks.remainder().is_empty() || !appended.keys().copied().eq(old_last_id + 1..=last_id) {
         return None;
     }
-    Some(
+    Some((
         fields[..3]
             .iter()
             .map(|field| rewrite(field))
@@ -547,7 +653,8 @@ fn normalize_handler_ids(
             .chain(appended.into_values())
             .chain(fields[block_end..].iter().map(|field| rewrite(field)))
             .join(";"),
-    )
+        handler_ids,
+    ))
 }
 
 // When splitting a range, Java picks the next entry from an identity set.

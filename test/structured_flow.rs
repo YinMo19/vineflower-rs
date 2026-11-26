@@ -822,6 +822,11 @@ fn check_flow(check: Check) {
         transfer.flush().unwrap();
         rust_snapshots.flush().unwrap();
     }
+    assert!(
+        !methods.is_empty(),
+        "no methods with Code entered the comparison in {}",
+        corpus.root.display()
+    );
 
     let mut reference = tempfile::tempfile().unwrap();
     corpus.run_to(
