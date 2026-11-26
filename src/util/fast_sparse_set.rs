@@ -22,6 +22,7 @@ use super::packed_map::{PackedMap, unpack_high, unpack_low};
 /// handle to the same factory.
 pub struct FastSparseSetFactory<E>(Rc<RefCell<FactoryState<E>>>);
 
+#[derive(Clone)]
 struct FactoryState<E> {
     col_values_internal: PackedMap<E>,
     last_block: i32,
@@ -43,6 +44,11 @@ impl<E: Hash + Eq + Clone + Debug> FastSparseSetFactory<E> {
             last_block: block,
             last_mask: mask,
         })))
+    }
+
+    /// Copies the current numbering into an independent factory.
+    pub(crate) fn fork(&self) -> Self {
+        Self(Rc::new(RefCell::new(self.0.borrow().clone())))
     }
 
     pub fn create_empty_set(&self) -> FastSparseSet<E> {

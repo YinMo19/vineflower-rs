@@ -23,6 +23,12 @@ use crate::structs::StructMethod;
 use crate::types::MethodDescriptor;
 use crate::util::fast_sparse_set::FastSparseSetFactory;
 
+thread_local! {
+    // Each split starts with Java's 64 numbered versions. Later versions are
+    // numbered in discovery order by that analysis's independent factory.
+    static INITIAL_VERSIONS: FastSparseSetFactory<i32> = FastSparseSetFactory::new(0..64);
+}
+
 pub(super) fn split<A: VersionAnalysis>(
     ir: &mut Ir,
     root: StatId,
@@ -30,7 +36,7 @@ pub(super) fn split<A: VersionAnalysis>(
     mut analysis: A,
 ) -> Result<VariableVersions<A>, Version> {
     let graph = build_direct_graph(ir, root);
-    let factory = FastSparseSetFactory::new(0..64);
+    let factory = INITIAL_VERSIONS.with(FastSparseSetFactory::fork);
     let mut entry = VersionMap::new(&factory);
     let mut index = 0;
     if method.access_flags & ACC_STATIC == 0 {
