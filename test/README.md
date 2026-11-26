@@ -163,3 +163,22 @@ Release `c1b5109` prepares the initial control-flow and statement graphs on root
 | Complete 26.3 client | auto | 44.67 / 44.24 | 6.265 / 5.999 |
 
 The automatic setting selected a thread count of 14. User and system CPU time summed to 44.80 s before and 46.44 s after on the full automatic run. At one, two and automatic workers the client's directory tree matched the pinned Java CLI. Both layouts of the 2,831-class subset also preserved archive entry order, source bytes and all 1,520 line maps against the previous native release. Four maps on JDK 25.0.2 have the same line pairs as Java in a different order, as in the baseline.
+
+### Retained bytecode and statement graphs
+
+For a live-object count, use a separate instrumented release and trace the published wrappers after preparing all roots in the input unit, before rendering the first one. Count distinct block handles and instruction Arcs, including instructions retained by variable expressions. The ordinary CLI samples below use the default collection schedule.
+
+On the complete 26.3 client with one worker, moving from `ac822b7` to `42107a8` reduced live blocks at that barrier from 305,549 to 161,109 and distinct instructions from 1,853,691 to 1,672,798. All 161,109 remaining blocks belong to statements. Both builds had 401,862 live statements. Across their incoming and outgoing indexes, 312,507 directions each referred to one distinct edge. The final representation stores its identity and view membership inline. On arm64 macOS the size of a statement fell from 480 to 448 bytes and that of an instruction from 112 to 104 bytes.
+
+The following release CLI runs used the same Apple M4 Pro, JDK and directory output options as the root worker comparison. Each full-client row is one consecutive pair. The subset rows compare the final build with earlier single-run samples of the baseline. The single-worker full-client pair isolates the release of completed CFG links. The other rows include both representation changes as well.
+
+| Input | Workers | Revisions (before / after) | Elapsed (s) | Peak RSS (GiB) | Peak macOS footprint (GiB) |
+| --- | ---: | --- | ---: | ---: | ---: |
+| Complete 26.3 client | 1 | `566e018` / `42107a8` | 44.93 / 44.50 | 6.157 / 6.273 | 4.102 / 4.229 |
+| Complete 26.3 client | auto (14) | `ac822b7` / `42107a8` | 44.36 / 43.46 | 6.386 / 6.486 | 4.476 / 4.137 |
+| 2,831 classes in one JAR | 1 | `ac822b7` / `42107a8` | 10.29 / 9.99 | 1.060 / 0.993 | 0.823 / 0.755 |
+| 2,831 classes in five JARs | 1 | `ac822b7` / `42107a8` | 10.14 / 9.93 | 0.786 / 0.765 | 0.622 / 0.596 |
+
+The full-client pairs produced the same 7,301 Java files and 21,495 resources as the pinned Java CLI. Peak RSS increased in both pairs despite the reduction in live objects at the preparation barrier.
+
+`public_method_callback_retains_its_cfg_after_wrapper_publication` processes the checked-in `TestSimpleWhile.class` through the public method callback and reads its saved CFG entry after the wrapper is published. It checks the identities and order of its incoming and outgoing blocks.
