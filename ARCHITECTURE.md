@@ -76,6 +76,8 @@ CFG、语句图和 DirectGraph 具有不同的边契约。
 | Unicode 字符分类 | 标识符和字面量转义通过 `unicode-general-category` 查询字符类别。当前依赖使用 Unicode 16.0。Java 原版使用运行它的 JDK 的字符表，例如 U+FDFF 在 JDK 17 下写成 `\ufdff`，在 JDK 21 和 25 下直接写出。 |
 | 打印与映射 | 保留 `TextBuffer` 对 UTF-16 位置、换行组和 tracer 的处理。优先级、导入冲突以及字节码到源码行的映射在原有调用位置解决。 |
 
+归档的 `0x4646` 行映射按 `BytecodeSourceMapper` 中原始行号表的桶顺序写出。JDK 17 和 JDK 25 的 `HashMap.putAll` 首次分配容量不同。例如在 Minecraft 26.3 的 `ConsoleInput` 构造器上，同一 tracer 产生三个行号对；JDK 17 分配八个桶，依次写出 10、11、12，JDK 25 分配四个桶，写出 12、10、11。Rust 的 `JHashMap` 遵循 JDK 17。
+
 ## 当前实现边界
 
 [Java 方法入口](src/engine/method_processor.rs) `structured_statement_graph` 完成 `MethodProcessor` 中首次 `DomHelper.parseGraph` 调用。返回的 `StructuredMethod` 保留根语句、CFG 和方法计数器。没有保留 Code 的方法返回 `None`，无法分解的图返回方法级解析错误。调用 `initial_statement_graph` 可以取得折叠前的图，再按值调用 `structure` 继续。

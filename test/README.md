@@ -135,7 +135,7 @@ For the larger memory comparison, use the Minecraft 26.3 client (SHA-256 `4508d0
 | 760 | `com/mojang/blaze3d/`, `net/minecraft/advancements/`, `net/minecraft/nbt/`, `net/minecraft/network/chat/`, `net/minecraft/server/commands/` |
 | 2,831 | `com/mojang/renderpearl/`, `net/minecraft/client/gui/`, `net/minecraft/network/`, `net/minecraft/server/`, `net/minecraft/world/item/` |
 
-Build both revisions with `cargo build --release --locked`. With the same JDK, run each binary on the identical archives and write each output to a fresh directory. The macOS measurements used JDK 25.0.2 and the median maximum resident set size from three alternating runs of each revision.
+Build both revisions with `cargo build --release --locked`. With the same JDK, run each binary on the identical archives and write each output to a fresh directory. The macOS comparison used JDK 25.0.2 and the median maximum resident set size from three runs of each binary. Retain the exact inputs, command lines and output manifests between revisions.
 
 ```sh
 /usr/bin/time -l "$cli" --folder --thread-count=1 --include-runtime=1 \
@@ -143,3 +143,8 @@ Build both revisions with `cargo build --release --locked`. With the same JDK, r
 ```
 
 Compare the relative filenames and bytes against both the previous binary and the pinned Java CLI. For archive line mappings use `--legacy-saving --dump-code-lines=1` and compare central-directory entry order, uncompressed contents and the `0x4646` extra field.
+
+
+With baseline `eb137e2` and execution code `4125b28`, the 2,831-class subset produced 1,762 Java files in both layouts. With a single worker, median peak RSS fell from 1,304.8 to 1,083.5 MiB for one input JAR, and from 1,280.5 to 804.3 MiB for five. Median elapsed time changed from 9.81 to 10.07 seconds and from 9.41 to 10.12 seconds, respectively.
+
+Three paired single-worker runs on the complete client produced identical output trees across revisions and against the Java CLI (7,301 Java files and 21,495 resources). Median peak RSS was 6.410 GiB before and 6.526 GiB after. The separate macOS peak memory footprint decreased in all three pairs, with medians of 5.460 and 4.379 GiB. Median elapsed time was 42.01 and 45.29 seconds. The single input unit retains all published root wrappers through the preparation barrier.
