@@ -14,6 +14,10 @@ mod nested_member_access;
 mod lambda_nodes;
 #[path = "support/oddities.rs"]
 mod oddities;
+#[path = "support/metadata_writer.rs"]
+mod metadata_writer;
+#[path = "support/local_class_declarations.rs"]
+mod local_class_declarations;
 #[path = "support/upstream_reference.rs"]
 mod upstream_reference;
 

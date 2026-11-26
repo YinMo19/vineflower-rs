@@ -11,6 +11,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use super::Cx;
 use super::class_nodes::{ClassKind, ClassNode, ClassNodes};
 use crate::structs::{StructClass, StructContext, struct_context::ClassResolver};
+use crate::util::text_buffer::TextBuffer;
 
 type InnerNames = FxHashMap<ArcStr, String>;
 
@@ -264,6 +265,23 @@ pub fn short_name(cx: &mut Cx, full_name: &str, imported: bool) -> Option<String
 
 pub fn get_short_name(cx: &mut Cx, full_name: &str) -> String {
     short_name(cx, full_name, true).unwrap_or_else(|| "<undefinedtype>".to_owned())
+}
+
+pub(crate) fn write_imports(cx: &Cx, buffer: &mut TextBuffer, separator: bool) {
+    if cx.options.remove_imports {
+        return;
+    }
+    let imports = cx.imports.imports();
+    for name in &imports {
+        buffer
+            .append("import ")
+            .append(name)
+            .append_char(';')
+            .append_line_separator();
+    }
+    if separator && !imports.is_empty() {
+        buffer.append_line_separator();
+    }
 }
 
 pub fn get_short_name_in_class_context(cx: &mut Cx, full_name: &str) -> String {

@@ -8,9 +8,11 @@ use std::sync::Arc;
 
 use super::Cx;
 use super::class_nodes::{ClassKind, ClassNodeId, ClassNodes, process_lambdas};
-use super::import_collector::{ImportCollector, short_name};
+use super::class_writer::metadata::{module_info_to_java, package_info_to_java};
+use super::import_collector::{ImportCollector, short_name, write_imports};
 use crate::code::code_constants::{ACC_FINAL, ACC_MODULE, ACC_STATIC, ACC_SYNTHETIC, CLINIT_NAME};
 use crate::structs::{StructClass, StructMember, StructMethod};
+use crate::util::text_buffer::TextBuffer;
 
 /// Start the root's import scope before discovering lambda classes. Nested
 /// classes share this scope throughout method processing and source writing.
@@ -78,6 +80,37 @@ pub fn process_class(cx: &mut Cx, root: ClassNodeId) -> io::Result<()> {
         super::nested::propagate_member_access(cx, root)?;
     }
     Ok(())
+}
+
+/// Write a prepared package-info or module-info root, returning whether it
+/// was handled by the metadata writer.
+pub fn write_metadata(
+    cx: &mut Cx,
+    class: &StructClass,
+    buffer: &mut TextBuffer,
+) -> io::Result<bool> {
+    let Some(root) = cx.class_nodes.id(&class.qualified_name) else {
+        return Ok(false);
+    };
+    let node = &cx.class_nodes[root];
+    if node.kind != ClassKind::Root {
+        return Ok(false);
+    }
+    let result = if class.is_synthetic() && node.simple_name.as_deref() == Some("package-info") {
+        package_info_to_java(cx, class, buffer).map(|()| write_imports(cx, buffer, false))
+    } else if class.has_modifier(ACC_MODULE)
+        && let Some(module) = &class.attributes.module
+    {
+        let mut body = TextBuffer::new(cx);
+        module_info_to_java(cx, class, module, &mut body).map(|()| {
+            write_imports(cx, buffer, true);
+            buffer.append_buffer(&body);
+        })
+    } else {
+        return Ok(false);
+    };
+    cx.class_nodes[root].wrapper = None;
+    result.map(|()| true)
 }
 
 fn append_wrapper_order(classes: &ClassNodes, id: ClassNodeId, order: &mut Vec<ClassNodeId>) {

@@ -119,6 +119,8 @@ CFG、语句图和 DirectGraph 具有不同的边契约。
 
 常量写出保留 JVM 类型、UTF-16 字符、字节码映射和源码 token。浮点数先按 JDK 17 的十进制转换规则求值，再应用 Vineflower 的截短和符号常量恢复。宽整数运算由 `num-bigint` 提供；普通转换走固定宽度路径。注解元素和方法里的常量共用同一入口。[字面量写出](src/decompiler/exps/literal/mod.rs) · [十进制转换](src/util/java_decimal.rs)
 
+包描述符和模块描述符可以直接从已准备的根类写出。包注解先登记导入，再把导入写在包声明之后。模块先生成正文，随后在正文前写入导入。两条路径和普通声明共用注解值、类型 token 和换行组。[元数据写出](src/engine/class_writer/metadata.rs) · [写出入口](src/engine/class_processor.rs)
+
 `RuntimeImage::open` 将模块化 JDK 的每个模块作为独立库登记，按 JRT 的目录遍历和模块描述符顺序提供条目。普通镜像与 ZIP 压缩镜像可由现有 JImage 库读取；该库遇到 compact-cp 压缩时返回 Unsupported。[运行时类路径](src/engine/context_source/runtime.rs)
 
 `StructContext::add_file` 根据文件后缀和 ZIP 结束记录登记目录、归档或单文件。重新载入上下文时再次扫描目录及其子归档。ZIP 保留中央目录顺序和重复条目，按 Java 的规则解释多版本路径。单个 class 文件在预读内部名称和正式解析时使用同一上下文的注解表达式计数器。直接读取缺失资源或目录时，Rust 的 `ContextSource` 返回 `Ok(None)`。Java 的目录源打开这些路径时抛出 I/O 异常，ZIP 源读取缺失条目时抛出空引用异常，读取显式目录条目时返回空流。正常登记按已有条目读取类和资源。[文件登记](src/structs/struct_context.rs)
