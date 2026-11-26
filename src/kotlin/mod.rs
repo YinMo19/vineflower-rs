@@ -2,7 +2,9 @@
 
 //! The Kotlin language plugin bundled with Vineflower.
 
+pub mod declarations;
 pub mod imports;
+pub mod metadata;
 pub mod passes;
 pub mod types;
 
