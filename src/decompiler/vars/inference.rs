@@ -10,6 +10,7 @@ use crate::code::code_constants::ACC_STATIC;
 use crate::decompiler::exps::{ConstantValue, Expr, ExprKind, FunctionType};
 use crate::decompiler::ir::{ExprId, Ir, StatId, VarProcessorId};
 use crate::decompiler::stats::StatementKind;
+use crate::engine::method_timeout::checkpoint;
 use crate::engine::Cx;
 use crate::engine::counter_container::{CounterContainer, EXPRESSION_COUNTER};
 use crate::structs::{StructClass, StructMember};
@@ -32,6 +33,7 @@ pub(super) fn calculate(
 
     'inference: loop {
         for &expr in expressions {
+            checkpoint();
             if check_expression(cx, counters, owner, expr)? {
                 continue 'inference;
             }

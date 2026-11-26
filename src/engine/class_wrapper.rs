@@ -14,6 +14,7 @@ use super::class_nodes::ClassNodeId;
 use super::context::Cx;
 use super::counter_container::CounterContainer;
 use super::method_processor::ExpressionMethod;
+use super::method_timeout::{self, MethodTimeout};
 use crate::decompiler::flow::{DirectGraph, flatten::build_direct_graph};
 use crate::decompiler::ir::{ExprId, ExprListId, Ir, IrNode, StatId, VarProcessorId};
 use crate::decompiler::stats::StatementKind;
@@ -146,6 +147,9 @@ pub(super) fn initialize_wrappers(
 
 pub(crate) fn catch_method_failure<T>(process: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
     catch_unwind(AssertUnwindSafe(process)).unwrap_or_else(|payload| {
+        if payload.is::<MethodTimeout>() {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, MethodTimeout));
+        }
         let reason = payload
             .downcast_ref::<String>()
             .map(String::as_str)
@@ -172,7 +176,14 @@ fn process_method(
     // last method remains the ambient sequence during nested-class processing.
     cx.expression_ids = Default::default();
     let previous = cx.current_method.replace((Arc::clone(method), variables));
-    let outcome = catch_method_failure(|| process(cx, class, method));
+    let outcome = catch_method_failure(|| {
+        let seconds = cx.options.max_time_per_method;
+        if seconds != 0 && !cx.options.unit_test_mode && method.contains_code() {
+            method_timeout::run(seconds, || process(cx, class, method))
+        } else {
+            process(cx, class, method)
+        }
+    });
     cx.current_method = previous;
     let variables = outcome
         .as_ref()
@@ -218,6 +229,13 @@ fn process_method(
             Ok(result.map(MethodBody::from))
         }
         Err(error) if error.kind() == io::ErrorKind::Interrupted => return Err(error),
+        Err(error) if error.get_ref().is_some_and(|cause| cause.is::<MethodTimeout>()) => {
+            log::error!(
+                "Processing time limit exceeded for method {}, execution interrupted.",
+                method.name
+            );
+            Err(error)
+        }
         Err(error) => {
             log::warn!(
                 "Could not decompile {}.{} {}: {error}",

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::BTreeMap, fs, io::Read, path::Path, process::Command, sync::Arc};
+use std::{
+    collections::BTreeMap, fs, io::Read, path::Path, process::Command, sync::Arc, time::Duration,
+};
 
 use vineflower_rs::{
     engine::{
@@ -40,7 +42,11 @@ fn memory_group_writes_roots_and_maps_lines_using_a_read_only_library() {
     driver
         .add_source_context(Arc::new(MemorySource::new("sample classes", classes)))
         .unwrap();
-    driver.add_library_context(Arc::new(LazyLibrary)).unwrap();
+    driver
+        .add_library_context(Arc::new(LazyLibrary {
+            before_read: |_| {},
+        }))
+        .unwrap();
     driver.set_javadoc(Arc::new(Documentation));
 
     let classes = driver.decompile().unwrap();
@@ -69,7 +75,9 @@ fn memory_group_writes_roots_and_maps_lines_using_a_read_only_library() {
     assert!(classes[1].source.contains("Hello from inner class 2"));
 }
 
-struct LazyLibrary;
+struct LazyLibrary {
+    before_read: fn(&str),
+}
 
 impl ContextSource for LazyLibrary {
     fn get_name(&self) -> String {
@@ -85,9 +93,51 @@ impl ContextSource for LazyLibrary {
     }
 
     fn get_input_stream(&self, resource: &str) -> std::io::Result<Option<Vec<u8>>> {
+        (self.before_read)(resource);
         Ok((resource == "ext/TestLibrary.class")
             .then(|| include_bytes!("smoke/java8/TestLibrary.class").to_vec()))
     }
+}
+
+#[test]
+fn method_deadline_expires_during_lazy_resolution_and_is_scoped_to_code() {
+    let decompile = |seconds, test_mode, before_read| {
+        let mut options = Options::default();
+        options.include_runtime = "0".into();
+        options.max_time_per_method = seconds;
+        options.unit_test_mode = test_mode;
+        let mut driver = Decompiler::new(options).unwrap();
+        driver
+            .add_source_context(Arc::new(MemorySource::new(
+                "method deadline",
+                [(
+                    "TestListIteratorHierarchy".into(),
+                    include_bytes!("smoke/java8/TestListIteratorHierarchy.class").to_vec(),
+                )],
+            )))
+            .unwrap();
+        driver
+            .add_library_context(Arc::new(LazyLibrary { before_read }))
+            .unwrap();
+        driver.decompile().unwrap().pop().unwrap().source
+    };
+
+    // Foreach recognition consults the iterator hierarchy during the method.
+    // Delay that lookup so the test is independent of processor speed.
+    let timed = decompile(1, false, |name| {
+        if name == "java/util/ListIterator.class" {
+            std::thread::sleep(Duration::from_millis(1100));
+        }
+    });
+    assert_eq!(
+        timed.matches("Couldn't be decompiled").count(),
+        1,
+        "{timed}"
+    );
+    assert!(timed.contains("Processing time limit exceeded"), "{timed}");
+    let untimed = decompile(0, false, |_| {});
+    assert!(untimed.contains("iterator.hasNext()"));
+    assert_eq!(decompile(-1, true, |_| {}), untimed);
 }
 
 struct Documentation;

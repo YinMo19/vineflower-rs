@@ -16,6 +16,7 @@ use crate::decompiler::exps::{Expr, ExprKind, STACK_BASE, SwitchCaseValues};
 use crate::decompiler::flow::{DirectEdgeType, DirectGraph, flatten::build_direct_graph};
 use crate::decompiler::ir::{ExprId, Ir, StatId, VarProcessorId};
 use crate::decompiler::stats::StatementKind;
+use crate::engine::method_timeout::checkpoint;
 use crate::engine::{Cx, counter_container::CounterContainer};
 use crate::structs::{StructClass, StructMethod};
 use crate::types::MethodDescriptor;
@@ -40,6 +41,7 @@ pub fn process_statement(
     discovered.insert(&graph[graph.first].id);
     let mut pending = vec![(graph.first, Vec::new())];
     while let Some((node, incoming)) = pending.pop() {
+        checkpoint();
         let mut data = match catch_variables.get(&graph[node].id) {
             Some(&var) => catch_entry(cx, counters, var, owner),
             None => ExpressionData {

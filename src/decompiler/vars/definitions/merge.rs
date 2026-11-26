@@ -15,6 +15,7 @@ use crate::decompiler::ir::{ExprId, Ir, StatId, VarProcessorId};
 use crate::decompiler::sforms::{reset_versions, try_split_ssau};
 use crate::decompiler::stats::StatementKind;
 use crate::decompiler::vars::var_version_pair::VarVersionPair as Version;
+use crate::engine::method_timeout::checkpoint;
 use crate::engine::Cx;
 use crate::structs::StructMethod;
 use crate::types::{CodeType, MethodDescriptor, TypeFamily, VarType};
@@ -140,6 +141,7 @@ impl Merge<'_> {
         leaked: &mut Scope,
         denylist: &Denylist,
     ) -> io::Result<Option<Candidate>> {
+        checkpoint();
         let mut active = parent.clone();
         for index in 0..self.cx.ir[stat].var_definitions.len() {
             let expr = self.cx.ir[stat].var_definitions[index];

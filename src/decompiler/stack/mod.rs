@@ -15,6 +15,7 @@ use rustc_hash::FxHashSet;
 use crate::decompiler::decompose::{finish::condense_sequences, if_helper::merge_ifs};
 use crate::decompiler::ir::StatId;
 use crate::decompiler::sforms::{SsaResult, reset_versions, split_ssa, split_ssau};
+use crate::engine::method_timeout::checkpoint;
 use crate::engine::{Cx, counter_container::CounterContainer};
 use crate::structs::StructClass;
 
@@ -40,6 +41,7 @@ pub fn simplify_stack_vars(
         let ssa = split_ssa(&mut cx.ir, root, &method);
         let mut changed = false;
         while simplify_statement(cx, counters, root, &mut reordered, &ssa, class, first) {
+            checkpoint();
             changed = true;
         }
         reset_versions(&mut cx.ir, root);
@@ -104,6 +106,7 @@ fn simplify_statement_with_optional_ssa(
     loop {
         let mut changed = false;
         for i in 0..cx.ir[stat].stats.len() {
+            checkpoint();
             let child = cx.ir[stat].stats[i];
             found |= simplify_statement_with_optional_ssa(
                 cx, counters, child, reordered, ssa, class, first,

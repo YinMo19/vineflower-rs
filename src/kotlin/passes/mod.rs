@@ -19,6 +19,7 @@ use crate::decompiler::{
     post_process, secondary,
     stack::{StackSimplifyOptions, simplify_stack_vars},
 };
+use crate::engine::method_timeout::checkpoint;
 use crate::engine::{
     Cx,
     method_processor::{DecodedMethod, ExpressionMethod},
@@ -73,6 +74,7 @@ pub fn defined_method(
 fn main_loop(cx: &mut Cx, class: &StructClass, method: &mut ExpressionMethod) -> io::Result<()> {
     let root = method.root;
     loop {
+        checkpoint();
         labels::clean_up_edges(&mut cx.ir, root);
         merge_loops(cx, class, method)?;
         method.simplify_stack_vars(cx, class);
@@ -99,6 +101,7 @@ fn merge_loops(cx: &mut Cx, class: &StructClass, method: &mut ExpressionMethod) 
     let root = method.root;
     let counters = &mut method.flow.counters;
     loop {
+        checkpoint();
         if eliminate::eliminate(cx, counters, root, class)? {
             continue;
         }

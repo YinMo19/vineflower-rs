@@ -11,12 +11,14 @@ use crate::decompiler::exps::{
 use crate::decompiler::flow::flatten::build_direct_graph;
 use crate::decompiler::ir::{ExprId, ExprListId, StatId};
 use crate::decompiler::stats::StatementKind;
+use crate::engine::method_timeout::checkpoint;
 use crate::engine::{Cx, counter_container::CounterContainer};
 use crate::types::VarType;
 
 use super::{Declaration, KotlinExpr, KotlinFunction};
 
 pub(super) fn replace_statements(cx: &mut Cx, counters: &mut CounterContainer, stat: StatId) {
+    checkpoint();
     for index in 0..cx.ir[stat].stats.len() {
         let child = cx.ir[stat].stats[index];
         replace_statements(cx, counters, child);
@@ -31,6 +33,7 @@ pub(super) fn replace_expressions(
     counters: &mut CounterContainer,
     stat: StatId,
 ) -> io::Result<()> {
+    checkpoint();
     for index in 0..cx.ir[stat].stats.len() {
         replace_expressions(cx, counters, cx.ir[stat].stats[index])?;
     }
@@ -333,6 +336,7 @@ pub(super) fn resugar(
 ) -> io::Result<()> {
     let graph = build_direct_graph(&mut cx.ir, root);
     for &node in &graph.order {
+        checkpoint();
         let list = graph[node].exprents;
         for index in 0..cx.ir[list].len() {
             resugar_children(cx, counters, cx.ir[list][index])?;
@@ -459,6 +463,7 @@ fn resugar_expression(
 }
 
 pub(super) fn collapse_string_concat(cx: &mut Cx, stat: StatId) {
+    checkpoint();
     for index in 0..cx.ir[stat].stats.len() {
         collapse_string_concat(cx, cx.ir[stat].stats[index]);
     }

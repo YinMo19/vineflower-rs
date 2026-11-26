@@ -14,6 +14,7 @@ use crate::code::cfg::ControlFlowGraph;
 use crate::decompiler::ir::{Ir, StatId};
 use crate::decompiler::stats::stat_edge::{EdgeType, StatEdge};
 use crate::decompiler::stats::{Statement, StatementKind, recognize::detect_statement};
+use crate::engine::method_timeout::checkpoint;
 use crate::engine::counter_container::CounterContainer;
 use crate::structs::StructMethod;
 use crate::util::vb_style_collection::VBStyleCollection;
@@ -145,6 +146,7 @@ fn reduce_general(
             }
             for force_all in [false, true] {
                 loop {
+                    checkpoint();
                     if find_simple(ir, counters, general, posts, try_loop_fix) {
                         attempt = 0;
                     }
@@ -191,6 +193,7 @@ fn find_simple(
 ) -> bool {
     let mut changed = false;
     loop {
+        checkpoint();
         let candidate = statement_order::post_reverse_post_order(ir, general)
             .into_iter()
             .find_map(|head| detect_statement(ir, counters, head, try_loop_fix));

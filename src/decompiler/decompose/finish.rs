@@ -12,6 +12,7 @@ use crate::decompiler::ir::{Expr, ExprListId, Ir, StatId};
 use crate::decompiler::labels::low_continue_labels;
 use crate::decompiler::stats::stat_edge::{EdgeType, StatEdge};
 use crate::decompiler::stats::{STATEDGE_ALL, STATEDGE_DIRECT_ALL, Statement, StatementKind};
+use crate::engine::method_timeout::checkpoint;
 use crate::engine::Cx;
 use crate::engine::counter_container::CounterContainer;
 
@@ -41,6 +42,7 @@ pub(crate) fn clear_statements(cx: &mut Cx, root: StatId) {
 }
 
 pub(crate) fn condense_sequences(cx: &mut Cx, counters: &mut CounterContainer, mut stat: StatId) {
+    checkpoint();
     let ir = &mut cx.ir;
     if matches!(ir[stat].kind, StatementKind::Sequence) {
         let mut children = ir[stat].stats.to_vec();

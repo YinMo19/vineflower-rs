@@ -14,6 +14,7 @@ use super::code_constants::{GROUP_GENERAL, OPC_ASTORE, OPC_BIPUSH, OPC_NEW, OPC_
 use super::{Instruction, InstructionSequence};
 use crate::decompiler::decompose::generic_dominator_engine::GenericDominatorEngine;
 use crate::decompiler::ir::{BlockId, Ir};
+use crate::engine::method_timeout::checkpoint;
 use crate::engine::Options;
 use crate::structs::StructClass;
 
@@ -36,6 +37,7 @@ pub fn restore_pop_ranges(ir: &mut Ir, graph: &mut ControlFlowGraph) {
     }
 
     for ((original_handler, exception_types), range) in &ranges {
+        checkpoint();
         if exception_types.is_none() {
             continue;
         }
@@ -182,6 +184,7 @@ fn get_reachable_blocks_restricted(
     let mut visited = FxHashSet::default();
 
     while let Some(block) = pending.pop_front() {
+        checkpoint();
         visited.insert(block);
         if protected.contains(&block) && dominators.is_dominator(block, start) {
             reachable.push(block);
@@ -224,6 +227,7 @@ pub fn handle_multiple_entry_exception_ranges(ir: &mut Ir, graph: &mut ControlFl
         let mut found_multiple = false;
         let mut split = false;
         for index in 0..graph.exceptions.len() {
+            checkpoint();
             let entries = get_range_entries(ir, &graph.exceptions[index]);
             if entries.len() <= 1 {
                 continue;

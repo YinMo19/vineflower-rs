@@ -15,6 +15,7 @@ pub mod counter_container;
 pub mod driver;
 pub mod import_collector;
 pub mod method_processor;
+pub(crate) mod method_timeout;
 pub mod nested;
 pub mod options;
 

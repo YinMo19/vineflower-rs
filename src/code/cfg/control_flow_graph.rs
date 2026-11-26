@@ -18,6 +18,7 @@ use crate::code::code_constants::{
 };
 use crate::code::{FullInstructionSequence, InstructionSequence};
 use crate::decompiler::ir::{BlockId, Ir};
+use crate::engine::method_timeout::checkpoint;
 use crate::util::vb_style_collection::VBStyleCollection;
 
 pub struct ControlFlowGraph {
@@ -161,6 +162,7 @@ impl ControlFlowGraph {
     fn set_exception_edges(&mut self, ir: &mut Ir, instruction_blocks: &[BlockId]) {
         let mut ranges: FxHashMap<_, usize> = FxHashMap::default();
         for handler in &self.sequence.exception_table.handlers {
+            checkpoint();
             let from = instruction_blocks[handler.from as usize];
             let to = instruction_blocks[handler.to as usize];
             let target = instruction_blocks[handler.handler as usize];
@@ -204,6 +206,7 @@ impl ControlFlowGraph {
             let mut visited = FxHashSet::default();
 
             while let Some((node, mut calls)) = pending.pop_front() {
+                checkpoint();
                 visited.insert(node);
 
                 match ir[node].seq.get_last_instr().opcode {

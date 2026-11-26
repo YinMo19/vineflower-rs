@@ -15,6 +15,7 @@ use super::statement_order::{components, reverse_post_order};
 use crate::decompiler::ir::{Ir, StatId};
 use crate::decompiler::stats::stat_edge::{EdgeType, StatEdge};
 use crate::decompiler::stats::{EdgeDirection, STATEDGE_ALL, STATEDGE_DIRECT_ALL, StatementKind};
+use crate::engine::method_timeout::checkpoint;
 use crate::util::jhash::JHashMap;
 
 const REGULAR: u32 = EdgeType::Regular.mask();
@@ -229,6 +230,7 @@ impl ExtendedPostdominance<'_> {
             let mut changed = false;
             sets.clear();
             for &stat in &self.order {
+                checkpoint();
                 let predecessors: Vec<_> = stat
                     .get_predecessor_edges(ir, STATEDGE_ALL)
                     .into_iter()
@@ -280,6 +282,7 @@ impl ExtendedPostdominance<'_> {
             visited.insert(head);
 
             while let Some((stat, mut path)) = queue.pop_front() {
+                checkpoint();
                 let index = self.position(stat);
                 if posts.contains(index) {
                     path.insert(index);

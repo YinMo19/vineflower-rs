@@ -20,6 +20,7 @@ use crate::decompiler::flow::{
 };
 use crate::decompiler::ir::{Ir, StatId};
 use crate::decompiler::stats::StatementKind;
+use crate::engine::method_timeout::checkpoint;
 use crate::structs::StructMethod;
 use crate::types::MethodDescriptor;
 use crate::util::fast_sparse_set::FastSparseSetFactory;
@@ -115,6 +116,7 @@ impl FlowState {
     ) -> Result<bool, Version> {
         let mut updated = FxHashSet::default();
         for &id in &graph.order {
+            checkpoint();
             let node = &graph[id];
             updated.remove(&node.id);
             let input = self.merge_inputs(ir, graph, id);

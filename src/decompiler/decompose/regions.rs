@@ -15,6 +15,7 @@ use crate::decompiler::stats::{
     EdgeDirection::{Backward, Forward},
     STATEDGE_ALL, STATEDGE_DIRECT_ALL, Statement,
 };
+use crate::engine::method_timeout::checkpoint;
 use crate::engine::counter_container::CounterContainer;
 use crate::util::{jhash::JHashMap, vb_style_collection::VBStyleCollection};
 
@@ -147,6 +148,7 @@ pub(super) fn find_general(
         calc_post_dominators(ir, stat)
     };
     for (index, posts) in candidates.iter().enumerate() {
+        checkpoint();
         let head_id = *candidates.get_key(index).unwrap();
         let ext_set = ext.get(head_id);
         if ext_set.is_none() && posts.as_slice() != [head_id] {
@@ -201,6 +203,7 @@ fn region_nodes(
     }) {
         let mut queue = VecDeque::from([handler]);
         while let Some(node) = queue.pop_front() {
+            checkpoint();
             if (head != post && node == post) || !nodes.insert(node) {
                 continue;
             }

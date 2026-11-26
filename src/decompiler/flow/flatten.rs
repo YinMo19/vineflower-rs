@@ -12,6 +12,7 @@ use crate::decompiler::stats::{
     DoStatement, IfStatement, LastBasicType, LoopType, STATEDGE_ALL, STATEDGE_DIRECT_ALL,
     StatementKind,
 };
+use crate::engine::method_timeout::checkpoint;
 
 pub fn build_direct_graph(ir: &mut Ir, root: StatId) -> DirectGraph {
     let StatementKind::Root { dummy_exit, .. } = ir[root].kind else {
@@ -78,6 +79,7 @@ impl<'a> Flatten<'a> {
     }
 
     fn flatten_statement(&mut self, stat: StatId) -> DirectId {
+        checkpoint();
         match self.ir[stat].kind {
             StatementKind::BasicBlock { .. } => self.flatten_basic_block(stat),
             StatementKind::Catch { resources, .. } => self.flatten_try(stat, false, resources),

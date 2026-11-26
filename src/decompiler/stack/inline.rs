@@ -15,6 +15,7 @@ use crate::decompiler::sforms::{Ssau, SsauResult};
 use crate::decompiler::stats::{LoopType, StatementKind};
 use crate::decompiler::vars::var_version_pair::VarVersionPair as Version;
 use crate::decompiler::vars::version_graph::VarVersionsGraph;
+use crate::engine::method_timeout::checkpoint;
 use crate::engine::{Cx, counter_container::CounterContainer};
 use crate::structs::attr::LocalVariable;
 use crate::types::CodeType;
@@ -45,6 +46,7 @@ pub(super) fn iterate_statements(
     let mut visited = FxHashSet::default();
     let mut pending = VecDeque::from([(graph.first, Replacements::default())]);
     while let Some((id, mut values)) = pending.pop_front() {
+        checkpoint();
         let node = &graph[id];
         if !visited.insert(&node.id) {
             continue;
@@ -75,6 +77,7 @@ pub(super) fn iterate_statements(
                 let Some(list) = list else { continue };
                 let mut index = 0;
                 while index < inliner.cx.ir[list].len() {
+                    checkpoint();
                     let next = inliner.cx.ir[list].get(index + 1).copied().or_else(|| {
                         lists
                             .get(position + 1)

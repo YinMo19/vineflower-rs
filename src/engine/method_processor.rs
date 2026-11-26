@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use indexmap::IndexSet;
 
+use super::method_timeout::checkpoint;
 use crate::code::{
     cfg::ControlFlowGraph, dead_code_helper as dead, exception_deobfuscator as exceptions,
 };
@@ -108,9 +109,11 @@ impl<'a> DecodedMethod<'a> {
     pub fn prepare_control_flow(mut self, ir: &mut Ir, options: &Options) -> CommonMethod<'a> {
         let graph = &mut self.flow.graph;
         dead::remove_dead_blocks(ir, graph);
+        checkpoint();
         if self.method.bytecode_version.has_jsr() || options.force_jsr_inline {
             graph.inline_jsr(ir, self.class, self.method, options);
         }
+        checkpoint();
         dead::connect_dummy_exit_block(ir, graph);
         dead::remove_gotos(ir, graph, options);
         CommonMethod {
@@ -135,6 +138,7 @@ impl CommonMethod<'_> {
         let graph = &mut self.flow.graph;
         exceptions::remove_circular_ranges(ir, graph);
         exceptions::restore_pop_ranges(ir, graph);
+        checkpoint();
         if force_cleanup || options.remove_empty_try_catch {
             exceptions::remove_empty_ranges(ir, graph);
         }
@@ -146,6 +150,7 @@ impl CommonMethod<'_> {
         }
         exceptions::insert_empty_exception_handler_blocks(ir, graph);
         dead::merge_basic_blocks(ir, graph, options);
+        checkpoint();
         if exceptions::has_obfuscated_exceptions(ir, graph) {
             if !exceptions::handle_multiple_entry_exception_ranges(ir, graph) {
                 log::warn!("Found multiple entry exception ranges which could not be splitted");
@@ -221,6 +226,7 @@ impl StructuredMethod {
     ) -> io::Result<RecoveredMethod> {
         let mut processor = FinallyProcessor::default();
         while processor.iterate_graph(cx, class, &mut self)? {
+            checkpoint();
             self.reparse(cx)?;
         }
         cx.ir[self.flow.variables]
@@ -489,6 +495,7 @@ impl ExpressionMethod {
         stage: MainLoopStage,
     ) -> io::Result<()> {
         loop {
+            checkpoint();
             self.identify_main_loop_labels(cx, class)?;
             if self.identify_secondary(cx)?
                 || crate::decompiler::intersection::make_casts(
@@ -630,6 +637,7 @@ impl ExpressionMethod {
     /// Native Java passes before the BEFORE_MAIN plugin location.
     pub fn prepare_main_loop(&mut self, cx: &mut Cx, class: &StructClass) -> io::Result<()> {
         self.process_increments(cx, class)?;
+        checkpoint();
         self.simplify_string_concat(cx, class)?;
         self.build_assertions(cx, class)?;
         Ok(())
@@ -678,6 +686,7 @@ impl ExpressionMethod {
         loop {
             self.simplify_stack_vars(cx, class);
             self.set_var_versions(cx, class)?;
+            checkpoint();
             if !self.find_increments(cx) {
                 break;
             }
@@ -777,6 +786,7 @@ pub fn after_main_method(
         return Ok(None);
     };
     result.simplify_switches(cx, class)?;
+    checkpoint();
     result.finish_post_processing(cx)?;
     Ok(Some(result))
 }
@@ -790,6 +800,7 @@ pub fn defined_method(
     let Some(mut result) = after_main_method(cx, class, method)? else {
         return Ok(None);
     };
+    checkpoint();
     result.set_var_definitions(cx)?;
     Ok(Some(result))
 }
@@ -803,7 +814,9 @@ pub fn code_to_java(
     let Some(mut result) = defined_method(cx, class, method)? else {
         return Ok(None);
     };
+    checkpoint();
     result.prepare_method_end(cx)?;
+    checkpoint();
     result.finish_method(cx, class)?;
     Ok(Some(result))
 }

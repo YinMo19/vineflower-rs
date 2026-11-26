@@ -11,6 +11,7 @@ use rustc_hash::FxHashMap;
 
 use crate::code::cfg::ControlFlowGraph;
 use crate::decompiler::ir::{BlockId, Ir};
+use crate::engine::method_timeout::checkpoint;
 
 pub struct GenericDominatorEngine<N> {
     positions: FxHashMap<N, usize>,
@@ -45,6 +46,7 @@ impl<N: Copy + Eq + Hash> GenericDominatorEngine<N> {
         loop {
             let mut changed = false;
             for (node, preds) in incoming.iter().enumerate() {
+                checkpoint();
                 let mut idom = None;
                 for &pred in preds.iter().filter(|&&pred| parents[pred].is_some()) {
                     idom = match idom {

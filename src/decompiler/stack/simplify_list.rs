@@ -11,6 +11,7 @@ use crate::decompiler::exps::{ExitType, Expr, ExprKind, FunctionType, MonitorTyp
 use crate::decompiler::ir::{ExprId, ExprListId, Ir, StatId};
 use crate::decompiler::sforms::SsaResult;
 use crate::decompiler::stats::StatementKind;
+use crate::engine::method_timeout::checkpoint;
 use crate::engine::Cx;
 use crate::engine::counter_container::CounterContainer;
 use crate::structs::StructClass;
@@ -27,6 +28,7 @@ pub(super) fn simplify_list(
     let mut changed = false;
     let mut index = 0;
     while let Some(&current) = cx.ir[list].get(index) {
+        checkpoint();
         if let Some(replacement) = constructors::simple(&mut cx.ir, current)
             .or_else(|| constructors::lambda(cx, counters, current, class))
         {

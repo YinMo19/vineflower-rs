@@ -12,6 +12,7 @@ use super::{ControlFlowGraph, ExceptionRangeCFG};
 use crate::code::code_constants::{OPC_ASTORE, OPC_JSR, OPC_POP, OPC_RET};
 use crate::code::{dead_code_helper, interpreter};
 use crate::decompiler::ir::{BlockId, Ir};
+use crate::engine::method_timeout::checkpoint;
 use crate::engine::Options;
 use crate::structs::{StructClass, StructMethod, consts::ConstantPool};
 use crate::types::{CodeType, data_point::DataPoint};
@@ -31,6 +32,7 @@ impl ControlFlowGraph {
         options: &Options,
     ) {
         while let Some((enter, ret, shared)) = self.intersecting_jsr_ranges(ir) {
+            checkpoint();
             self.split_jsr_range(ir, enter, ret, &shared);
         }
         self.remove_jsr_instructions(ir, &class.pool, DataPoint::initial(class, method));
@@ -198,6 +200,7 @@ impl ControlFlowGraph {
         // block. Only the first visit to a successor needs a copy of the frame.
         let mut stack = vec![enter_block(ir, self.first, initial)];
         while let Some((node, frame, next_edge)) = stack.last_mut() {
+            checkpoint();
             let block = &ir[*node];
             let exceptional = *next_edge >= block.succs.len();
             let successor = if exceptional {

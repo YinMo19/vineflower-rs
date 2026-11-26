@@ -146,6 +146,8 @@ CFG、语句图和 DirectGraph 具有不同的边契约。
 
 普通根类通过 `process_class` 和 `class_processor::write_class` 写成完整的 Java 编译单元。表达式在原有 IR 对象上处理强制转换、泛型实参及装箱，语句树负责标签、跳转、作用域和块换行。局部类、匿名类、方法引用和 lambda 递归使用所属的类或方法包装器。各字段和方法先生成独立的正文，再把字节码映射归到原方法；汇总正文和导入后，源码映射器才补入类头行数。写完只释放根类包装器，其他根类仍可查询其子类构造器。[表达式写出](src/decompiler/exps/write/mod.rs) · [语句写出](src/decompiler/stats/write/mod.rs) · [成员写出](src/engine/class_writer/class.rs) · [源码行映射](src/engine/bytecode_source_mapper.rs)
 
+方法超时只包围有 Code 的 Java 或 Kotlin 方法处理。零值和单元测试模式关闭期限；负值在方法入口即到期。计时采用单调时钟，CFG、结构分解、数据流和固定点迭代在检查点退出，包装器记录方法级超时并继续下一方法。正在阻塞的类路径 I/O 需等调用返回才能退出。作用域结束恢复调用方的期限，普通取消继续传回驱动。
+
 方法处理失败时仍可写出同一类的其他成员。错误注释和剩余字节码列表遵循原选项；异常说明记录 Rust 返回的原因。上游 JVM 异常的类名和 Java 栈帧会与 Rust 的诊断文本不同。[错误写出](src/engine/class_writer/method_errors.rs)
 
 `RuntimeImage::open` 将模块化 JDK 的每个模块作为独立库登记，按 JRT 的目录遍历和模块描述符顺序提供条目。随仓库固定的 `jimage-rs` 复用内存映射和资源索引，普通资源直接借用映射中的字节。读取压缩资源时，按镜像头的字节序逐层解码 ZIP 或 `compact-cp`。后者从镜像的共享字符串表重建 class 常量池，直接复制 Modified UTF-8 字节，保留 JVM 字符串的原始表示。[运行时类路径](src/engine/context_source/runtime.rs) · [镜像读取器及版本来源](vendor/jimage-rs/README.md)

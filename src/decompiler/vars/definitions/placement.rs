@@ -14,6 +14,7 @@ use crate::decompiler::flow::flatten::build_direct_graph;
 use crate::decompiler::ir::{ExprId, Ir, StatId, VarProcessorId};
 use crate::decompiler::stats::{LoopType, StatementKind};
 use crate::decompiler::vars::var_version_pair::VarVersionPair;
+use crate::engine::method_timeout::checkpoint;
 use crate::engine::{Cx, counter_container::CounterContainer};
 use crate::structs::attr::LocalVariable;
 use crate::types::MethodDescriptor;
@@ -80,6 +81,7 @@ pub(super) fn place(
     build_direct_graph(ir, root);
 
     for (&index, &stat) in scopes.definitions.iter() {
+        checkpoint();
         if implicit.0.contains(&index) {
             continue;
         }
@@ -159,6 +161,7 @@ struct DeclarationScopes {
 
 impl DeclarationScopes {
     fn init_statement(&mut self, ir: &Ir, stat: StatId) -> &JHashSet<i32> {
+        checkpoint();
         let mut counts = JHashMap::new();
         if let Some(list) = ir[stat].exprents {
             count_expression_vars(ir, ir[list].iter().copied(), &mut counts);

@@ -18,6 +18,7 @@ use super::exps::Expr;
 use super::flow::{DirectEdgeType, DirectGraph, flatten::build_direct_graph};
 use super::ir::{ExprId, ExprKind, ExprListId, Ir, StatId};
 use super::stats::{StatementKind, stat_edge::EdgeType};
+use crate::engine::method_timeout::checkpoint;
 use crate::engine::{Cx, counter_container::CounterContainer};
 use crate::structs::StructClass;
 
@@ -37,6 +38,7 @@ pub(crate) fn merge(
 ) -> std::io::Result<()> {
     let cx = &mut *cx.enter_method(counters);
     loop {
+        checkpoint();
         if eliminate::eliminate(cx, counters, root, class)? {
             continue;
         }

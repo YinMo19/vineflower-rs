@@ -16,6 +16,7 @@ use crate::code::code_constants::{
     OPC_MONITORENTER, OPC_MONITOREXIT, OPC_RETURN, OPC_SIPUSH,
 };
 use crate::decompiler::ir::{BlockId, Ir};
+use crate::engine::method_timeout::checkpoint;
 use crate::engine::Options;
 
 pub fn remove_dead_blocks(ir: &mut Ir, graph: &mut ControlFlowGraph) {
@@ -46,6 +47,7 @@ pub fn remove_empty_blocks(ir: &mut Ir, graph: &mut ControlFlowGraph, options: &
     loop {
         let mut deleted_ranges = false;
         for index in (0..graph.blocks.len()).rev() {
+            checkpoint();
             if remove_empty_block(ir, graph, graph.blocks[index], false, options) {
                 deleted_ranges = true;
                 break;
@@ -229,6 +231,7 @@ pub fn extend_synchronized_range_to_monitorexit(ir: &mut Ir, graph: &mut Control
     loop {
         let mut extended = false;
         for index in 0..graph.exceptions.len() {
+            checkpoint();
             let range = &graph.exceptions[index];
             let predecessors = range_boundary(&range.protected_range, |block| &ir[block].preds);
             if predecessors.len() != 1 || last_opcode(ir, predecessors[0]) != Some(OPC_MONITORENTER)
@@ -460,6 +463,7 @@ pub fn merge_basic_blocks(ir: &mut Ir, graph: &mut ControlFlowGraph, options: &O
     loop {
         let origin_block_count = graph.blocks.len();
         for index in 0..origin_block_count {
+            checkpoint();
             let block = graph.blocks[index];
             let &[next] = ir[block].succs.as_slice() else {
                 continue;

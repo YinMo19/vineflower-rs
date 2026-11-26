@@ -18,6 +18,7 @@ use crate::decompiler::ir::{BlockId, Ir, StatId};
 use crate::decompiler::sforms::InstructionRewrites;
 use crate::decompiler::stats::StatementKind;
 use crate::decompiler::vars::version_graph::VarVersionsGraph;
+use crate::engine::method_timeout::checkpoint;
 use crate::util::interpreter_util::equal_sets;
 
 use super::rewrite::{delete_area, remove_exception_instructions};
@@ -142,6 +143,7 @@ impl Comparison<'_> {
             mut store_vars,
         }) = pending.pop_front()
         {
+            checkpoint();
             let last = self.info.last.get(&catch).copied();
             if !self.compare_basic_blocks(
                 ir,
