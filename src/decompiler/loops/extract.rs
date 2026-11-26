@@ -7,9 +7,7 @@ use crate::decompiler::decompose::finish::condense_sequences;
 use crate::decompiler::exps::FunctionType;
 use crate::decompiler::ir::{EdgeId, Expr, ExprKind, Ir, StatId};
 use crate::decompiler::stats::stat_edge::{EdgeType, StatEdge};
-use crate::decompiler::stats::{
-    EdgeDirection::Backward, LoopType, STATEDGE_ALL, STATEDGE_DIRECT_ALL, Statement, StatementKind,
-};
+use crate::decompiler::stats::{LoopType, Statement, StatementKind};
 use crate::engine::{Cx, counter_container::CounterContainer};
 
 pub(crate) fn extract(cx: &mut Cx, counters: &mut CounterContainer, root: StatId) -> bool {
@@ -262,17 +260,12 @@ fn extract_if_block_into_loop(
     };
     let edge = branch.if_edge.unwrap();
     let old_destination = ir[edge].destination;
-    let old_type = ir[edge].edge_type.mask();
-    for mask in [old_type, STATEDGE_ALL, STATEDGE_DIRECT_ALL] {
-        ir[old_destination].remove_edge_from_index(Backward, mask, edge);
-    }
+    old_destination.remove_predecessor(ir, edge);
     // Retyping restores only the Break index on the old destination.
     // Java leaves that entry there when it registers the new destination.
     make_if_break(ir, loop_stat, if_stat, target, edge);
     ir[edge].destination = destination;
-    for mask in [EdgeType::Break.mask(), STATEDGE_ALL, STATEDGE_DIRECT_ALL] {
-        ir[destination].add_edge_to_index(Backward, mask, edge);
-    }
+    destination.add_predecessor(ir, edge);
     loop_stat.add_labeled_edge(ir, edge);
 
     let sequence = Statement::new_sequence(ir, counters, &[if_stat, target]);

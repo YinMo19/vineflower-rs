@@ -6,6 +6,7 @@
 use arcstr::ArcStr;
 
 use super::EdgeDirection::{Backward, Forward};
+use super::{STATEDGE_ALL, STATEDGE_DIRECT_ALL};
 use crate::decompiler::ir::{EdgeId, Ir, StatId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,6 +30,14 @@ impl EdgeType {
 
     pub const fn mask(self) -> u32 {
         self as u32
+    }
+
+    /// Every edge appears in its typed and all-edge views. The direct view
+    /// also includes it unless control is transferring to an exception handler.
+    pub(super) fn index_views(self) -> impl Iterator<Item = u32> {
+        [self.mask(), STATEDGE_ALL]
+            .into_iter()
+            .chain((self != Self::Exception).then_some(STATEDGE_DIRECT_ALL))
     }
 }
 
@@ -87,10 +96,8 @@ impl EdgeId {
     }
 
     pub fn change_destination(self, ir: &mut Ir, destination: StatId) {
-        ir[self]
-            .destination
-            .remove_edge_internal(ir, Backward, self);
-        destination.add_edge_internal(ir, Backward, self);
+        ir[self].destination.remove_predecessor(ir, self);
+        destination.add_predecessor(ir, self);
         ir[self].destination = destination;
     }
 
@@ -107,8 +114,9 @@ impl EdgeId {
         // Retyping changes the order among edges of this type. The all-edge
         // and direct-edge lists keep their existing order.
         for (stat, direction) in [(ir[self].source, Forward), (ir[self].destination, Backward)] {
-            ir[stat].remove_edge_from_index(direction, old_type.mask(), self);
-            ir[stat].add_edge_to_index(direction, new_type.mask(), self);
+            let index = ir[stat].edge_index_mut(direction);
+            index.remove(old_type.mask(), self);
+            index.add(new_type.mask(), self);
         }
         ir[self].edge_type = new_type;
     }

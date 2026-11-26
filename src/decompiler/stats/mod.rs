@@ -4,6 +4,7 @@
 //! `modules.decompiler.stats.Statement` variants and the
 //! operations shared by statements in a control-flow graph.
 
+mod edge_index;
 pub mod recognize;
 pub mod rewrite;
 pub mod stat_edge;
@@ -13,8 +14,8 @@ use std::sync::Arc;
 
 use arcstr::ArcStr;
 use indexmap::IndexSet;
-use rustc_hash::FxHashMap;
 
+use self::edge_index::EdgeIndex;
 use self::stat_edge::EdgeType;
 use crate::code::cfg::ControlFlowGraph;
 use crate::code::cfg::basic_block::BasicBlock;
@@ -205,8 +206,8 @@ pub struct Statement {
     pub label_edges: IndexSet<EdgeId>,
     pub exprents: Option<ExprListId>,
     pub var_definitions: Vec<ExprId>,
-    successor_edges: FxHashMap<u32, Vec<EdgeId>>,
-    predecessor_edges: FxHashMap<u32, Vec<EdgeId>>,
+    successor_edges: EdgeIndex,
+    predecessor_edges: EdgeIndex,
 }
 
 impl Statement {
@@ -229,8 +230,8 @@ impl Statement {
             label_edges: IndexSet::new(),
             exprents: None,
             var_definitions: Vec::new(),
-            successor_edges: FxHashMap::default(),
-            predecessor_edges: FxHashMap::default(),
+            successor_edges: EdgeIndex::default(),
+            predecessor_edges: EdgeIndex::default(),
         }
     }
 
@@ -360,14 +361,14 @@ impl Statement {
         ir.stats.push(statement)
     }
 
-    fn edge_index(&self, direction: EdgeDirection) -> &FxHashMap<u32, Vec<EdgeId>> {
+    fn edge_index(&self, direction: EdgeDirection) -> &EdgeIndex {
         match direction {
             EdgeDirection::Backward => &self.predecessor_edges,
             EdgeDirection::Forward => &self.successor_edges,
         }
     }
 
-    fn edge_index_mut(&mut self, direction: EdgeDirection) -> &mut FxHashMap<u32, Vec<EdgeId>> {
+    fn edge_index_mut(&mut self, direction: EdgeDirection) -> &mut EdgeIndex {
         match direction {
             EdgeDirection::Backward => &mut self.predecessor_edges,
             EdgeDirection::Forward => &mut self.successor_edges,
@@ -375,9 +376,7 @@ impl Statement {
     }
 
     fn edge_view(&self, direction: EdgeDirection, mask: u32) -> &[EdgeId] {
-        self.edge_index(direction)
-            .get(&mask)
-            .map_or(&[], Vec::as_slice)
+        self.edge_index(direction).view(mask)
     }
 
     pub fn all_successors(&self) -> &[EdgeId] {
@@ -389,11 +388,7 @@ impl Statement {
     }
 
     pub(crate) fn indexed_edges(&self) -> impl Iterator<Item = EdgeId> + '_ {
-        self.successor_edges
-            .values()
-            .chain(self.predecessor_edges.values())
-            .flatten()
-            .copied()
+        self.successor_edges.edges().chain(self.predecessor_edges.edges())
     }
 
     pub fn direct_successors(&self) -> &[EdgeId] {
@@ -409,26 +404,6 @@ impl Statement {
             StatementKind::BasicBlock { .. } | StatementKind::If(IfStatement { has_else: false, .. }) => true,
             StatementKind::Do(header) => header.ty != LoopType::Infinite,
             _ => false,
-        }
-    }
-
-    pub(super) fn add_edge_to_index(&mut self, direction: EdgeDirection, mask: u32, edge: EdgeId) {
-        self.edge_index_mut(direction)
-            .entry(mask)
-            .or_default()
-            .push(edge);
-    }
-
-    pub(super) fn remove_edge_from_index(
-        &mut self,
-        direction: EdgeDirection,
-        mask: u32,
-        edge: EdgeId,
-    ) {
-        if let Some(edges) = self.edge_index_mut(direction).get_mut(&mask)
-            && let Some(index) = edges.iter().position(|&entry| entry == edge)
-        {
-            edges.remove(index);
         }
     }
 
@@ -469,16 +444,8 @@ impl Statement {
         self.is_monitor_enter = false;
         self.contains_monitor_exit = false;
 
-        // Copy the direct view into the all-edge view. These are index changes;
-        // the edge objects and the statement's remaining metadata stay live.
-        for index in [&mut self.successor_edges, &mut self.predecessor_edges] {
-            index.remove(&EdgeType::Exception.mask());
-            if let Some(direct) = index.get(&STATEDGE_DIRECT_ALL).cloned() {
-                index.insert(STATEDGE_ALL, direct);
-            } else {
-                index.remove(&STATEDGE_ALL);
-            }
-        }
+        self.successor_edges.clear_exceptions();
+        self.predecessor_edges.clear_exceptions();
     }
 }
 
@@ -599,10 +566,14 @@ impl StatId {
         if let Some(closure) = ir[edge].closure {
             ir[closure].label_edges.insert(edge);
         }
-        destination.add_edge_internal(ir, EdgeDirection::Backward, edge);
+        destination.add_predecessor(ir, edge);
     }
 
-    /// Detach the predecessor entry while discarding an entire source subtree.
+    pub(crate) fn add_predecessor(self, ir: &mut Ir, edge: EdgeId) {
+        self.add_edge_internal(ir, EdgeDirection::Backward, edge);
+    }
+
+    /// Detach the incoming edge without changing the source's outgoing views.
     pub(crate) fn remove_predecessor(self, ir: &mut Ir, edge: EdgeId) {
         debug_assert_eq!(self, ir[edge].destination);
         self.remove_edge_internal(ir, EdgeDirection::Backward, edge);
@@ -624,19 +595,17 @@ impl StatId {
 
     fn add_edge_internal(self, ir: &mut Ir, direction: EdgeDirection, edge: EdgeId) {
         let kind = ir[edge].edge_type;
-        ir[self].add_edge_to_index(direction, kind.mask(), edge);
-        ir[self].add_edge_to_index(direction, STATEDGE_ALL, edge);
-        if kind != EdgeType::Exception {
-            ir[self].add_edge_to_index(direction, STATEDGE_DIRECT_ALL, edge);
+        let index = ir[self].edge_index_mut(direction);
+        for mask in kind.index_views() {
+            index.add(mask, edge);
         }
     }
 
     fn remove_edge_internal(self, ir: &mut Ir, direction: EdgeDirection, edge: EdgeId) {
         let kind = ir[edge].edge_type;
-        ir[self].remove_edge_from_index(direction, kind.mask(), edge);
-        ir[self].remove_edge_from_index(direction, STATEDGE_ALL, edge);
-        if kind != EdgeType::Exception {
-            ir[self].remove_edge_from_index(direction, STATEDGE_DIRECT_ALL, edge);
+        let index = ir[self].edge_index_mut(direction);
+        for mask in kind.index_views() {
+            index.remove(mask, edge);
         }
     }
 
