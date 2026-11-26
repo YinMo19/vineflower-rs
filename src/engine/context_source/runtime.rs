@@ -13,6 +13,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{CLASS_SUFFIX, ContextSource, Entries, Entry};
 use crate::code::bytecode_version::BytecodeVersion;
+mod boot_modules;
 use crate::engine::Options;
 use crate::structs::StructClass;
 use crate::util::data_input::DataInputFullStream;
@@ -23,7 +24,7 @@ const MAJOR_26: i32 = 70;
 /// `JrtFinder.JavaRuntimeContextSource`. Resources are exposed by module.
 pub struct RuntimeImage {
     home: PathBuf,
-    modules: Vec<Arc<dyn ContextSource>>,
+    modules: Vec<Arc<RuntimeModule>>,
 }
 
 impl RuntimeImage {
@@ -62,11 +63,28 @@ impl RuntimeImage {
                     module,
                     name,
                     entries: module_entries(paths, runtime_major.unwrap_or(major)),
-                }) as Arc<dyn ContextSource>);
+                }));
             }
         }
 
         Ok(Self { home, modules })
+    }
+
+    pub(crate) fn bootstrap_sources(&self) -> impl Iterator<Item = Arc<dyn ContextSource>> + '_ {
+        let modules = self
+            .modules
+            .iter()
+            .find(|module| module.module == "java.base")
+            .and_then(|base| boot_modules::read(base));
+        self.modules
+            .iter()
+            .filter(move |module| {
+                module.module == "java.base"
+                    || modules
+                        .as_ref()
+                        .is_some_and(|names| names.contains(&module.module))
+            })
+            .map(|module| Arc::clone(module) as Arc<dyn ContextSource>)
     }
 }
 
@@ -77,7 +95,11 @@ impl ContextSource for RuntimeImage {
 
     fn get_entries(&self) -> Entries {
         Entries {
-            child_contexts: self.modules.clone(),
+            child_contexts: self
+                .modules
+                .iter()
+                .map(|module| Arc::clone(module) as Arc<dyn ContextSource>)
+                .collect(),
             ..Entries::default()
         }
     }

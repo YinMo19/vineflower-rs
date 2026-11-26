@@ -15,7 +15,6 @@ use crate::decompiler::ir::ExprId;
 use crate::decompiler::stats::StatementKind;
 use crate::decompiler::vars::var_version_pair::VarVersionPair;
 use crate::engine::class_nodes::{ClassNodeId, LambdaInformation};
-use crate::structs::consts::PooledConstant;
 use crate::types::{
     CodeType, GenericMethodDescriptor, GenericType, GenericsMap, MethodDescriptor, VarType,
 };
@@ -187,17 +186,7 @@ impl Inference<'_> {
             return Ok(None);
         };
         let sam_descriptor = if let Some(constructor) = constructor {
-            let call = invocation(&self.cx.ir, constructor);
-            match call
-                .bootstrap_arguments
-                .as_ref()
-                .and_then(|args| args.first())
-            {
-                Some(Some(PooledConstant::Primitive(descriptor))) => {
-                    descriptor.get_string().as_str()
-                }
-                _ => return Err(invalid("Missing LambdaMetafactory SAM descriptor")),
-            }
+            invocation(&self.cx.ir, constructor).lambda_sam_descriptor()?
         } else {
             ""
         };

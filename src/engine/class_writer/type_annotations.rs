@@ -235,10 +235,7 @@ fn is_static_in_context(cx: &Cx, node: ClassNodeId, outermost_node: Option<Class
     let chain = |start: Option<ClassNodeId>| successors(start, |&id| cx.class_nodes[id].parent);
     let is_static = |id: ClassNodeId| cx.class_nodes[id].access & ACC_STATIC != 0;
     if chain(outermost_node).any(is_static) {
-        let current = cx
-            .current_class_node
-            .as_deref()
-            .and_then(|name| cx.class_nodes.id(name));
+        let current = cx.current_node();
         if chain(current).any(|id| id == node) {
             return true;
         }

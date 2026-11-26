@@ -685,6 +685,7 @@ version = "0.1.0"
 dependencies = [
  "arcstr",
  "bit-set",
+ "bitflags",
  "clap",
  "flate2",
  "index_vec",

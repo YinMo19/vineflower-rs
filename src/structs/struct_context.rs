@@ -9,7 +9,7 @@
 //! lives with it.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use arcstr::ArcStr;
@@ -21,7 +21,7 @@ use super::jar_context_source::{JarContextSource, is_jar_file};
 use super::single_file_context_source::SingleFileContextSource;
 use super::struct_class::StructClass;
 use crate::engine::Options;
-use crate::engine::context_source::ContextSource;
+use crate::engine::context_source::{ContextSource, RuntimeImage};
 use crate::engine::counter_container::ExpressionIds;
 use crate::renamer::pool_interceptor::PoolInterceptor;
 use crate::types::generic_main;
@@ -46,6 +46,8 @@ pub struct StructContext {
     /// Every class asked for so far; `None` for a name no unit has.
     classes: RwLock<FxHashMap<ArcStr, LoadedClass>>,
     units_by_class_name: RwLock<FxHashMap<ArcStr, Arc<ContextUnit>>>,
+    bootstrap_java_home: Option<PathBuf>,
+    bootstrap_runtime: OnceLock<Option<Box<StructContext>>>,
     abstract_names: FxHashMap<String, Vec<String>>,
 }
 
@@ -59,6 +61,10 @@ impl StructContext {
             lazy_units: Vec::new(),
             classes: RwLock::default(),
             units_by_class_name: RwLock::default(),
+            bootstrap_java_home: std::env::var_os("JAVA_HOME")
+                .filter(|home| !home.is_empty())
+                .map(PathBuf::from),
+            bootstrap_runtime: OnceLock::new(),
             abstract_names: FxHashMap::default(),
         }
     }
@@ -85,6 +91,29 @@ impl StructContext {
 
     pub fn get_class(&self, name: &str) -> Option<Arc<StructClass>> {
         self.resolver().get_class(name)
+    }
+
+    /// Select the host JDK for runtime-only lookups. Its classes are not
+    /// registered as ordinary source or library classes.
+    pub fn set_bootstrap_java_home(&mut self, home: Option<PathBuf>) {
+        self.bootstrap_java_home = home;
+        self.bootstrap_runtime.take();
+    }
+
+    /// Runtime class lookup for Vineflower's reflection fallback. This class
+    /// path contains only the configured JDK's bootstrap modules.
+    pub(crate) fn bootstrap_class(&self, name: &str) -> Option<Arc<StructClass>> {
+        self.bootstrap_runtime
+            .get_or_init(|| {
+                let image = RuntimeImage::open(self.bootstrap_java_home.as_deref()?).ok()?;
+                let mut context = Box::new(Self::new(Arc::clone(&self.options), None));
+                for source in image.bootstrap_sources() {
+                    context.add_unit(source, false, true).ok()?;
+                }
+                Some(context)
+            })
+            .as_deref()?
+            .get_class(name)
     }
 
     pub fn has_class(&self, name: &str) -> bool {
@@ -128,6 +157,7 @@ impl StructContext {
     ) -> io::Result<()> {
         let mut updated = Self::new(Arc::clone(&self.options), interceptor);
         updated.metadata_ids = self.metadata_ids.clone();
+        updated.bootstrap_java_home = self.bootstrap_java_home.clone();
         for unit in self.units.iter().filter(|unit| unit.root) {
             updated.add_unit(Arc::clone(&unit.source), unit.own, true)?;
         }
@@ -246,10 +276,21 @@ impl StructContext {
         index: i32,
         default: &'a str,
     ) -> &'a str {
+        self.abstract_parameter_name(class_name, method_name, descriptor, index)
+            .unwrap_or(default)
+    }
+
+    pub(crate) fn abstract_parameter_name(
+        &self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+        index: i32,
+    ) -> Option<&str> {
         self.abstract_names
             .get(&format!("{class_name} {method_name} {descriptor}"))
             .and_then(|params| params.get(index as usize))
-            .map_or(default, String::as_str)
+            .map(String::as_str)
     }
 
     pub fn get_units(&self) -> &[Arc<ContextUnit>] {

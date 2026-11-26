@@ -78,8 +78,12 @@ impl StructField {
         let name_index = input.read_unsigned_short()?;
         let descriptor_index = input.read_unsigned_short()?;
 
-        let (name, descriptor) =
-            pool.get_class_element(consts::FIELD, cl_qualified_name, name_index, descriptor_index);
+        let (name, descriptor) = pool.get_class_element(
+            consts::FIELD,
+            cl_qualified_name,
+            name_index,
+            descriptor_index,
+        );
         let attributes = read_attributes_with_context(input, pool, true, version, context)?;
 
         Ok(Self::new(
@@ -165,6 +169,20 @@ impl StructField {
     /// `getSignature()`: the generic type of the field as it is now.
     pub fn signature(&self) -> Option<Arc<GenericFieldDescriptor>> {
         self.signature.as_ref().map(|signature| signature.get())
+    }
+
+    pub(crate) fn verified_type(
+        &self,
+        cx: &crate::engine::Cx,
+        owner: &super::StructClass,
+        erased: &crate::types::VarType,
+    ) -> crate::types::VarType {
+        if let Some(signature) = self.shared_signature() {
+            signature.update(|s| s.verify_type(cx, owner.signature().as_deref(), erased));
+            signature.get().ty.clone()
+        } else {
+            erased.clone()
+        }
     }
 
     /// The cell behind [`signature`](Self::signature), for verifying it.

@@ -8,9 +8,10 @@ mod symbols;
 
 pub use symbols::precedence;
 
-use super::{BytecodeOffsets, ConstantValue};
+use super::{BytecodeOffsets, ConstantValue, ExprKind};
+use crate::decompiler::ir::{ExprId, Ir};
 use crate::engine::{Cx, import_collector};
-use crate::types::{CodeType, FieldDescriptor, VarType};
+use crate::types::{CodeType, FieldDescriptor, TypeFamily, VarType};
 use crate::util::{
     java_str::JavaString,
     text_buffer::TextBuffer,
@@ -147,13 +148,13 @@ pub fn render(
     Ok(buf)
 }
 
-fn add_offsets(buf: &mut TextBuffer, offsets: Option<&BytecodeOffsets>) {
+pub(crate) fn add_offsets(buf: &mut TextBuffer, offsets: Option<&BytecodeOffsets>) {
     for offset in offsets.into_iter().flat_map(BytecodeOffsets::iter) {
         buf.add_bytecode_mapping(offset as i32);
     }
 }
 
-fn escape_string(value: &JavaString, ascii: bool) -> String {
+pub(crate) fn escape_string(value: &JavaString, ascii: bool) -> String {
     let mut text = String::new();
     for unit in value.utf16() {
         escaped_unit(&mut text, unit, b'"', ascii);
@@ -194,7 +195,20 @@ pub(crate) fn static_field(
     descriptor: &FieldDescriptor,
     offsets: Option<&BytecodeOffsets>,
 ) -> TextBuffer {
-    let mut buf = TextBuffer::new(cx);
+    let mut buffer = TextBuffer::new(cx);
+    append_static_field(cx, &mut buffer, owner, name, descriptor, offsets, false);
+    buffer
+}
+
+pub(crate) fn append_static_field(
+    cx: &mut Cx,
+    buf: &mut TextBuffer,
+    owner: &str,
+    name: &str,
+    descriptor: &FieldDescriptor,
+    offsets: Option<&BytecodeOffsets>,
+    force_qualified: bool,
+) {
     if name == "TYPE" {
         let wrapper = VarType::from_signature_cl(owner, true);
         let primitive = wrapper
@@ -202,19 +216,49 @@ pub(crate) fn static_field(
             .or_else(|| (owner == "java/lang/Void").then_some(VarType::VARTYPE_VOID));
         if let Some(primitive) = primitive {
             buf.append_cast_type_name(cx, &primitive).append(".class");
-            return buf;
+            return;
         }
     }
-    let ambiguous = cx
-        .writing_method()
-        .and_then(|method| method.method.get_local_variable_attr())
-        .is_some_and(|lvt| lvt.contains_name(name));
-    if cx.current_class_node.as_deref() != Some(owner) || ambiguous {
+    if uses_qualified_static(cx, owner, name, force_qualified) {
         let dotted = import_collector::java_class_name(cx, owner);
         let short = import_collector::get_short_name_in_class_context(cx, &dotted);
         buf.append_all_classes(&short, owner).append_char('.');
     }
-    add_offsets(&mut buf, offsets);
+    add_offsets(buf, offsets);
     buf.append_field_with(name, false, owner, name, descriptor.clone());
-    buf
+}
+
+pub(crate) fn uses_qualified_static(
+    cx: &Cx,
+    owner: &str,
+    name: &str,
+    force_qualified: bool,
+) -> bool {
+    cx.current_class_node.as_deref() != Some(owner)
+        || cx
+            .writing_method()
+            .and_then(|method| method.method.get_local_variable_attr())
+            .is_some_and(|lvt| lvt.contains_name(name))
+        || force_qualified
+}
+
+/// ConstExprent.adjustConstType. Returns whether the expression is a constant.
+pub(crate) fn adjust_const_type(ir: &mut Ir, expr: ExprId, expected: &VarType) -> bool {
+    let ExprKind::Constant {
+        var_type, value, ..
+    } = &mut ir[expr].kind
+    else {
+        return false;
+    };
+    if (*expected == VarType::VARTYPE_CHAR || *expected == VarType::VARTYPE_CHARACTER)
+        && (*var_type == VarType::VARTYPE_BYTECHAR || *var_type == VarType::VARTYPE_SHORTCHAR)
+        && matches!(value, ConstantValue::Integer(8..=10 | 12 | 13 | 32..=126))
+    {
+        *var_type = VarType::VARTYPE_CHAR;
+    } else if (*expected == VarType::VARTYPE_INT || *expected == VarType::VARTYPE_INTEGER)
+        && var_type.type_family == TypeFamily::Integer
+    {
+        *var_type = VarType::VARTYPE_INT;
+    }
+    true
 }

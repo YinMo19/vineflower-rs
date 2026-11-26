@@ -42,6 +42,22 @@ pub(super) fn parameter_annotations(
     .flatten()
 }
 
+pub(super) fn append_parameter_annotations(
+    cx: &mut Cx,
+    buffer: &mut TextBuffer,
+    attrs: &Attributes,
+    parameter: usize,
+) -> io::Result<FxHashSet<String>> {
+    let mut filter = FxHashSet::default();
+    for annotation in parameter_annotations(attrs, parameter) {
+        filter.insert(render(cx, annotation, -1)?.convert_to_string_and_allow_data_discard());
+        buffer
+            .append_buffer(&render(cx, annotation, -1)?)
+            .append_char(' ');
+    }
+    Ok(filter)
+}
+
 pub(super) fn append_annotations(
     cx: &mut Cx,
     buffer: &mut TextBuffer,

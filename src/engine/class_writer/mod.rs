@@ -7,16 +7,25 @@ pub(super) mod annotations;
 pub(super) mod metadata;
 pub(crate) mod type_annotations;
 
+mod class;
 mod class_references14;
+mod comments;
 mod declaration;
 mod enums;
+mod fields;
 mod initializers;
 pub mod javadoc;
+mod lambda;
 mod late_methods;
+mod method_errors;
+mod method_parameters;
+mod methods;
 mod record_components;
 mod records;
 
+pub use class::write_class;
 pub use declaration::write_class_definition;
+pub(crate) use lambda::write_lambda;
 
 use super::{
     Cx,
@@ -26,6 +35,46 @@ use super::{
 use crate::code::code_constants::ACC_ENUM;
 use crate::structs::StructMember;
 use std::io;
+
+/// Render within a declared method's ClassWriter context. Local classes and
+/// lambda bodies can enter another method and then return to this one.
+pub fn with_method_for_writing<T>(
+    cx: &mut Cx,
+    node: ClassNodeId,
+    index: usize,
+    write: impl FnOnce(&mut Cx) -> io::Result<T>,
+) -> io::Result<T> {
+    let owner = cx
+        .class_nodes
+        .wrapper_owner(node)
+        .filter(|&owner| {
+            cx.class_nodes[owner]
+                .wrapper
+                .as_ref()
+                .is_some_and(|w| index < w.methods.len())
+        })
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "missing method wrapper for writing",
+            )
+        })?;
+    cx.with_class_node(node, |cx| {
+        struct MethodScope<'a> {
+            cx: &'a mut Cx,
+            previous: Option<MethodSlot>,
+        }
+        impl Drop for MethodScope<'_> {
+            fn drop(&mut self) {
+                self.cx.current_method_wrapper = self.previous;
+            }
+        }
+        let previous = cx
+            .current_method_wrapper
+            .replace(MethodSlot { node: owner, index });
+        write(MethodScope { cx, previous }.cx)
+    })
+}
 
 /// Run the built-in Java passes at ClassWriter.invokeProcessors. The class and
 /// its nested methods must already have gone through ClassesProcessor.processClass.

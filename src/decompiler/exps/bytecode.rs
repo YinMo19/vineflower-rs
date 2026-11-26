@@ -24,6 +24,11 @@ enum OffsetRanges {
 }
 
 impl BytecodeOffsets {
+    /// BitSet.length, one past the last marked bytecode position.
+    pub(crate) fn length(&self) -> i32 {
+        self.ranges().last().map_or(0, |range| range.end as i32)
+    }
+
     /// Every byte of a decoded instruction contributes its position. Negative
     /// offsets belong to synthesized instructions.
     pub fn for_instruction(offset: i32, length: i32) -> Option<Self> {

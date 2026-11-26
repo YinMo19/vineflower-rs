@@ -179,16 +179,44 @@ impl TextBuffer {
 
     /// Append the Java type spelling with class tokens at their UTF-16 positions.
     pub fn append_cast_type_name(&mut self, cx: &mut Cx, ty: &crate::types::VarType) -> &mut Self {
-        use crate::{decompiler::expr_processor::get_cast_type_name, types::CodeType};
-        let name = get_cast_type_name(cx, ty);
+        let name = crate::decompiler::expr_processor::get_cast_type_name(cx, ty);
+        self.append_cast_type_name_with(cx, &name, ty)
+    }
+
+    pub fn append_cast_type_name_with(
+        &mut self,
+        cx: &mut Cx,
+        name: &str,
+        ty: &crate::types::VarType,
+    ) -> &mut Self {
+        use crate::types::CodeType;
         if ty.ty != CodeType::Object {
-            return self.append(&name);
+            return self.append(name);
         }
         let (component, brackets) = name.split_at(name.len() - 2 * ty.array_dim as usize);
-        let start = self.length();
-        self.append_all_classes(component, ty.name());
-        self.add_generic_type_tokens(cx, start, component, ty);
-        self.append(brackets)
+        self.append_type_name_with(cx, component, ty)
+            .append(brackets)
+    }
+
+    pub fn append_type_name(&mut self, cx: &mut Cx, ty: &crate::types::VarType) -> &mut Self {
+        let name = crate::decompiler::expr_processor::type_name(cx, ty, true);
+        self.append_type_name_with(cx, &name, ty)
+    }
+
+    pub fn append_type_name_with(
+        &mut self,
+        cx: &mut Cx,
+        name: &str,
+        ty: &crate::types::VarType,
+    ) -> &mut Self {
+        if ty.ty == crate::types::CodeType::Object {
+            let start = self.length();
+            self.append_all_classes(name, ty.name());
+            self.add_generic_type_tokens(cx, start, name, ty);
+        } else {
+            self.append(name);
+        }
+        self
     }
 
     /// Append a Java type while consuming the paths of its type-use annotations.
@@ -211,6 +239,20 @@ impl TextBuffer {
             flush,
         )?;
         Ok(self)
+    }
+
+    pub fn add_type_name_token(
+        &mut self,
+        cx: &mut Cx,
+        ty: &crate::types::VarType,
+        index: i32,
+    ) -> &mut Self {
+        if ty.ty == crate::types::CodeType::Object {
+            let name = crate::decompiler::expr_processor::type_name(cx, ty, true);
+            self.add_all_class_tokens(index, &name, ty.name());
+            self.add_generic_type_tokens(cx, index, &name, ty);
+        }
+        self
     }
 
     fn add_generic_type_tokens(

@@ -78,16 +78,24 @@ impl Invocation {
 
 pub(crate) struct Inference<'a> {
     pub cx: &'a mut Cx,
-    active_method: Arc<StructMethod>,
+    expanded_method: Option<Arc<StructMethod>>,
     lambda_variables: JHashMap<Option<ArcStr>, VarType>,
     active: FxHashSet<ExprId>,
 }
 
 impl<'a> Inference<'a> {
     pub(crate) fn at_end(cx: &'a mut Cx, active_method: Arc<StructMethod>) -> Self {
+        Self::new(cx, Some(active_method))
+    }
+
+    pub(crate) fn for_writing(cx: &'a mut Cx) -> Self {
+        Self::new(cx, None)
+    }
+
+    fn new(cx: &'a mut Cx, expanded_method: Option<Arc<StructMethod>>) -> Self {
         Self {
             cx,
-            active_method,
+            expanded_method,
             lambda_variables: JHashMap::new(),
             active: FxHashSet::default(),
         }
@@ -164,21 +172,17 @@ impl<'a> Inference<'a> {
 
     fn current_class(&self) -> Option<Arc<StructClass>> {
         self.cx
-            .current_class_node
-            .as_deref()
-            .and_then(|name| self.cx.class_nodes.get(name))
-            .map(|node| Arc::clone(&node.class))
+            .current_node()
+            .map(|node| Arc::clone(&self.cx.class_nodes[node].class))
     }
 
-    fn named_generics(&self) -> NamedGenerics {
+    pub(crate) fn named_generics(&self) -> NamedGenerics {
         let mut names = NamedGenerics::new();
-        let mut class = self
+        let mut class = self.cx.current_node();
+        let mut method = self
             .cx
-            .current_class_node
-            .as_deref()
-            .and_then(|name| self.cx.class_nodes.id(name));
-        // There is no CURRENT_METHOD_WRAPPER during ClassWrapper.init.
-        let mut method = None;
+            .writing_method()
+            .map(|wrapper| wrapper.method.as_ref());
         loop {
             if let Some(signature) = class.and_then(|id| self.cx.class_nodes[id].class.signature())
             {
@@ -217,7 +221,7 @@ impl<'a> Inference<'a> {
         names
     }
 
-    fn mark_instance(&mut self, expr: ExprId) {
+    pub(crate) fn mark_instance(&mut self, expr: ExprId) {
         match &self.cx.ir[expr].kind {
             ExprKind::Invocation(_) => self.invocation_state(expr).is_invocation_instance = true,
             ExprKind::Function {

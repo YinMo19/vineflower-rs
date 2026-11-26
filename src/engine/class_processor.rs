@@ -23,6 +23,7 @@ pub fn prepare_class(cx: &mut Cx, root: ClassNodeId) -> io::Result<()> {
     }
     cx.imports = ImportCollector::for_root(&cx.struct_context, &cx.class_nodes, node);
     cx.expression_ids = Default::default(); // DecompilerContext.startClass
+    cx.source_mapper = Default::default();
     let package_info =
         node.class.is_synthetic() && node.simple_name.as_deref() == Some("package-info");
     let module_info = node.class.has_modifier(ACC_MODULE) && node.class.attributes.module.is_some();
@@ -109,8 +110,70 @@ pub fn write_metadata(
     } else {
         return Ok(false);
     };
-    cx.class_nodes[root].wrapper = None;
+    release_root(cx, root);
     result.map(|()| true)
+}
+
+/// Write a complete prepared compilation unit with imports, line wrapping
+/// and source mappings, then release its root wrapper.
+pub fn write_class(cx: &mut Cx, class: &StructClass, output: &mut TextBuffer) -> io::Result<()> {
+    let root = cx.class_nodes.id(&class.qualified_name).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Class is not registered in this compilation group",
+        )
+    })?;
+    if cx.class_nodes[root].kind != ClassKind::Root || write_metadata(cx, class, output)? {
+        return Ok(());
+    }
+    let result = (|| {
+        let mut body = TextBuffer::new(cx);
+        super::class_writer::write_class(cx, root, &mut body, 0)?;
+        body.reformat();
+        for ((owner, key), mut tracer) in body.get_tracers() {
+            let Some(key) = key else { continue };
+            if let Some(owner_class) = cx.classes().get_class(&owner)
+                && let Some(method) = owner_class.get_method_by_key(&key)
+            {
+                tracer.set_line_number_table(method.attributes.line_number_table.clone());
+                cx.source_mapper.add_tracer(&owner, &key, &mut tracer);
+            }
+        }
+        if let Some((package, _)) = class.qualified_name.rsplit_once('/') {
+            output
+                .append("package ")
+                .append(&package.replace('/', "."))
+                .append_char(';')
+                .append_line_separator()
+                .append_line_separator();
+        }
+        write_imports(cx, output, true);
+        let header_lines = output.count_lines();
+        output.append_buffer(&body);
+        if cx.options.bytecode_source_mapping {
+            cx.source_mapper.add_total_offset(header_lines);
+            if cx.options.dump_original_lines {
+                output.dump_original_line_numbers(&cx.source_mapper.original_lines_mapping());
+            }
+            if cx.options.unit_test_mode {
+                output.append_line_separator();
+                cx.source_mapper.dump_mapping(output, true);
+            }
+        }
+        Ok(())
+    })();
+    release_root(cx, root);
+    result
+}
+
+fn release_root(cx: &mut Cx, root: ClassNodeId) {
+    let node = &mut cx.class_nodes[root];
+    node.wrapper = None;
+    // Method bytecode is owned by its Rust processing scope. Nested wrappers
+    // remain available to constructor calls in other compilation units.
+    for method in &node.class.methods {
+        method.clear_variable_namer();
+    }
 }
 
 fn append_wrapper_order(classes: &ClassNodes, id: ClassNodeId, order: &mut Vec<ClassNodeId>) {

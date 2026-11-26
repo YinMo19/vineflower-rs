@@ -29,11 +29,20 @@ pub fn get_cast_type_name(cx: &mut Cx, ty: &VarType) -> String {
 }
 
 pub(crate) fn cast_type_name(cx: &mut Cx, ty: &VarType, short: bool) -> String {
-    let mut name = match ty.ty {
+    let mut name = type_name(cx, ty, short);
+    for _ in 0..ty.array_dim {
+        name.push_str("[]");
+    }
+    name
+}
+
+/// ExprProcessor.getTypeName spells the element type. Array brackets belong to the caller.
+pub(crate) fn type_name(cx: &mut Cx, ty: &VarType, short: bool) -> String {
+    match ty.ty {
         CodeType::Object if ty.is_generic() => ty.get_cast_name(cx),
         CodeType::Object => {
             let name = ty.name();
-            let dotted = import_collector::java_class_name(cx,name);
+            let dotted = import_collector::java_class_name(cx, name);
             if short {
                 import_collector::get_short_name(cx, &dotted)
             } else {
@@ -58,9 +67,5 @@ pub(crate) fn cast_type_name(cx: &mut Cx, ty: &VarType, short: bool) -> String {
             other => panic!("invalid type: {other:?}"),
         }
         .to_owned(),
-    };
-    for _ in 0..ty.array_dim {
-        name.push_str("[]");
     }
-    name
 }

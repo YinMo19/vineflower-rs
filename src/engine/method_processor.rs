@@ -196,6 +196,9 @@ impl StructuredMethod {
         while processor.iterate_graph(cx, class, &mut self)? {
             self.reparse(cx)?;
         }
+        cx.ir[self.flow.variables]
+            .synthetic_semaphores
+            .extend(processor.synthetic_semaphores.iter().copied());
         Ok(RecoveredMethod {
             structured: self,
             synthetic_semaphores: processor.synthetic_semaphores,
@@ -234,7 +237,7 @@ impl InitialMethod {
     pub fn structure(mut self, cx: &mut Cx) -> io::Result<StructuredMethod> {
         structure_root(cx, &mut self.flow.counters, self.root)?;
         let method = self.root.method(&cx.ir);
-        let mut descriptor = MethodDescriptor::parse_descriptor(&method.descriptor);
+        let descriptor = MethodDescriptor::parse_descriptor(&method.descriptor);
         if let Some(signature) = method.shared_signature() {
             descriptor.add_generic_descriptor(Arc::clone(signature));
         }

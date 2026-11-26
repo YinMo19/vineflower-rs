@@ -28,19 +28,19 @@ impl Field {
     }
 
     pub(super) const fn integer(name: &'static str) -> Self {
-        Self::new("java/lang/Integer", name, "I")
+        Self::new("java/lang/Integer", name, "Ljava/lang/Integer;")
     }
     pub(super) const fn long(name: &'static str) -> Self {
-        Self::new("java/lang/Long", name, "J")
+        Self::new("java/lang/Long", name, "Ljava/lang/Long;")
     }
     const fn float(name: &'static str) -> Self {
-        Self::new("java/lang/Float", name, "F")
+        Self::new("java/lang/Float", name, "Ljava/lang/Float;")
     }
     const fn double(name: &'static str) -> Self {
-        Self::new("java/lang/Double", name, "D")
+        Self::new("java/lang/Double", name, "Ljava/lang/Double;")
     }
     const fn math(name: &'static str) -> Self {
-        Self::new("java/lang/Math", name, "D")
+        Self::new("java/lang/Math", name, "Ljava/lang/Double;")
     }
 
     fn buffer(self, cx: &mut Cx, offsets: Option<&BytecodeOffsets>) -> TextBuffer {

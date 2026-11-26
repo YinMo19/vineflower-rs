@@ -29,6 +29,7 @@ path = "test/class_nodes.rs"
 [dependencies]
 arcstr = "1.2.0"
 bit-set = "0.11.1"
+bitflags = "2"
 clap = { version = "4.6", features = ["derive"] }
 flate2 = "1"
 index_vec = "0.1.4"

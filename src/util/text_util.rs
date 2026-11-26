@@ -3,6 +3,8 @@
 
 //! `util.TextUtil`: identifier checks and other small text helpers.
 
+use std::borrow::Cow;
+
 use unicode_general_category::{GeneralCategory, get_general_category};
 
 use crate::code::BytecodeVersion;
@@ -40,9 +42,29 @@ pub fn is_valid_identifier(id: &str, version: BytecodeVersion, mt: &StructMethod
     is_java_identifier(id) && !is_keyword(id, version, mt)
 }
 
-fn is_java_identifier(id: &str) -> bool {
+pub(crate) fn is_java_identifier(id: &str) -> bool {
     let mut units = id.encode_utf16();
     units.next().is_some_and(is_java_identifier_start) && units.all(is_java_identifier_part)
+}
+
+/// `ClassWriter.toValidJavaIdentifier`: replace each invalid UTF-16 unit.
+pub fn to_valid_java_identifier(name: &str) -> Cow<'_, str> {
+    if name.is_empty() || is_java_identifier(name) {
+        return Cow::Borrowed(name);
+    }
+    let units: Vec<_> = name
+        .encode_utf16()
+        .enumerate()
+        .map(|(index, unit)| {
+            let valid = if index == 0 {
+                is_java_identifier_start(unit)
+            } else {
+                is_java_identifier_part(unit)
+            };
+            if valid { unit } else { u16::from(b'_') }
+        })
+        .collect();
+    Cow::Owned(String::from_utf16(&units).unwrap())
 }
 
 /// `Character.isJavaIdentifierStart(char)`.

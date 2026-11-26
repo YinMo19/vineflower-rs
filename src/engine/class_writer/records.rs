@@ -6,7 +6,8 @@ use std::{borrow::Cow, sync::Arc};
 
 use crate::code::code_constants::INIT_NAME;
 use crate::decompiler::exps::{Expr, ExprKind, Variable};
-use crate::decompiler::ir::{ExprId, Ir};
+use crate::decompiler::ir::{ExprId, Ir, StatId};
+use crate::decompiler::stats::StatementKind;
 use crate::decompiler::vars::var_version_pair::VarVersionPair;
 use crate::engine::Cx;
 use crate::engine::class_wrapper::MethodSlot;
@@ -23,6 +24,91 @@ pub(super) fn canonical_constructor<'a>(
     }
     desc.push_str(")V");
     class.get_method(INIT_NAME, &desc)
+}
+
+pub(super) fn has_annotations(method: &StructMethod) -> bool {
+    method.attributes.runtime_visible_annotations.is_some()
+        || method.attributes.runtime_invisible_annotations.is_some()
+}
+
+/// `RecordHelper.isHiddenRecordMethod`.
+pub(super) fn is_hidden_record_method(
+    cx: &Cx,
+    class: &StructClass,
+    method: &StructMethod,
+    root: StatId,
+) -> bool {
+    let Some(components) = class.get_record_components() else {
+        return false;
+    };
+    let Some(block) = cx.ir[root].first else {
+        return false;
+    };
+    if !matches!(cx.ir[block].kind, StatementKind::BasicBlock { .. }) {
+        return false;
+    }
+    let Some(list) = cx.ir[block].exprents else {
+        return false;
+    };
+    let ir = &cx.ir;
+    let list = &ir[list];
+    if let Some(&first) = list.first()
+        && let ExprKind::Exit {
+            value: Some(value), ..
+        } = ir[first].kind
+    {
+        match &ir[value].kind {
+            ExprKind::Invocation(call)
+                if matches!(
+                    (method.name.as_str(), method.descriptor.as_str()),
+                    ("equals", "(Ljava/lang/Object;)Z")
+                        | ("hashCode", "()I")
+                        | ("toString", "()Ljava/lang/String;")
+                ) && call.bootstrap_method.as_ref().is_some_and(|bootstrap| {
+                    bootstrap.classname.as_deref() == Some("java/lang/runtime/ObjectMethods")
+                        && bootstrap.elementname == "bootstrap"
+                }) =>
+            {
+                return true;
+            }
+            ExprKind::Field(field)
+                if field.name == method.name
+                    && field
+                        .instance
+                        .and_then(|instance| Expr::variable(ir, instance))
+                        .is_some_and(|var| var.index == 0) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    if method.name != INIT_NAME || has_annotations(method) || list.len() != components.len() {
+        return false;
+    }
+    let mut previous_slot = 0;
+    for (&expr, component) in list.iter().zip(components) {
+        let ExprKind::Assignment { left, right, .. } = ir[expr].kind else {
+            return false;
+        };
+        let ExprKind::Field(field) = &ir[left].kind else {
+            return false;
+        };
+        let Some(parameter) = Expr::variable(ir, right) else {
+            return false;
+        };
+        if field.name != component.name
+            || field
+                .instance
+                .and_then(|instance| Expr::variable(ir, instance))
+                .is_none_or(|var| var.index != 0)
+            || parameter.index <= previous_slot
+        {
+            return false;
+        }
+        previous_slot = parameter.index;
+    }
+    true
 }
 
 /// `RecordHelper.fixupCanonicalConstructor`.

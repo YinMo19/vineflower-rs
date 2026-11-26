@@ -14,7 +14,7 @@ use crate::code::code_constants::{ACC_ENUM, ACC_PRIVATE, ACC_PROTECTED, ACC_PUBL
 use crate::decompiler::exps::{Expr, ExprKind, Invocation, InvocationFunction};
 use crate::decompiler::ir::ExprId;
 use crate::engine::Cx;
-use crate::engine::class_nodes::{ClassKind, ClassNode};
+use crate::engine::class_nodes::{ClassKind, ClassNode, ClassNodeId};
 use crate::structs::{StructClass, StructMember, StructMethod};
 use crate::types::{CodeType, GenericType, GenericsMap, TypeFamily, VarType};
 use crate::util::jhash::{JHashMap, JHashSet};
@@ -203,6 +203,7 @@ impl Inference<'_> {
                 arguments.len(),
                 constructor,
             )?;
+            let common = self.common_class_generics(&owner, &method);
             for (index, formal) in slots.zip(&signature.parameter_types) {
                 if !formal.is_generic() {
                     continue;
@@ -255,8 +256,12 @@ impl Inference<'_> {
                     if actual.is_generic() {
                         let mut temporary = GenericsMap::new();
                         formal.map_gen_vars_to(self.cx, &actual, &mut temporary);
-                        // Java only protects class-scoped variables from lowering
-                        // when CURRENT_METHOD_WRAPPER is set during writing.
+                        VarType::clean_lowered_generic_types(
+                            &mut temporary,
+                            formal,
+                            &actual,
+                            Some(&common),
+                        );
                         for (from, to) in temporary.iter() {
                             if !excluded.contains(from) {
                                 parameter_generics.insert(from.clone());
@@ -361,6 +366,38 @@ impl Inference<'_> {
         Ok(inferred.unwrap_or(erased))
     }
 
+    fn common_class_generics(
+        &self,
+        owner: &StructClass,
+        method: &StructMethod,
+    ) -> JHashSet<VarType> {
+        let mut names = JHashSet::new();
+        if method.has_modifier(ACC_STATIC)
+            || self
+                .cx
+                .writing_method()
+                .is_none_or(|wrapper| wrapper.method.has_modifier(ACC_STATIC))
+        {
+            return names;
+        }
+        let nodes = &self.cx.class_nodes;
+        let parent = |&id: &ClassNodeId| {
+            let node = &nodes[id];
+            (node.access & ACC_STATIC == 0)
+                .then_some(node.parent)
+                .flatten()
+        };
+        let parents: Vec<_> = std::iter::successors(self.cx.current_node(), parent).collect();
+        for id in std::iter::successors(nodes.id(&owner.qualified_name), parent) {
+            if parents.contains(&id)
+                && let Some(signature) = nodes[id].class.signature()
+            {
+                names.extend(signature.fparameters.iter().map(|name| name_type(name)));
+            }
+        }
+        names
+    }
+
     fn excluded_lambda_generics(
         &self,
         expr: ExprId,
@@ -406,9 +443,13 @@ impl Inference<'_> {
         else {
             return Ok(excluded);
         };
-        // The active method is the only method expanded at this boundary.
+        // During ClassWrapper.init, only the active method's sequence is expanded.
         let Some(method) = interface.methods.iter().find(|method| {
-            !method.has_modifier(ACC_STATIC) && !Arc::ptr_eq(method, &self.active_method)
+            !method.has_modifier(ACC_STATIC)
+                && self
+                    .expanded_method
+                    .as_ref()
+                    .is_none_or(|active| !Arc::ptr_eq(method, active))
         }) else {
             return Ok(excluded);
         };

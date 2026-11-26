@@ -10,7 +10,6 @@ use crate::code::code_constants::*;
 use crate::engine::{
     Cx,
     class_nodes::{ClassKind, ClassNodeId},
-    import_collector::java_class_name,
 };
 use crate::structs::{Attributes, StructClass, StructMember};
 use crate::types::{GenericClassDescriptor, VarType};
@@ -27,7 +26,7 @@ pub fn write_class_definition(
     cx.with_class_node(node, |cx| append_definition(cx, node, buffer, indent))
 }
 
-fn append_definition(
+pub(super) fn append_definition(
     cx: &mut Cx,
     node: ClassNodeId,
     buffer: &mut TextBuffer,
@@ -74,7 +73,7 @@ fn append_definition(
         flags &= !(ACC_PUBLIC | ACC_STATIC);
     }
 
-    append_class_comments(cx, buffer, &class, synthetic, indent);
+    append_class_comments(cx, buffer, &class, synthetic, indent)?;
     annotations::append_annotations(cx, buffer, &class.attributes, indent, -1)?;
     buffer.append_indent(indent);
     if is_enum {
@@ -208,29 +207,27 @@ fn append_definition(
 }
 
 fn append_class_comments(
-    cx: &Cx,
+    cx: &mut Cx,
     buffer: &mut TextBuffer,
     class: &StructClass,
     synthetic: bool,
     indent: i32,
-) {
+) -> io::Result<()> {
     append_deprecation(buffer, &class.attributes, indent);
-    if let Some(old) = cx
+    let old = cx
         .pool_interceptor
         .as_ref()
         .and_then(|pool| pool.get_old_name(&class.qualified_name))
-    {
-        buffer
-            .append_indent(indent)
-            .append("// $VF: renamed from: ")
-            .append(&java_class_name(cx, old))
-            .append_line_separator();
-    }
+        .map(str::to_owned);
+    super::comments::append_rename_comment(
+        cx,
+        buffer,
+        old.as_deref(),
+        super::comments::RenameKind::Class,
+        indent,
+    )?;
     if synthetic {
-        buffer
-            .append_indent(indent)
-            .append("// $VF: synthetic class")
-            .append_line_separator();
+        super::comments::append_comment(buffer, "synthetic class", indent);
     }
     if let Some(provider) = &cx.javadoc {
         let style = provider.class_style(class);
@@ -238,6 +235,7 @@ fn append_class_comments(
             javadoc::append(buffer, style, &doc, indent);
         }
     }
+    Ok(())
 }
 
 pub(super) fn append_modifiers(buffer: &mut TextBuffer, flags: i32) {

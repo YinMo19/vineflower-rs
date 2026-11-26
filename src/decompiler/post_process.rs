@@ -3,14 +3,14 @@
 
 //! Return and monitor rewrites after switch simplification.
 
-use super::exps::{ConstantValue, ExitType, Expr, ExprKind, Variable};
+use super::exps::{ExitType, Expr, ExprKind, Variable};
 use super::ir::{ExprId, Ir, StatId, VarProcessorId};
 use super::stats::StatementKind;
 use crate::engine::{
     Cx,
     counter_container::{CounterContainer, VAR_COUNTER},
 };
-use crate::types::{TypeFamily, VarType};
+use crate::types::VarType;
 
 fn dummy_exit(ir: &Ir, root: StatId) -> StatId {
     let StatementKind::Root { dummy_exit, .. } = ir[root].kind else {
@@ -32,24 +32,7 @@ pub(crate) fn adjust_returns(ir: &mut Ir, root: StatId, expected: &VarType) -> b
             continue;
         }
         for expr in Expr::all_exprents(ir, exit, true, false) {
-            if let ExprKind::Constant {
-                var_type, value, ..
-            } = &mut ir[expr].kind
-            {
-                visited = true;
-                if (*expected == VarType::VARTYPE_CHAR || *expected == VarType::VARTYPE_CHARACTER)
-                    && (*var_type == VarType::VARTYPE_BYTECHAR
-                        || *var_type == VarType::VARTYPE_SHORTCHAR)
-                    && matches!(value, ConstantValue::Integer(8..=10 | 12 | 13 | 32..=126))
-                {
-                    *var_type = VarType::VARTYPE_CHAR;
-                } else if (*expected == VarType::VARTYPE_INT
-                    || *expected == VarType::VARTYPE_INTEGER)
-                    && var_type.type_family == TypeFamily::Integer
-                {
-                    *var_type = VarType::VARTYPE_INT;
-                }
-            }
+            visited |= super::exps::literal::adjust_const_type(ir, expr, expected);
         }
     }
     visited

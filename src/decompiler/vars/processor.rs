@@ -27,6 +27,7 @@ pub struct VarProcessor {
     pub inherited_names: FxHashMap<VarVersionPair, Option<ArcStr>>,
     pub sources: FxHashMap<VarVersionPair, (ArcStr, VarVersionPair)>,
     pub nested_processed: bool,
+    pub synthetic_semaphores: FxHashSet<i32>,
     pub external_vars: FxHashSet<VarVersionPair>,
     pub this_vars: JHashMap<VarVersionPair, ArcStr>,
     pub name_collector: VarNamesCollector,

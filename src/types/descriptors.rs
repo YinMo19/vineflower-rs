@@ -6,7 +6,7 @@
 
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use arcstr::ArcStr;
 
@@ -51,12 +51,23 @@ impl Hash for FieldDescriptor {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct MethodDescriptor {
     pub params: Vec<VarType>,
     pub ret: VarType,
     descriptor: ArcStr,
-    pub generic_info: Option<Arc<SharedSignature<GenericMethodDescriptor>>>,
+    generic_info: RwLock<Option<Arc<SharedSignature<GenericMethodDescriptor>>>>,
+}
+
+impl Clone for MethodDescriptor {
+    fn clone(&self) -> Self {
+        Self {
+            params: self.params.clone(),
+            ret: self.ret.clone(),
+            descriptor: self.descriptor.clone(),
+            generic_info: RwLock::new(self.generic_info()),
+        }
+    }
 }
 
 impl MethodDescriptor {
@@ -88,7 +99,7 @@ impl MethodDescriptor {
             params,
             ret: VarType::from_signature(&descriptor[parenth + 1..]),
             descriptor: descriptor.into(),
-            generic_info: None,
+            generic_info: RwLock::default(),
         }
     }
 
@@ -101,8 +112,14 @@ impl MethodDescriptor {
         })
     }
 
-    pub fn add_generic_descriptor(&mut self, desc: Arc<SharedSignature<GenericMethodDescriptor>>) {
-        self.generic_info = Some(desc);
+    pub fn generic_info(&self) -> Option<Arc<SharedSignature<GenericMethodDescriptor>>> {
+        self.generic_info.read().unwrap().clone()
+    }
+
+    /// Return expressions of the same method share this descriptor. Lambda
+    /// inference can replace its generic signature while writing an allocation.
+    pub fn add_generic_descriptor(&self, desc: Arc<SharedSignature<GenericMethodDescriptor>>) {
+        *self.generic_info.write().unwrap() = Some(desc);
     }
 
     pub fn as_str(&self) -> &str {

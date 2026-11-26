@@ -34,7 +34,8 @@ pub(super) fn append_components(
                 .append_possible_newline_or(" ", false);
         }
         let written = append_annotations(cx, buffer, class, component, constructor, i)?;
-        let mut ty = verified_field_type(cx, class, component);
+        let erased = VarType::from_signature(&component.descriptor);
+        let mut ty = component.verified_type(cx, class, &erased);
         let vararg = varargs && i + 1 == components.len();
         if vararg {
             ty = ty.decrease_array_dim();
@@ -69,21 +70,6 @@ pub(super) fn append_components(
         .append_possible_newline_or("", true)
         .pop_newline_group();
     Ok(())
-}
-
-pub(super) fn verified_field_type(
-    cx: &Cx,
-    class: &StructClass,
-    field: &StructRecordComponent,
-) -> VarType {
-    let erased = VarType::from_signature(&field.descriptor);
-    match field.shared_signature() {
-        Some(signature) => {
-            signature.update(|s| s.verify_type(cx, class.signature().as_deref(), &erased));
-            signature.get().ty.clone()
-        }
-        None => erased,
-    }
 }
 
 fn append_annotations(

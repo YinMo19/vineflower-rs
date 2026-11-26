@@ -16,9 +16,9 @@ use crate::code::code_constants::{
 use crate::decompiler::exps::{
     Expr, ExprKind, Field, FunctionType, Invocation, InvocationFunction,
 };
+use crate::decompiler::exps::expr_util::synthetic_parameters_mask;
 use crate::decompiler::ir::{ExprId, ExprListId, Ir, StatId, VarProcessorId};
 use crate::decompiler::stats::StatementKind;
-use crate::decompiler::vars::var_version_pair::VarVersionPair;
 use crate::engine::Cx;
 use crate::engine::class_nodes::{ClassKind, ClassNodeId};
 use crate::engine::class_wrapper::{MethodSlot, catch_method_failure};
@@ -627,60 +627,6 @@ fn super_parameters_are_synthetic(cx: &Cx, call: &Invocation) -> io::Result<bool
         return Ok(false);
     }
     Ok(true)
-}
-
-fn synthetic_parameters_mask(
-    cx: &Cx,
-    call: &Invocation,
-) -> io::Result<Option<Vec<Option<VarVersionPair>>>> {
-    let Some(node) = call
-        .classname
-        .as_deref()
-        .and_then(|name| cx.class_nodes.id(name))
-    else {
-        return Ok(None);
-    };
-    let class_node = &cx.class_nodes[node];
-    if cx
-        .class_nodes
-        .wrapper_owner(node)
-        .is_some_and(|owner| cx.class_nodes[owner].wrapper.is_some())
-    {
-        let key = make_unique_key(INIT_NAME, call.descriptor.as_str());
-        if let Some(method) = MethodSlot::by_key(cx, node, &key) {
-            return Ok(method.get(cx).synthetic_parameters.clone());
-        }
-        if !cx.options.ignore_invalid_bytecode {
-            return Err(invalid(format!(
-                "Constructor {}.<init>{} not found",
-                class_node.class.qualified_name,
-                call.descriptor.as_str()
-            )));
-        }
-    } else if !call.parameters.is_empty()
-        && class_node.kind == ClassKind::Member
-        && !is_static_member(&class_node.class)
-    {
-        let mut mask = vec![None; call.parameters.len()];
-        mask[0] = Some(VarVersionPair::new(-1, 0));
-        return Ok(Some(mask));
-    }
-    Ok(None)
-}
-
-fn is_static_member(class: &StructClass) -> bool {
-    class.has_modifier(ACC_STATIC)
-        || class
-            .attributes
-            .inner_classes
-            .as_ref()
-            .and_then(|attribute| {
-                attribute
-                    .entries
-                    .iter()
-                    .find(|entry| entry.inner_name == class.qualified_name)
-            })
-            .is_some_and(|entry| entry.access_flags & ACC_STATIC != 0)
 }
 
 fn invalid(message: impl Into<String>) -> io::Error {

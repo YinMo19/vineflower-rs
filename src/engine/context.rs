@@ -36,8 +36,12 @@ pub struct Cx {
     pub class_nodes: ClassNodes,
     /// ClassNode currently used for import shadowing.
     pub current_class_node: Option<arcstr::ArcStr>,
+    /// Lambda call sites can share their declaring class and even their
+    /// synthetic name. Preserve the exact node while running inside ClassWriter.
+    current_node_id: Option<super::class_nodes::ClassNodeId>,
     /// `DecompilerContext.getImportCollector()`.
     pub imports: ImportCollector,
+    pub source_mapper: super::bytecode_source_mapper::BytecodeSourceMapper,
 }
 
 impl Cx {
@@ -53,13 +57,20 @@ impl Cx {
             struct_context,
             class_nodes: ClassNodes::default(),
             current_class_node: None,
+            current_node_id: None,
             imports: ImportCollector::default(),
+            source_mapper: Default::default(),
             ir: Ir::default(),
         }
     }
 
     pub(crate) fn classes(&self) -> ClassResolver<'_> {
         self.struct_context.resolving_with(&self.expression_ids)
+    }
+
+    pub(crate) fn current_node(&self) -> Option<super::class_nodes::ClassNodeId> {
+        self.current_node_id
+            .or_else(|| self.class_nodes.id(self.current_class_node.as_deref()?))
     }
 
     /// Imports and type names resolve against the class currently being written.
@@ -71,16 +82,26 @@ impl Cx {
         struct ClassScope<'a> {
             cx: &'a mut Cx,
             previous: Option<arcstr::ArcStr>,
+            previous_id: Option<super::class_nodes::ClassNodeId>,
         }
         impl Drop for ClassScope<'_> {
             fn drop(&mut self) {
                 self.cx.current_class_node = self.previous.take();
+                self.cx.current_node_id = self.previous_id;
             }
         }
         let previous = self
             .current_class_node
             .replace(self.class_nodes[node].class.qualified_name.clone());
-        write(ClassScope { cx: self, previous }.cx)
+        let previous_id = self.current_node_id.replace(node);
+        write(
+            ClassScope {
+                cx: self,
+                previous,
+                previous_id,
+            }
+            .cx,
+        )
     }
 
     /// Allow lookups during speculative rendering without adding imports.

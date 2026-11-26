@@ -8,6 +8,16 @@ mod literals;
 mod generic_chains;
 #[path = "support/writer_enum_records.rs"]
 mod writer_enum_records;
+#[path = "support/method_writer.rs"]
+mod method_writer;
+#[path = "support/compilation_unit.rs"]
+mod compilation_unit;
+#[path = "support/function_writer.rs"]
+mod function_writer;
+#[path = "support/invocation_writer.rs"]
+mod invocation_writer;
+#[path = "support/statement_writer.rs"]
+mod statement_writer;
 #[path = "support/class_initializers.rs"]
 mod class_initializers;
 #[path = "support/nested_classes.rs"]

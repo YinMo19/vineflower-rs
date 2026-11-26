@@ -127,6 +127,13 @@ impl StructMethod {
         })
     }
 
+    pub(crate) fn clear_variable_namer(&self) {
+        self.variable_namer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+    }
+
     pub(crate) fn with_variable_namer<T>(
         &self,
         options: &Options,

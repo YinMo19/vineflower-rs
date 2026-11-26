@@ -7,6 +7,7 @@
 pub mod recognize;
 pub mod rewrite;
 pub mod stat_edge;
+pub mod write;
 
 use std::sync::Arc;
 

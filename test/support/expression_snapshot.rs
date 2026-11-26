@@ -497,7 +497,7 @@ pub(super) fn var_type(ty: Option<&VarType>) -> String {
 }
 
 fn descriptor(descriptor: &MethodDescriptor) -> String {
-    let generic = descriptor.generic_info.as_ref().map_or_else(
+    let generic = descriptor.generic_info().map_or_else(
         || "~".into(),
         |generic| {
             let generic = generic.get();

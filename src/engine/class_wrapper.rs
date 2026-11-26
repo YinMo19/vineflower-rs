@@ -227,7 +227,7 @@ pub(crate) struct MethodSlot {
 }
 
 impl MethodSlot {
-    pub(super) fn by_key(cx: &Cx, node: ClassNodeId, key: &str) -> Option<Self> {
+    pub(crate) fn by_key(cx: &Cx, node: ClassNodeId, key: &str) -> Option<Self> {
         let node = cx.class_nodes.wrapper_owner(node)?;
         let class = &cx.class_nodes[node];
         class.wrapper.as_ref()?;
@@ -235,7 +235,7 @@ impl MethodSlot {
         Some(Self { node, index })
     }
 
-    pub(super) fn get(self, cx: &Cx) -> &MethodWrapper {
+    pub(crate) fn get(self, cx: &Cx) -> &MethodWrapper {
         &cx.class_nodes[self.node].wrapper.as_ref().unwrap().methods[self.index]
     }
 
@@ -262,6 +262,10 @@ impl Cx {
             .as_ref()?
             .methods
             .get(slot.index)
+    }
+
+    pub(crate) fn method_wrapper_by_key(&self, node: ClassNodeId, key: &str) -> Option<&MethodWrapper> {
+        MethodSlot::by_key(self, node, key).map(|slot| slot.get(self))
     }
 
     pub(crate) fn wrapper_method(

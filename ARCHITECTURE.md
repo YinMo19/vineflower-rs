@@ -125,6 +125,10 @@ CFG、语句图和 DirectGraph 具有不同的边契约。
 
 包描述符和模块描述符可以直接从已准备的根类写出。包注解先登记导入，再把导入写在包声明之后。模块先生成正文，随后在正文前写入导入。两条路径和普通声明共用注解值、类型 token 和换行组。[元数据写出](src/engine/class_writer/metadata.rs) · [写出入口](src/engine/class_processor.rs)
 
+普通根类通过 `process_class` 和 `class_processor::write_class` 写成完整的 Java 编译单元。表达式在原有 IR 对象上处理强制转换、泛型实参及装箱，语句树负责标签、跳转、作用域和块换行。局部类、匿名类、方法引用和 lambda 递归使用所属的类或方法包装器。各字段和方法先生成独立的正文，再把字节码映射归到原方法；汇总正文和导入后，源码映射器才补入类头行数。写完只释放根类包装器，其他根类仍可查询其子类构造器。[表达式写出](src/decompiler/exps/write/mod.rs) · [语句写出](src/decompiler/stats/write/mod.rs) · [成员写出](src/engine/class_writer/class.rs) · [源码行映射](src/engine/bytecode_source_mapper.rs)
+
+方法处理失败时仍可写出同一类的其他成员。错误注释和剩余字节码列表遵循原选项；异常说明记录 Rust 返回的原因。上游 JVM 异常的类名和 Java 栈帧会与 Rust 的诊断文本不同。[错误写出](src/engine/class_writer/method_errors.rs)
+
 `RuntimeImage::open` 将模块化 JDK 的每个模块作为独立库登记，按 JRT 的目录遍历和模块描述符顺序提供条目。普通镜像与 ZIP 压缩镜像可由现有 JImage 库读取；该库遇到 compact-cp 压缩时返回 Unsupported。[运行时类路径](src/engine/context_source/runtime.rs)
 
 `StructContext::add_file` 根据文件后缀和 ZIP 结束记录登记目录、归档或单文件。重新载入上下文时再次扫描目录及其子归档。ZIP 保留中央目录顺序和重复条目，按 Java 的规则解释多版本路径。单个 class 文件在预读内部名称和正式解析时使用同一上下文的注解表达式计数器。直接读取缺失资源或目录时，Rust 的 `ContextSource` 返回 `Ok(None)`。Java 的目录源打开这些路径时抛出 I/O 异常，ZIP 源读取缺失条目时抛出空引用异常，读取显式目录条目时返回空流。正常登记按已有条目读取类和资源。[文件登记](src/structs/struct_context.rs)

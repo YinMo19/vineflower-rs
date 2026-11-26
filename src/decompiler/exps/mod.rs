@@ -5,10 +5,12 @@
 
 pub(crate) mod bounds;
 mod bytecode;
+pub(crate) mod expr_util;
 mod function;
 pub(crate) mod generic_inference;
 mod increments;
 pub mod literal;
+pub mod write;
 mod operations;
 mod traversal;
 
@@ -39,10 +41,25 @@ use crate::types::{CodeType, FieldDescriptor, GenericType, MethodDescriptor, Typ
 /// `VarExprent.STACK_BASE`.
 pub const STACK_BASE: i32 = 10_000;
 
+bitflags::bitflags! {
+    /// Mutable print state belongs to the expression object. Recursive writers
+    /// can revisit an aliased operand after a previous use has marked it.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(crate) struct WriteFlags: u8 {
+        const QUALIFIER       = 1 << 0;
+        const WRITING_PATTERN = 1 << 1;
+        const FORCE_UNBOXING  = 1 << 2;
+        const VARARG          = 1 << 3;
+        const UNGROUPED       = 1 << 4;
+        const ENUM_CONST      = 1 << 5;
+    }
+}
+
 #[derive(Debug)]
 pub struct Expr {
     pub id: i32,
     pub kind: ExprKind,
+    pub(crate) write_flags: WriteFlags,
     pub bytecode: Option<BytecodeOffsets>,
 }
 
@@ -337,6 +354,21 @@ pub struct Invocation {
 }
 
 impl Invocation {
+    /// The first LambdaMetafactory bootstrap argument is the erased SAM descriptor.
+    pub(crate) fn lambda_sam_descriptor(&self) -> std::io::Result<&str> {
+        match self
+            .bootstrap_arguments
+            .as_ref()
+            .and_then(|args| args.first())
+        {
+            Some(Some(PooledConstant::Primitive(descriptor))) => Ok(descriptor.get_string()),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Missing LambdaMetafactory SAM descriptor",
+            )),
+        }
+    }
+
     pub fn new(name: ArcStr, classname: Option<ArcStr>, descriptor: Arc<MethodDescriptor>) -> Self {
         Self {
             kind: InvocationType::Virtual,
@@ -454,6 +486,7 @@ impl Expr {
         bytecode: Option<BytecodeOffsets>,
     ) -> ExprId {
         ir.exprs.push(Self {
+            write_flags: WriteFlags::empty(),
             id: counters.get_counter_and_increment(EXPRESSION_COUNTER),
             kind,
             bytecode,
@@ -467,6 +500,7 @@ impl Expr {
         bytecode: Option<BytecodeOffsets>,
     ) -> ExprId {
         cx.ir.exprs.push(Self {
+            write_flags: WriteFlags::empty(),
             id: cx.expression_ids.next(),
             kind,
             bytecode,
@@ -511,6 +545,7 @@ impl Expr {
         );
         let bound_types = vec![None; children.len()];
         ir.exprs.push(Self {
+            write_flags: WriteFlags::empty(),
             id,
             kind: ExprKind::Pattern(Box::new(Pattern {
                 class,
@@ -613,6 +648,7 @@ impl Expr {
         let id = counters.get_counter_and_increment(EXPRESSION_COUNTER);
         let condition = build_condition(ir, counters);
         ir.exprs.push(Self {
+            write_flags: WriteFlags::empty(),
             id,
             kind: ExprKind::If { condition },
             bytecode,
@@ -812,7 +848,14 @@ impl Expr {
                 bytecode = None;
             }
         }
+        // NewExprent.copy keeps enumConst; the other writing flags start clear.
+        let write_flags = if matches!(kind, ExprKind::New { .. }) {
+            cx.ir[expr].write_flags & WriteFlags::ENUM_CONST
+        } else {
+            WriteFlags::empty()
+        };
         cx.ir.exprs.push(Self {
+            write_flags,
             id: id.unwrap_or_else(|| counters.get_counter_and_increment(EXPRESSION_COUNTER)),
             kind,
             bytecode,
