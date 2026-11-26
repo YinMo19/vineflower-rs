@@ -6,6 +6,7 @@
 
 use std::fmt;
 use std::hash::{Hash, Hasher};
+use std::io;
 use std::sync::{Arc, RwLock};
 
 use arcstr::ArcStr;
@@ -72,11 +73,20 @@ impl Clone for MethodDescriptor {
 
 impl MethodDescriptor {
     pub fn parse_descriptor(descriptor: &str) -> Self {
-        let invalid = || panic!("Invalid descriptor: {descriptor}");
-        let parenth = descriptor.rfind(')').unwrap_or_else(invalid);
-        if !descriptor.starts_with('(') {
-            invalid();
-        }
+        Self::try_parse_descriptor(descriptor).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    pub(crate) fn try_parse_descriptor(descriptor: &str) -> io::Result<Self> {
+        let invalid = || {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Invalid descriptor: {descriptor}"),
+            )
+        };
+        let parenth = descriptor
+            .rfind(')')
+            .filter(|_| descriptor.starts_with('('))
+            .ok_or_else(invalid)?;
 
         let mut params = Vec::new();
         let parameters = &descriptor[1..parenth];
@@ -86,21 +96,24 @@ impl MethodDescriptor {
             let start = *from.get_or_insert(index);
             index += match c {
                 '[' => 1,
-                'L' => parameters[index..].find(';').unwrap_or_else(invalid) + 1,
+                'L' => parameters[index..].find(';').ok_or_else(invalid)? + 1,
                 _ => c.len_utf8(),
             };
             if c != '[' {
-                params.push(VarType::from_signature(&parameters[start..index]));
+                params.push(VarType::try_from_signature_cl(
+                    &parameters[start..index],
+                    false,
+                )?);
                 from = None;
             }
         }
 
-        Self {
+        Ok(Self {
             params,
-            ret: VarType::from_signature(&descriptor[parenth + 1..]),
+            ret: VarType::try_from_signature_cl(&descriptor[parenth + 1..], false)?,
             descriptor: descriptor.into(),
             generic_info: RwLock::default(),
-        }
+        })
     }
 
     /// Bytecode local slots of the declared parameters, excluding the receiver.

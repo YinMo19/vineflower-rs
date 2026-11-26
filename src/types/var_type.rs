@@ -13,6 +13,7 @@
 
 use std::fmt;
 use std::hash::{Hash, Hasher};
+use std::io;
 use std::sync::Arc;
 
 use arcstr::{ArcStr, literal};
@@ -186,6 +187,10 @@ impl VarType {
     /// `new VarType(signature, clType)`: with `cl_type`, a signature that
     /// does not start an array is a class name.
     pub fn from_signature_cl(signature: &str, cl_type: bool) -> VarType {
+        Self::try_from_signature_cl(signature, cl_type).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    pub(crate) fn try_from_signature_cl(signature: &str, cl_type: bool) -> io::Result<VarType> {
         let mut ty = CodeType::Byte; // TODO: should be null!
         let mut array_dim = 0;
         let mut value = None;
@@ -203,7 +208,9 @@ impl VarType {
                     ty = if (cl_type && i == 0) || utf16_len(rest) > 1 {
                         CodeType::Object
                     } else {
-                        Self::get_type(c)
+                        Self::try_get_type(c).ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidData, format!("Invalid type: {c}"))
+                        })?
                     };
                     value = Some(rest);
                     break;
@@ -211,7 +218,7 @@ impl VarType {
             }
         }
 
-        Self::raw(ty, array_dim, value.map(ArcStr::from))
+        Ok(Self::raw(ty, array_dim, value.map(ArcStr::from)))
     }
 
     pub fn get_char(ty: CodeType) -> Option<ArcStr> {

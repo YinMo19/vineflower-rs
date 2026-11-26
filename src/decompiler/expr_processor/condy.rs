@@ -66,7 +66,7 @@ impl CondyHelper<'_> {
         Ok(match method.as_str() {
             "nullConstant" => self.constant(VarType::VARTYPE_NULL, ConstantValue::Null, true),
             "primitiveClass" if name.len() == 1 && "ZCBSIJFDV".contains(name.as_str()) => {
-                self.class_literal(&name, true)
+                self.class_literal(&name, true)?
             }
             "enumConstant" => {
                 let descriptor = format!("L{};", ret.name());
@@ -95,7 +95,7 @@ impl CondyHelper<'_> {
                     Vec::new(),
                     false,
                 );
-                let owner = self.class_literal(string_value(owner)?, false);
+                let owner = self.class_literal(string_value(owner)?, false)?;
                 let field = self.constant(
                     VarType::VARTYPE_STRING,
                     ConstantValue::String(name.into()),
@@ -134,7 +134,7 @@ impl CondyHelper<'_> {
     fn class_argument(&mut self, arg: Option<&PooledConstant>) -> io::Result<ExprId> {
         match arg {
             Some(PooledConstant::Primitive(constant)) => {
-                Ok(self.class_literal(string_value(constant)?, false))
+                self.class_literal(string_value(constant)?, false)
             }
             Some(PooledConstant::Link(link)) => {
                 let key = (link.index1, link.index2);
@@ -177,13 +177,14 @@ impl CondyHelper<'_> {
         )
     }
 
-    fn class_literal(&mut self, descriptor: &str, was_condy: bool) -> ExprId {
-        let name = get_cast_type_name(self.cx, &VarType::from_signature(descriptor));
-        self.constant(
+    fn class_literal(&mut self, descriptor: &str, was_condy: bool) -> io::Result<ExprId> {
+        let ty = VarType::try_from_signature_cl(descriptor, false)?;
+        let name = get_cast_type_name(self.cx, &ty);
+        Ok(self.constant(
             VarType::VARTYPE_CLASS,
             ConstantValue::String(name.into()),
             was_condy,
-        )
+        ))
     }
 
     fn field(&mut self, name: ArcStr, classname: Option<ArcStr>, descriptor: &str) -> ExprId {

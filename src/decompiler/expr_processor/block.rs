@@ -795,9 +795,9 @@ pub(super) fn invocation(
         _ => InvocationFunction::General,
     };
     let descriptor = Arc::new(if kind == InvocationType::ConstantDynamic {
-        MethodDescriptor::parse_descriptor(&format!("(){}", constant.descriptor))
+        MethodDescriptor::try_parse_descriptor(&format!("(){}", constant.descriptor))?
     } else {
-        MethodDescriptor::parse_descriptor(&constant.descriptor)
+        MethodDescriptor::try_parse_descriptor(&constant.descriptor)?
     });
     let parameters = take_operands(stack, descriptor.params.len())?;
     let (is_static, instance) = if let Some(method) = &bootstrap_method {
@@ -877,7 +877,7 @@ fn class_type(pool: &ConstantPool, index: i32) -> io::Result<VarType> {
         )));
     }
     let constant = pool.get_primitive_constant(index).unwrap();
-    Ok(VarType::from_signature_cl(constant.get_string(), true))
+    VarType::try_from_signature_cl(constant.get_string(), true)
 }
 
 fn pop(stack: &mut Vec<ExprId>) -> io::Result<ExprId> {

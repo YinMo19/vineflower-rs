@@ -182,6 +182,26 @@ fn compile_java17(sources: &[&Path], dest: &Path) {
         .args(sources));
 }
 
+fn replace_utf8_entry(bytes: &mut Vec<u8>, original: &str, replacement: &str) {
+    // The fixtures use ASCII strings that each occupy one complete CONSTANT_Utf8.
+    let entry = |value: &str| {
+        let mut bytes = vec![1];
+        bytes.extend_from_slice(&u16::try_from(value.len()).unwrap().to_be_bytes());
+        bytes.extend_from_slice(value.as_bytes());
+        bytes
+    };
+    let original = entry(original);
+    let offsets: Vec<_> = bytes
+        .windows(original.len())
+        .enumerate()
+        .filter_map(|(offset, bytes)| (bytes == original).then_some(offset))
+        .collect();
+    let [offset] = offsets.as_slice() else {
+        panic!("expected a unique CONSTANT_Utf8 entry");
+    };
+    bytes.splice(*offset..offset + original.len(), entry(replacement));
+}
+
 fn run_main(classpath: &Path, class_name: &str) -> Vec<u8> {
     use upstream_reference::{jdk_tool, run};
 
@@ -614,6 +634,7 @@ fn parallel_stack_preparation_preserves_shared_class_access() {
 package art;
 public class WarningSubject {
     static int value = 1;
+    public void call() { "a".length(); }
     public int branch(boolean a, boolean b) {
         if (a) {
             if (b) return 1;
@@ -671,6 +692,8 @@ public class WarningSubject {
         panic!("expected one <clinit> with iconst_1, putstatic and return");
     };
     code[*opcode] = 0xaa;
+    // Keep call()'s own descriptor valid. Expression lifting reads the broken String.length reference.
+    replace_utf8_entry(code, "()I", "()Q");
     let malformed = write_input("malformed.jar", &entries);
 
     let options = [
@@ -735,11 +758,13 @@ public class WarningSubject {
 
     // The malformed initializer has native diagnostics that differ from Java's.
     let damaged = decompile(&malformed, "1");
+    assert!(damaged.1.contains("Invalid type: Q"));
     let diagnostics = [
         "Preprocessing class pkg/TestComplexCondy",
         "Loading Class: TestCondy from directory",
         "Preprocessing class art/WarningSubject",
         "Could not read method properties of art/WarningSubject.<clinit>",
+        "Could not decompile art/WarningSubject.call ()V",
         "Could not decompile art/WarningSubject.<clinit>",
         "Preprocessing class pkg/TestAssertInterface2",
     ];

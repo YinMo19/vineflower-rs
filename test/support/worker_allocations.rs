@@ -3,7 +3,7 @@
 use std::{fs, io::Write, process::Command};
 
 use super::upstream_reference::{jdk_tool, run, upstream_jar};
-use super::{compile_java17, directory, run_main};
+use super::{compile_java17, directory, replace_utf8_entry, run_main};
 
 #[test]
 #[ignore = "requires the upstream +local.jar and JDK 17 or later"]
@@ -142,24 +142,4 @@ public class Verify {
             );
         }
     }
-}
-
-fn replace_utf8_entry(bytes: &mut Vec<u8>, original: &str, replacement: &str) {
-    // The names are ASCII and each is the complete value of a CONSTANT_Utf8.
-    let entry = |value: &str| {
-        let mut bytes = vec![1];
-        bytes.extend_from_slice(&u16::try_from(value.len()).unwrap().to_be_bytes());
-        bytes.extend_from_slice(value.as_bytes());
-        bytes
-    };
-    let original = entry(original);
-    let offsets: Vec<_> = bytes
-        .windows(original.len())
-        .enumerate()
-        .filter_map(|(offset, bytes)| (bytes == original).then_some(offset))
-        .collect();
-    let [offset] = offsets.as_slice() else {
-        panic!("expected a unique class-name constant");
-    };
-    bytes.splice(*offset..offset + original.len(), entry(replacement));
 }
