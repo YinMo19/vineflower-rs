@@ -6,6 +6,7 @@
 use arcstr::ArcStr;
 use indexmap::IndexSet;
 use rustc_hash::FxHashSet;
+use std::any::Any;
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
@@ -146,17 +147,19 @@ pub(super) fn initialize_wrappers(
 }
 
 pub(crate) fn catch_method_failure<T>(process: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
-    catch_unwind(AssertUnwindSafe(process)).unwrap_or_else(|payload| {
-        if payload.is::<MethodTimeout>() {
-            return Err(io::Error::new(io::ErrorKind::TimedOut, MethodTimeout));
-        }
-        let reason = payload
-            .downcast_ref::<String>()
-            .map(String::as_str)
-            .or_else(|| payload.downcast_ref::<&str>().copied())
-            .unwrap_or("Unrecognized method processing failure");
-        Err(io::Error::other(reason.to_owned()))
-    })
+    catch_unwind(AssertUnwindSafe(process)).map_err(method_error_from_panic)?
+}
+
+pub(super) fn method_error_from_panic(payload: Box<dyn Any + Send>) -> io::Error {
+    if payload.is::<MethodTimeout>() {
+        return io::Error::new(io::ErrorKind::TimedOut, MethodTimeout);
+    }
+    let reason = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("Unrecognized method processing failure");
+    io::Error::other(reason.to_owned())
 }
 
 fn process_method(
@@ -176,7 +179,7 @@ fn process_method(
     let (variables, expression_ids) = cx
         .prepared_methods
         .as_mut()
-        .and_then(|prepared| prepared.start_method(method))
+        .and_then(|prepared| prepared.start_method(method, &cx.class_nodes))
         .unwrap_or_else(|| {
             (
                 cx.ir.variable_processors.push(Default::default()),

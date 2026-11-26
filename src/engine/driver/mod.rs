@@ -13,7 +13,7 @@ mod token_dump;
 pub use memory::MemorySource;
 pub use saver::Output;
 
-use std::{io, path::Path, sync::Arc};
+use std::{cell::OnceCell, io, path::Path, sync::Arc};
 
 use fancy_regex::Regex;
 use rustc_hash::FxHashSet;
@@ -157,6 +157,7 @@ impl Decompiler {
 
         let mut result = Vec::new();
         let mut reclaim = ReclaimSchedule::default();
+        let definitions = OnceCell::new();
         for unit in context.get_units().iter().filter(|unit| unit.own) {
             let layout = unit.source.output_layout();
             let mut sink = output
@@ -166,7 +167,13 @@ impl Decompiler {
 
             let mut classes = unit_classes(&mut cx, unit, &layout);
             let root_session = cx.take_class_session();
-            prepare::unit(&mut cx, &mut classes, &mut reclaim, &root_session)?;
+            prepare::unit(
+                &mut cx,
+                &mut classes,
+                &mut reclaim,
+                &root_session,
+                &definitions,
+            )?;
             let mut classes = classes.into_iter();
             while let Some(pending) = classes.next() {
                 reclaim.retired_bytes += pending.prepared_bytes;

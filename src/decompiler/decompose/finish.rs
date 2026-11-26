@@ -26,9 +26,20 @@ pub fn finish(cx: &mut Cx, counters: &mut CounterContainer, root: StatId) {
 /// Prepare the final statement tree for expression lifting once finally
 /// processing has finished rebuilding it.
 pub fn prepare_expressions(cx: &mut Cx, counters: &mut CounterContainer, root: StatId) {
+    prepare_expression_tree(cx, counters, root, true);
+}
+
+pub(crate) fn prepare_expression_tree(
+    cx: &mut Cx,
+    counters: &mut CounterContainer,
+    root: StatId,
+    build_content_flags: bool,
+) {
     build_synchronized(&mut cx.ir, counters, root);
     remove_synchronized_handlers(&mut cx.ir, root);
-    root.build_content_flags(&mut cx.ir);
+    if build_content_flags {
+        root.build_content_flags(&mut cx.ir);
+    }
     condense_sequences(cx, counters, root);
     clear_statements(cx, root);
 }

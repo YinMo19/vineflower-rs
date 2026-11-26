@@ -729,9 +729,10 @@ impl Expr {
                 ..
             } => {
                 if *anonymous {
-                    cx.class_nodes[new_type.name()]
+                    cx.class_nodes
+                        .allocation_class(new_type.name())
+                        .expect("no entry found for key")
                         .anonymous_type
-                        .as_ref()
                         .expect("Anonymous allocation type")
                         .clone()
                 } else {
@@ -886,17 +887,13 @@ impl Expr {
 pub(crate) fn allocation_flags(cx: &Cx, new_type: &VarType) -> (bool, bool, bool) {
     if new_type.ty == CodeType::Object
         && new_type.array_dim == 0
-        && let Some(node) = cx.class_nodes.get(new_type.name())
+        && let Some(node) = cx.class_nodes.allocation_class(new_type.name())
     {
         let lambda = node.kind == ClassKind::Lambda;
         (
             node.kind == ClassKind::Anonymous || lambda,
             lambda,
-            lambda
-                && node
-                    .lambda
-                    .as_ref()
-                    .is_some_and(|info| info.is_method_reference),
+            lambda && node.lambda.is_some_and(|info| info.is_method_reference),
         )
     } else {
         (false, false, false)

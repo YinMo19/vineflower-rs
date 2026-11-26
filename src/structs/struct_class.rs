@@ -191,15 +191,27 @@ impl StructClass {
 
     /// Bytecode properties computed in declaration order before method simplification.
     pub fn method_properties(&self, key: &str) -> Option<&MethodProperties> {
+        self.method_properties_with(key, || {})
+    }
+
+    pub(crate) fn method_properties_with(
+        &self,
+        key: &str,
+        before_warning: impl Fn(),
+    ) -> Option<&MethodProperties> {
         let index = self.methods.index_of_key(key)?;
-        Some(&self.prepare_method_properties()[index])
+        Some(&self.prepare_method_properties_with(before_warning)[index])
     }
 
     pub(crate) fn prepare_method_properties(&self) -> &[MethodProperties] {
+        self.prepare_method_properties_with(|| {})
+    }
+
+    fn prepare_method_properties_with(&self, before_warning: impl Fn()) -> &[MethodProperties] {
         self.method_properties.get_or_init(|| {
             self.methods
                 .iter()
-                .map(|method| MethodProperties::analyze(Arc::clone(method), self))
+                .map(|method| MethodProperties::analyze(Arc::clone(method), self, &before_warning))
                 .collect()
         })
     }

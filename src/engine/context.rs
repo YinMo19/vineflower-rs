@@ -11,6 +11,7 @@ use super::class_nodes::ClassNodes;
 use super::counter_container::{CounterContainer, ExpressionIds};
 use super::import_collector::ImportCollector;
 use super::options::Options;
+use crate::code::method_properties::MethodProperties;
 use crate::decompiler::ir::{Ir, IrNode, VarProcessorId};
 use crate::renamer::pool_interceptor::PoolInterceptor;
 use crate::structs::struct_context::ClassResolver;
@@ -32,7 +33,7 @@ pub struct Cx {
     pub javadoc: Option<Arc<dyn super::class_writer::javadoc::JavadocProvider>>,
     /// Stable handles shared by all methods and classes processed by this worker.
     pub ir: Ir,
-    /// First statement graphs returned by workers for the root currently being initialized.
+    /// Prepared method graphs returned by workers for the root currently being initialized.
     pub(super) prepared_methods: Option<Box<super::method_processor::PreparedMethods>>,
     pub(crate) kotlin_body: Option<Box<crate::kotlin::body::KotlinBody>>,
     /// ClassesProcessor.mapRootClasses in this root-class worker.
@@ -134,7 +135,18 @@ impl Cx {
     }
 
     pub(crate) fn classes(&self) -> ClassResolver<'_> {
+        self.class_nodes.require_class_session();
         self.struct_context.resolving_with(&self.expression_ids)
+    }
+
+    pub(crate) fn method_properties<'a>(
+        &self,
+        class: &'a StructClass,
+        key: &str,
+    ) -> Option<&'a MethodProperties> {
+        // A failed read leaves the worker's OnceLock initialization unfinished.
+        // The coordinator reads and reports it in class wrapper order.
+        class.method_properties_with(key, || self.class_nodes.require_class_session())
     }
 
     pub fn kotlin_members(&self) -> Option<&crate::kotlin::members::KotlinMembers> {

@@ -277,6 +277,7 @@ pub fn java_class_name(cx: &Cx, internal: &str) -> String {
 }
 
 pub fn short_name(cx: &mut Cx, full_name: &str, imported: bool) -> Option<String> {
+    cx.class_nodes.require_class_session();
     let current = cx.current_class_node.as_deref().map(|name| {
         cx.class_nodes
             .get(name)

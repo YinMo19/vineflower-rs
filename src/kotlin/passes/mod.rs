@@ -8,12 +8,7 @@ mod dead_vars;
 use std::{io, sync::Arc};
 
 use crate::decompiler::{
-    decompose::{
-        finish::{
-            build_synchronized, clear_statements, condense_sequences, remove_synchronized_handlers,
-        },
-        if_helper::merge_all_ifs,
-    },
+    decompose::if_helper::merge_all_ifs,
     exits, increments, inline_blocks, labels,
     loops::{eliminate, enhance, extract, late},
     post_process, secondary,
@@ -22,7 +17,7 @@ use crate::decompiler::{
 use crate::engine::method_timeout::checkpoint;
 use crate::engine::{
     Cx,
-    method_processor::{ExpressionMethod, structured_statement_graph_for_language},
+    method_processor::{ExpressionMethod, initial_stack_method_for_language},
 };
 use crate::structs::{StructClass, StructMethod};
 
@@ -33,20 +28,12 @@ pub fn defined_method(
     class: &StructClass,
     method: &Arc<StructMethod>,
 ) -> io::Result<Option<ExpressionMethod>> {
-    let Some(structured) = structured_statement_graph_for_language(cx, class, method, true)? else {
+    let Some(mut result) = initial_stack_method_for_language(cx, class, method, true)? else {
         return Ok(None);
     };
-    let cx = &mut *cx.enter_method(&structured.flow.counters);
-    let mut recovered = structured.recover_finally(cx, class)?;
-    let root = recovered.structured.root;
-    let counters = &mut recovered.structured.flow.counters;
-    build_synchronized(&mut cx.ir, counters, root);
-    remove_synchronized_handlers(&mut cx.ir, root);
-    condense_sequences(cx, counters, root);
-    clear_statements(cx, root);
-
-    let mut result = recovered.lift_expressions(cx, class)?;
-    result.recover_initial_increments(cx, class)?;
+    let cx = &mut *cx.enter_method(&result.flow.counters);
+    let root = result.root;
+    result.finish_initial_increments(cx, class)?;
     increments::inline_in_conditions(cx, root);
     result.build_assertions(cx, class)?;
 

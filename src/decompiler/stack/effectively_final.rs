@@ -63,7 +63,7 @@ impl Scan<'_> {
                 constructor,
                 ..
             } => {
-                if let Some(node) = self.classes.get(new_type.name()) {
+                if let Some(node) = self.classes.allocation_class(new_type.name()) {
                     if !lambda {
                         if let Some(init) = node
                             .class
@@ -87,7 +87,7 @@ impl Scan<'_> {
                             }
                         }
                     } else if !method_reference {
-                        self.lambda_captures(node.lambda.as_ref().unwrap(), constructor.unwrap());
+                        self.lambda_captures(node.lambda.unwrap(), constructor.unwrap());
                     }
                 }
             }

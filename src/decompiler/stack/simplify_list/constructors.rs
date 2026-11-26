@@ -61,7 +61,7 @@ pub(super) fn lambda(
         class.qualified_name,
         invocation.dynamic_class_suffix.as_deref()?
     );
-    cx.class_nodes.get(&name)?;
+    cx.class_nodes.allocation_class(&name)?;
 
     let ty = VarType::from_signature_cl(&name, true);
     let offsets = cx.ir[expr].bytecode.clone();
@@ -197,7 +197,7 @@ pub(super) fn qualified_new_get_class(cx: &Cx, first: ExprId, second: ExprId) ->
                 || is_unambiguously_same_param(cx, invoke.is_static, target, &ctor.parameters))
             && cx
                 .class_nodes
-                .get(new_type.name())
+                .allocation_class(new_type.name())
                 .is_some_and(|node| node.kind != ClassKind::Root)
         {
             return true;
@@ -255,10 +255,10 @@ pub(super) fn inline_method_reference_assignment(
             && Expr::contains(cx, *constructor, left)
             && let Some(info) = cx
                 .class_nodes
-                .get(new_type.name())
-                .and_then(|node| node.lambda.as_ref())
-            && class
-                .method_properties(&info.content_method_key)
+                .allocation_class(new_type.name())
+                .and_then(|node| node.lambda)
+            && cx
+                .method_properties(class, &info.content_method_key)
                 .is_some_and(|properties| properties.is_synthetic_reference_lambda)
         {
             let (constructor, parameter) = (*constructor, *parameter);

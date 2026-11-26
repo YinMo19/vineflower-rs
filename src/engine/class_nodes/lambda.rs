@@ -54,6 +54,29 @@ struct LambdaSite {
 }
 
 impl LambdaScan {
+    /// The allocation facts of the nodes that this scan will publish. A
+    /// repeated synthetic name resolves to its last site, just as in insert.
+    pub(super) fn definitions(
+        &self,
+        classes: &[Arc<StructClass>],
+    ) -> super::preparation::Definitions {
+        let mut definitions = FxHashMap::default();
+        for class in classes {
+            if let Some(Some(scan)) = self.0.get(&(Arc::as_ptr(class) as usize)) {
+                definitions.extend(scan.sites.iter().map(|site| {
+                    let definition = super::preparation::Definition {
+                        class: Arc::clone(class),
+                        kind: ClassKind::Lambda,
+                        anonymous_type: Some(site.anonymous_type.clone()),
+                        lambda: Some(site.information.clone()),
+                    };
+                    (site.name.clone(), Arc::new(definition))
+                }));
+            }
+        }
+        definitions
+    }
+
     pub(crate) fn for_classes(classes: &[Arc<StructClass>]) -> Self {
         let mut scan = Self::default();
         for class in classes {

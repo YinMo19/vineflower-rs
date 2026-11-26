@@ -22,10 +22,12 @@ use crate::util::jhash::{JHashMap, JHashSet};
 
 mod lambda;
 mod load;
+mod preparation;
 
 pub(super) use lambda::LambdaScan;
 pub use lambda::process_lambdas;
 pub use load::load_classes;
+pub(super) use preparation::{ClassObservations, ClassSnapshot, NeedsClassSession};
 
 define_index_type! {
     pub struct ClassNodeId = u32;
@@ -38,6 +40,7 @@ pub struct ClassNodes {
     arena: IndexVec<ClassNodeId, ClassNode>,
     names: FxHashMap<ArcStr, ClassNodeId>,
     wrapper_orders: FxHashMap<ClassNodeId, Vec<ClassNodeId>>,
+    preparing: Option<Box<preparation::WorkerClasses>>,
 }
 
 impl ClassNodes {
@@ -46,6 +49,7 @@ impl ClassNodes {
     }
 
     pub fn id(&self, name: &str) -> Option<ClassNodeId> {
+        self.require_class_session();
         self.names.get(name).copied()
     }
 
@@ -158,7 +162,7 @@ pub struct ClassNode {
     pub hidden_members: FxHashSet<String>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct LambdaInformation {
     pub method_name: ArcStr,
     pub method_descriptor: ArcStr,

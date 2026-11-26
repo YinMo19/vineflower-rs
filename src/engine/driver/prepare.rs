@@ -3,13 +3,13 @@
 //! ContextUnit preparation. Workers own the initial method graphs until the
 //! coordinator reaches the corresponding root in publication order.
 
-use std::io;
 use std::sync::{Arc, mpsc};
 use std::thread;
+use std::{cell::OnceCell, io};
 
 use super::{ClassSession, Cx, PendingClass, ReclaimSchedule};
 use crate::decompiler::ir::Ir;
-use crate::engine::class_nodes::LambdaScan;
+use crate::engine::class_nodes::{ClassNodes, ClassSnapshot, LambdaScan};
 use crate::engine::class_processor::{process_class_with_lambda_scan, worker_classes};
 use crate::engine::class_wrapper::catch_method_failure;
 use crate::engine::method_processor::PreparedMethods;
@@ -24,28 +24,32 @@ struct PreparedRoot {
 struct RootWork {
     classes: Vec<Arc<StructClass>>,
     kotlin: bool,
-    ir: Option<Ir>,
+    methods: Option<(Ir, ClassSnapshot)>,
 }
 
 impl RootWork {
-    fn snapshot(cx: &mut Cx, root: &PendingClass) -> Self {
+    fn snapshot(cx: &mut Cx, root: &PendingClass, definitions: &OnceCell<ClassSnapshot>) -> Self {
         let classes = worker_classes(&cx.class_nodes, root.node);
         // A timed method stays inside one deadline from decode through its
         // final pass. Lambda discovery is outside that deadline in Java.
-        let ir =
-            (!classes.is_empty() && cx.options.method_time_limit().is_none()).then(|| cx.ir.fork());
+        let methods =
+            (!classes.is_empty() && cx.options.method_time_limit().is_none()).then(|| {
+                let definitions = definitions.get_or_init(|| ClassSnapshot::new(&cx.class_nodes));
+                (cx.ir.fork(), definitions.clone())
+            });
         Self {
             classes,
             kotlin: root.kotlin,
-            ir,
+            methods,
         }
     }
 
     fn prepare(self, context: &Arc<StructContext>) -> PreparedRoot {
         let lambdas = LambdaScan::for_classes(&self.classes);
-        let methods = self.ir.map(|ir| {
+        let methods = self.methods.map(|(ir, definitions)| {
             let mut worker = Cx::new(Arc::clone(context));
             worker.ir = ir;
+            worker.class_nodes = ClassNodes::for_preparation(definitions, &lambdas, &self.classes);
             PreparedMethods::prepare(worker, self.classes, self.kotlin)
         });
         PreparedRoot { lambdas, methods }
@@ -57,6 +61,7 @@ pub(super) fn unit(
     roots: &mut [PendingClass],
     reclaim: &mut ReclaimSchedule,
     parent: &ClassSession,
+    definitions: &OnceCell<ClassSnapshot>,
 ) -> io::Result<()> {
     let count = cx.options.worker_count();
     // ContextUnit constructs its ForkJoinPool even for small input units.
@@ -92,14 +97,16 @@ pub(super) fn unit(
                         }
                     }
                 })?;
-            jobs.send(RootWork::snapshot(cx, root)).unwrap();
+            jobs.send(RootWork::snapshot(cx, root, definitions))
+                .unwrap();
             workers.push((jobs, ready));
         }
         for i in 0..roots.len() {
             let (jobs, ready) = &workers[i % workers.len()];
             let prepared = ready.recv().expect("root preparation worker stopped");
             if let Some(next) = roots.get(i + workers.len()) {
-                jobs.send(RootWork::snapshot(cx, next)).unwrap();
+                jobs.send(RootWork::snapshot(cx, next, definitions))
+                    .unwrap();
             }
             publish(cx, &mut roots[i], prepared)?;
             reclaim.after_root(cx, &roots[..=i], parent);

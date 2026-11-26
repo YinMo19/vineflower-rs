@@ -26,7 +26,11 @@ impl MethodProperties {
         }
     }
 
-    pub(crate) fn analyze(method: Arc<StructMethod>, class: &StructClass) -> Self {
+    pub(crate) fn analyze(
+        method: Arc<StructMethod>,
+        class: &StructClass,
+        before_warning: impl FnOnce(),
+    ) -> Self {
         let mut result = Self::new(method);
         let method = &result.mt;
         let synthetic = method.has_modifier(ACC_STATIC | ACC_SYNTHETIC);
@@ -44,10 +48,13 @@ impl MethodProperties {
                     result.assert_field = assert_field(class, &code.instructions);
                 }
             }
-            Err(err) => log::warn!(
-                "Could not read method properties of {}.{method}: {err}",
-                class.qualified_name
-            ),
+            Err(err) => {
+                before_warning();
+                log::warn!(
+                    "Could not read method properties of {}.{method}: {err}",
+                    class.qualified_name
+                );
+            }
             Ok(None) => {}
         }
         result

@@ -78,18 +78,17 @@ pub(super) fn assertion_field<'a>(
             }
             let holder = classes[wrapper].class.as_ref();
             if holder.is_synthetic()
-                && let Some(field) = class_assertion_field(holder)
+                && let Some(field) = class_assertion_field(cx, holder)
             {
                 return Some((holder, field));
             }
         }
     }
-    class_assertion_field(class).map(|field| (class, field))
+    class_assertion_field(cx, class).map(|field| (class, field))
 }
 
-fn class_assertion_field(class: &StructClass) -> Option<&StructField> {
-    class
-        .method_properties("<clinit> ()V")?
+fn class_assertion_field<'a>(cx: &Cx, class: &'a StructClass) -> Option<&'a StructField> {
+    cx.method_properties(class, "<clinit> ()V")?
         .assert_field
         .as_deref()
 }

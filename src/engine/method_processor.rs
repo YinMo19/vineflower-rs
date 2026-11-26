@@ -8,19 +8,21 @@
 //! `DomHelper`. The original graph remains available for finally processing.
 
 use std::io;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
 use indexmap::IndexSet;
 use rustc_hash::FxHashMap;
 
-use super::class_wrapper::catch_method_failure;
+use super::class_nodes::NeedsClassSession;
+use super::class_wrapper::method_error_from_panic;
 use super::method_timeout::checkpoint;
 use crate::code::{
     cfg::ControlFlowGraph, dead_code_helper as dead, exception_deobfuscator as exceptions,
 };
 use crate::decompiler::decompose::{
     dom_helper::{graph_to_statement, process_statement},
-    finish::{condense_sequences, finish, prepare_expressions},
+    finish::{condense_sequences, finish, prepare_expression_tree},
 };
 use crate::decompiler::{
     expr_processor,
@@ -318,26 +320,7 @@ pub fn structured_statement_graph(
     class: &StructClass,
     method: &Arc<StructMethod>,
 ) -> io::Result<Option<StructuredMethod>> {
-    structured_statement_graph_for_language(cx, class, method, false)
-}
-
-pub(crate) fn structured_statement_graph_for_language(
-    cx: &mut Cx,
-    class: &StructClass,
-    method: &Arc<StructMethod>,
-    kotlin: bool,
-) -> io::Result<Option<StructuredMethod>> {
-    if let Some(prepared) = cx
-        .prepared_methods
-        .as_mut()
-        .and_then(|root| root.active.take())
-    {
-        for warning in prepared.warnings {
-            warning.emit();
-        }
-        return prepared.result;
-    }
-    prepare_structured_method(cx, class, method, kotlin, ExceptionWarning::emit)
+    prepare_structured_method(cx, class, method, false, ExceptionWarning::emit)
 }
 
 fn prepare_structured_method(
@@ -347,15 +330,12 @@ fn prepare_structured_method(
     kotlin: bool,
     warn: impl FnMut(ExceptionWarning),
 ) -> io::Result<Option<StructuredMethod>> {
-    // Before expression lifting the tree contains empty expression lists and
-    // explicitly typed catch variables. This stage uses only the loaded method,
-    // options and IR, so it can run before classpath lookups and wrapper publication.
     initial_statement_graph_for_language(cx, class, method, kotlin, warn)?
         .map(|method| method.structure(cx))
         .transpose()
 }
 
-/// The immutable-input prefix of each method in one compilation unit. The
+/// Method graphs through their first stack simplification. The
 /// coordinator adopts the worker's IR before installing this scope.
 pub(super) struct PreparedMethods {
     methods: FxHashMap<usize, PreparedMethod>,
@@ -367,8 +347,9 @@ struct PreparedMethod {
     // Both handles must survive a graph-recognition failure as method state.
     variables: VarProcessorId,
     expression_ids: ExpressionIds,
+    observations: super::class_nodes::ClassObservations,
     warnings: Vec<ExceptionWarning>,
-    result: io::Result<Option<StructuredMethod>>,
+    result: io::Result<Option<ExpressionMethod>>,
 }
 
 impl PreparedMethod {
@@ -377,22 +358,29 @@ impl PreparedMethod {
         class: &StructClass,
         method: &Arc<StructMethod>,
         kotlin: bool,
-    ) -> Self {
+    ) -> Option<Self> {
         let variables = worker.ir.variable_processors.push(Default::default());
         worker.expression_ids = Default::default();
         worker.current_method = Some((Arc::clone(method), variables));
         let mut warnings = Vec::new();
-        let result = catch_method_failure(|| {
-            prepare_structured_method(worker, class, method, kotlin, |warning| {
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            prepare_initial_stack(worker, class, method, kotlin, |warning| {
                 warnings.push(warning)
             })
-        });
-        Self {
+        }));
+        let observations = worker.class_nodes.take_observations();
+        let result = match result {
+            Ok(result) => result,
+            Err(payload) if payload.is::<NeedsClassSession>() => return None,
+            Err(payload) => Err(method_error_from_panic(payload)),
+        };
+        Some(Self {
             variables,
             expression_ids: worker.expression_ids.clone(),
+            observations,
             warnings,
             result,
-        }
+        })
     }
 }
 
@@ -404,12 +392,16 @@ impl PreparedMethods {
     ) -> (Ir, Self) {
         let mut methods = FxHashMap::default();
         for class in classes {
+            worker.current_class = Some(Arc::clone(&class));
+            worker.current_class_node = Some(class.qualified_name.clone());
             for method in class.methods.iter().filter(|method| method.contains_code()) {
-                methods
-                    .entry(Arc::as_ptr(method) as usize)
-                    .or_insert_with(|| {
+                if let std::collections::hash_map::Entry::Vacant(slot) =
+                    methods.entry(Arc::as_ptr(method) as usize)
+                    && let Some(prepared) =
                         PreparedMethod::from_bytecode(&mut worker, &class, method, kotlin)
-                    });
+                {
+                    slot.insert(prepared);
+                }
             }
         }
         (
@@ -424,8 +416,12 @@ impl PreparedMethods {
     pub(super) fn start_method(
         &mut self,
         method: &Arc<StructMethod>,
+        nodes: &super::class_nodes::ClassNodes,
     ) -> Option<(VarProcessorId, ExpressionIds)> {
-        self.active = self.methods.remove(&(Arc::as_ptr(method) as usize));
+        self.active = self
+            .methods
+            .remove(&(Arc::as_ptr(method) as usize))
+            .filter(|method| method.observations.valid_for(nodes));
         let prepared = self.active.as_ref()?;
         Some((prepared.variables, prepared.expression_ids.clone()))
     }
@@ -775,7 +771,16 @@ impl ExpressionMethod {
 
     /// Native Java passes before the BEFORE_MAIN plugin location.
     pub fn prepare_main_loop(&mut self, cx: &mut Cx, class: &StructClass) -> io::Result<()> {
-        self.process_increments(cx, class)?;
+        self.simplify_stack_vars(cx, class);
+        self.prepare_main_loop_after_initial_stack(cx, class)
+    }
+
+    fn prepare_main_loop_after_initial_stack(
+        &mut self,
+        cx: &mut Cx,
+        class: &StructClass,
+    ) -> io::Result<()> {
+        self.process_increments_after_initial_stack(cx, class)?;
         checkpoint();
         self.simplify_string_concat(cx, class)?;
         self.build_assertions(cx, class)?;
@@ -812,23 +817,32 @@ impl ExpressionMethod {
 
     /// The first fixed point in MethodProcessor after expression lifting.
     pub fn process_increments(&mut self, cx: &mut Cx, class: &StructClass) -> io::Result<()> {
-        self.recover_initial_increments(cx, class)?;
+        self.simplify_stack_vars(cx, class);
+        self.process_increments_after_initial_stack(cx, class)
+    }
+
+    fn process_increments_after_initial_stack(
+        &mut self,
+        cx: &mut Cx,
+        class: &StructClass,
+    ) -> io::Result<()> {
+        self.finish_initial_increments(cx, class)?;
         self.inline_increments_in_conditions(cx);
         Ok(())
     }
 
-    pub(crate) fn recover_initial_increments(
+    pub(crate) fn finish_initial_increments(
         &mut self,
         cx: &mut Cx,
         class: &StructClass,
     ) -> io::Result<()> {
         loop {
-            self.simplify_stack_vars(cx, class);
             self.set_var_versions(cx, class)?;
             checkpoint();
             if !self.find_increments(cx) {
                 break;
             }
+            self.simplify_stack_vars(cx, class);
         }
         Ok(())
     }
@@ -847,21 +861,26 @@ impl ExpressionMethod {
 impl RecoveredMethod {
     /// Removing the synchronized handlers consumes the recovered statement tree.
     pub fn into_expressions(
-        mut self,
+        self,
         cx: &mut Cx,
         class: &StructClass,
     ) -> io::Result<ExpressionMethod> {
-        let method = &mut self.structured;
-        prepare_expressions(cx, &mut method.flow.counters, method.root);
-        self.lift_expressions(cx, class)
+        self.lift_expressions(cx, class, true)
     }
 
-    pub(crate) fn lift_expressions(
+    fn lift_expressions(
         mut self,
         cx: &mut Cx,
         class: &StructClass,
+        build_content_flags: bool,
     ) -> io::Result<ExpressionMethod> {
         let method = &mut self.structured;
+        prepare_expression_tree(
+            cx,
+            &mut method.flow.counters,
+            method.root,
+            build_content_flags,
+        );
         method.process_expressions(cx, class)?;
         condense_sequences(cx, &mut method.flow.counters, method.root);
         Ok(ExpressionMethod {
@@ -878,13 +897,65 @@ pub fn expression_method(
     class: &StructClass,
     method: &Arc<StructMethod>,
 ) -> io::Result<Option<ExpressionMethod>> {
-    let Some(structured) = structured_statement_graph(cx, class, method)? else {
+    expression_method_for_language(cx, class, method, false, ExceptionWarning::emit)
+}
+
+fn expression_method_for_language(
+    cx: &mut Cx,
+    class: &StructClass,
+    method: &Arc<StructMethod>,
+    kotlin: bool,
+    warn: impl FnMut(ExceptionWarning),
+) -> io::Result<Option<ExpressionMethod>> {
+    let Some(structured) = prepare_structured_method(cx, class, method, kotlin, warn)? else {
         return Ok(None);
     };
+    if kotlin {
+        let cx = &mut *cx.enter_method(&structured.flow.counters);
+        // The Kotlin schedule clears statements without building the Java
+        // main loop's content flags.
+        return structured
+            .recover_finally(cx, class)?
+            .lift_expressions(cx, class, false)
+            .map(Some);
+    }
     structured
         .recover_finally(cx, class)?
         .into_expressions(cx, class)
         .map(Some)
+}
+
+fn prepare_initial_stack(
+    cx: &mut Cx,
+    class: &StructClass,
+    method: &Arc<StructMethod>,
+    kotlin: bool,
+    warn: impl FnMut(ExceptionWarning),
+) -> io::Result<Option<ExpressionMethod>> {
+    let Some(mut result) = expression_method_for_language(cx, class, method, kotlin, warn)? else {
+        return Ok(None);
+    };
+    result.simplify_stack_vars(cx, class);
+    Ok(Some(result))
+}
+
+pub(crate) fn initial_stack_method_for_language(
+    cx: &mut Cx,
+    class: &StructClass,
+    method: &Arc<StructMethod>,
+    kotlin: bool,
+) -> io::Result<Option<ExpressionMethod>> {
+    if let Some(prepared) = cx
+        .prepared_methods
+        .as_mut()
+        .and_then(|root| root.active.take())
+    {
+        for warning in prepared.warnings {
+            warning.emit();
+        }
+        return prepared.result;
+    }
+    prepare_initial_stack(cx, class, method, kotlin, ExceptionWarning::emit)
 }
 
 /// Processes a method with code up to the Java BEFORE_MAIN pass location.
@@ -895,10 +966,10 @@ pub fn pre_main_method(
     class: &StructClass,
     method: &Arc<StructMethod>,
 ) -> io::Result<Option<ExpressionMethod>> {
-    let Some(mut result) = expression_method(cx, class, method)? else {
+    let Some(mut result) = initial_stack_method_for_language(cx, class, method, false)? else {
         return Ok(None);
     };
-    result.prepare_main_loop(cx, class)?;
+    result.prepare_main_loop_after_initial_stack(cx, class)?;
     Ok(Some(result))
 }
 
