@@ -81,6 +81,14 @@ cargo test --locked --test jhash -- --include-ignored
 cargo test --locked --test class_nodes colliding_interface_names -- --ignored
 ```
 
+## JDK runtime images
+
+With JDK 17, the runtime-image check compiles a module and uses `jlink` to produce plain, ZIP, shared-constant-pool, layered, and opposite-endian images. It compares individual resources against the JDK extraction, including a class whose name contains a supplementary character. The CLI must resolve an interface from each image to recover an override.
+
+```sh
+cargo test --locked --test class_nodes runtime_image -- --include-ignored
+```
+
 ## End-to-end source and CLI suite
 
 The `upstream_parity` target compares the native library and CLI against the upstream source and archive goldens. The separate `driver` target also runs the original Java CLI on the same input to check configuration, resources, manifests and archived line mappings.
@@ -95,6 +103,8 @@ cargo test --locked --test upstream_parity full_parity -- --ignored --nocapture 
 ```
 
 Parity fails on any missing JDK, missing fixture, unsupported capability, source/output mismatch or execution error. Each is reported separately. `VINEFLOWER_RS_PARITY_FILTER` optionally selects a substring of case IDs, such as `core/LVT` or `cli/`. No golden gets created or rewritten. Comparison uses only upstream's newline and outer whitespace normalization, with the three upstream alternate goldens explicitly allowed. Upstream's failable rename case remains a failure on mismatch.
+
+At the pinned revision, the original Java CLI and the native CLI produce identical output for the Scala plugin registrations `TestCaseClasses`, `TestObject` and `TestCompanionObject` when given the same classes and options. Both differ from the three stored plugin goldens. The full suite reports those mismatches.
 
 ### Compiled inputs
 
