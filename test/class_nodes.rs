@@ -69,6 +69,48 @@ use vineflower_rs::structs::StructContext;
 use vineflower_rs::types::VarType;
 
 #[test]
+fn public_method_callback_retains_its_cfg_after_wrapper_publication() {
+    use vineflower_rs::engine::{
+        class_processor::process_class_methods, method_processor::code_to_java,
+    };
+
+    let options = Arc::new(Options::default());
+    let mut context = StructContext::new(Arc::clone(&options), None);
+    let input =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("test/smoke/java8/TestSimpleWhile.class");
+    context.add_file(&input, true).unwrap();
+    let mut cx = Cx::new(Arc::new(context));
+    cx.class_nodes = load_classes(
+        &cx.struct_context,
+        &options,
+        |_| true,
+        |_| true,
+        |_, _| None,
+    );
+    let root = cx.class_nodes.id("pkg/TestSimpleWhile").unwrap();
+
+    let mut observed = None;
+    process_class_methods(&mut cx, root, |cx, class, method| {
+        let result = code_to_java(cx, class, method)?;
+        if method.name.as_str() == "test" {
+            let entry = result.as_ref().unwrap().flow.graph.first;
+            observed = Some((
+                entry,
+                cx.ir[entry].preds.clone(),
+                cx.ir[entry].succs.clone(),
+            ));
+        }
+        Ok(result)
+    })
+    .unwrap();
+
+    let (entry, predecessors, successors) = observed.unwrap();
+    assert_eq!((predecessors.len(), successors.len()), (1, 2));
+    assert_eq!(cx.ir[entry].preds, predecessors);
+    assert_eq!(cx.ir[entry].succs, successors);
+}
+
+#[test]
 #[ignore = "requires the upstream +local.jar and JDK 17 or later"]
 fn class_wrappers_publish_declared_methods_in_order() {
     use vineflower_rs::engine::{

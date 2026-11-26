@@ -1,14 +1,16 @@
 // Copyright 2000-2024 JetBrains s.r.o. and the Vineflower contributors.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Strong references between IR arena entries.
+//! References retained by published method and class wrappers.
 
 use super::{ExprId, Ir, IrNode};
 use crate::decompiler::exps::{Expr, ExprKind, SwitchCaseValues};
 use crate::decompiler::stats::{DoStatement, IfStatement, Statement, StatementKind};
 
-/// Report every immediate arena reference, including references in indexes.
-pub(crate) fn visit_children(ir: &Ir, node: IrNode, mut visit: impl FnMut(IrNode)) {
+/// At a built-in driver boundary all method passes using CFG topology have
+/// returned. Nested-class and writer passes traverse statements and direct
+/// graphs. Their basic blocks still own instruction sequences and old offsets.
+pub(super) fn visit_published(ir: &mut Ir, node: IrNode, mut visit: impl FnMut(IrNode)) {
     match node {
         IrNode::Stat(stat) => visit_statement(&ir[stat], visit),
         IrNode::Edge(edge) => {
@@ -26,18 +28,11 @@ pub(crate) fn visit_children(ir: &Ir, node: IrNode, mut visit: impl FnMut(IrNode
             }
         }
         IrNode::Block(block) => {
-            let block = &ir[block];
-            for &neighbour in [
-                &block.preds,
-                &block.succs,
-                &block.pred_exceptions,
-                &block.succ_exceptions,
-            ]
-            .into_iter()
-            .flatten()
-            {
-                visit(neighbour.into());
-            }
+            let block = &mut ir[block];
+            block.preds = Vec::new();
+            block.succs = Vec::new();
+            block.pred_exceptions = Vec::new();
+            block.succ_exceptions = Vec::new();
         }
         IrNode::VarProcessor(_) => {}
     }

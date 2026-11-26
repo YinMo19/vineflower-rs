@@ -117,11 +117,11 @@ impl Ir {
         self.lists.push(exprents)
     }
 
-    pub(crate) fn reachable(&self, mut pending: Vec<IrNode>) -> LiveNodes {
+    pub(crate) fn trace_published(&mut self, mut pending: Vec<IrNode>) -> LiveNodes {
         let mut live = LiveNodes::default();
         while let Some(node) = pending.pop() {
             if live.insert(node) {
-                reachable::visit_children(self, node, |child| pending.push(child));
+                reachable::visit_published(self, node, |child| pending.push(child));
             }
         }
         live

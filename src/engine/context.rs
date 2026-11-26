@@ -126,7 +126,7 @@ impl Cx {
         {
             roots.push((*variables).into());
         }
-        let live = self.ir.reachable(roots);
+        let live = self.ir.trace_published(roots);
         if let Some(body) = &mut self.kotlin_body {
             body.retain_ir_nodes(|node| live.contains(node));
         }
