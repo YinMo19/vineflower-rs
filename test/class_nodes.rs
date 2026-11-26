@@ -4,12 +4,12 @@ use std::{env, fmt::Display, fs, io::Write, path::Path, process::Command, sync::
 
 #[path = "support/literals.rs"]
 mod literals;
+#[path = "support/generic_chains.rs"]
+mod generic_chains;
 #[path = "support/writer_enum_records.rs"]
 mod writer_enum_records;
 #[path = "support/class_initializers.rs"]
 mod class_initializers;
-#[path = "support/generic_chains.rs"]
-mod generic_chains;
 #[path = "support/nested_classes.rs"]
 mod nested_classes;
 #[path = "support/nested_member_access.rs"]
@@ -22,6 +22,12 @@ mod oddities;
 mod metadata_writer;
 #[path = "support/local_class_declarations.rs"]
 mod local_class_declarations;
+#[path = "support/writer_snapshot.rs"]
+mod writer_snapshot;
+#[path = "support/class_declarations.rs"]
+mod class_declarations;
+#[path = "support/type_annotations.rs"]
+mod type_annotations;
 #[path = "support/upstream_reference.rs"]
 mod upstream_reference;
 

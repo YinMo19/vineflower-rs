@@ -16,6 +16,32 @@ use crate::structs::struct_member::Attributes;
 use crate::types::{CodeType, TypeFamily, VarType};
 use crate::util::text_buffer::TextBuffer;
 
+use super::type_annotations;
+
+pub(super) fn declaration_annotations(attrs: &Attributes) -> impl Iterator<Item = &AnnotationData> {
+    [
+        &attrs.runtime_visible_annotations,
+        &attrs.runtime_invisible_annotations,
+    ]
+    .into_iter()
+    .flatten()
+    .flat_map(|attribute| &attribute.annotations)
+}
+
+pub(super) fn parameter_annotations(
+    attrs: &Attributes,
+    parameter: usize,
+) -> impl Iterator<Item = &AnnotationData> {
+    [
+        &attrs.runtime_visible_parameter_annotations,
+        &attrs.runtime_invisible_parameter_annotations,
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(move |attribute| attribute.param_annotations.get(parameter))
+    .flatten()
+}
+
 pub(super) fn append_annotations(
     cx: &mut Cx,
     buffer: &mut TextBuffer,
@@ -23,49 +49,45 @@ pub(super) fn append_annotations(
     indent: i32,
     target_type: i32,
 ) -> io::Result<FxHashSet<String>> {
-    let mut written = FxHashSet::default();
-    for attribute in [
-        &attrs.runtime_visible_annotations,
-        &attrs.runtime_invisible_annotations,
-    ]
-    .into_iter()
-    .flatten()
-    {
-        for annotation in &attribute.annotations {
-            buffer.append_indent(indent);
-            written.insert(render(cx, annotation, -1)?.convert_to_string_and_allow_data_discard());
-            buffer.append_buffer(&render(cx, annotation, indent)?);
-            finish_annotation(buffer, indent);
-        }
+    let mut filter = FxHashSet::default();
+    for annotation in declaration_annotations(attrs) {
+        annotation.mark_written();
+        buffer.append_indent(indent);
+        filter.insert(render(cx, annotation, -1)?.convert_to_string_and_allow_data_discard());
+        buffer.append_buffer(&render(cx, annotation, indent)?);
+        finish_annotation(buffer, indent);
     }
 
     if !matches!(
         target_type,
         TypeAnnotationData::FIELD | TypeAnnotationData::METHOD_RETURN_TYPE
     ) {
-        for attribute in [
-            &attrs.runtime_visible_type_annotations,
-            &attrs.runtime_invisible_type_annotations,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            for entry in &attribute.annotations {
-                if !entry.path.is_empty() || entry.target >> 24 != target_type {
-                    continue;
-                }
-                let annotation = &entry.annotation;
-                let single_line =
-                    render(cx, annotation, -1)?.convert_to_string_and_allow_data_discard();
-                if !written.contains(&single_line) {
-                    buffer.append_indent(indent);
-                    buffer.append_buffer(&render(cx, annotation, indent)?);
-                    finish_annotation(buffer, indent);
-                }
-            }
+        append_top_level_type_annotations(cx, buffer, attrs, indent, target_type, -1, &filter)?;
+    }
+    Ok(filter)
+}
+
+fn append_top_level_type_annotations(
+    cx: &mut Cx,
+    buffer: &mut TextBuffer,
+    attrs: &Attributes,
+    indent: i32,
+    target_type: i32,
+    index: i32,
+    filter: &FxHashSet<String>,
+) -> io::Result<()> {
+    for entry in
+        type_annotations::for_target(attrs, target_type, index).filter(|entry| entry.is_top_level())
+    {
+        let annotation = &entry.annotation;
+        let single_line = render(cx, annotation, -1)?.convert_to_string_and_allow_data_discard();
+        if !filter.contains(&single_line) {
+            buffer.append_indent(indent);
+            buffer.append_buffer(&render(cx, annotation, indent)?);
+            finish_annotation(buffer, indent);
         }
     }
-    Ok(written)
+    Ok(())
 }
 
 fn finish_annotation(buffer: &mut TextBuffer, indent: i32) {

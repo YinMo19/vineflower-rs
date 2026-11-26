@@ -191,6 +191,28 @@ impl TextBuffer {
         self.append(brackets)
     }
 
+    /// Append a Java type while consuming the paths of its type-use annotations.
+    pub(crate) fn append_annotated_cast_type_name(
+        &mut self,
+        cx: &mut Cx,
+        ty: &crate::types::VarType,
+        annotations: &mut crate::engine::class_writer::type_annotations::TypeAnnotations<'_>,
+        filter: &rustc_hash::FxHashSet<String>,
+        vararg: bool,
+        flush: bool,
+    ) -> std::io::Result<&mut Self> {
+        crate::engine::class_writer::type_annotations::append_cast_type_name(
+            cx,
+            self,
+            ty,
+            annotations,
+            filter,
+            vararg,
+            flush,
+        )?;
+        Ok(self)
+    }
+
     fn add_generic_type_tokens(
         &mut self,
         cx: &mut Cx,

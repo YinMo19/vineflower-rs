@@ -9,7 +9,10 @@
 use std::cmp::Ordering;
 use std::fmt;
 use std::io;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering as AtomicOrdering},
+};
 
 use arcstr::ArcStr;
 
@@ -683,9 +686,21 @@ impl StructNestHostAttribute {
 #[derive(Clone, Debug)]
 pub struct AnnotationData {
     pub id: i32,
+    did_write_already: Arc<AtomicBool>,
     pub class_name: ArcStr,
     pub par_names: Vec<ArcStr>,
     pub par_values: Vec<AnnotationElement>,
+}
+
+impl AnnotationData {
+    /// ClassWriter and all type paths refer to the same parsed AnnotationExprent.
+    pub(crate) fn was_written(&self) -> bool {
+        self.did_write_already.load(AtomicOrdering::Relaxed)
+    }
+
+    pub(crate) fn mark_written(&self) {
+        self.did_write_already.store(true, AtomicOrdering::Relaxed);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -753,6 +768,7 @@ impl AnnotationData {
         let class_name = VarType::from_signature(&class_name).value.unwrap();
         Ok(AnnotationData {
             id: ids.next(),
+            did_write_already: Arc::default(),
             class_name,
             par_names,
             par_values,

@@ -121,6 +121,8 @@ CFG、语句图和 DirectGraph 具有不同的边契约。
 
 写出普通类前，`prepare_class_for_writing` 逐个恢复当前方法及其计数器，执行末轮 switch 和 if 改写。随后按声明和执行顺序抽取静态初始化器与各构造器共有的实例初始化器，处理合成构造器、Java 1.4 类字面量和 enum 成员。最后检查 record 的规范构造器并重新核对变量重名。抽出的右值保留原表达式身份，后续写字段仍能访问原字节码位置。[写出准备](src/engine/class_writer/mod.rs) · [初始化器](src/engine/class_writer/initializers.rs)
 
+普通类的声明头从类节点、父类和所在接口取修饰符，并在使用泛型签名前用擦除后的描述符校验。record 组件按组件、访问方法、规范构造器参数的次序查找声明注解，再按 JVM type path 写入类型注解。已写标志属于解析出的注解对象，重复写同一对象时沿用其状态。类型、类名和组件名写入同一份 `TextBuffer`，换行之后仍可定位对应 token。[类声明](src/engine/class_writer/declaration.rs) · [record 组件](src/engine/class_writer/record_components.rs) · [类型注解](src/engine/class_writer/type_annotations.rs)
+
 包描述符和模块描述符可以直接从已准备的根类写出。包注解先登记导入，再把导入写在包声明之后。模块先生成正文，随后在正文前写入导入。两条路径和普通声明共用注解值、类型 token 和换行组。[元数据写出](src/engine/class_writer/metadata.rs) · [写出入口](src/engine/class_processor.rs)
 
 `RuntimeImage::open` 将模块化 JDK 的每个模块作为独立库登记，按 JRT 的目录遍历和模块描述符顺序提供条目。普通镜像与 ZIP 压缩镜像可由现有 JImage 库读取；该库遇到 compact-cp 压缩时返回 Unsupported。[运行时类路径](src/engine/context_source/runtime.rs)

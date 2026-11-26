@@ -28,6 +28,8 @@ pub struct Cx {
     pub(crate) expression_ids: ExpressionIds,
     /// `DecompilerContext.getPoolInterceptor()`.
     pub pool_interceptor: Option<Arc<PoolInterceptor>>,
+    /// Optional documentation supplied by the embedding application.
+    pub javadoc: Option<Arc<dyn super::class_writer::javadoc::JavadocProvider>>,
     /// Object identities shared by methods and nested classes in this root class.
     pub ir: Ir,
     /// ClassesProcessor.mapRootClasses in this root-class worker.
@@ -45,6 +47,7 @@ impl Cx {
             options: Arc::clone(struct_context.options()),
             pool_interceptor: struct_context.pool_interceptor().cloned(),
             current_method_wrapper: None,
+            javadoc: None,
             current_method: None,
             expression_ids: struct_context.metadata_ids().clone(),
             struct_context,

@@ -3,14 +3,20 @@
 
 //! Native Java source writing after class and method processing.
 
-mod annotations;
+pub(super) mod annotations;
 pub(super) mod metadata;
+pub(crate) mod type_annotations;
 
 mod class_references14;
+mod declaration;
 mod enums;
 mod initializers;
+pub mod javadoc;
 mod late_methods;
+mod record_components;
 mod records;
+
+pub use declaration::write_class_definition;
 
 use super::{
     Cx,
