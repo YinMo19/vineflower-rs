@@ -110,33 +110,55 @@ fn method_deadline_expires_during_lazy_resolution_and_is_scoped_to_code() {
         driver
             .add_source_context(Arc::new(MemorySource::new(
                 "method deadline",
-                [(
-                    "TestListIteratorHierarchy".into(),
-                    include_bytes!("smoke/java8/TestListIteratorHierarchy.class").to_vec(),
-                )],
+                [
+                    (
+                        "TestListIteratorHierarchy".into(),
+                        include_bytes!("smoke/java8/TestListIteratorHierarchy.class").to_vec(),
+                    ),
+                    (
+                        "pkg/TestLibraryIsOnClasspath".into(),
+                        include_bytes!("smoke/java8/TestLibraryIsOnClasspath.class").to_vec(),
+                    ),
+                ],
             )))
             .unwrap();
         driver
             .add_library_context(Arc::new(LazyLibrary { before_read }))
             .unwrap();
-        driver.decompile().unwrap().pop().unwrap().source
+        driver
+            .decompile()
+            .unwrap()
+            .into_iter()
+            .map(|class| class.source)
+            .collect::<Vec<_>>()
     };
 
     // Foreach recognition consults the iterator hierarchy during the method.
-    // Delay that lookup so the test is independent of processor speed.
+    // The second root first resolves ext/TestLibrary in the writer. Delay both
+    // lookups to distinguish their scopes independently of processor speed.
     let timed = decompile(1, false, |name| {
-        if name == "java/util/ListIterator.class" {
+        if matches!(
+            name,
+            "java/util/ListIterator.class" | "ext/TestLibrary.class"
+        ) {
             std::thread::sleep(Duration::from_millis(1100));
         }
     });
     assert_eq!(
-        timed.matches("Couldn't be decompiled").count(),
+        timed[0].matches("Couldn't be decompiled").count(),
         1,
-        "{timed}"
+        "{}",
+        timed[0]
     );
-    assert!(timed.contains("Processing time limit exceeded"), "{timed}");
+    assert!(
+        timed[0].contains("Processing time limit exceeded"),
+        "{}",
+        timed[0]
+    );
     let untimed = decompile(0, false, |_| {});
-    assert!(untimed.contains("iterator.hasNext()"));
+    assert!(untimed[0].contains("iterator.hasNext()"));
+    assert_eq!(timed[1], untimed[1]);
+    assert!(timed[1].contains("TestLibrary.identity("));
     assert_eq!(decompile(-1, true, |_| {}), untimed);
 }
 
