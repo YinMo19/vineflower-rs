@@ -21,7 +21,9 @@ pub fn prepare_class(cx: &mut Cx, root: ClassNodeId) -> io::Result<()> {
     if node.kind != ClassKind::Root {
         return Ok(());
     }
-    cx.imports = ImportCollector::for_root(&cx.struct_context, &cx.class_nodes, node);
+    // The Java constructor can read library annotations before startClass
+    // installs the root's counter. Those IDs belong to the active caller.
+    cx.imports = ImportCollector::for_root_resolved(cx.classes(), &cx.class_nodes, node);
     cx.expression_ids = Default::default(); // DecompilerContext.startClass
     cx.source_mapper = Default::default();
     let package_info =

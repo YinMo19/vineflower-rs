@@ -37,9 +37,14 @@ public final class KotlinBodyReference {
     var processor = DecompilerContext.getClassProcessor();
     processor.loadClasses(null);
     var nodes = new TreeMap<>(processor.getMapRootClasses()).values();
+    ImportCollector selectedImports = null;
     if (selected != null) {
       for (var node : nodes) {
-        if (node.type == ClassNode.Type.ROOT) processor.processClass(node.classStruct);
+        if (node.type != ClassNode.Type.ROOT) continue;
+        processor.processClass(node.classStruct);
+        if (selected.equals(node.classStruct.qualifiedName)) {
+          selectedImports = DecompilerContext.getImportCollector();
+        }
       }
     }
     for (var node : nodes) {
@@ -50,9 +55,9 @@ public final class KotlinBodyReference {
       } else if (!selected.equals(cls.qualifiedName)) {
         continue;
       }
-      DecompilerContext.setProperty(DecompilerContext.CURRENT_CLASS, cls);
       DecompilerContext.setProperty(DecompilerContext.CURRENT_CLASS_NODE, node);
-      DecompilerContext.setImportCollector(new KotlinImportCollector(new ImportCollector(node)));
+      var imports = selected == null ? DecompilerContext.getImportCollector() : selectedImports;
+      DecompilerContext.setImportCollector(new KotlinImportCollector(imports));
       for (var method : node.getWrapper().getMethods()) {
         if (method.decompileError != null) {
           throw new IllegalStateException(method.methodStruct.getName(), method.decompileError);
@@ -60,6 +65,8 @@ public final class KotlinBodyReference {
         if (method.root == null) continue;
         String key = method.methodStruct.getName() + " " + method.methodStruct.getDescriptor();
         DecompilerContext.setProperty(DecompilerContext.CURRENT_METHOD_WRAPPER, method);
+        int statements = method.counter.getCounter(CounterContainer.STATEMENT_COUNTER);
+        int expressions = method.counter.getCounter(CounterContainer.EXPRESSION_COUNTER);
         TextBuffer body = method.root.toJava(1);
         body.addBytecodeMapping(method.root.getDummyExit().bytecode);
         TextBuffer full = new TextBuffer();
@@ -71,8 +78,7 @@ public final class KotlinBodyReference {
         }
         String text = full.convertToStringAndAllowDataDiscard();
         System.out.println(cls.qualifiedName + "\t" + key + "\t"
-          + method.counter.getCounter(CounterContainer.STATEMENT_COUNTER) + ","
-          + method.counter.getCounter(CounterContainer.EXPRESSION_COUNTER) + "\t"
+          + statements + "," + expressions + "\t"
           + HexFormat.of().formatHex(text.getBytes(StandardCharsets.UTF_8)) + "\t" + mapping);
       }
     }

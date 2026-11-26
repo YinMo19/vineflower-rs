@@ -28,6 +28,10 @@ pub struct ImportCollector {
 
 impl ImportCollector {
     pub fn for_class(context: &StructContext, class: &StructClass) -> Self {
+        Self::for_class_resolved(context.resolver(), class)
+    }
+
+    fn for_class_resolved(context: ClassResolver<'_>, class: &StructClass) -> Self {
         let package = class.qualified_name.rsplit_once('/').map(|(pkg, _)| pkg);
         let mut collector = Self {
             package: package.unwrap_or("").replace('/', "."),
@@ -59,7 +63,15 @@ impl ImportCollector {
     }
 
     pub fn for_root(context: &StructContext, nodes: &ClassNodes, root: &ClassNode) -> Self {
-        let mut collector = Self::for_class(context, &root.class);
+        Self::for_root_resolved(context.resolver(), nodes, root)
+    }
+
+    pub(super) fn for_root_resolved(
+        context: ClassResolver<'_>,
+        nodes: &ClassNodes,
+        root: &ClassNode,
+    ) -> Self {
+        let mut collector = Self::for_class_resolved(context, &root.class);
         let root_names = &collector.inner_names[&root.class.qualified_name];
         let mut pending: Vec<_> = root
             .nested
@@ -210,7 +222,7 @@ impl ImportCollector {
 }
 
 fn inherited_names(
-    context: &StructContext,
+    context: ClassResolver<'_>,
     class: &StructClass,
     mut names: InnerNames,
 ) -> InnerNames {

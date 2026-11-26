@@ -175,9 +175,8 @@ fn kotlin_lambda_sources_tokens_and_archive_mappings_match_plugin() {
                 );
             }
             assert_eq!(expected.len(), actual.len());
-            for (method, (_, source, mapping)) in expected {
-                let (_, rendered, actual_mapping) = actual.get(&method).unwrap();
-                assert_eq!((&source, &mapping), (rendered, actual_mapping), "{method}");
+            for (method, expected) in expected {
+                assert_eq!(&expected, actual.get(&method).unwrap(), "{method}");
             }
         }
     }
@@ -326,9 +325,13 @@ fn native_bodies(
         .filter(|(_, node)| node.kind == ClassKind::Root)
         .map(|(name, _)| (name.clone(), cx.class_nodes.id(name).unwrap()))
         .collect::<BTreeMap<_, _>>();
-    if selected.is_some() {
-        for &node in roots.values() {
+    let mut selected_imports = None;
+    if let Some(selected) = selected {
+        for (name, &node) in &roots {
             process_class(&mut cx, node)?;
+            if *name == selected {
+                selected_imports = Some(cx.imports.clone());
+            }
         }
     }
     let mut source = BTreeMap::new();
@@ -340,7 +343,7 @@ fn native_bodies(
         } else {
             process_class(&mut cx, node)?;
         }
-        cx.imports = imports::from_parent(&cx.imports);
+        cx.imports = imports::from_parent(selected_imports.as_ref().unwrap_or(&cx.imports));
         let count = cx.class_nodes[node].wrapper.as_ref().unwrap().methods.len();
         for index in 0..count {
             let method = &cx.class_nodes[node].wrapper.as_ref().unwrap().methods[index];
