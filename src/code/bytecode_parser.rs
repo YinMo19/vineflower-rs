@@ -12,7 +12,7 @@ use rustc_hash::FxHashMap;
 use super::bytecode_version::BytecodeVersion;
 use super::code_constants::*;
 use super::exception_table::{ExceptionHandler, ExceptionTable};
-use super::instruction::Instruction;
+use super::instruction::{Instruction, Operands};
 use super::instruction_sequence::FullInstructionSequence;
 use crate::structs::consts::ConstantPool;
 use crate::util::data_input::DataInputFullStream;
@@ -49,7 +49,7 @@ pub fn parse_bytecode(
             opcode = input.read_unsigned_byte()?;
         }
 
-        let mut operands = Vec::new();
+        let mut operands = Operands::default();
 
         if (OPC_ICONST_M1..=OPC_ICONST_5).contains(&opcode) {
             operands.push(OPR_ICONST[(opcode - OPC_ICONST_M1) as usize]);
@@ -214,7 +214,7 @@ pub fn parse_bytecode(
 
         i += 1;
 
-        let instr = Instruction::create(
+        let instr = Instruction::create_with_operands(
             opcode,
             wide,
             group,

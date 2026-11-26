@@ -29,8 +29,7 @@ pub struct Instruction {
     pub bytecode_version: BytecodeVersion,
     pub start_offset: i32,
     pub length: i32,
-    /// Empty where upstream has `null`.
-    operands: Vec<i32>,
+    operands: Operands,
     pub kind: InstructionKind,
 }
 
@@ -58,6 +57,63 @@ pub struct SwitchInstruction {
     pub default_destination: i32,
 }
 
+/// Zero, one and two operands fit inline. Larger lists need a thin pointer so
+/// that their lengths and capacities occupy space only for those instructions.
+#[derive(Clone, Default)]
+pub(super) enum Operands {
+    /// Upstream uses `null` for an instruction with no operands.
+    #[default]
+    Empty,
+    One([i32; 1]),
+    Two([i32; 2]),
+    Many(Box<ManyOperands>),
+}
+
+#[derive(Clone)]
+pub(super) struct ManyOperands(Vec<i32>);
+
+impl Operands {
+    pub(super) fn push(&mut self, value: i32) {
+        *self = match self {
+            Self::Empty => Self::One([value]),
+            Self::One([first]) => Self::Two([*first, value]),
+            Self::Two([first, second]) => Self::Many(Box::new(ManyOperands(vec![
+                *first, *second, value,
+            ]))),
+            Self::Many(operands) => {
+                operands.0.push(value);
+                return;
+            }
+        };
+    }
+
+    fn as_slice(&self) -> &[i32] {
+        match self {
+            Self::Empty => &[],
+            Self::One(operands) => operands,
+            Self::Two(operands) => operands,
+            Self::Many(operands) => &operands.0,
+        }
+    }
+}
+
+impl From<Vec<i32>> for Operands {
+    fn from(operands: Vec<i32>) -> Self {
+        match operands.as_slice() {
+            [] => Self::Empty,
+            [first] => Self::One([*first]),
+            [first, second] => Self::Two([*first, *second]),
+            _ => Self::Many(Box::new(ManyOperands(operands))),
+        }
+    }
+}
+
+impl fmt::Debug for Operands {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.as_slice().fmt(f)
+    }
+}
+
 impl Instruction {
     /// Pass no operands where upstream passes `null`.
     pub fn create(
@@ -66,6 +122,26 @@ impl Instruction {
         group: i32,
         bytecode_version: BytecodeVersion,
         operands: Vec<i32>,
+        start_offset: i32,
+        length: i32,
+    ) -> Instruction {
+        Self::create_with_operands(
+            opcode,
+            wide,
+            group,
+            bytecode_version,
+            operands.into(),
+            start_offset,
+            length,
+        )
+    }
+
+    pub(super) fn create_with_operands(
+        opcode: i32,
+        wide: bool,
+        group: i32,
+        bytecode_version: BytecodeVersion,
+        operands: Operands,
         start_offset: i32,
         length: i32,
     ) -> Instruction {
@@ -121,15 +197,16 @@ impl Instruction {
     }
 
     fn init_switch(&self, seq: &FullInstructionSequence) -> SwitchInstruction {
-        let default_destination = seq.get_index_by_rel_offset(self, self.operands[0]);
+        let operands = self.operands.as_slice();
+        let default_destination = seq.get_index_by_rel_offset(self, operands[0]);
 
         let prefix = if self.opcode == OPC_TABLESWITCH { 3 } else { 2 };
-        let mut len = self.operands.len() - prefix;
+        let mut len = operands.len() - prefix;
         let mut low = 0;
         if self.opcode == OPC_LOOKUPSWITCH {
             len /= 2;
         } else {
-            low = self.operands[1];
+            low = operands[1];
         }
 
         let mut destinations = vec![0; len];
@@ -137,12 +214,12 @@ impl Instruction {
         let mut k = 0;
         for i in 0..len {
             if self.opcode == OPC_LOOKUPSWITCH {
-                values[i] = self.operands[prefix + k];
+                values[i] = operands[prefix + k];
                 k += 1;
             } else {
                 values[i] = low.wrapping_add(k as i32);
             }
-            destinations[i] = seq.get_index_by_rel_offset(self, self.operands[prefix + k]);
+            destinations[i] = seq.get_index_by_rel_offset(self, operands[prefix + k]);
             k += 1;
         }
 
@@ -154,11 +231,11 @@ impl Instruction {
     }
 
     pub fn operands_count(&self) -> i32 {
-        self.operands.len() as i32
+        self.operands.as_slice().len() as i32
     }
 
     pub fn operand(&self, index: i32) -> i32 {
-        self.operands[index as usize]
+        self.operands.as_slice()[index as usize]
     }
 
     pub fn can_fall_through(&self) -> bool {
@@ -196,7 +273,7 @@ impl fmt::Display for Instruction {
         }
         write!(f, "@{}", text_util::get_instruction_name(self.opcode))?;
 
-        for &op in &self.operands {
+        for &op in self.operands.as_slice() {
             if op < 0 {
                 write!(f, " -{:x}", op.wrapping_neg())?;
             } else {
