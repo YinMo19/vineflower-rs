@@ -126,7 +126,9 @@ Point `VINEFLOWER_RS_CLASS_ROOT` at that checkout. Prebuilt outputs are also nee
 
 ### IR lifetime on multiple input units
 
-The ignored driver test `nested_constructor_and_switch_map_survive_class_and_unit_order` compiles an inner constructor and an enum-table holder with javac. It compares the two CLIs with both root orders in one archive and both archive orders across units, then recompiles and executes the emitted sources. The enum switch depends on when the holder's method graph becomes available.
+The ignored driver test `nested_constructor_and_switch_map_survive_class_and_unit_order` compiles an inner constructor and an enum-table holder with javac. It compares native output at one and two workers with Java at one worker, using both root orders in one archive and both archive orders across units. It recompiles and executes the emitted sources. The enum switch depends on when the holder's method graph becomes available.
+
+`parallel_method_graphs_preserve_archive_order_and_mappings` compiles three roots with distinct implementations of the same method signature, switch and finally blocks, and methods without Code. The input omits a class referenced by one signature. It compares archive entry order, sources and line mappings at the default worker count, one, two and automatic, repeats the two-worker run, then recompiles and executes the result with the dependency available.
 
 For the larger memory comparison, use the Minecraft 26.3 client (SHA-256 `4508d006323f24fa02876310c192d739af56516eb259000ac50f0909a68c9a2d`). Select the complete class subtrees below in central-directory order. Make one combined archive and one archive per subtree, registering the latter in the order shown. Supply the remaining class entries as one external library.
 
@@ -148,3 +150,16 @@ Compare the relative filenames and bytes against both the previous binary and th
 With baseline `eb137e2` and execution code `4125b28`, the 2,831-class subset produced 1,762 Java files in both layouts. With a single worker, median peak RSS fell from 1,304.8 to 1,083.5 MiB for one input JAR, and from 1,280.5 to 804.3 MiB for five. Median elapsed time changed from 9.81 to 10.07 seconds and from 9.41 to 10.12 seconds, respectively.
 
 Three paired single-worker runs on the complete client produced identical output trees across revisions and against the Java CLI (7,301 Java files and 21,495 resources). Median peak RSS was 6.410 GiB before and 6.526 GiB after. The separate macOS peak memory footprint decreased in all three pairs, with medians of 5.460 and 4.379 GiB. Median elapsed time was 42.01 and 45.29 seconds. The single input unit retains all published root wrappers through the preparation barrier.
+
+### Root worker comparison
+
+Release `c1b5109` prepares the initial control-flow and statement graphs on root workers. The comparison used the inputs, JDK, directory output and flags above, with release `381a023` as the baseline. Each before/after pair measures one run per release on an Apple M4 Pro after earlier runs on the same archives. RSS is the maximum resident set size reported by macOS.
+
+| Input | Workers | Elapsed before / after (s) | Peak RSS before / after (GiB) |
+| --- | --- | ---: | ---: |
+| 2,831 classes in one JAR | 1 | 10.17 / 10.20 | 1.059 / 1.059 |
+| 2,831 classes in one JAR | auto | 10.13 / 9.89 | 1.058 / 1.066 |
+| Complete 26.3 client | 1 | 44.69 / 44.90 | 6.401 / 6.557 |
+| Complete 26.3 client | auto | 44.67 / 44.24 | 6.265 / 5.999 |
+
+The automatic setting selected a thread count of 14. User and system CPU time summed to 44.80 s before and 46.44 s after on the full automatic run. At one, two and automatic workers the client's directory tree matched the pinned Java CLI. Both layouts of the 2,831-class subset also preserved archive entry order, source bytes and all 1,520 line maps against the previous native release. Four maps on JDK 25.0.2 have the same line pairs as Java in a different order, as in the baseline.
