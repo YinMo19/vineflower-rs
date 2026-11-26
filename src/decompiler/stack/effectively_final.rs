@@ -87,7 +87,7 @@ impl Scan<'_> {
                             }
                         }
                     } else if !method_reference {
-                        self.lambda_captures(node.lambda.unwrap(), constructor.unwrap());
+                        self.lambda_captures(node.lambda.unwrap(), *constructor);
                     }
                 }
             }
@@ -99,13 +99,13 @@ impl Scan<'_> {
         }
     }
 
-    fn lambda_captures(&mut self, lambda: &LambdaInformation, constructor: ExprId) {
+    fn lambda_captures(&mut self, lambda: &LambdaInformation, constructor: Option<ExprId>) {
         let content = MethodDescriptor::parse_descriptor(&lambda.content_method_descriptor);
         let interface = MethodDescriptor::parse_descriptor(&lambda.method_descriptor);
         let count = content.params.len().saturating_sub(interface.params.len());
         let offset = usize::from(!lambda.is_content_method_static);
         for (i, ty) in content.params.iter().take(count).enumerate() {
-            let ExprKind::Invocation(invocation) = &self.ir[constructor].kind else {
+            let ExprKind::Invocation(invocation) = &self.ir[constructor.unwrap()].kind else {
                 unreachable!()
             };
             let param = invocation.parameters[offset + i];
