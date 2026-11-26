@@ -29,3 +29,18 @@ class Host {
 class CompanionRead {
     fun reference(): Host = Host.INSTANCE
 }
+
+enum class Place {
+    INSTANCE, OTHER;
+
+    companion object
+}
+
+enum class PlainPlace { INSTANCE }
+
+annotation class EnumDefaults(
+    val place: Place = Place.INSTANCE,
+    val other: Place = Place.OTHER,
+    val plain: PlainPlace = PlainPlace.INSTANCE,
+    val places: Array<Place> = [Place.INSTANCE, Place.OTHER],
+)

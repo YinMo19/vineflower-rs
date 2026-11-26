@@ -104,7 +104,7 @@ fn constant(
 }
 
 /// KConstExprent.toJava on a JVM class literal, including boxed primitive handles.
-pub(crate) fn append_class_literal(cx: &mut Cx, buffer: &mut TextBuffer, name: &str) {
+fn append_class_literal(cx: &mut Cx, buffer: &mut TextBuffer, name: &str) {
     let ty = VarType::from_signature_cl(name, !name.starts_with('['));
     buffer.append_cast_type_name(cx, &ty).append("::class.java");
     if primitive_box(name) {

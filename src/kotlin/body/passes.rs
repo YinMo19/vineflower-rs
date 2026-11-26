@@ -230,15 +230,7 @@ fn wrap_unmarked(
         ExprKind::Invocation(_) => {
             return Ok(wrap_invocation(cx, counters, original));
         }
-        ExprKind::Constant { was_condy, .. } => {
-            *was_condy = false;
-            KotlinExpr::Constant { unsigned: None }
-        }
-        ExprKind::Field(field) => {
-            field.force_qualified = false;
-            field.was_condy = false;
-            KotlinExpr::Field
-        }
+        ExprKind::Constant { .. } | ExprKind::Field(_) => super::scalar_wrapper(&mut kind),
         ExprKind::SwitchHead { .. } => KotlinExpr::SwitchHead,
         ExprKind::New {
             new_type,

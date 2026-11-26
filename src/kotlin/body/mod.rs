@@ -145,7 +145,7 @@ pub fn set_unsigned_type(cx: &mut Cx, expr: ExprId, ty: CodeType) {
     }
 }
 
-pub(crate) use expression::{append_class_literal, precedence, write_expression};
+pub(crate) use expression::{precedence, write_expression};
 pub(crate) use passes::copy_expression;
 
 pub use statement::statement;
@@ -157,6 +157,29 @@ pub use crate::decompiler::exps::write::to_java as expression;
 pub fn replace_expression(cx: &mut Cx, expr: ExprId) -> io::Result<ExprId> {
     let mut counters = ambient_counters(cx);
     passes::wrap(cx, &mut counters, expr)
+}
+
+/// Allocate a Kotlin wrapper for a parsed scalar stored outside the IR.
+pub(super) fn new_scalar(cx: &mut Cx, mut kind: ExprKind) -> ExprId {
+    let wrapper = scalar_wrapper(&mut kind);
+    let expr = Expr::new_ambient(cx, kind, None);
+    cx.set_kotlin_expr(expr, wrapper);
+    expr
+}
+
+fn scalar_wrapper(kind: &mut ExprKind) -> KotlinExpr {
+    match kind {
+        ExprKind::Constant { was_condy, .. } => {
+            *was_condy = false;
+            KotlinExpr::Constant { unsigned: None }
+        }
+        ExprKind::Field(field) => {
+            field.force_qualified = false;
+            field.was_condy = false;
+            KotlinExpr::Field
+        }
+        _ => unreachable!("Expected a Kotlin scalar expression"),
+    }
 }
 
 fn ambient_counters(cx: &Cx) -> crate::engine::counter_container::CounterContainer {

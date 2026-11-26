@@ -89,7 +89,7 @@ fn kotlin_lambda_sources_tokens_and_archive_mappings_match_plugin() {
             ][..],
         ),
     ];
-    for (mode, fixture, entries) in mode_cases {
+    for (mode, fixture, mapped_entries) in mode_cases {
         let root = scratch.path().join(mode);
         let classes = root.join("classes");
         compile_kotlin(workspace, &jdk, &stdlib, &classes, fixture, Some(mode));
@@ -130,7 +130,13 @@ fn kotlin_lambda_sources_tokens_and_archive_mappings_match_plugin() {
         );
         let mut expected = zip::ZipArchive::new(fs::File::open(expected).unwrap()).unwrap();
         let mut actual = zip::ZipArchive::new(fs::File::open(actual).unwrap()).unwrap();
-        for &entry in entries {
+        let entries = kotlin_entry_names(&expected);
+        assert_eq!(
+            entries,
+            kotlin_entry_names(&actual),
+            "{mode} Kotlin sources"
+        );
+        for entry in &entries {
             let mut expected = expected.by_name(entry).unwrap();
             let mut actual = actual.by_name(entry).unwrap();
             let mut source = String::new();
@@ -141,17 +147,26 @@ fn kotlin_lambda_sources_tokens_and_archive_mappings_match_plugin() {
             assert_eq!(
                 expected.extra_data(),
                 actual.extra_data(),
-                "{entry} mapping"
+                "{entry} ZIP extra data"
             );
-            assert!(
-                has_mapping_field(expected.extra_data().unwrap_or_default()),
-                "{entry}"
-            );
-            if mode == "indy" {
+            if entry == "indy/IndySubject.kt" {
                 assert!(source.contains("return@lambda_"));
             }
         }
+        for &entry in mapped_entries {
+            let mapped = expected.by_name(entry).unwrap();
+            assert!(
+                has_mapping_field(mapped.extra_data().unwrap_or_default()),
+                "{entry} missing mapping"
+            );
+        }
         if mode == "class" {
+            assert!(
+                entries
+                    .iter()
+                    .any(|entry| entry == "classlambda/EnumDefaults.kt"),
+                "the plugin archive omitted the annotation fixture"
+            );
             let selected = "classlambda/References";
             fs::write(
                 &request,
@@ -180,6 +195,16 @@ fn kotlin_lambda_sources_tokens_and_archive_mappings_match_plugin() {
             }
         }
     }
+}
+
+fn kotlin_entry_names(archive: &zip::ZipArchive<fs::File>) -> Vec<String> {
+    let mut names: Vec<_> = archive
+        .file_names()
+        .filter(|name| name.ends_with(".kt"))
+        .map(str::to_owned)
+        .collect();
+    names.sort_unstable();
+    names
 }
 
 fn has_mapping_field(mut bytes: &[u8]) -> bool {

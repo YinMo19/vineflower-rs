@@ -8,16 +8,19 @@ use rustc_hash::FxHashSet;
 
 use crate::{
     code::code_constants::*,
-    decompiler::exps::literal,
+    decompiler::{
+        exps::{ConstantValue, Expr, ExprKind, Field, literal},
+        ir::ExprId,
+    },
     engine::{
         Cx,
         class_writer::{annotations as java, type_annotations},
         import_collector::get_short_name,
     },
-    kotlin::types::kotlin_type,
+    kotlin::{body, types::kotlin_type},
     structs::{
         StructMember,
-        attr::{AnnotationData, ElementValue, TypeAnnotationData},
+        attr::{AnnotationData, AnnotationElement, ElementValue, TypeAnnotationData},
         consts::ConstantPool,
         struct_member::Attributes,
     },
@@ -176,29 +179,58 @@ pub fn write_value(cx: &mut Cx, buffer: &mut TextBuffer, value: &ElementValue) -
     Ok(())
 }
 
-/// Kotlin's default-argument map wraps an annotation value when the map is built.
+/// A default argument prepared for the current compilation unit. Scalar wrappers
+/// belong to its expression arena and are rendered using the same context.
 #[derive(Clone, Debug)]
-pub struct DefaultValue(ElementValue);
+pub struct DefaultValue(DefaultExpression);
+
+#[derive(Clone, Debug)]
+enum DefaultExpression {
+    Scalar(ExprId),
+    Annotation(AnnotationData),
+    Array(Vec<AnnotationElement>),
+}
 
 impl DefaultValue {
-    pub fn from_element(cx: &Cx, value: &ElementValue) -> Self {
-        if let ElementValue::Annotation(annotation) = value {
-            allocate_wrapper(cx, annotation);
-        } else {
-            cx.expression_ids.next();
-        }
-        Self(value.clone())
+    pub fn from_element(cx: &mut Cx, value: &ElementValue) -> Self {
+        let expression = match value {
+            ElementValue::Const { ty, value } => Expr::constant(ty.clone(), value.clone(), false),
+            ElementValue::Class(name) => Expr::constant(
+                VarType::VARTYPE_CLASS,
+                ConstantValue::String(name.clone().into()),
+                false,
+            ),
+            ElementValue::EnumConstant {
+                const_name,
+                descriptor,
+            } => ExprKind::Field(Box::new(Field {
+                name: const_name.clone(),
+                classname: descriptor.ty.value.clone(),
+                instance: None,
+                descriptor: descriptor.clone(),
+                force_qualified: false,
+                was_condy: false,
+            })),
+            ElementValue::Annotation(annotation) => {
+                allocate_wrapper(cx, annotation);
+                return Self(DefaultExpression::Annotation(annotation.clone()));
+            }
+            ElementValue::Array(elements) => {
+                // KNewExprent shares the original Java element expressions.
+                cx.expression_ids.next();
+                return Self(DefaultExpression::Array(elements.clone()));
+            }
+        };
+        Self(DefaultExpression::Scalar(body::new_scalar(cx, expression)))
     }
 
     pub fn render(&self, cx: &mut Cx, indent: i32) -> io::Result<TextBuffer> {
         match &self.0 {
-            ElementValue::Class(name) => {
-                let mut buffer = TextBuffer::new(cx);
-                crate::kotlin::body::append_class_literal(cx, &mut buffer, name);
-                Ok(buffer)
+            DefaultExpression::Scalar(expr) => body::expression(cx, *expr, indent),
+            DefaultExpression::Annotation(annotation) => {
+                render_wrapped(cx, annotation, indent, None)
             }
-            ElementValue::Annotation(annotation) => render_wrapped(cx, annotation, indent, None),
-            ElementValue::Array(elements) => {
+            DefaultExpression::Array(elements) => {
                 let mut buffer = TextBuffer::new(cx);
                 buffer
                     .append_char('[')
@@ -218,7 +250,6 @@ impl DefaultValue {
                     .append_char(']');
                 Ok(buffer)
             }
-            value => java::render_element(cx, value, indent),
         }
     }
 }
