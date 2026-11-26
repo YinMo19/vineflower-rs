@@ -12,6 +12,8 @@ mod writer_enum_records;
 mod method_writer;
 #[path = "support/compilation_unit.rs"]
 mod compilation_unit;
+#[path = "support/identifier_rename.rs"]
+mod identifier_rename;
 #[path = "support/function_writer.rs"]
 mod function_writer;
 #[path = "support/invocation_writer.rs"]

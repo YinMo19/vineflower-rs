@@ -68,7 +68,7 @@ pub fn to_valid_java_identifier(name: &str) -> Cow<'_, str> {
 }
 
 /// `Character.isJavaIdentifierStart(char)`.
-fn is_java_identifier_start(unit: u16) -> bool {
+pub(crate) fn is_java_identifier_start(unit: u16) -> bool {
     use GeneralCategory::*;
     category(unit).is_some_and(|category| {
         matches!(
@@ -86,16 +86,18 @@ fn is_java_identifier_start(unit: u16) -> bool {
 }
 
 /// `Character.isJavaIdentifierPart(char)`.
-fn is_java_identifier_part(unit: u16) -> bool {
+pub(crate) fn is_java_identifier_part(unit: u16) -> bool {
     use GeneralCategory::*;
     is_java_identifier_start(unit)
-        || matches!(unit, 0x00..=0x08 | 0x0E..=0x1B | 0x7F..=0x9F)
+        || is_java_identifier_ignorable(unit)
         || category(unit).is_some_and(|category| {
-            matches!(
-                category,
-                DecimalNumber | SpacingMark | NonspacingMark | Format
-            )
+            matches!(category, DecimalNumber | SpacingMark | NonspacingMark)
         })
+}
+
+pub(crate) fn is_java_identifier_ignorable(unit: u16) -> bool {
+    matches!(unit, 0x00..=0x08 | 0x0E..=0x1B | 0x7F..=0x9F)
+        || category(unit) == Some(GeneralCategory::Format)
 }
 
 pub fn is_keyword(id: &str, version: BytecodeVersion, mt: &StructMethod) -> bool {
@@ -104,7 +106,7 @@ pub fn is_keyword(id: &str, version: BytecodeVersion, mt: &StructMethod) -> bool
         || mt.has_modifier(ACC_STATIC) && id == "this"
 }
 
-fn is_reserved_word(id: &str) -> bool {
+pub(crate) fn is_reserved_word(id: &str) -> bool {
     matches!(
         id,
         "abstract"
