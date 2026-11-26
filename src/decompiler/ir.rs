@@ -5,7 +5,7 @@
 //!
 //! Upstream's statements, edges, expressions and basic blocks form a mutable
 //! object graph with cycles, aliasing and identity comparisons. Here every
-//! such object lives in the worker's arena for the duration of the run.
+//! live object keeps its handle when the worker reclaims unreachable graphs.
 //! A `Copy` handle stands for the Java reference: two handles
 //! are equal exactly when the references were identical, and a change made
 //! through one alias is visible through all others.
@@ -17,52 +17,88 @@
 
 use std::ops::{Index, IndexMut};
 
-use index_vec::{IndexVec, define_index_type};
+use index_vec::define_index_type;
+
+mod arena;
+mod reachable;
+
+pub use arena::Arena;
+use arena::Marks;
 
 pub use super::exps::{Expr, ExprKind};
 use super::stats::{Statement, stat_edge::StatEdge};
 use super::vars::processor::VarProcessor;
 use crate::code::cfg::basic_block::BasicBlock;
 
-define_index_type! {
+macro_rules! arenas {
+    ($( $(#[$doc:meta])* $id:ident($variant:ident): $field:ident => $object:ty, )+) => {
+        $( define_index_type! { $(#[$doc])* pub struct $id = u32; } )+
+
+        #[derive(Default)]
+        pub struct Ir {
+            $( pub $field: Arena<$id, $object>, )+
+        }
+
+        #[derive(Clone, Copy)]
+        pub(crate) enum IrNode {
+            $( $variant($id), )+
+        }
+
+        #[derive(Default)]
+        pub(crate) struct LiveNodes {
+            $( $field: Marks, )+
+        }
+
+        impl LiveNodes {
+            fn insert(&mut self, node: IrNode) -> bool {
+                match node { $( IrNode::$variant(id) => self.$field.insert(id), )+ }
+            }
+
+            pub(crate) fn contains(&self, node: IrNode) -> bool {
+                match node { $( IrNode::$variant(id) => self.$field.contains(id), )+ }
+            }
+        }
+
+        impl Ir {
+            pub(crate) fn allocated_bytes(&self) -> u64 {
+                0 $( + self.$field.allocated_bytes() )+
+            }
+
+            pub(crate) fn sweep(&mut self, live: &LiveNodes) -> u64 {
+                0 $( + self.$field.sweep(&live.$field) )+
+            }
+        }
+
+        $(
+            impl From<$id> for IrNode {
+                fn from(id: $id) -> Self { Self::$variant(id) }
+            }
+
+            impl Index<$id> for Ir {
+                type Output = $object;
+                fn index(&self, id: $id) -> &$object { &self.$field[id] }
+            }
+
+            impl IndexMut<$id> for Ir {
+                fn index_mut(&mut self, id: $id) -> &mut $object { &mut self.$field[id] }
+            }
+        )+
+    };
+}
+
+arenas! {
     /// A reference to a `Statement`.
-    pub struct StatId = u32;
-}
-
-define_index_type! {
+    StatId(Stat): stats => Statement,
     /// A reference to a `StatEdge`.
-    pub struct EdgeId = u32;
-}
-
-define_index_type! {
+    EdgeId(Edge): edges => StatEdge,
     /// A reference to an `Exprent`.
-    pub struct ExprId = u32;
-}
-
-define_index_type! {
-    /// A reference to a `List<Exprent>` object that statements and flattened
-    /// graph nodes share.
-    pub struct ExprListId = u32;
-}
-
-define_index_type! {
+    ExprId(Expr): exprs => Expr,
+    /// A list shared by statements and flattened graph nodes.
+    ExprListId(List): lists => Vec<ExprId>,
     /// A reference to a `BasicBlock`.
-    pub struct BlockId = u32;
-}
-
-define_index_type! {
+    BlockId(Block): blocks => BasicBlock,
     /// The variable processor shared by all local expressions of one method.
-    pub struct VarProcessorId = u32;
-}
-
-#[derive(Default)]
-pub struct Ir {
-    pub variable_processors: IndexVec<VarProcessorId, VarProcessor>,
-    pub stats: IndexVec<StatId, Statement>,
-    pub edges: IndexVec<EdgeId, StatEdge>,
-    pub exprs: IndexVec<ExprId, Expr>,
-    pub lists: IndexVec<ExprListId, Vec<ExprId>>,
-    pub blocks: IndexVec<BlockId, BasicBlock>,
+    VarProcessorId(VarProcessor): variable_processors => VarProcessor,
 }
 
 impl Ir {
@@ -70,31 +106,14 @@ impl Ir {
     pub fn new_list(&mut self, exprents: Vec<ExprId>) -> ExprListId {
         self.lists.push(exprents)
     }
-}
 
-macro_rules! arena_index {
-    ($($field:ident: $id:ty => $node:ty,)*) => {$(
-        impl Index<$id> for Ir {
-            type Output = $node;
-
-            fn index(&self, id: $id) -> &$node {
-                &self.$field[id]
+    pub(crate) fn reachable(&self, mut pending: Vec<IrNode>) -> LiveNodes {
+        let mut live = LiveNodes::default();
+        while let Some(node) = pending.pop() {
+            if live.insert(node) {
+                reachable::visit_children(self, node, |child| pending.push(child));
             }
         }
-
-        impl IndexMut<$id> for Ir {
-            fn index_mut(&mut self, id: $id) -> &mut $node {
-                &mut self.$field[id]
-            }
-        }
-    )*};
-}
-
-arena_index! {
-    variable_processors: VarProcessorId => VarProcessor,
-    stats: StatId => Statement,
-    edges: EdgeId => StatEdge,
-    exprs: ExprId => Expr,
-    lists: ExprListId => Vec<ExprId>,
-    blocks: BlockId => BasicBlock,
+        live
+    }
 }

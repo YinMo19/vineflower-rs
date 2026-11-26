@@ -15,7 +15,7 @@ use super::context::Cx;
 use super::counter_container::CounterContainer;
 use super::method_processor::ExpressionMethod;
 use crate::decompiler::flow::{DirectGraph, flatten::build_direct_graph};
-use crate::decompiler::ir::{ExprId, ExprListId, Ir, StatId, VarProcessorId};
+use crate::decompiler::ir::{ExprId, ExprListId, Ir, IrNode, StatId, VarProcessorId};
 use crate::decompiler::stats::StatementKind;
 use crate::decompiler::vars::{processor::VarNamesCollector, var_version_pair::VarVersionPair};
 use crate::structs::{StructClass, StructMethod};
@@ -29,6 +29,21 @@ pub struct ClassWrapper {
     /// Encounter order of assignments. The writer follows the class field table.
     pub static_field_initializers: VBStyleCollection<ExprId, String>,
     pub dynamic_field_initializers: VBStyleCollection<ExprId, String>,
+}
+
+impl ClassWrapper {
+    pub(crate) fn visit_ir_roots(&self, visit: &mut impl FnMut(IrNode)) {
+        for method in &self.methods {
+            method.visit_ir_roots(visit);
+        }
+        for &expr in self
+            .static_field_initializers
+            .iter()
+            .chain(&self.dynamic_field_initializers)
+        {
+            visit(expr.into());
+        }
+    }
 }
 
 pub struct MethodWrapper {
@@ -47,6 +62,16 @@ pub struct MethodWrapper {
 }
 
 impl MethodWrapper {
+    pub(super) fn visit_ir_roots(&self, visit: &mut impl FnMut(IrNode)) {
+        visit(self.variables.into());
+        if let Ok(Some(body)) = &self.body {
+            visit(body.root.into());
+            if let Some(graph) = &body.graph {
+                graph.visit_ir_roots(visit);
+            }
+        }
+    }
+
     pub fn root(&self) -> Option<StatId> {
         self.body.as_ref().ok()?.as_ref().map(|body| body.root)
     }

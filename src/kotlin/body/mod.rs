@@ -15,7 +15,7 @@ use std::io;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::decompiler::exps::{Expr, ExprKind};
-use crate::decompiler::ir::{ExprId, StatId};
+use crate::decompiler::ir::{ExprId, IrNode, StatId};
 use crate::engine::{Cx, method_processor::ExpressionMethod};
 use crate::types::{CodeType, VarType};
 
@@ -59,10 +59,18 @@ pub(crate) enum KotlinExpr {
     Exit { lambda_name: Option<String> },
 }
 
+/// Language-specific state follows the lifetime of the IR node used as its key.
 #[derive(Default)]
 pub(crate) struct KotlinBody {
     statements: FxHashSet<StatId>,
     expressions: FxHashMap<ExprId, KotlinExpr>,
+}
+
+impl KotlinBody {
+    pub(crate) fn retain_ir_nodes(&mut self, live: impl Fn(IrNode) -> bool) {
+        self.statements.retain(|&stat| live(stat.into()));
+        self.expressions.retain(|&expr, _| live(expr.into()));
+    }
 }
 
 impl Cx {

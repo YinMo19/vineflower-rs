@@ -7,12 +7,28 @@ use std::io;
 use std::sync::Arc;
 
 use super::Cx;
-use super::class_nodes::{ClassKind, ClassNodeId, ClassNodes, process_lambdas};
+use super::class_nodes::{ClassKind, ClassNode, ClassNodeId, ClassNodes, process_lambdas};
 use super::class_writer::metadata::{module_info_to_java, package_info_to_java};
 use super::import_collector::{ImportCollector, short_name, write_imports};
 use crate::code::code_constants::{ACC_FINAL, ACC_MODULE, ACC_STATIC, ACC_SYNTHETIC, CLINIT_NAME};
+use crate::structs::attr::StructModuleAttribute;
 use crate::structs::{StructClass, StructMember, StructMethod};
 use crate::util::text_buffer::TextBuffer;
+
+enum Metadata<'a> {
+    Package,
+    Module(&'a StructModuleAttribute),
+}
+
+fn metadata<'a>(node: &ClassNode, class: &'a StructClass) -> Option<Metadata<'a>> {
+    if class.is_synthetic() && node.simple_name.as_deref() == Some("package-info") {
+        Some(Metadata::Package)
+    } else if class.has_modifier(ACC_MODULE) {
+        class.attributes.module.as_ref().map(Metadata::Module)
+    } else {
+        None
+    }
+}
 
 /// Start the root's import scope before discovering lambda classes. Nested
 /// classes share this scope throughout method processing and source writing.
@@ -26,10 +42,7 @@ pub fn prepare_class(cx: &mut Cx, root: ClassNodeId) -> io::Result<()> {
     cx.imports = ImportCollector::for_root_resolved(cx.classes(), &cx.class_nodes, node);
     cx.expression_ids = Default::default(); // DecompilerContext.startClass
     cx.source_mapper = Default::default();
-    let package_info =
-        node.class.is_synthetic() && node.simple_name.as_deref() == Some("package-info");
-    let module_info = node.class.has_modifier(ACC_MODULE) && node.class.attributes.module.is_some();
-    if package_info || module_info {
+    if metadata(node, &node.class).is_some() {
         return Ok(());
     }
     process_lambdas(&mut cx.class_nodes, root)?;
@@ -79,9 +92,7 @@ pub fn process_class(cx: &mut Cx, root: ClassNodeId) -> io::Result<()> {
     }
     prepare_class(cx, root)?;
     let class = cx.class_nodes[root].class.clone();
-    if class.is_synthetic() && cx.class_nodes[root].simple_name.as_deref() == Some("package-info")
-        || class.has_modifier(ACC_MODULE) && class.attributes.module.is_some()
-    {
+    if metadata(&cx.class_nodes[root], &class).is_some() {
         return Ok(());
     }
     let kotlin = crate::kotlin::members::select_language(cx, &class);
@@ -112,21 +123,24 @@ pub fn write_metadata(
     if node.kind != ClassKind::Root {
         return Ok(false);
     }
-    let result = if class.is_synthetic() && node.simple_name.as_deref() == Some("package-info") {
-        package_info_to_java(cx, class, buffer).map(|()| write_imports(cx, buffer, false))
-    } else if class.has_modifier(ACC_MODULE)
-        && let Some(module) = &class.attributes.module
-    {
-        let mut body = TextBuffer::new(cx);
-        module_info_to_java(cx, class, module, &mut body).map(|()| {
-            write_imports(cx, buffer, true);
-            buffer.append_buffer(&body);
-        })
-    } else {
+    let Some(metadata) = metadata(node, class) else {
         return Ok(false);
     };
-    release_root(cx, root);
-    result.map(|()| true)
+    let scope = WritingRoot { cx, root };
+    let cx = &mut *scope.cx;
+    match metadata {
+        Metadata::Package => {
+            package_info_to_java(cx, class, buffer)?;
+            write_imports(cx, buffer, false);
+        }
+        Metadata::Module(module) => {
+            let mut body = TextBuffer::new(cx);
+            module_info_to_java(cx, class, module, &mut body)?;
+            write_imports(cx, buffer, true);
+            buffer.append_buffer(&body);
+        }
+    }
+    Ok(true)
 }
 
 /// Write a complete prepared compilation unit with imports, line wrapping
@@ -141,63 +155,68 @@ pub fn write_class(cx: &mut Cx, class: &StructClass, output: &mut TextBuffer) ->
     if cx.class_nodes[root].kind != ClassKind::Root || write_metadata(cx, class, output)? {
         return Ok(());
     }
-    let result = (|| {
-        let mut body = TextBuffer::new(cx);
-        let root_class = cx.class_nodes[root].class.clone();
-        let kotlin = crate::kotlin::members::select_language(cx, &root_class);
-        if kotlin {
-            crate::kotlin::writer::write_class(cx, root, &mut body, 0)?;
-        } else {
-            super::class_writer::write_class(cx, root, &mut body, 0)?;
+    let scope = WritingRoot { cx, root };
+    let cx = &mut *scope.cx;
+    let mut body = TextBuffer::new(cx);
+    let root_class = cx.class_nodes[root].class.clone();
+    let kotlin = crate::kotlin::members::select_language(cx, &root_class);
+    if kotlin {
+        crate::kotlin::writer::write_class(cx, root, &mut body, 0)?;
+    } else {
+        super::class_writer::write_class(cx, root, &mut body, 0)?;
+    }
+    body.reformat();
+    for ((owner, key), mut tracer) in body.get_tracers() {
+        let Some(key) = key else { continue };
+        if let Some(owner_class) = cx.classes().get_class(&owner)
+            && let Some(method) = owner_class.get_method_by_key(&key)
+        {
+            tracer.set_line_number_table(method.attributes.line_number_table.clone());
+            cx.source_mapper.add_tracer(&owner, &key, &mut tracer);
         }
-        body.reformat();
-        for ((owner, key), mut tracer) in body.get_tracers() {
-            let Some(key) = key else { continue };
-            if let Some(owner_class) = cx.classes().get_class(&owner)
-                && let Some(method) = owner_class.get_method_by_key(&key)
-            {
-                tracer.set_line_number_table(method.attributes.line_number_table.clone());
-                cx.source_mapper.add_tracer(&owner, &key, &mut tracer);
-            }
+    }
+    if kotlin {
+        crate::kotlin::writer::write_header(cx, class, output)?;
+    } else {
+        if let Some((package, _)) = class.qualified_name.rsplit_once('/') {
+            output
+                .append("package ")
+                .append(&package.replace('/', "."))
+                .append_char(';')
+                .append_line_separator()
+                .append_line_separator();
         }
-        if kotlin {
-            crate::kotlin::writer::write_header(cx, class, output)?;
-        } else {
-            if let Some((package, _)) = class.qualified_name.rsplit_once('/') {
-                output
-                    .append("package ")
-                    .append(&package.replace('/', "."))
-                    .append_char(';')
-                    .append_line_separator()
-                    .append_line_separator();
-            }
-            write_imports(cx, output, true);
+        write_imports(cx, output, true);
+    }
+    let header_lines = output.count_lines();
+    output.append_buffer(&body);
+    if cx.options.bytecode_source_mapping {
+        cx.source_mapper.add_total_offset(header_lines);
+        if cx.options.dump_original_lines {
+            output.dump_original_line_numbers(&cx.source_mapper.original_lines_mapping());
         }
-        let header_lines = output.count_lines();
-        output.append_buffer(&body);
-        if cx.options.bytecode_source_mapping {
-            cx.source_mapper.add_total_offset(header_lines);
-            if cx.options.dump_original_lines {
-                output.dump_original_line_numbers(&cx.source_mapper.original_lines_mapping());
-            }
-            if cx.options.unit_test_mode {
-                output.append_line_separator();
-                cx.source_mapper.dump_mapping(output, true);
-            }
+        if cx.options.unit_test_mode {
+            output.append_line_separator();
+            cx.source_mapper.dump_mapping(output, true);
         }
-        Ok(())
-    })();
-    release_root(cx, root);
-    result
+    }
+    Ok(())
 }
 
-fn release_root(cx: &mut Cx, root: ClassNodeId) {
-    let node = &mut cx.class_nodes[root];
-    node.wrapper = None;
-    // Method bytecode is owned by its Rust processing scope. Nested wrappers
-    // remain available to constructor calls in other compilation units.
-    for method in &node.class.methods {
-        method.clear_variable_namer();
+struct WritingRoot<'a> {
+    cx: &'a mut Cx,
+    root: ClassNodeId,
+}
+
+impl Drop for WritingRoot<'_> {
+    fn drop(&mut self) {
+        // ClassesProcessor.writeClass releases the root in its finally block.
+        // Inner wrappers stay published for later constructor and graph lookups.
+        let node = &mut self.cx.class_nodes[self.root];
+        node.wrapper = None;
+        for method in &node.class.methods {
+            method.clear_variable_namer();
+        }
     }
 }
 

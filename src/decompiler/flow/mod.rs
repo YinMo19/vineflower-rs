@@ -5,7 +5,7 @@
 
 pub mod flatten;
 
-use crate::decompiler::ir::{Expr, ExprId, ExprListId, Ir, StatId};
+use crate::decompiler::ir::{Expr, ExprId, ExprListId, Ir, IrNode, StatId};
 use crate::decompiler::stats::StatementKind;
 use arcstr::ArcStr;
 use index_vec::{IndexVec, define_index_type};
@@ -90,6 +90,25 @@ pub struct DirectGraph {
 }
 
 impl DirectGraph {
+    pub(crate) fn visit_ir_roots(&self, visit: &mut impl FnMut(IrNode)) {
+        // Cached graphs can own lists with no corresponding statement list.
+        // Include exception-only nodes and nodes omitted from traversal order.
+        for node in &self.nodes {
+            visit(node.stat.into());
+            if let Some(block) = node.block {
+                visit(block.into());
+            }
+            visit(node.exprents.into());
+        }
+        for &stat in self
+            .destinations
+            .keys()
+            .chain(self.continue_destinations.keys())
+        {
+            visit(stat.into());
+        }
+    }
+
     /// Regular BFS followed by Exprent.getAllExprents(true, true) within each
     /// list. Callers may reuse this order while the expression tree is stable.
     pub(crate) fn deep_exprents(&self, ir: &Ir) -> Vec<ExprId> {

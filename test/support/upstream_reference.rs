@@ -30,16 +30,7 @@ impl Corpus {
             .unwrap_or_else(|error| panic!("reading {}: {error}", root.display()));
         classes.sort_unstable();
         assert!(!classes.is_empty(), "no classes in {}", root.display());
-        let libs = upstream.join("build/libs");
-        let jar = fs::read_dir(&libs)
-            .unwrap_or_else(|error| panic!("reading {}: {error}", libs.display()))
-            .map(|entry| entry.unwrap().path())
-            .filter(|path| {
-                path.file_name()
-                    .is_some_and(|name| name.to_string_lossy().ends_with("+local.jar"))
-            })
-            .min()
-            .unwrap_or_else(|| panic!("no *+local.jar in {}", libs.display()));
+        let jar = upstream_jar();
         Self { classes, root, jar }
     }
 
@@ -129,6 +120,19 @@ pub(super) fn upstream_root() -> PathBuf {
     env::var_os("VINEFLOWER_UPSTREAM")
         .map(PathBuf::from)
         .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../vineflower"))
+}
+
+pub(super) fn upstream_jar() -> PathBuf {
+    let libs = upstream_root().join("build/libs");
+    fs::read_dir(&libs)
+        .unwrap_or_else(|error| panic!("reading {}: {error}", libs.display()))
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().ends_with("+local.jar"))
+        })
+        .min()
+        .unwrap_or_else(|| panic!("no *+local.jar in {}", libs.display()))
 }
 
 pub(super) fn jdk_tool(name: &str) -> PathBuf {

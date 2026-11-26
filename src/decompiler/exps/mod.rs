@@ -18,7 +18,6 @@ use std::fmt;
 use std::sync::Arc;
 
 use arcstr::ArcStr;
-use index_vec::IndexVec;
 
 pub use self::generic_inference::{AllocationGenerics, InvocationGenerics};
 pub(crate) use self::increments::{delta_by_one, increment};
@@ -26,7 +25,7 @@ pub use self::{bytecode::BytecodeOffsets, function::FunctionType};
 pub use crate::structs::consts::ConstantValue;
 
 use crate::code::instruction::Instruction;
-use crate::decompiler::ir::{ExprId, Ir, StatId, VarProcessorId};
+use crate::decompiler::ir::{Arena, ExprId, Ir, StatId, VarProcessorId};
 use crate::decompiler::stats::StatementKind;
 use crate::decompiler::vars::{processor::VarProcessor, var_version_pair::VarVersionPair};
 use crate::engine::Cx;
@@ -216,7 +215,7 @@ impl Variable {
     }
 
     /// VarExprent.setLVT also seeds its method's active type processor.
-    fn record_local_type(&self, processors: &mut IndexVec<VarProcessorId, VarProcessor>) {
+    fn record_local_type(&self, processors: &mut Arena<VarProcessorId, VarProcessor>) {
         if let Some(owner) = self.processor
             && processors[owner].versions.initialized
             && let Some(lvt) = &self.lvt

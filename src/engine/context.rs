@@ -11,7 +11,7 @@ use super::class_nodes::ClassNodes;
 use super::counter_container::{CounterContainer, ExpressionIds};
 use super::import_collector::ImportCollector;
 use super::options::Options;
-use crate::decompiler::ir::{Ir, VarProcessorId};
+use crate::decompiler::ir::{Ir, IrNode, VarProcessorId};
 use crate::renamer::pool_interceptor::PoolInterceptor;
 use crate::structs::struct_context::ClassResolver;
 use crate::structs::{StructClass, StructContext, StructMethod};
@@ -107,6 +107,27 @@ impl Cx {
         self.current_node_id = session.current_node_id;
         self.imports = session.imports;
         self.source_mapper = session.source_mapper;
+    }
+
+    /// At a driver phase boundary no pass holds a temporary graph. Published
+    /// wrappers, class nodes and saved method scopes own all remaining handles.
+    pub(super) fn reclaim_ir<'a>(
+        &mut self,
+        sessions: impl Iterator<Item = &'a ClassSession>,
+    ) -> u64 {
+        let mut roots = Vec::<IrNode>::new();
+        self.class_nodes.visit_ir_roots(|node| roots.push(node));
+        for (_, variables) in sessions
+            .filter_map(|session| session.current_method.as_ref())
+            .chain(self.current_method.as_ref())
+        {
+            roots.push((*variables).into());
+        }
+        let live = self.ir.reachable(roots);
+        if let Some(body) = &mut self.kotlin_body {
+            body.retain_ir_nodes(|node| live.contains(node));
+        }
+        self.ir.sweep(&live)
     }
 
     pub(crate) fn classes(&self) -> ClassResolver<'_> {

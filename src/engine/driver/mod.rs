@@ -155,6 +155,7 @@ impl Decompiler {
         cx.javadoc = self.javadoc;
 
         let mut result = Vec::new();
+        let mut reclaim = ReclaimSchedule::default();
         for unit in context.get_units().iter().filter(|unit| unit.own) {
             let layout = unit.source.output_layout();
             let mut sink = output
@@ -166,10 +167,13 @@ impl Decompiler {
             // Each root gets fresh imports, counters and mappings. Its methods
             // remain accessible to the other roots through the shared IR.
             let root_session = cx.take_class_session();
-            for pending in &mut classes {
+            for index in 0..classes.len() {
+                let pending = &mut classes[index];
+                let start = cx.ir.allocated_bytes();
                 log::info!("Preprocessing class {}", pending.class.qualified_name);
                 let processed = catch_method_failure(|| process_class(&mut cx, pending.node));
                 pending.session = Some(cx.take_class_session());
+                pending.prepared_bytes = cx.ir.allocated_bytes() - start;
                 if let Err(error) = processed {
                     if error.kind() == io::ErrorKind::Interrupted {
                         return Err(error);
@@ -180,8 +184,11 @@ impl Decompiler {
                     );
                     pending.error = Some(error);
                 }
+                reclaim.after_root(&mut cx, &classes[..=index], &root_session);
             }
-            for pending in classes {
+            let mut classes = classes.into_iter();
+            while let Some(pending) = classes.next() {
+                reclaim.retired_bytes += pending.prepared_bytes;
                 if let Some(class) = render(&mut cx, pending)? {
                     if let Some(sink) = &mut sink {
                         sink.class(&class, options.dump_code_lines)?;
@@ -189,6 +196,7 @@ impl Decompiler {
                         result.push(class);
                     }
                 }
+                reclaim.after_root(&mut cx, classes.as_slice(), &root_session);
             }
             cx.restore_class_session(root_session);
             if let Some(sink) = sink {
@@ -199,7 +207,31 @@ impl Decompiler {
     }
 }
 
+/// Charge preparation when nodes are allocated and again when the root is
+/// retired. This also schedules collections during emission, when a unit can
+/// release large method graphs while allocating very little new IR.
+#[derive(Default)]
+struct ReclaimSchedule {
+    retired_bytes: u64,
+    next_sweep: u64,
+}
+
+impl ReclaimSchedule {
+    fn after_root(&mut self, cx: &mut Cx, pending: &[PendingClass], parent: &ClassSession) {
+        let work = cx.ir.allocated_bytes() + self.retired_bytes;
+        if work >= self.next_sweep {
+            let live = cx.reclaim_ir(
+                std::iter::once(parent).chain(pending.iter().filter_map(|p| p.session.as_ref())),
+            );
+            // Amortize the next full traversal over at least its live graph
+            // and the class table that owns the wrappers.
+            self.next_sweep = work + live + cx.class_nodes.ir_root_scan_bytes();
+        }
+    }
+}
+
 struct PendingClass {
+    prepared_bytes: u64,
     class: Arc<StructClass>,
     entry_name: String,
     node: ClassNodeId,
@@ -244,6 +276,7 @@ fn unit_classes(cx: &mut Cx, unit: &ContextUnit, layout: &OutputLayout) -> Vec<P
             }
             name.push_str(if kotlin { ".kt" } else { ".java" });
             Some(PendingClass {
+                prepared_bytes: 0,
                 class,
                 entry_name: name,
                 node,

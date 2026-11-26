@@ -123,3 +123,23 @@ Alternatively, set `VINEFLOWER_RS_CLASS_ROOT` to a tree with the upstream layout
 ```
 
 Point `VINEFLOWER_RS_CLASS_ROOT` at that checkout. Prebuilt outputs are also needed for Jasm, Kotlin (including `ktold` with upstream's old compiler flags), Groovy and Scala. The Scala plugin is not an included Gradle project at this upstream revision; its plugin classes must be built separately using its `testDataClasses` task from a checkout with that plugin enabled. These tasks only prepare inputs; parity testing never invokes the Java decompiler.
+
+### IR lifetime on multiple input units
+
+The ignored driver test `nested_constructor_and_switch_map_survive_class_and_unit_order` compiles an inner constructor and an enum-table holder with javac. It compares the two CLIs with both root orders in one archive and both archive orders across units, then recompiles and executes the emitted sources. The enum switch depends on when the holder's method graph becomes available.
+
+For the larger memory comparison, use the Minecraft 26.3 client (SHA-256 `4508d006323f24fa02876310c192d739af56516eb259000ac50f0909a68c9a2d`). Select the complete class subtrees below in central-directory order. Make one combined archive and one archive per subtree, registering the latter in the order shown. Supply the remaining class entries as one external library.
+
+| Class count | Subtrees |
+| ---: | --- |
+| 760 | `com/mojang/blaze3d/`, `net/minecraft/advancements/`, `net/minecraft/nbt/`, `net/minecraft/network/chat/`, `net/minecraft/server/commands/` |
+| 2,831 | `com/mojang/renderpearl/`, `net/minecraft/client/gui/`, `net/minecraft/network/`, `net/minecraft/server/`, `net/minecraft/world/item/` |
+
+Build both revisions with `cargo build --release --locked`. With the same JDK, run each binary on the identical archives and write each output to a fresh directory. The macOS measurements used JDK 25.0.2 and the median maximum resident set size from three alternating runs of each revision.
+
+```sh
+/usr/bin/time -l "$cli" --folder --thread-count=1 --include-runtime=1 \
+  --bytecode-source-mapping=1 --log-level=ERROR "-e=$external" "$@" "$destination"
+```
+
+Compare the relative filenames and bytes against both the previous binary and the pinned Java CLI. For archive line mappings use `--legacy-saving --dump-code-lines=1` and compare central-directory entry order, uncompressed contents and the `0x4646` extra field.

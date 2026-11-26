@@ -134,6 +134,156 @@ fn generic_inner_class_and_loop_survive_recompilation() {
 
 #[test]
 #[ignore = "requires the upstream +local.jar and JDK 17 or later"]
+fn nested_constructor_and_switch_map_survive_class_and_unit_order() {
+    use upstream_reference::{jdk_tool, run, upstream_jar};
+
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path();
+    let classes = root.join("classes");
+    fs::write(
+        root.join("Owner.java"),
+        r#"
+public final class Owner {
+    private final int base;
+
+    public Owner(int base) {
+        this.base = base;
+    }
+
+    public class Member {
+        private final int delta;
+
+        public Member(int delta) {
+            this.delta = delta;
+        }
+
+        public int value() {
+            return Owner.this.base + this.delta;
+        }
+    }
+
+    public enum Mode {
+        OFF, ON, OTHER
+    }
+
+    public static final class Table {
+        public static int[] $SWITCH_TABLE$Mode() {
+            int[] map = new int[Mode.values().length];
+            map[Mode.OFF.ordinal()] = 70000;
+            map[Mode.ON.ordinal()] = 90000;
+            return map;
+        }
+    }
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("Consumer.java"),
+        r#"
+public final class Consumer {
+    private static int select(Owner.Mode mode) {
+        switch (Owner.Table.$SWITCH_TABLE$Mode()[mode.ordinal()]) {
+            case 70000: return 13;
+            case 90000: return 17;
+            default: return 23;
+        }
+    }
+
+    public static void main(String[] args) {
+        Owner owner = new Owner(31);
+        System.out.println(owner.new Member(11).value());
+        for (Owner.Mode mode : Owner.Mode.values()) {
+            System.out.println(select(mode));
+        }
+    }
+}
+"#,
+    )
+    .unwrap();
+    let compile = |sources: &Path, dest: &Path| {
+        run(Command::new(jdk_tool("javac"))
+            .args(["--release", "17", "-g", "-d"])
+            .arg(dest)
+            .arg(sources.join("Owner.java"))
+            .arg(sources.join("Consumer.java")));
+    };
+    let execute = |dir: &Path| {
+        run(Command::new(jdk_tool("java"))
+            .arg("-cp")
+            .arg(dir)
+            .arg("Consumer"))
+        .stdout
+    };
+    compile(root, &classes);
+    let expected_execution = execute(&classes);
+    assert_eq!(expected_execution, b"42\n13\n17\n23\n");
+
+    // ZIP entry order controls preprocessing within a unit independently of
+    // the command-line order of separate units.
+    let owner = [
+        "Owner.class",
+        "Owner$Member.class",
+        "Owner$Mode.class",
+        "Owner$Table.class",
+    ];
+    let consumer = ["Consumer.class"];
+    for (name, entries) in [
+        ("owner", owner.to_vec()),
+        ("consumer", consumer.to_vec()),
+        ("owner-first", [owner.as_slice(), &consumer].concat()),
+        ("consumer-first", [consumer.as_slice(), &owner].concat()),
+    ] {
+        let mut jar =
+            zip::ZipWriter::new(fs::File::create(root.join(format!("{name}.jar"))).unwrap());
+        for entry in entries {
+            jar.start_file(entry, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            std::io::copy(&mut fs::File::open(classes.join(entry)).unwrap(), &mut jar).unwrap();
+        }
+        jar.finish().unwrap();
+    }
+
+    let options = [
+        "--thread-count=1",
+        "--include-runtime=0",
+        "--folder",
+        "--silent",
+    ];
+    let upstream = upstream_jar();
+    for (layout, inputs, enum_switch) in [
+        ("holder-first", &["owner-first"][..], true),
+        ("holder-last", &["consumer-first"][..], true),
+        ("holder-unit-first", &["owner", "consumer"][..], true),
+        ("holder-unit-last", &["consumer", "owner"][..], false),
+    ] {
+        let actual = root.join(format!("{layout}-native"));
+        let expected = root.join(format!("{layout}-upstream"));
+        fs::create_dir(&actual).unwrap();
+        fs::create_dir(&expected).unwrap();
+        let inputs = inputs.iter().map(|name| root.join(format!("{name}.jar")));
+        run(Command::new(env!("CARGO_BIN_EXE_vineflower-rs"))
+            .args(options)
+            .args(inputs.clone())
+            .arg(&actual));
+        run(Command::new(jdk_tool("java"))
+            .arg("-jar")
+            .arg(&upstream)
+            .args(options)
+            .args(inputs)
+            .arg(&expected));
+        assert_eq!(directory(&actual), directory(&expected), "{layout}");
+        let source = fs::read_to_string(actual.join("Consumer.java")).unwrap();
+        assert_eq!(source.contains("switch (mode)"), enum_switch, "{layout}");
+        assert!(source.contains("owner.new Member(11)"), "{layout}");
+        let rebuilt = root.join(format!("{layout}-rebuilt"));
+        compile(&actual, &rebuilt);
+        assert_eq!(execute(&rebuilt), expected_execution, "{layout}");
+    }
+}
+
+#[test]
+#[ignore = "requires the upstream +local.jar and JDK 17 or later"]
 fn native_cli_saving_and_configuration_match_upstream() {
     let scratch = tempfile::tempdir().unwrap();
     let root = scratch.path();

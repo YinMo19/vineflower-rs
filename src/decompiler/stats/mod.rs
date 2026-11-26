@@ -388,6 +388,14 @@ impl Statement {
         self.edge_view(EdgeDirection::Backward, STATEDGE_ALL)
     }
 
+    pub(crate) fn indexed_edges(&self) -> impl Iterator<Item = EdgeId> + '_ {
+        self.successor_edges
+            .values()
+            .chain(self.predecessor_edges.values())
+            .flatten()
+            .copied()
+    }
+
     pub fn direct_successors(&self) -> &[EdgeId] {
         self.edge_view(EdgeDirection::Forward, STATEDGE_DIRECT_ALL)
     }

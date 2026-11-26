@@ -11,11 +11,14 @@ use arcstr::ArcStr;
 use index_vec::{IndexVec, define_index_type};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::decompiler::{ir::ExprId, vars::var_version_pair::VarVersionPair};
+use crate::decompiler::{
+    ir::{ExprId, IrNode},
+    vars::var_version_pair::VarVersionPair,
+};
 use crate::structs::StructClass;
-use crate::util::jhash::{JHashMap, JHashSet};
 use crate::types::VarType;
 use crate::util::interpreter_util::make_unique_key;
+use crate::util::jhash::{JHashMap, JHashSet};
 
 mod lambda;
 mod load;
@@ -37,6 +40,10 @@ pub struct ClassNodes {
 }
 
 impl ClassNodes {
+    pub(super) fn ir_root_scan_bytes(&self) -> u64 {
+        self.arena.len() as u64 * size_of::<ClassNode>() as u64
+    }
+
     pub fn id(&self, name: &str) -> Option<ClassNodeId> {
         self.names.get(name).copied()
     }
@@ -53,6 +60,19 @@ impl ClassNodes {
 
     pub fn iter(&self) -> impl Iterator<Item = (&ArcStr, &ClassNode)> {
         self.names.iter().map(|(name, &id)| (name, &self[id]))
+    }
+
+    pub(crate) fn visit_ir_roots(&self, mut visit: impl FnMut(IrNode)) {
+        // A synthetic name may have been replaced in the name table while
+        // the original node remains accessible through the class tree.
+        for node in &self.arena {
+            if let Some(invocation) = node.super_invocation {
+                visit(invocation.into());
+            }
+            if let Some(wrapper) = &node.wrapper {
+                wrapper.visit_ir_roots(&mut visit);
+            }
+        }
     }
 
     /// Non-lambda wrappers in the order they finish initialization for a root.
