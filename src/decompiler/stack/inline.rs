@@ -44,13 +44,11 @@ pub(super) fn iterate_statements(
     };
     let mut changed = false;
     let mut visited = FxHashSet::default();
+    visited.insert(&graph[graph.first].id);
     let mut pending = VecDeque::from([(graph.first, Replacements::default())]);
     while let Some((id, mut values)) = pending.pop_front() {
         checkpoint();
         let node = &graph[id];
-        if !visited.insert(&node.id) {
-            continue;
-        }
         let successors = node.successors(DirectEdgeType::Regular);
         let tail = match successors {
             [tail]
@@ -97,11 +95,20 @@ pub(super) fn iterate_statements(
             stage += 1;
         }
 
-        pending.extend(
-            successors
-                .iter()
-                .map(|&successor| (successor, values.clone())),
-        );
+        // The first path queued for a node supplies its replacements. Only
+        // forks need independent maps; the last new successor takes this one.
+        let mut new_successors = successors
+            .iter()
+            .copied()
+            .filter(|&next| visited.insert(&graph[next].id))
+            .peekable();
+        while let Some(next) = new_successors.next() {
+            if new_successors.peek().is_none() {
+                pending.push_back((next, values));
+                break;
+            }
+            pending.push_back((next, values.clone()));
+        }
 
         // A cleared header list now represents Java's restored null entry.
         // A detached init node also reaches this check when it starts empty.
