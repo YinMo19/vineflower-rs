@@ -11,6 +11,7 @@ use std::hash::Hash;
 use std::rc::Rc;
 
 use itertools::Itertools;
+use smallvec::SmallVec;
 
 use super::jhash::{JHashSet, JavaHash};
 use super::packed_map::{PackedMap, unpack_high, unpack_low};
@@ -51,7 +52,7 @@ impl<E: Hash + Eq + Clone + Debug> FastSparseSetFactory<E> {
         let length = self.0.borrow().last_block.max(1) as usize;
         FastSparseSet {
             factory: self.clone(),
-            data: vec![0; length],
+            data: SmallVec::from_elem(0, length),
             next: None,
         }
     }
@@ -90,14 +91,15 @@ impl<E> Clone for FastSparseSetFactory<E> {
 
 /// A set of elements of one factory.
 ///
-/// `data` holds one 32-bit block per 32 elements and grows on demand. `next`
-/// links each block to the next non-empty one (0 ends the chain) and exists
+/// `data` holds one 32-bit block per 32 elements. Up to four blocks fit
+/// inline, so most SForms sets need no heap storage. `next` links each
+/// block to the next non-empty one (0 ends the chain) and exists
 /// only once a block other than the first has been used. Iteration,
 /// [`union`](Self::union), [`complement`](Self::complement) and
 /// [`is_empty`](Self::is_empty) trust these links.
 pub struct FastSparseSet<E> {
     factory: FastSparseSetFactory<E>,
-    data: Vec<i32>,
+    data: SmallVec<[i32; 4]>,
     next: Option<Vec<usize>>,
 }
 
