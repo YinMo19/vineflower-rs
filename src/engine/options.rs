@@ -169,6 +169,11 @@ fn available_processors() -> i32 {
 }
 
 impl Options {
+    /// ClassWrapper times methods with code outside unit test mode.
+    pub(super) fn method_time_limit(&self) -> Option<i32> {
+        (self.max_time_per_method != 0 && !self.unit_test_mode).then_some(self.max_time_per_method)
+    }
+
     /// ContextUnit uses the processor count for a non-positive preference.
     pub(super) fn worker_count(&self) -> usize {
         if self.thread_count > 0 {

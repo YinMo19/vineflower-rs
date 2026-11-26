@@ -11,7 +11,9 @@ use std::io;
 use std::sync::Arc;
 
 use indexmap::IndexSet;
+use rustc_hash::FxHashMap;
 
+use super::class_wrapper::catch_method_failure;
 use super::method_timeout::checkpoint;
 use crate::code::{
     cfg::ControlFlowGraph, dead_code_helper as dead, exception_deobfuscator as exceptions,
@@ -27,7 +29,7 @@ use crate::decompiler::{
 };
 use crate::engine::{
     Cx, Options,
-    counter_container::{CounterContainer, VAR_COUNTER},
+    counter_container::{CounterContainer, ExpressionIds, VAR_COUNTER},
 };
 use crate::structs::{StructClass, StructMethod};
 use crate::types::MethodDescriptor;
@@ -82,7 +84,7 @@ impl<'a> DecodedMethod<'a> {
         ir: &mut Ir,
         class: &'a StructClass,
         method: &'a StructMethod,
-        scope: Option<(VarProcessorId, super::counter_container::ExpressionIds)>,
+        scope: Option<(VarProcessorId, ExpressionIds)>,
     ) -> io::Result<Option<Self>> {
         Ok(method.expand_data(class)?.map(|seq| {
             let graph = ControlFlowGraph::new(ir, seq);
@@ -125,15 +127,16 @@ impl<'a> DecodedMethod<'a> {
 
 impl CommonMethod<'_> {
     pub fn prepare_java_graph(self, ir: &mut Ir, options: &Options) -> MethodGraph {
-        self.prepare_exception_graph(ir, options, false)
+        self.prepare_exception_graph(ir, options, false, ExceptionWarning::emit)
     }
 
     /// Kotlin's CFG schedule always runs the three optional Java cleanups.
-    pub(crate) fn prepare_exception_graph(
+    fn prepare_exception_graph(
         mut self,
         ir: &mut Ir,
         options: &Options,
         force_cleanup: bool,
+        mut warn: impl FnMut(ExceptionWarning),
     ) -> MethodGraph {
         let graph = &mut self.flow.graph;
         exceptions::remove_circular_ranges(ir, graph);
@@ -152,8 +155,10 @@ impl CommonMethod<'_> {
         dead::merge_basic_blocks(ir, graph, options);
         checkpoint();
         if exceptions::has_obfuscated_exceptions(ir, graph) {
-            if !exceptions::handle_multiple_entry_exception_ranges(ir, graph) {
-                log::warn!("Found multiple entry exception ranges which could not be splitted");
+            if !exceptions::handle_multiple_entry_exception_ranges_with(ir, graph, || {
+                warn(ExceptionWarning::InconsistentSplit)
+            }) {
+                warn(ExceptionWarning::MultipleEntries);
                 graph.add_comment("$VF: Could not handle exception ranges with multiple entries");
                 graph.add_error_comment = true;
             }
@@ -163,7 +168,23 @@ impl CommonMethod<'_> {
     }
 }
 
-/// The first statement graph for a Java method, together with the CFG from
+enum ExceptionWarning {
+    InconsistentSplit,
+    MultipleEntries,
+}
+
+impl ExceptionWarning {
+    fn emit(self) {
+        match self {
+            Self::InconsistentSplit => exceptions::warn_inconsistent_split(),
+            Self::MultipleEntries => {
+                log::warn!("Found multiple entry exception ranges which could not be splitted")
+            }
+        }
+    }
+}
+
+/// The first statement graph for a method, together with the CFG from
 /// which finally processing can build further revisions.
 pub struct InitialMethod {
     pub flow: MethodGraph,
@@ -175,11 +196,21 @@ pub fn initial_statement_graph(
     class: &StructClass,
     method: &Arc<StructMethod>,
 ) -> io::Result<Option<InitialMethod>> {
+    initial_statement_graph_for_language(cx, class, method, false, ExceptionWarning::emit)
+}
+
+fn initial_statement_graph_for_language(
+    cx: &mut Cx,
+    class: &StructClass,
+    method: &Arc<StructMethod>,
+    kotlin: bool,
+    warn: impl FnMut(ExceptionWarning),
+) -> io::Result<Option<InitialMethod>> {
     let Some(decoded) = DecodedMethod::from_context(cx, class, method)? else {
         return Ok(None);
     };
     let common = decoded.prepare_control_flow(&mut cx.ir, &cx.options);
-    let flow = common.prepare_java_graph(&mut cx.ir, &cx.options);
+    let flow = common.prepare_exception_graph(&mut cx.ir, &cx.options, kotlin, warn);
     Ok(Some(flow.into_initial_tree(&mut cx.ir, method)))
 }
 
@@ -200,7 +231,7 @@ impl MethodGraph {
     }
 }
 
-/// A Java method after the structure recognition and cleanup in DomHelper.parseGraph.
+/// A method after the structure recognition and cleanup in DomHelper.parseGraph.
 /// The CFG is retained because finally recovery can change it and require a new tree.
 pub struct StructuredMethod {
     pub flow: MethodGraph,
@@ -287,9 +318,117 @@ pub fn structured_statement_graph(
     class: &StructClass,
     method: &Arc<StructMethod>,
 ) -> io::Result<Option<StructuredMethod>> {
-    initial_statement_graph(cx, class, method)?
+    structured_statement_graph_for_language(cx, class, method, false)
+}
+
+pub(crate) fn structured_statement_graph_for_language(
+    cx: &mut Cx,
+    class: &StructClass,
+    method: &Arc<StructMethod>,
+    kotlin: bool,
+) -> io::Result<Option<StructuredMethod>> {
+    if let Some(prepared) = cx
+        .prepared_methods
+        .as_mut()
+        .and_then(|root| root.active.take())
+    {
+        for warning in prepared.warnings {
+            warning.emit();
+        }
+        return prepared.result;
+    }
+    prepare_structured_method(cx, class, method, kotlin, ExceptionWarning::emit)
+}
+
+fn prepare_structured_method(
+    cx: &mut Cx,
+    class: &StructClass,
+    method: &Arc<StructMethod>,
+    kotlin: bool,
+    warn: impl FnMut(ExceptionWarning),
+) -> io::Result<Option<StructuredMethod>> {
+    // Before expression lifting the tree contains empty expression lists and
+    // explicitly typed catch variables. This stage uses only the loaded method,
+    // options and IR, so it can run before classpath lookups and wrapper publication.
+    initial_statement_graph_for_language(cx, class, method, kotlin, warn)?
         .map(|method| method.structure(cx))
         .transpose()
+}
+
+/// The immutable-input prefix of each method in one compilation unit. The
+/// coordinator adopts the worker's IR before installing this scope.
+pub(super) struct PreparedMethods {
+    methods: FxHashMap<usize, PreparedMethod>,
+    // Selected by ClassWrapper immediately before calling the built-in pipeline.
+    active: Option<PreparedMethod>,
+}
+
+struct PreparedMethod {
+    // Both handles must survive a graph-recognition failure as method state.
+    variables: VarProcessorId,
+    expression_ids: ExpressionIds,
+    warnings: Vec<ExceptionWarning>,
+    result: io::Result<Option<StructuredMethod>>,
+}
+
+impl PreparedMethod {
+    fn from_bytecode(
+        worker: &mut Cx,
+        class: &StructClass,
+        method: &Arc<StructMethod>,
+        kotlin: bool,
+    ) -> Self {
+        let variables = worker.ir.variable_processors.push(Default::default());
+        worker.expression_ids = Default::default();
+        worker.current_method = Some((Arc::clone(method), variables));
+        let mut warnings = Vec::new();
+        let result = catch_method_failure(|| {
+            prepare_structured_method(worker, class, method, kotlin, |warning| {
+                warnings.push(warning)
+            })
+        });
+        Self {
+            variables,
+            expression_ids: worker.expression_ids.clone(),
+            warnings,
+            result,
+        }
+    }
+}
+
+impl PreparedMethods {
+    pub(super) fn prepare(
+        mut worker: Cx,
+        classes: impl IntoIterator<Item = Arc<StructClass>>,
+        kotlin: bool,
+    ) -> (Ir, Self) {
+        let mut methods = FxHashMap::default();
+        for class in classes {
+            for method in class.methods.iter().filter(|method| method.contains_code()) {
+                methods
+                    .entry(Arc::as_ptr(method) as usize)
+                    .or_insert_with(|| {
+                        PreparedMethod::from_bytecode(&mut worker, &class, method, kotlin)
+                    });
+            }
+        }
+        (
+            worker.ir,
+            Self {
+                methods,
+                active: None,
+            },
+        )
+    }
+
+    pub(super) fn start_method(
+        &mut self,
+        method: &Arc<StructMethod>,
+    ) -> Option<(VarProcessorId, ExpressionIds)> {
+        self.active = self.methods.remove(&(Arc::as_ptr(method) as usize));
+        let prepared = self.active.as_ref()?;
+        Some((prepared.variables, prepared.expression_ids.clone()))
+    }
 }
 
 /// The stable tree after finally recovery and the synthetic locals introduced by it.

@@ -222,6 +222,18 @@ pub fn has_obfuscated_exceptions(ir: &Ir, graph: &ControlFlowGraph) -> bool {
 }
 
 pub fn handle_multiple_entry_exception_ranges(ir: &mut Ir, graph: &mut ControlFlowGraph) -> bool {
+    handle_multiple_entry_exception_ranges_with(ir, graph, warn_inconsistent_split)
+}
+
+pub(crate) fn warn_inconsistent_split() {
+    log::warn!("Inconsistency found while splitting protected range");
+}
+
+pub(crate) fn handle_multiple_entry_exception_ranges_with(
+    ir: &mut Ir,
+    graph: &mut ControlFlowGraph,
+    mut on_inconsistent_split: impl FnMut(),
+) -> bool {
     let dominators = GenericDominatorEngine::for_cfg(ir, graph);
     loop {
         let mut found_multiple = false;
@@ -234,7 +246,14 @@ pub fn handle_multiple_entry_exception_ranges(ir: &mut Ir, graph: &mut ControlFl
             }
 
             found_multiple = true;
-            if split_exception_range(ir, graph, index, &entries, &dominators) {
+            if split_exception_range(
+                ir,
+                graph,
+                index,
+                &entries,
+                &dominators,
+                &mut on_inconsistent_split,
+            ) {
                 split = true;
                 graph.add_comment(
                     "$VF: Handled exception range with multiple entry points by splitting it",
@@ -268,6 +287,7 @@ fn split_exception_range(
     index: usize,
     entries: &IndexSet<BlockId>,
     dominators: &GenericDominatorEngine<BlockId>,
+    on_inconsistent_split: &mut impl FnMut(),
 ) -> bool {
     for &entry in entries {
         let range = &graph.exceptions[index];
@@ -285,7 +305,7 @@ fn split_exception_range(
             return true;
         }
 
-        log::warn!("Inconsistency found while splitting protected range");
+        on_inconsistent_split();
     }
     false
 }

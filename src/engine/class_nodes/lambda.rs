@@ -54,21 +54,18 @@ struct LambdaSite {
 }
 
 impl LambdaScan {
-    pub(crate) fn for_root(nodes: &ClassNodes, root: ClassNodeId) -> Self {
+    pub(crate) fn for_classes(classes: &[Arc<StructClass>]) -> Self {
         let mut scan = Self::default();
-        scan.scan_postorder(nodes, root);
-        scan
-    }
-
-    fn scan_postorder(&mut self, nodes: &ClassNodes, node: ClassNodeId) -> bool {
-        for &child in &nodes[node].nested {
-            if !self.scan_postorder(nodes, child) {
-                return false;
+        for class in classes {
+            if scan
+                .class_scan(class)
+                .as_ref()
+                .is_some_and(|s| s.failure.is_some())
+            {
+                break;
             }
         }
-        self.class_scan(&nodes[node].class)
-            .as_ref()
-            .is_none_or(|scan| scan.failure.is_none())
+        scan
     }
 
     fn class_scan(&mut self, class: &Arc<StructClass>) -> &mut Option<ClassLambdaScan> {

@@ -32,6 +32,8 @@ pub struct Cx {
     pub javadoc: Option<Arc<dyn super::class_writer::javadoc::JavadocProvider>>,
     /// Stable handles shared by all methods and classes processed by this worker.
     pub ir: Ir,
+    /// First statement graphs returned by workers for the root currently being initialized.
+    pub(super) prepared_methods: Option<Box<super::method_processor::PreparedMethods>>,
     pub(crate) kotlin_body: Option<Box<crate::kotlin::body::KotlinBody>>,
     /// ClassesProcessor.mapRootClasses in this root-class worker.
     pub class_nodes: ClassNodes,
@@ -80,6 +82,7 @@ impl Cx {
             imports: ImportCollector::default(),
             source_mapper: Default::default(),
             ir: Ir::default(),
+            prepared_methods: None,
             kotlin_body: None,
         }
     }

@@ -36,13 +36,21 @@ pub fn prepare_class(cx: &mut Cx, root: ClassNodeId) -> io::Result<()> {
     prepare_class_with_lambda_scan(cx, root, LambdaScan::default())
 }
 
-pub(super) fn scan_class_lambdas(nodes: &ClassNodes, root: ClassNodeId) -> LambdaScan {
-    let node = &nodes[root];
-    if node.kind == ClassKind::Root && metadata(node, &node.class).is_none() {
-        LambdaScan::for_root(nodes, root)
-    } else {
-        LambdaScan::default()
+/// Snapshot only the loaded class objects. Lambda discovery visits children
+/// before their parent and publishes its findings later on the live tree.
+pub(super) fn worker_classes(nodes: &ClassNodes, root: ClassNodeId) -> Vec<Arc<StructClass>> {
+    fn postorder(nodes: &ClassNodes, id: ClassNodeId, classes: &mut Vec<Arc<StructClass>>) {
+        for &child in &nodes[id].nested {
+            postorder(nodes, child, classes);
+        }
+        classes.push(Arc::clone(&nodes[id].class));
     }
+    let node = &nodes[root];
+    let mut classes = Vec::new();
+    if metadata(node, &node.class).is_none() {
+        postorder(nodes, root, &mut classes);
+    }
+    classes
 }
 
 fn prepare_class_with_lambda_scan(

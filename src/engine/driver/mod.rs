@@ -5,6 +5,7 @@
 
 mod manifest;
 mod memory;
+mod prepare;
 mod runtime;
 mod saver;
 mod token_dump;
@@ -17,8 +18,8 @@ use std::{io, path::Path, sync::Arc};
 use fancy_regex::Regex;
 use rustc_hash::FxHashSet;
 
-use super::class_nodes::{ClassKind, ClassNodeId, ClassNodes, LambdaScan, load_classes};
-use super::class_processor::{process_class_with_lambda_scan, scan_class_lambdas, write_class};
+use super::class_nodes::{ClassKind, ClassNodeId, load_classes};
+use super::class_processor::write_class;
 use super::class_wrapper::catch_method_failure;
 use super::class_writer::{javadoc::JavadocProvider, write_class_error, write_exception};
 use super::context::ClassSession;
@@ -164,32 +165,8 @@ impl Decompiler {
                 .transpose()?;
 
             let mut classes = unit_classes(&mut cx, unit, &layout);
-            scan_unit_lambdas(&cx.class_nodes, &mut classes, options.worker_count())?;
-            // Each root gets fresh imports, counters and mappings. Its methods
-            // remain accessible to the other roots through the shared IR.
             let root_session = cx.take_class_session();
-            for index in 0..classes.len() {
-                let pending = &mut classes[index];
-                let start = cx.ir.allocated_bytes();
-                log::info!("Preprocessing class {}", pending.class.qualified_name);
-                let scan = std::mem::take(&mut pending.lambda_scan);
-                let processed = catch_method_failure(|| {
-                    process_class_with_lambda_scan(&mut cx, pending.node, scan)
-                });
-                pending.session = Some(cx.take_class_session());
-                pending.prepared_bytes = cx.ir.allocated_bytes() - start;
-                if let Err(error) = processed {
-                    if error.kind() == io::ErrorKind::Interrupted {
-                        return Err(error);
-                    }
-                    log::error!(
-                        "Class {} couldn't be fully decompiled: {error}",
-                        pending.class.qualified_name
-                    );
-                    pending.error = Some(error);
-                }
-                reclaim.after_root(&mut cx, &classes[..=index], &root_session);
-            }
+            prepare::unit(&mut cx, &mut classes, &mut reclaim, &root_session)?;
             let mut classes = classes.into_iter();
             while let Some(pending) = classes.next() {
                 reclaim.retired_bytes += pending.prepared_bytes;
@@ -234,42 +211,8 @@ impl ReclaimSchedule {
     }
 }
 
-/// Workers inspect only loaded bytecode and constant pools. The coordinator
-/// installs each discovered call site in the live tree at its original point
-/// in processClass, after constructing that root's import collector.
-fn scan_unit_lambdas(
-    nodes: &ClassNodes,
-    roots: &mut [PendingClass],
-    workers: usize,
-) -> io::Result<()> {
-    // ContextUnit constructs a ForkJoinPool even for a small input unit.
-    if workers > 0x7fff {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "thread-count exceeds the ForkJoinPool limit of 32767",
-        ));
-    }
-    let count = workers.min(roots.len());
-    if count <= 1 {
-        return Ok(());
-    }
-    let batch = roots.len().div_ceil(count);
-    std::thread::scope(|scope| {
-        for (index, chunk) in roots.chunks_mut(batch).enumerate() {
-            std::thread::Builder::new()
-                .name(format!("Vineflower-DecompilerThread-{index}"))
-                .spawn_scoped(scope, move || {
-                    for root in chunk {
-                        root.lambda_scan = scan_class_lambdas(nodes, root.node);
-                    }
-                })?;
-        }
-        Ok(())
-    })
-}
-
 struct PendingClass {
-    lambda_scan: LambdaScan,
+    kotlin: bool,
     prepared_bytes: u64,
     class: Arc<StructClass>,
     entry_name: String,
@@ -315,7 +258,7 @@ fn unit_classes(cx: &mut Cx, unit: &ContextUnit, layout: &OutputLayout) -> Vec<P
             }
             name.push_str(if kotlin { ".kt" } else { ".java" });
             Some(PendingClass {
-                lambda_scan: LambdaScan::default(),
+                kotlin,
                 prepared_bytes: 0,
                 class,
                 entry_name: name,

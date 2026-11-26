@@ -22,7 +22,7 @@ use crate::decompiler::{
 use crate::engine::method_timeout::checkpoint;
 use crate::engine::{
     Cx,
-    method_processor::{DecodedMethod, ExpressionMethod},
+    method_processor::{ExpressionMethod, structured_statement_graph_for_language},
 };
 use crate::structs::{StructClass, StructMethod};
 
@@ -33,14 +33,11 @@ pub fn defined_method(
     class: &StructClass,
     method: &Arc<StructMethod>,
 ) -> io::Result<Option<ExpressionMethod>> {
-    let Some(decoded) = DecodedMethod::from_context(cx, class, method)? else {
+    let Some(structured) = structured_statement_graph_for_language(cx, class, method, true)? else {
         return Ok(None);
     };
-    let common = decoded.prepare_control_flow(&mut cx.ir, &cx.options);
-    let flow = common.prepare_exception_graph(&mut cx.ir, &cx.options, true);
-    let cx = &mut *cx.enter_method(&flow.counters);
-    let initial = flow.into_initial_tree(&mut cx.ir, method);
-    let mut recovered = initial.structure(cx)?.recover_finally(cx, class)?;
+    let cx = &mut *cx.enter_method(&structured.flow.counters);
+    let mut recovered = structured.recover_finally(cx, class)?;
     let root = recovered.structured.root;
     let counters = &mut recovered.structured.flow.counters;
     build_synchronized(&mut cx.ir, counters, root);

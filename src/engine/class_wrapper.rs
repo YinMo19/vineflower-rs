@@ -171,14 +171,24 @@ fn process_method(
 ) -> io::Result<MethodWrapper> {
     // ClassWrapper catches failures at the method boundary. A failure in
     // graph recognition leaves other methods in this class available.
-    let variables = cx.ir.variable_processors.push(Default::default());
     // startMethod installs a new sequence even for methods without code. The
     // last method remains the ambient sequence during nested-class processing.
-    cx.expression_ids = Default::default();
+    let (variables, expression_ids) = cx
+        .prepared_methods
+        .as_mut()
+        .and_then(|prepared| prepared.start_method(method))
+        .unwrap_or_else(|| {
+            (
+                cx.ir.variable_processors.push(Default::default()),
+                Default::default(),
+            )
+        });
+    cx.expression_ids = expression_ids;
     let previous = cx.current_method.replace((Arc::clone(method), variables));
     let outcome = catch_method_failure(|| {
-        let seconds = cx.options.max_time_per_method;
-        if seconds != 0 && !cx.options.unit_test_mode && method.contains_code() {
+        if let Some(seconds) = cx.options.method_time_limit()
+            && method.contains_code()
+        {
             method_timeout::run(seconds, || process(cx, class, method))
         } else {
             process(cx, class, method)

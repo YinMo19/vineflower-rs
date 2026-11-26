@@ -60,6 +60,16 @@ macro_rules! arenas {
         }
 
         impl Ir {
+            /// Create an empty worker IR that can later return its pages to this coordinator.
+            pub(crate) fn fork(&mut self) -> Self {
+                Self { $( $field: self.$field.fork(), )+ }
+            }
+
+            /// Take ownership of a worker's nodes without changing their handles.
+            pub(crate) fn adopt(&mut self, worker: Self) {
+                $( self.$field.adopt(worker.$field); )+
+            }
+
             pub(crate) fn allocated_bytes(&self) -> u64 {
                 0 $( + self.$field.allocated_bytes() )+
             }

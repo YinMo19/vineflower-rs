@@ -2,16 +2,23 @@
 
 use std::marker::PhantomData;
 use std::ops::{Index, IndexMut};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use index_vec::Idx;
+use rustc_hash::FxHashMap;
 
 const SLOTS: usize = u64::BITS as usize;
 
-/// Handles increase in allocation order for the entire run. Within each page
-/// the set bits identify the slots packed into its value vector, in order.
+/// Each allocator owns whole pages, so their handles survive being moved to
+/// another arena in the same session. Within a page, the set bits identify
+/// the slots packed into its value vector, in order.
 pub struct Arena<I, T> {
     pages: Vec<Page<T>>,
-    next: usize,
+    page_numbers: Option<Arc<AtomicUsize>>,
+    worker_pages: Option<FxHashMap<usize, Page<T>>>,
+    next: u64,
+    allocations: u64,
     index: PhantomData<I>,
 }
 
@@ -24,59 +31,164 @@ impl<I, T> Default for Arena<I, T> {
     fn default() -> Self {
         Self {
             pages: Vec::new(),
+            page_numbers: None,
+            worker_pages: None,
             next: 0,
+            allocations: 0,
             index: PhantomData,
         }
     }
 }
 
 impl<I: Idx, T> Arena<I, T> {
+    #[inline]
     pub fn push(&mut self, value: T) -> I {
-        let id = I::from_usize(self.next);
-        let offset = self.next % SLOTS;
-        if offset == 0 {
-            self.pages.push(Page {
-                present: 0,
-                values: Vec::new(),
-            });
+        let slot = self.next as usize % SLOTS;
+        if slot == 0 {
+            self.start_page();
         }
-        let page = self.pages.last_mut().unwrap();
+        let id = I::from_usize(self.next as usize);
+        let page = self.page_mut(self.next as usize / SLOTS);
         page.values.push(value);
-        page.present |= 1 << offset;
+        page.present |= 1 << slot;
         self.next += 1;
+        self.allocations += 1;
         id
     }
 
+    #[cold]
+    fn start_page(&mut self) {
+        let number = self.page_numbers.as_ref().map_or_else(
+            || self.pages.len(),
+            |numbers| numbers.fetch_add(1, Ordering::Relaxed),
+        );
+        let first_slot = number
+            .checked_mul(SLOTS)
+            .expect("IR handle space exhausted");
+        I::from_usize(first_slot);
+        if let Some(pages) = &mut self.worker_pages {
+            pages.insert(number, Page::empty());
+        } else {
+            self.pages.resize_with(number + 1, Page::empty);
+        }
+        self.next = first_slot as u64;
+    }
+
+    pub(super) fn fork(&mut self) -> Self {
+        assert!(
+            self.worker_pages.is_none(),
+            "IR workers can only be forked from the coordinator"
+        );
+        let page_numbers = self
+            .page_numbers
+            .get_or_insert_with(|| Arc::new(AtomicUsize::new(self.pages.len())));
+        Self {
+            page_numbers: Some(Arc::clone(page_numbers)),
+            worker_pages: Some(FxHashMap::default()),
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn adopt(&mut self, worker: Self) {
+        assert!(
+            self.worker_pages.is_none(),
+            "only the IR coordinator can adopt worker pages"
+        );
+        let worker_pages = worker
+            .worker_pages
+            .expect("adoption requires IR worker pages");
+        assert!(
+            matches!((&self.page_numbers, &worker.page_numbers), (Some(own), Some(other)) if Arc::ptr_eq(own, other)),
+            "cannot adopt IR from another session"
+        );
+        // Leave room for pages still held by other workers.
+        let end = worker.next.div_ceil(SLOTS as u64) as usize;
+        if end > self.pages.len() {
+            self.pages.resize_with(end, Page::empty);
+        }
+        for (number, page) in worker_pages {
+            self.pages[number] = page;
+        }
+        self.allocations += worker.allocations;
+    }
+
     pub(super) fn allocated_bytes(&self) -> u64 {
-        self.next as u64 * size_of::<T>() as u64
+        self.allocations * size_of::<T>() as u64
     }
 
     /// Release backing storage as well as the contents of dead slots.
     pub(super) fn sweep(&mut self, marks: &Marks) -> u64 {
-        let mut live = 0;
-        for (i, page) in self.pages.iter_mut().enumerate() {
-            let keep = marks.page(i);
-            if page.present != keep {
-                let mut slots = page.present;
-                page.values.retain(|_| {
-                    let bit = slots & slots.wrapping_neg();
-                    slots ^= bit;
-                    keep & bit != 0
-                });
-                page.values.shrink_to_fit();
-                page.present = keep;
-            }
-            live += page.values.len();
-        }
+        assert!(
+            self.worker_pages.is_none(),
+            "IR worker pages must be adopted before sweeping"
+        );
+        let live: usize = self
+            .pages
+            .iter_mut()
+            .enumerate()
+            .map(|(number, page)| page.sweep(marks.page(number)))
+            .sum();
         live as u64 * size_of::<T>() as u64
+    }
+
+    #[inline(always)]
+    fn page(&self, number: usize) -> &Page<T> {
+        self.pages
+            .get(number)
+            .unwrap_or_else(|| self.sparse_page(number))
+    }
+
+    #[inline(always)]
+    fn page_mut(&mut self, number: usize) -> &mut Page<T> {
+        if let Some(page) = self.pages.get_mut(number) {
+            return page;
+        }
+        Self::sparse_page_mut(&mut self.worker_pages, number)
+    }
+
+    #[cold]
+    fn sparse_page(&self, number: usize) -> &Page<T> {
+        &self.worker_pages.as_ref().expect("missing IR page")[&number]
+    }
+
+    #[cold]
+    fn sparse_page_mut(
+        worker_pages: &mut Option<FxHashMap<usize, Page<T>>>,
+        number: usize,
+    ) -> &mut Page<T> {
+        worker_pages
+            .as_mut()
+            .and_then(|pages| pages.get_mut(&number))
+            .expect("missing IR page")
     }
 }
 
 impl<T> Page<T> {
+    fn empty() -> Self {
+        Self {
+            present: 0,
+            values: Vec::new(),
+        }
+    }
+
     fn offset(&self, id: usize) -> usize {
         let bit = 1 << (id % SLOTS);
         assert_ne!(self.present & bit, 0, "released IR handle {id}");
         (self.present & (bit - 1)).count_ones() as usize
+    }
+
+    fn sweep(&mut self, keep: u64) -> usize {
+        if self.present != keep {
+            let mut slots = self.present;
+            self.values.retain(|_| {
+                let bit = slots & slots.wrapping_neg();
+                slots ^= bit;
+                keep & bit != 0
+            });
+            self.values.shrink_to_fit();
+            self.present = keep;
+        }
+        self.values.len()
     }
 }
 
@@ -85,7 +197,7 @@ impl<I: Idx, T> Index<I> for Arena<I, T> {
 
     fn index(&self, id: I) -> &T {
         let id = id.index();
-        let page = &self.pages[id / SLOTS];
+        let page = self.page(id / SLOTS);
         &page.values[page.offset(id)]
     }
 }
@@ -93,7 +205,7 @@ impl<I: Idx, T> Index<I> for Arena<I, T> {
 impl<I: Idx, T> IndexMut<I> for Arena<I, T> {
     fn index_mut(&mut self, id: I) -> &mut T {
         let id = id.index();
-        let page = &mut self.pages[id / SLOTS];
+        let page = self.page_mut(id / SLOTS);
         let offset = page.offset(id);
         &mut page.values[offset]
     }
