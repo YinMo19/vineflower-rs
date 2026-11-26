@@ -4,27 +4,56 @@
 //!
 //! Vineflower sometimes depends on the iteration order of hash collections
 //! keyed by integers, strings, or other value-hashed objects. The table keeps
-//! both the indices in each `HashMap` bucket and the entries they refer to.
-//!
-//! The bucket chains follow JDK 17 through insertion, removal and resize. At
-//! capacities where the JDK would turn a chain into a tree, the chain remains
-//! a list, so iteration can differ from Java for those buckets.
+//! both the bucket order and a separate lookup index. Tree bins keep the
+//! red-black links and the iteration chain independently, as in JDK 17. The
+//! last tie-break between equal-hash keys of the same class that compare as
+//! equal is their JVM identity hash. A stable arena handle or the stored
+//! key's insertion serial models identity when the JVM hash is unavailable.
 
 use std::borrow::Borrow;
+use std::cmp::Ordering;
 use std::hash::Hash;
 use std::sync::Arc;
 
 use indexmap::IndexMap;
+use itertools::{Either, Itertools};
 use rustc_hash::FxBuildHasher;
+
+mod tree;
+
+use tree::{Bucket, TreeBin};
 
 /// `Object.hashCode()` for the key types stored in upstream's hash collections.
 pub trait JavaHash {
     fn java_hash(&self) -> i32;
+
+    /// `HashMap.compareComparables` for Java classes implementing
+    /// `Comparable<TheirOwnClass>`.
+    fn java_cmp(&self, _other: &Self) -> Option<Ordering> {
+        None
+    }
+
+    /// Used only for equal-hash keys with no comparative order. A homogeneous
+    /// Rust key type needs only a common name. Heterogeneous representations
+    /// use the actual Java class name, with `None` representing null.
+    fn java_class_name(&self) -> Option<&'static str> {
+        Some(std::any::type_name::<Self>())
+    }
+
+    /// A stable identity for keys that already model an upstream object
+    /// handle. Other keys receive a serial when entered into the map.
+    fn java_identity(&self) -> Option<u64> {
+        None
+    }
 }
 
 impl JavaHash for i32 {
     fn java_hash(&self) -> i32 {
         *self
+    }
+
+    fn java_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -32,11 +61,19 @@ impl JavaHash for i64 {
     fn java_hash(&self) -> i32 {
         (*self ^ (*self as u64 >> 32) as i64) as i32
     }
+
+    fn java_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl JavaHash for bool {
     fn java_hash(&self) -> i32 {
         if *self { 1231 } else { 1237 }
+    }
+
+    fn java_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -46,11 +83,19 @@ impl JavaHash for str {
             hash.wrapping_mul(31).wrapping_add(i32::from(unit))
         })
     }
+
+    fn java_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.encode_utf16().cmp(other.encode_utf16()))
+    }
 }
 
 impl JavaHash for String {
     fn java_hash(&self) -> i32 {
         self.as_str().java_hash()
+    }
+
+    fn java_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.as_str().java_cmp(other.as_str())
     }
 }
 
@@ -58,17 +103,37 @@ impl JavaHash for arcstr::ArcStr {
     fn java_hash(&self) -> i32 {
         self.as_str().java_hash()
     }
+
+    fn java_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.as_str().java_cmp(other.as_str())
+    }
 }
 
 impl JavaHash for Arc<str> {
     fn java_hash(&self) -> i32 {
         self.as_ref().java_hash()
     }
+
+    fn java_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.as_ref().java_cmp(other.as_ref())
+    }
 }
 
 impl<T: JavaHash + ?Sized> JavaHash for &T {
     fn java_hash(&self) -> i32 {
         (**self).java_hash()
+    }
+
+    fn java_cmp(&self, other: &Self) -> Option<Ordering> {
+        (**self).java_cmp(*other)
+    }
+
+    fn java_class_name(&self) -> Option<&'static str> {
+        (**self).java_class_name()
+    }
+
+    fn java_identity(&self) -> Option<u64> {
+        (**self).java_identity()
     }
 }
 
@@ -77,12 +142,23 @@ impl<T: JavaHash> JavaHash for Option<T> {
     fn java_hash(&self) -> i32 {
         self.as_ref().map_or(0, JavaHash::java_hash)
     }
+
+    fn java_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.as_ref()?.java_cmp(other.as_ref()?)
+    }
+
+    fn java_class_name(&self) -> Option<&'static str> {
+        self.as_ref()?.java_class_name()
+    }
+
+    fn java_identity(&self) -> Option<u64> {
+        self.as_ref()?.java_identity()
+    }
 }
 
 /// `HashMap.hash`: fold the high half into the bits that select a bucket.
-fn spread(hash: i32) -> u32 {
-    let hash = hash as u32;
-    hash ^ (hash >> 16)
+fn spread(hash: i32) -> i32 {
+    hash ^ ((hash as u32 >> 16) as i32)
 }
 
 /// `HashMap.tableSizeFor`.
@@ -92,17 +168,21 @@ fn table_size_for(capacity: usize) -> usize {
 
 #[derive(Clone, Debug)]
 struct Entry<V> {
-    hash: usize,
+    hash: i32,
+    serial: u32,
     value: V,
 }
+
+type Entries<K, V> = IndexMap<K, Entry<V>, FxBuildHasher>;
 
 /// A `java.util.HashMap` with respect to iteration order.
 #[derive(Clone, Debug)]
 pub struct JHashMap<K, V> {
-    entries: IndexMap<K, Entry<V>, FxBuildHasher>,
-    /// Entry indices in chain order, by bucket number.
-    buckets: Vec<Vec<usize>>,
+    entries: Entries<K, V>,
+    buckets: Vec<Bucket>,
     threshold: usize,
+    next_serial: u32,
+    swapped_entries: bool,
 }
 
 impl<K, V> Default for JHashMap<K, V> {
@@ -111,6 +191,8 @@ impl<K, V> Default for JHashMap<K, V> {
             entries: IndexMap::default(),
             buckets: Vec::new(),
             threshold: 0,
+            next_serial: 0,
+            swapped_entries: false,
         }
     }
 }
@@ -134,8 +216,8 @@ impl<K: JavaHash + Hash + Eq, V> JHashMap<K, V> {
         }
     }
 
-    /// `new HashMap<>(other)`: the copy sizes its own table, so it may iterate
-    /// in a different order than `other`. `clone()` keeps the table instead.
+    /// `new HashMap<>(other)` and Java's `HashMap.clone()` both reinsert the
+    /// entries into a newly sized table. Rust's `Clone` preserves the table.
     pub fn copy_of(other: &Self) -> Self
     where
         K: Clone,
@@ -171,8 +253,8 @@ impl<K: JavaHash + Hash + Eq, V> JHashMap<K, V> {
         }
     }
 
-    fn bucket(&self, hash: usize) -> usize {
-        hash & (self.buckets.len() - 1)
+    fn bucket(&self, hash: i32) -> usize {
+        hash as usize & (self.buckets.len() - 1)
     }
 
     fn resize(&mut self) {
@@ -192,13 +274,12 @@ impl<K: JavaHash + Hash + Eq, V> JHashMap<K, V> {
             _ => new_capacity * 3 / 4,
         };
 
-        let old_buckets = std::mem::replace(&mut self.buckets, vec![Vec::new(); new_capacity]);
-        // Each old chain splits between its low and high buckets. Appending
-        // in chain order keeps both halves stable.
-        for index in old_buckets.into_iter().flatten() {
-            let hash = self.entries[index].hash;
-            let bucket = self.bucket(hash);
-            self.buckets[bucket].push(index);
+        let old_buckets =
+            std::mem::replace(&mut self.buckets, vec![Bucket::default(); new_capacity]);
+        for (index, bucket) in old_buckets.into_iter().enumerate() {
+            let (low, high) = bucket.split(old_capacity, &self.entries);
+            self.buckets[index] = low;
+            self.buckets[index + old_capacity] = high;
         }
     }
 
@@ -210,56 +291,76 @@ impl<K: JavaHash + Hash + Eq, V> JHashMap<K, V> {
         if let Some(slot) = self.entries.get_mut(&key) {
             return Some(std::mem::replace(&mut slot.value, value));
         }
-        let hash = spread(key.java_hash()) as usize;
-        let bucket = self.bucket(hash);
-        let overlong = self.buckets[bucket].len() >= TREEIFY_THRESHOLD;
-        let index = self.entries.len();
-        self.entries.insert(key, Entry { hash, value });
-        self.buckets[bucket].push(index);
-        self.resize_long_chain(overlong);
+        self.insert_new(key, value, false);
         if self.entries.len() > self.threshold {
             self.resize();
         }
         None
     }
 
-    fn resize_long_chain(&mut self, overlong: bool) {
-        // The JDK grows a small table before allowing a bucket to become a tree.
-        if overlong && self.buckets.len() < MIN_TREEIFY_CAPACITY {
-            self.resize();
-        }
-    }
-
-    /// `computeIfAbsent`.
-    pub fn get_or_insert_with(&mut self, key: K, value: impl FnOnce() -> V) -> &mut V
-    where
-        K: Clone,
-    {
-        // This check also happens when the key is already present. A previous
-        // compute can leave the size one entry above the threshold.
+    /// `computeIfAbsent` for a mapping function that returns a value.
+    pub fn get_or_insert_with(&mut self, key: K, value: impl FnOnce() -> V) -> &mut V {
+        // A previous compute can leave the size one entry above the threshold.
         if self.buckets.is_empty() || self.entries.len() > self.threshold {
             self.resize();
         }
         let index = match self.entries.get_index_of(&key) {
             Some(index) => index,
-            None => {
-                let hash = spread(key.java_hash()) as usize;
-                let bucket = self.bucket(hash);
-                let overlong = self.buckets[bucket].len() >= TREEIFY_THRESHOLD - 1;
-                let index = self.entries.len();
-                self.entries.insert(
-                    key,
-                    Entry {
-                        hash,
-                        value: value(),
-                    },
-                );
-                self.buckets[bucket].insert(0, index);
-                self.resize_long_chain(overlong);
-                index
-            }
+            None => self.insert_new(key, value(), true),
         };
         &mut self.entries[index].value
+    }
+
+    fn insert_new(&mut self, key: K, value: V, compute: bool) -> usize {
+        if self.next_serial == u32::MAX {
+            // There can be at most i32::MAX live entries. Compact the serials
+            // while preserving every relative order used by the trees.
+            for (serial, entry) in self
+                .entries
+                .values_mut()
+                .sorted_by_key(|entry| entry.serial)
+                .enumerate()
+            {
+                entry.serial = serial as u32;
+            }
+            self.next_serial = self.entries.len() as u32;
+        }
+        let hash = spread(key.java_hash());
+        let slot = self.bucket(hash);
+        let (index, old) = self.entries.insert_full(
+            key,
+            Entry {
+                hash,
+                serial: self.next_serial,
+                value,
+            },
+        );
+        debug_assert!(old.is_none());
+        self.next_serial += 1;
+        let chain = match &mut self.buckets[slot] {
+            Bucket::List(chain) => chain,
+            Bucket::Tree(tree) => {
+                tree.insert(index, &self.entries);
+                return index;
+            }
+        };
+        let treeify = chain.len() >= TREEIFY_THRESHOLD - usize::from(compute);
+        if compute {
+            chain.insert(0, index);
+        } else {
+            chain.push(index);
+        }
+        if treeify {
+            if self.buckets.len() < MIN_TREEIFY_CAPACITY {
+                self.resize();
+            } else {
+                let Bucket::List(chain) = std::mem::take(&mut self.buckets[slot]) else {
+                    unreachable!();
+                };
+                self.buckets[slot] = TreeBin::from_chain(chain, &self.entries);
+            }
+        }
+        index
     }
 
     pub fn get<Q>(&self, key: &Q) -> Option<&V>
@@ -291,50 +392,73 @@ impl<K: JavaHash + Hash + Eq, V> JHashMap<K, V> {
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let (index, _key, entry) = self.entries.shift_remove_full(key)?;
-        let bucket = self.bucket(entry.hash);
-        self.buckets[bucket].retain(|&position| position != index);
-        for position in self.buckets.iter_mut().flatten() {
-            *position -= usize::from(*position > index);
-        }
+        let (index, _, entry) = self.entries.swap_remove_full(key)?;
+        self.unlink(index, entry.hash, true);
         Some(entry.value)
     }
 
-    /// Removal through an iterator or `removeIf`; the table is left alone.
-    pub fn retain(&mut self, mut keep: impl FnMut(&K, &mut V) -> bool) {
-        let mut retained = vec![false; self.entries.len()];
-        for &index in self.buckets.iter().flatten() {
-            let (key, entry) = self.entries.get_index_mut(index).unwrap();
-            retained[index] = keep(key, &mut entry.value);
+    /// Update the removed entry's bin and the bin of the last dense entry,
+    /// which now occupies the vacant index.
+    fn unlink(&mut self, index: usize, hash: i32, movable: bool) {
+        let bucket = self.bucket(hash);
+        self.buckets[bucket].remove(index, movable);
+        let old_index = self.entries.len();
+        if index != old_index {
+            let moved_bucket = self.bucket(self.entries[index].hash);
+            self.buckets[moved_bucket].replace_index(old_index, index);
+            self.swapped_entries = true;
         }
+    }
 
-        let mut next_position = 0;
-        let positions = retained
-            .into_iter()
-            .map(|keep| {
-                let position = keep.then_some(next_position);
-                next_position += usize::from(keep);
-                position
-            })
-            .collect::<Vec<_>>();
-        let mut old_positions = positions.iter();
-        self.entries
-            .retain(|_, _| old_positions.next().unwrap().is_some());
-        for bucket in &mut self.buckets {
-            bucket.retain_mut(|index| match positions[*index] {
-                Some(position) => {
-                    *index = position;
-                    true
+    /// Removal through an iterator or `removeIf`. The current tree root
+    /// need not become the first entry and a nonempty bin stays treeified.
+    pub fn retain(&mut self, mut keep: impl FnMut(&K, &mut V) -> bool) {
+        let mut keep_entry = |entries: &mut Entries<K, V>, index| {
+            let (key, entry) = entries.get_index_mut(index).unwrap();
+            keep(key, &mut entry.value)
+        };
+        for bucket in 0..self.buckets.len() {
+            match &self.buckets[bucket] {
+                Bucket::List(_) => {
+                    let mut position = 0;
+                    while let Bucket::List(chain) = &self.buckets[bucket] {
+                        let Some(&index) = chain.get(position) else {
+                            break;
+                        };
+                        if keep_entry(&mut self.entries, index) {
+                            position += 1;
+                        } else {
+                            let (_, entry) = self.entries.swap_remove_index(index).unwrap();
+                            self.unlink(index, entry.hash, false);
+                        }
+                    }
                 }
-                None => false,
-            });
+                Bucket::Tree(tree) => {
+                    let mut current = tree.head();
+                    while let Some(index) = current {
+                        let Bucket::Tree(tree) = &self.buckets[bucket] else {
+                            unreachable!();
+                        };
+                        current = tree.next(index);
+                        if !keep_entry(&mut self.entries, index) {
+                            let (_, entry) = self.entries.swap_remove_index(index).unwrap();
+                            self.unlink(index, entry.hash, false);
+                            if current == Some(self.entries.len()) {
+                                current = Some(index);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
     /// `clear` empties the buckets and keeps the table.
     pub fn clear(&mut self) {
         self.entries.clear();
-        self.buckets.fill_with(Vec::new);
+        self.buckets.fill_with(Bucket::default);
+        self.next_serial = 0;
+        self.swapped_entries = false;
     }
 
     pub fn len(&self) -> usize {
@@ -346,7 +470,7 @@ impl<K: JavaHash + Hash + Eq, V> JHashMap<K, V> {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
-        self.buckets.iter().flatten().map(|&index| {
+        self.buckets.iter().flat_map(Bucket::indices).map(|index| {
             let (key, entry) = self.entries.get_index(index).unwrap();
             (key, &entry.value)
         })
@@ -362,7 +486,13 @@ impl<K: JavaHash + Hash + Eq, V> JHashMap<K, V> {
 
     /// Values in insertion order, for updates that do not depend on the order.
     pub fn values_mut(&mut self) -> impl Iterator<Item = &mut V> {
-        self.entries.values_mut().map(|entry| &mut entry.value)
+        let values = self.entries.values_mut();
+        let ordered = if self.swapped_entries {
+            Either::Left(values.sorted_by_key(|entry| entry.serial))
+        } else {
+            Either::Right(values)
+        };
+        ordered.map(|entry| &mut entry.value)
     }
 }
 
@@ -446,7 +576,15 @@ impl<T: JavaHash + Hash + Eq> JHashSet<T> {
 
     /// `removeAll`.
     pub fn remove_all(&mut self, other: &Self) {
-        self.retain(|element| !other.contains(element));
+        // AbstractSet.removeAll chooses key removal or iterator removal
+        // depending on the relative sizes.
+        if self.len() > other.len() {
+            for element in other.iter() {
+                self.remove(element);
+            }
+        } else {
+            self.retain(|element| !other.contains(element));
+        }
     }
 
     pub fn clear(&mut self) {

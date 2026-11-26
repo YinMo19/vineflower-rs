@@ -802,3 +802,49 @@ fn variable_names_and_debug_tables_match_published_method_wrappers() {
     }
     assert_eq!(rows, reference.lines().collect::<Vec<_>>());
 }
+
+#[test]
+#[ignore = "compares a javac-compiled generic hierarchy with the upstream JDK map"]
+fn colliding_interface_names_keep_the_original_generic_hierarchy_order() {
+    use std::fmt::Write;
+    let corpus = upstream_reference::Corpus::discover();
+    let group = tempfile::tempdir().unwrap();
+    // These are distinct Java identifiers with the same String.hashCode().
+    let interfaces: Vec<String> = (0..32)
+        .map(|pattern| {
+            (0..5)
+                .map(|bit| {
+                    if pattern & (1 << bit) != 0 {
+                        "Aa"
+                    } else {
+                        "BB"
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    let mut source = String::from("package keys;\n");
+    for name in &interfaces {
+        writeln!(source, "interface {name}<T> {{}}").unwrap();
+    }
+    let supertypes = interfaces
+        .iter()
+        .map(|name| format!("{name}<T>"))
+        .collect::<Vec<_>>();
+    writeln!(
+        source,
+        "class Hierarchy<T> implements {} {{}}",
+        supertypes.join(", ")
+    )
+    .unwrap();
+    std::fs::write(group.path().join("Hierarchy.java"), source).unwrap();
+    let reference = corpus.run("GenericHierarchyReference", &[], group.path());
+    let mut context = StructContext::new(Arc::new(Options::default()), None);
+    context.add_file(group.path(), true).unwrap();
+    let cx = Cx::new(Arc::new(context));
+    let class = cx.struct_context.get_class("keys/Hierarchy").unwrap();
+    let hierarchy = class.get_all_generics(&cx);
+    let actual: Vec<_> = hierarchy.keys().map(|name| name.as_str()).collect();
+    assert_eq!(actual.len(), interfaces.len() + 1);
+    assert_eq!(actual, reference.lines().collect::<Vec<_>>());
+}

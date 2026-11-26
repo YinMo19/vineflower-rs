@@ -72,6 +72,15 @@ KOTLIN_COMPILER_CLASSPATH="..." KOTLIN_STDLIB="..." cargo test --locked --test k
 
 The body comparison covers both string-concatenation settings, reformatted source, method counters, and bytecode-to-source mappings. The full parity harness runs complete Kotlin compilation units using the original test registrations and class files. Select them with `VINEFLOWER_RS_PARITY_FILTER=kotlin/`.
 
+## Java hash collections
+
+The `jhash` target compares insertion, treeification, resizing, and removal order against the actual JDK 17 collections. The class-level hierarchy probe compiles 32 generic interfaces with distinct names that share a Java string hash and compares the declaration order returned by Vineflower's `StructClass.getAllGenerics`.
+
+```sh
+cargo test --locked --test jhash -- --include-ignored
+cargo test --locked --test class_nodes colliding_interface_names -- --ignored
+```
+
 ## End-to-end source and CLI suite
 
 The `upstream_parity` target compares the native library and CLI against the upstream source and archive goldens. The separate `driver` target also runs the original Java CLI on the same input to check configuration, resources, manifests and archived line mappings.

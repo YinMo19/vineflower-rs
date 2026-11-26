@@ -659,6 +659,14 @@ impl JavaHash for VarType {
                 .map_or(0, JavaHash::java_hash),
         )
     }
+
+    fn java_class_name(&self) -> Option<&'static str> {
+        Some(if self.generic.is_some() {
+            "org.jetbrains.java.decompiler.struct.gen.generics.GenericType"
+        } else {
+            "org.jetbrains.java.decompiler.struct.gen.VarType"
+        })
+    }
 }
 
 /// `VarType.toString()`: the descriptor form. The text upstream's

@@ -68,6 +68,10 @@ impl JavaHash for JavaString {
             hash.wrapping_mul(31).wrapping_add(i32::from(unit))
         })
     }
+
+    fn java_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.utf16().cmp(other.utf16()))
+    }
 }
 
 /// `String.length()`: the number of UTF-16 units in `text`.

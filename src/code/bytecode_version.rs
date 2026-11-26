@@ -118,4 +118,8 @@ impl JavaHash for BytecodeVersion {
     fn java_hash(&self) -> i32 {
         self.major << 16 | self.minor
     }
+
+    fn java_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }

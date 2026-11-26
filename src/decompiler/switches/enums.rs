@@ -506,6 +506,7 @@ fn integer_label(ir: &Ir, expr: ExprId) -> Option<i32> {
 #[derive(Clone)]
 struct LabelKey {
     expr: ExprId,
+    class_name: &'static str,
     constant: Option<(VarType, ConstantValue)>,
 }
 
@@ -517,7 +518,30 @@ impl LabelKey {
             } => Some((var_type.clone(), value.clone())),
             _ => None,
         };
-        Self { expr, constant }
+        // These Exprent subclasses all share the same Java package.
+        let class_name = match &ir[expr].kind {
+            ExprKind::Array { .. } => "ArrayExprent",
+            ExprKind::Assert { .. } => "AssertExprent",
+            ExprKind::Assignment { .. } => "AssignmentExprent",
+            ExprKind::Constant { .. } => "ConstExprent",
+            ExprKind::Exit { .. } => "ExitExprent",
+            ExprKind::Field(_) => "FieldExprent",
+            ExprKind::Function { .. } => "FunctionExprent",
+            ExprKind::If { .. } => "IfExprent",
+            ExprKind::Invocation(_) => "InvocationExprent",
+            ExprKind::Monitor { .. } => "MonitorExprent",
+            ExprKind::New { .. } => "NewExprent",
+            ExprKind::Pattern(_) => "PatternExprent",
+            ExprKind::Switch { .. } => "SwitchExprent",
+            ExprKind::SwitchHead { .. } => "SwitchHeadExprent",
+            ExprKind::Variable(_) => "VarExprent",
+            ExprKind::Yield { .. } => "YieldExprent",
+        };
+        Self {
+            expr,
+            class_name,
+            constant,
+        }
     }
 }
 
@@ -566,6 +590,14 @@ impl JavaHash for LabelKey {
             ConstantValue::String(value) => value.java_hash(),
         };
         ty.java_hash().wrapping_mul(31).wrapping_add(value)
+    }
+
+    fn java_class_name(&self) -> Option<&'static str> {
+        Some(self.class_name)
+    }
+
+    fn java_identity(&self) -> Option<u64> {
+        Some(self.expr.index() as u64)
     }
 }
 
