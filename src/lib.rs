@@ -54,6 +54,7 @@
 pub mod code;
 pub mod decompiler;
 pub mod engine;
+pub mod kotlin;
 pub mod renamer;
 pub mod structs;
 pub mod types;

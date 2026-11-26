@@ -83,7 +83,17 @@ impl ImportCollector {
         collector
     }
 
+    pub(crate) fn reserve_name(&mut self, simple: &str, package: &str) {
+        self.simple_names
+            .entry(simple.to_owned())
+            .or_insert_with(|| package.to_owned());
+    }
+
     pub fn imports(&self) -> Vec<String> {
+        self.imports_matching(|_| true)
+    }
+
+    pub(crate) fn imports_matching(&self, keep_package: impl Fn(&str) -> bool) -> Vec<String> {
         let mut entries: Vec<_> = self
             .simple_names
             .iter()
@@ -92,6 +102,7 @@ impl ImportCollector {
                     && !package.is_empty()
                     && *package != "java.lang"
                     && **package != self.package
+                    && keep_package(package)
             })
             .collect();
         entries.sort_unstable_by(|(a, ap), (b, bp)| {
@@ -241,7 +252,12 @@ fn inherited_names(
 /// ExprProcessor.buildJavaClassName preserves the binary name of an own class.
 pub fn java_class_name(cx: &Cx, internal: &str) -> String {
     let name = internal.replace('/', ".");
-    if internal.contains('$') && !cx.classes().get_class(internal).is_some_and(|class| class.own) {
+    if internal.contains('$')
+        && !cx
+            .classes()
+            .get_class(internal)
+            .is_some_and(|class| class.own)
+    {
         name.replace('$', ".")
     } else {
         name
