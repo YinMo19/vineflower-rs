@@ -30,7 +30,7 @@ pub struct Cx {
     pub pool_interceptor: Option<Arc<PoolInterceptor>>,
     /// Optional documentation supplied by the embedding application.
     pub javadoc: Option<Arc<dyn super::class_writer::javadoc::JavadocProvider>>,
-    /// Object identities shared by methods and nested classes in this root class.
+    /// Stable handles shared by all methods and classes processed by this worker.
     pub ir: Ir,
     pub(crate) kotlin_body: Option<Box<crate::kotlin::body::KotlinBody>>,
     /// ClassesProcessor.mapRootClasses in this root-class worker.

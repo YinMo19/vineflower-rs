@@ -5,8 +5,8 @@
 //!
 //! Upstream's statements, edges, expressions and basic blocks form a mutable
 //! object graph with cycles, aliasing and identity comparisons. Here every
-//! such object lives in an arena for as long as its root class is being
-//! decompiled, and a `Copy` handle stands for the Java reference: two handles
+//! such object lives in the worker's arena for the duration of the run.
+//! A `Copy` handle stands for the Java reference: two handles
 //! are equal exactly when the references were identical, and a change made
 //! through one alias is visible through all others.
 //!

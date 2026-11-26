@@ -163,8 +163,8 @@ impl Decompiler {
                 .transpose()?;
 
             let mut classes = unit_classes(&mut cx, unit, &layout);
-            // ContextUnit collects the source entries in the parent context.
-            // Each processed root starts in a fresh worker context.
+            // Each root gets fresh imports, counters and mappings. Its methods
+            // remain accessible to the other roots through the shared IR.
             let root_session = cx.take_class_session();
             for pending in &mut classes {
                 log::info!("Preprocessing class {}", pending.class.qualified_name);
