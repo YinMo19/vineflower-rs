@@ -157,8 +157,8 @@ preferences! {
     // Variable renaming plugin
     variable_renaming: Option<String> = None::<String>, "variable-renaming";
     rename_parameters: bool = false, "rename-parameters";
-    jad_style_variable_naming: bool = false, "jad-style-variable-naming";
-    jad_style_parameter_naming: bool = false, "jad-style-parameter-naming";
+    jad_style_variable_naming: bool = false, "jad-style-variable-naming" | "jvn";
+    jad_style_parameter_naming: bool = false, "jad-style-parameter-naming" | "jpr";
 
     // IDEA @NotNull plugin
     resugar_idea_notnull: bool = true, "resugar-idea-notnull" | "inn";
