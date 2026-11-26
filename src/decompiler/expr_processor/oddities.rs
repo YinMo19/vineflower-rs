@@ -6,8 +6,6 @@
 use std::io;
 use std::sync::Arc;
 
-use arcstr::ArcStr;
-
 use super::get_cast_type_name;
 use crate::decompiler::assertions::assertion_field;
 use crate::decompiler::exps::{Expr, ExprKind, FunctionType};
@@ -81,7 +79,7 @@ fn mark_expression(
                 let definition_type = var.definition.then(|| var.definition_var_type(cx));
                 if definition_type
                     .is_some_and(|ty| is_invalid_type_name(&definition_type_name(cx, &ty)))
-                    || is_unknown_type(&Expr::expr_type(cx, expr))
+                    || Expr::expr_type(cx, expr).same_singleton(&VarType::VARTYPE_UNKNOWN)
                 {
                     cx.ir[root].add_comment(VARIABLE_TYPE_WARNING, true);
                 }
@@ -121,13 +119,6 @@ fn definition_type_name(cx: &mut Cx, ty: &VarType) -> String {
 
 fn is_invalid_type_name(name: &str) -> bool {
     matches!(name, "<undefinedtype>" | "<null>" | "<unknown>")
-}
-
-fn is_unknown_type(ty: &VarType) -> bool {
-    let unknown = VarType::VARTYPE_UNKNOWN;
-    // The stored descriptor of the singleton survives type cloning. A type
-    // freshly parsed from a debug descriptor must not replace that identity.
-    ty == &unknown && ArcStr::ptr_eq(ty.value.as_ref().unwrap(), unknown.value.as_ref().unwrap())
 }
 
 fn cast_operand_string(cx: &mut Cx, expr: ExprId) -> io::Result<String> {

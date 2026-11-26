@@ -9,95 +9,106 @@ use crate::types::{CodeType, VarType};
 
 use super::{Expr, ExprKind};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FunctionType {
-    Add,
-    Sub,
-    Mul,
-    Div,
-    And,
-    Or,
-    Xor,
-    Rem,
-    Shl,
-    Shr,
-    Ushr,
-    BitNot,
-    BoolNot,
-    Neg,
-    I2l,
-    I2f,
-    I2d,
-    L2i,
-    L2f,
-    L2d,
-    F2i,
-    F2l,
-    F2d,
-    D2i,
-    D2l,
-    D2f,
-    I2b,
-    I2c,
-    I2s,
-    Cast,
-    InstanceOf,
-    ArrayLength,
-    Imm,
-    Mmi,
-    Ipp,
-    Ppi,
-    Ternary,
-    Lcmp,
-    Fcmpl,
-    Fcmpg,
-    Dcmpl,
-    Dcmpg,
-    Eq,
-    Ne,
-    Lt,
-    Ge,
-    Gt,
-    Le,
-    BoolAnd,
-    BoolOr,
-    StrConcat,
-    Other,
+// FunctionExprent.FunctionType supplies the same operator metadata to both
+// stack lifting and source writing. Primitive conversions also name their target.
+macro_rules! function_types {
+    ($( $op:ident($arity:literal, $operator:literal, $precedence:expr) $(=> $cast:ident)?; )+) => {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub enum FunctionType { $( $op, )+ }
+
+        impl FunctionType {
+            pub const fn arity(self) -> usize {
+                match self { $( Self::$op => $arity, )+ }
+            }
+
+            pub(crate) fn java_operator(self) -> &'static str {
+                match self { $( Self::$op => $operator, )+ }
+            }
+
+            pub(crate) fn java_precedence(self) -> i32 {
+                match self { $( Self::$op => $precedence, )+ }
+            }
+
+            pub(crate) fn simple_cast_type(self) -> Option<VarType> {
+                match self {
+                    $( $( Self::$op => Some(VarType::$cast), )? )+
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+function_types! {
+    Add(2, "+", 3);
+    Sub(2, "-", 3);
+    Mul(2, "*", 2);
+    Div(2, "/", 2);
+    And(2, "&", 7);
+    Or(2, "|", 9);
+    Xor(2, "^", 8);
+    Rem(2, "%", 2);
+    Shl(2, "<<", 4);
+    Shr(2, ">>", 4);
+    Ushr(2, ">>>", 4);
+
+    BitNot(1, "~", 1);
+    BoolNot(1, "!", 1);
+    Neg(1, "-", 1);
+
+    I2l(1, "", 1) => VARTYPE_LONG;
+    I2f(1, "", 1) => VARTYPE_FLOAT;
+    I2d(1, "", 1) => VARTYPE_DOUBLE;
+    L2i(1, "", 1) => VARTYPE_INT;
+    L2f(1, "", 1) => VARTYPE_FLOAT;
+    L2d(1, "", 1) => VARTYPE_DOUBLE;
+    F2i(1, "", 1) => VARTYPE_INT;
+    F2l(1, "", 1) => VARTYPE_LONG;
+    F2d(1, "", 1) => VARTYPE_DOUBLE;
+    D2i(1, "", 1) => VARTYPE_INT;
+    D2l(1, "", 1) => VARTYPE_LONG;
+    D2f(1, "", 1) => VARTYPE_FLOAT;
+    I2b(1, "", 1) => VARTYPE_BYTE;
+    I2c(1, "", 1) => VARTYPE_CHAR;
+    I2s(1, "", 1) => VARTYPE_SHORT;
+
+    Cast(2, "", 1);
+    InstanceOf(2, "instanceof", 6);
+    ArrayLength(1, ".length", 0);
+    Imm(1, "--", 1);
+    Mmi(1, "--", 1);
+    Ipp(1, "++", 1);
+    Ppi(1, "++", 1);
+    Ternary(3, "", 12);
+
+    Lcmp(2, "__lcmp__", -1);
+    Fcmpl(2, "__fcmpl__", -1);
+    Fcmpg(2, "__fcmpg__", -1);
+    Dcmpl(2, "__dcmpl__", -1);
+    Dcmpg(2, "__dcmpg__", -1);
+    Eq(2, "==", 6);
+    Ne(2, "!=", 6);
+    Lt(2, "<", 5);
+    Ge(2, ">=", 5);
+    Gt(2, ">", 5);
+    Le(2, "<=", 5);
+    BoolAnd(2, "&&", 10);
+    BoolOr(2, "||", 11);
+    StrConcat(2, "+", 3);
+    Other(0, "??????", 999);
 }
 
 impl FunctionType {
-    pub const fn arity(self) -> usize {
-        use FunctionType::*;
-        match self {
-            BitNot | BoolNot | Neg | I2l | I2f | I2d | L2i | L2f | L2d | F2i | F2l | F2d | D2i
-            | D2l | D2f | I2b | I2c | I2s | ArrayLength | Imm | Mmi | Ipp | Ppi => 1,
-            Ternary => 3,
-            Other => 0,
-            _ => 2,
-        }
-    }
-
     pub(crate) const fn is_arithmetic_binary(self) -> bool {
         use FunctionType::*;
-        matches!(self, Add | Sub | Mul | Div | And | Or | Xor | Rem | Shl | Shr | Ushr)
+        matches!(
+            self,
+            Add | Sub | Mul | Div | And | Or | Xor | Rem | Shl | Shr | Ushr
+        )
     }
 
     pub const fn is_inc_dec(self) -> bool {
         matches!(self, Self::Imm | Self::Mmi | Self::Ipp | Self::Ppi)
-    }
-
-    pub(crate) fn simple_cast_type(self) -> Option<VarType> {
-        use FunctionType::*;
-        Some(match self {
-            L2i | F2i | D2i => VarType::VARTYPE_INT,
-            I2l | F2l | D2l => VarType::VARTYPE_LONG,
-            I2f | L2f | D2f => VarType::VARTYPE_FLOAT,
-            I2d | L2d | F2d => VarType::VARTYPE_DOUBLE,
-            I2b => VarType::VARTYPE_BYTE,
-            I2c => VarType::VARTYPE_CHAR,
-            I2s => VarType::VARTYPE_SHORT,
-            _ => return None,
-        })
     }
 
     pub(super) fn expr_type(
@@ -112,8 +123,8 @@ impl FunctionType {
             StrConcat => VarType::VARTYPE_STRING,
             Other => unreachable!("Missing Kotlin function type"),
             ArrayLength => VarType::VARTYPE_INT,
-            I2l | I2f | I2d | L2i | L2f | L2d | F2i | F2l | F2d | D2i | D2l | D2f
-            | I2b | I2c | I2s => self.simple_cast_type().unwrap(),
+            I2l | I2f | I2d | L2i | L2f | L2d | F2i | F2l | F2d | D2i | D2l | D2f | I2b | I2c
+            | I2s => self.simple_cast_type().unwrap(),
             // Vineflower's temporary compare operations have boolean expression
             // type even though the JVM comparison instructions produce an int.
             Lcmp | Fcmpl | Fcmpg | Dcmpl | Dcmpg | Eq | Ne | Lt | Ge | Gt | Le | InstanceOf

@@ -85,14 +85,13 @@ impl VarType {
         arguments: Vec<Option<VarType>>,
         wildcard: i32,
     ) -> VarType {
-        VarType {
-            generic: Some(Arc::new(GenericType {
-                parent,
-                arguments,
-                wildcard,
-            })),
-            ..VarType::raw(ty, array_dim, value)
-        }
+        let mut var_type = VarType::raw(ty, array_dim, value);
+        var_type.generic = Some(Arc::new(GenericType {
+            parent,
+            arguments,
+            wildcard,
+        }));
+        var_type
     }
 
     /// `GenericType.parse(signature)`, for a signature known to be well formed.

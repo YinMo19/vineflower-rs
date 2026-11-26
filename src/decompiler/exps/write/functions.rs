@@ -15,55 +15,6 @@ use crate::util::text_buffer::TextBuffer;
 use super::to_java;
 
 impl FunctionType {
-    fn java_syntax(self) -> (i32, &'static str) {
-        use FunctionType::*;
-        match self {
-            ArrayLength => (0, ".length"),
-            BitNot => (1, "~"),
-            BoolNot => (1, "!"),
-            Neg => (1, "-"),
-            Imm | Mmi => (1, "--"),
-            Ipp | Ppi => (1, "++"),
-            Cast | I2l | I2f | I2d | L2i | L2f | L2d | F2i | F2l | F2d | D2i | D2l | D2f | I2b
-            | I2c | I2s => (1, ""),
-            Mul => (2, "*"),
-            Div => (2, "/"),
-            Rem => (2, "%"),
-            Add | StrConcat => (3, "+"),
-            Sub => (3, "-"),
-            Shl => (4, "<<"),
-            Shr => (4, ">>"),
-            Ushr => (4, ">>>"),
-            Lt => (5, "<"),
-            Ge => (5, ">="),
-            Gt => (5, ">"),
-            Le => (5, "<="),
-            Eq => (6, "=="),
-            Ne => (6, "!="),
-            InstanceOf => (6, "instanceof"),
-            And => (7, "&"),
-            Xor => (8, "^"),
-            Or => (9, "|"),
-            BoolAnd => (10, "&&"),
-            BoolOr => (11, "||"),
-            Ternary => (12, ""),
-            Lcmp => (-1, "__lcmp__"),
-            Fcmpl => (-1, "__fcmpl__"),
-            Fcmpg => (-1, "__fcmpg__"),
-            Dcmpl => (-1, "__dcmpl__"),
-            Dcmpg => (-1, "__dcmpg__"),
-            Other => unreachable!("Kotlin function has no Java syntax"),
-        }
-    }
-
-    pub(crate) fn java_operator(self) -> &'static str {
-        self.java_syntax().1
-    }
-
-    pub(crate) fn java_precedence(self) -> i32 {
-        self.java_syntax().0
-    }
-
     fn associative(self) -> bool {
         use FunctionType::*;
         matches!(
@@ -114,52 +65,32 @@ pub(super) fn function(cx: &mut Cx, expr: ExprId, indent: i32) -> io::Result<Tex
         unreachable!("Expected a function expression")
     };
     let (op, operands, needs_cast) = (*op, operands.clone(), *needs_cast);
-    if op == Other {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Missing Kotlin function renderer"));
-    }
     let operator = op.java_operator();
     let mut buf = TextBuffer::new(cx);
     literal::add_offsets(&mut buf, cx.ir[expr].bytecode.as_ref());
 
-    if op.is_arithmetic_binary() {
-        let (left, right) = (operands[0], operands[1]);
-        adjust_binary_constant(cx, left, right);
-        let mut left_text = wrap_operand(cx, expr, left, false, indent, true)?;
-        let mut right_text = wrap_operand(cx, expr, right, true, indent, true)?;
-        if matches!(op, And | Or) {
-            bit_mask(cx, right, &mut right_text);
-            bit_mask(cx, left, &mut left_text);
-        }
-        let grouped = !cx.ir[expr].write_flags.contains(WriteFlags::UNGROUPED);
-        if grouped {
-            buf.push_newline_group(indent, 1);
-        }
-        buf.append_buffer(&left_text)
-            .append_possible_newline_or(" ", false)
-            .append(operator)
-            .append(" ")
-            .append_buffer(&right_text);
-        if grouped {
-            buf.pop_newline_group();
-        }
-        return Ok(buf);
-    }
-
     match op {
-        Eq | Ne | Lt | Ge | Gt | Le | BoolAnd | BoolOr | StrConcat => {
+        Add | Sub | Mul | Div | And | Or | Xor | Rem | Shl | Shr | Ushr | Eq | Ne | Lt | Ge
+        | Gt | Le | BoolAnd | BoolOr | StrConcat => {
             let (left, right) = (operands[0], operands[1]);
-            if matches!(op, Eq | Ne | Lt | Ge | Gt | Le) {
+            if !matches!(op, BoolAnd | BoolOr | StrConcat) {
                 adjust_binary_constant(cx, left, right);
+            }
+            let mut left_text = wrap_operand(cx, expr, left, false, indent, true)?;
+            let mut right_text = wrap_operand(cx, expr, right, true, indent, true)?;
+            if matches!(op, And | Or) {
+                bit_mask(cx, right, &mut right_text);
+                bit_mask(cx, left, &mut left_text);
             }
             let grouped = !cx.ir[expr].write_flags.contains(WriteFlags::UNGROUPED);
             if grouped {
                 buf.push_newline_group(indent, 1);
             }
-            buf.append_buffer(&wrap_operand(cx, expr, left, false, indent, true)?)
+            buf.append_buffer(&left_text)
                 .append_possible_newline_or(" ", false)
                 .append(operator)
                 .append(" ")
-                .append_buffer(&wrap_operand(cx, expr, right, true, indent, true)?);
+                .append_buffer(&right_text);
             if grouped {
                 buf.pop_newline_group();
             }
@@ -252,7 +183,12 @@ pub(super) fn function(cx: &mut Cx, expr: ExprId, indent: i32) -> io::Result<Tex
                 buf.append_buffer(&to_java(cx, operand, indent)?);
             }
         }
-        Add | Sub | Mul | Div | And | Or | Xor | Rem | Shl | Shr | Ushr | Other => unreachable!(),
+        Other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Missing Kotlin function renderer",
+            ));
+        }
     }
     Ok(buf)
 }
@@ -273,7 +209,7 @@ fn bit_mask(cx: &Cx, expr: ExprId, buf: &mut TextBuffer) {
         var_type,
         ..
     } = &cx.ir[expr].kind
-        && *var_type == VarType::VARTYPE_INT
+        && var_type.same_singleton(&VarType::VARTYPE_INT)
     {
         buf.set_length(0);
         match *value as u32 {
@@ -305,7 +241,10 @@ pub(crate) fn wrap_operand(
         parentheses = true;
         if matches!(cx.ir[operand].kind, ExprKind::Function { op: child, .. } if child == op) {
             let ty = Expr::expr_type(cx, operand);
-            if ty != VarType::VARTYPE_FLOAT && ty != VarType::VARTYPE_DOUBLE && op.associative() {
+            if op.associative()
+                && !ty.same_singleton(&VarType::VARTYPE_FLOAT)
+                && !ty.same_singleton(&VarType::VARTYPE_DOUBLE)
+            {
                 parentheses = false;
             }
         }

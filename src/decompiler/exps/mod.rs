@@ -232,12 +232,14 @@ impl Variable {
         if cx.options.use_lvt_names
             && let Some(lvt) = &self.lvt
         {
-            lvt.get_var_type()
-        } else if let Some(ty) = &self.var_type
+            return lvt.get_var_type();
+        }
+        if let Some(ty) = &self.var_type
             && ty.ty != CodeType::Unknown
         {
-            ty.clone()
-        } else if let Some(owner) = self.processor {
+            return ty.clone();
+        }
+        if let Some(owner) = self.processor {
             let pair = self.pair();
             let processor = &cx.ir[owner];
             let inferred = processor.versions.lower.get(&pair);
@@ -253,10 +255,11 @@ impl Variable {
                     return VarType::with_value(CodeType::Object, 0, name.clone());
                 }
             }
-            inferred.cloned().unwrap_or(VarType::VARTYPE_UNKNOWN)
-        } else {
-            VarType::VARTYPE_UNKNOWN
+            if let Some(ty) = inferred {
+                return ty.clone();
+            }
         }
+        self.var_type.clone().unwrap_or(VarType::VARTYPE_UNKNOWN)
     }
 
     /// A definition's type during method processing, before a MethodWrapper is active.

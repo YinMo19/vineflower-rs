@@ -8,7 +8,8 @@
 //! Java object would be a `GenericType` carries [`GenericType`] data (see
 //! `generic_type.rs` for its methods). As upstream, equality and hashing look
 //! only at the kind, the array dimension and the name, never at type
-//! arguments; [`VarType::same`] stands in for reference identity.
+//! arguments. [`VarType::same`] includes generic data. Static type constants
+//! also retain their identity across clones.
 
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -95,6 +96,8 @@ pub struct VarType {
     pub stack_size: i32,
     /// Present exactly when the Java object would be a `GenericType`.
     pub(super) generic: Option<Arc<GenericType>>,
+    /// Whether this value came from an upstream `static final` type constant.
+    singleton: bool,
 }
 
 macro_rules! basic_type {
@@ -144,6 +147,7 @@ impl VarType {
             type_family: Self::get_family(ty, 0),
             stack_size: Self::get_stack_size(ty, 0),
             generic: None,
+            singleton: true,
         }
     }
 
@@ -170,6 +174,7 @@ impl VarType {
             type_family: Self::get_family(ty, array_dim),
             stack_size: Self::get_stack_size(ty, array_dim),
             generic: None,
+            singleton: false,
         }
     }
 
@@ -282,6 +287,7 @@ impl VarType {
         }
         VarType {
             array_dim: new_array_dim,
+            singleton: false,
             ..self.clone()
         }
     }
@@ -303,8 +309,13 @@ impl VarType {
         self.value.as_deref().unwrap()
     }
 
-    /// Whether the two are indistinguishable, type arguments included. This
-    /// is what the port uses where upstream compares references.
+    /// Whether both values came from the same upstream static type constant.
+    pub(crate) fn same_singleton(&self, other: &VarType) -> bool {
+        // Every static type constant has a distinct value under VarType.equals.
+        self.singleton && other.singleton && self == other
+    }
+
+    /// Structural equivalence including type arguments and stack metadata.
     pub fn same(&self, other: &VarType) -> bool {
         self == other
             && self.type_family == other.type_family
