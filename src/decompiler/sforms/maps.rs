@@ -75,6 +75,14 @@ impl VersionMap {
         self.stacks.clear();
     }
 
+    /// Throwing clears the operand stack and invalidates tracked field reads.
+    pub(super) fn catchable_locals(&self) -> Self {
+        Self {
+            locals: self.locals.clone(),
+            ..Self::new(&self.factory)
+        }
+    }
+
     pub fn union(&mut self, other: &Self) {
         for (key, versions) in other.iter() {
             match self.domain_mut(key).entry(key) {

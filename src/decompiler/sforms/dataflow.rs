@@ -5,8 +5,6 @@
 //! direct graph in its stored order. A change schedules another sweep only
 //! when the affected successor has already been passed or is the current node.
 
-use std::borrow::Cow;
-
 use arcstr::ArcStr;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -14,7 +12,7 @@ use super::{
     Transfer, VarMapHolder, VariableVersions, Version, VersionAnalysis, VersionMap, variable,
 };
 use crate::code::code_constants::ACC_STATIC;
-use crate::decompiler::exps::{ExprKind, STACK_BASE};
+use crate::decompiler::exps::ExprKind;
 use crate::decompiler::flow::{
     DirectEdgeType, DirectGraph, DirectId, NodeType, flatten::build_direct_graph,
 };
@@ -62,7 +60,6 @@ type NodeMaps = FxHashMap<ArcStr, VersionMap>;
 
 struct FlowState {
     factory: FastSparseSetFactory<i32>,
-    inputs: NodeMaps,
     outputs: FxHashMap<ArcStr, VarMapHolder>,
     seeds: NodeMaps,
     catchable: NodeMaps,
@@ -73,7 +70,6 @@ impl FlowState {
     fn new(factory: FastSparseSetFactory<i32>) -> Self {
         Self {
             factory,
-            inputs: NodeMaps::default(),
             outputs: FxHashMap::default(),
             seeds: NodeMaps::default(),
             catchable: NodeMaps::default(),
@@ -119,18 +115,14 @@ impl FlowState {
             checkpoint();
             let node = &graph[id];
             updated.remove(&node.id);
-            let input = self.merge_inputs(ir, graph, id);
-            self.inputs.insert(node.id.clone(), input.clone());
+            let input = self.merge_inputs(graph, id);
             let catchable = if node.successors(DirectEdgeType::Exception).is_empty() {
                 None
             } else {
-                let mut locals = input.clone();
-                locals.clear_stacks();
-                locals.clear_fields();
                 Some(
                     self.catchable
                         .entry(node.id.clone())
-                        .insert_entry(locals)
+                        .insert_entry(input.catchable_locals())
                         .into_mut(),
                 )
             };
@@ -193,107 +185,58 @@ impl FlowState {
         Ok(!updated.is_empty())
     }
 
-    fn merge_inputs(&self, ir: &Ir, graph: &DirectGraph, id: DirectId) -> VersionMap {
+    fn merge_inputs(&self, graph: &DirectGraph, id: DirectId) -> VersionMap {
         let node = &graph[id];
-        let mut input = VersionMap::new(&self.factory);
-        for &pred in node.predecessors(DirectEdgeType::Regular) {
-            let versions = self.filtered_output(ir, graph, id, pred);
-            if input.is_empty() {
-                input = versions.into_owned();
-            } else {
-                input.union(&versions);
-            }
-        }
-        for map in node
+        let regular = node
+            .predecessors(DirectEdgeType::Regular)
+            .iter()
+            .filter_map(|&pred| self.predecessor_output(graph, id, pred));
+        let exceptional = node
             .predecessors(DirectEdgeType::Exception)
             .iter()
-            .filter_map(|&pred| self.catchable.get(&graph[pred].id))
-            .chain(self.seeds.get(&node.id))
-        {
-            if input.is_empty() {
-                input.clone_from(map);
-            } else {
-                input.union(map);
-            }
+            .filter_map(|&pred| self.catchable.get(&graph[pred].id));
+        let mut incoming = regular.chain(exceptional).chain(self.seeds.get(&node.id));
+        let mut input = incoming
+            .next()
+            .cloned()
+            .unwrap_or_else(|| VersionMap::new(&self.factory));
+        for map in incoming {
+            input.union(map);
         }
         input
     }
 
-    fn filtered_output(
+    fn predecessor_output(
         &self,
-        ir: &Ir,
         graph: &DirectGraph,
         dest: DirectId,
         pred: DirectId,
-    ) -> Cow<'_, VersionMap> {
+    ) -> Option<&VersionMap> {
         let node = &graph[dest];
         let pred_node = &graph[pred];
-        let mut output = match self.outputs.get(&pred_node.id) {
-            None => Cow::Owned(VersionMap::new(&self.factory)),
-            Some(maps)
-                if graph
-                    .neg_if_branch
-                    .get(&pred)
-                    .is_some_and(|&negative| graph[negative].id == node.id) =>
-            {
-                Cow::Borrowed(maps.if_false())
-            }
-            Some(maps) => Cow::Borrowed(maps.if_true()),
-        };
 
+        // SFormsConstructor walks the scopes on this edge. Its finally diff
+        // looks up "<statement>_FINALLY", while DirectNodeType.makeId gives
+        // every finally node a lowercase "_finally" suffix. In 1.12.0 the
+        // lookup always misses, so only the enclosing-scope check remains.
         let mut scope = pred_node.try_finally;
         let entering_try = node
             .try_finally
             .is_some_and(|id| graph[id].ty == NodeType::Finally && graph[id].try_finally == scope);
         if !entering_try && pred_node.ty != NodeType::Finally {
             while scope != node.try_finally {
-                let finally = &graph[scope.expect("Inconsistent finally scope")];
-                if finally.ty == NodeType::Finally {
-                    // The pinned Java lookup uses the uppercase enum name here,
-                    // although DirectNode normally creates lowercase suffixes.
-                    let input_id = format!("{}_FINALLY", ir[finally.stat].id);
-                    if let (Some(before), Some(after)) = (
-                        self.inputs.get(input_id.as_str()),
-                        self.outputs.get(&finally.id),
-                    ) {
-                        apply_diff(before, after.if_true(), output.to_mut());
-                    }
-                }
-                scope = finally.try_finally;
+                scope = graph[scope.expect("Inconsistent finally scope")].try_finally;
             }
         }
-        output
-    }
-}
-
-fn apply_diff(input: &VersionMap, output: &VersionMap, target: &mut VersionMap) {
-    for (key, versions) in input
-        .iter()
-        .filter(|(key, set)| *key < STACK_BASE && !set.is_empty())
-    {
-        let Some(writes) = output.get(key) else {
-            continue;
-        };
-        let first = versions.iter().next().unwrap();
-        if writes.contains(&first) {
-            let mut added = writes.clone();
-            added.complement(versions);
-            if !added.is_empty() {
-                target
-                    .get_mut(key)
-                    .expect("Missing incoming version")
-                    .union(&added);
-            }
+        let maps = self.outputs.get(&pred_node.id)?;
+        let negative = graph
+            .neg_if_branch
+            .get(&pred)
+            .is_some_and(|&negative| graph[negative].id == node.id);
+        Some(if negative {
+            maps.if_false()
         } else {
-            target.put(key, versions.clone());
-        }
-    }
-    for (key, writes) in output
-        .iter()
-        .filter(|(key, set)| *key < STACK_BASE && !set.is_empty())
-    {
-        if input.get(key).is_none_or(|set| set.is_empty()) {
-            target.put(key, writes.clone());
-        }
+            maps.if_true()
+        })
     }
 }
