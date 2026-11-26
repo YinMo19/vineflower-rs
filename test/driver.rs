@@ -14,9 +14,12 @@ use vineflower_rs::{
     structs::StructClass,
 };
 
-#[allow(dead_code, reason = "the driver fixture compiles its own classes")]
+#[allow(dead_code, reason = "the driver uses CLI and fixture helpers")]
 #[path = "support/upstream_reference.rs"]
 mod upstream_reference;
+
+#[path = "support/worker_allocations.rs"]
+mod worker_allocations;
 
 #[test]
 fn memory_group_writes_roots_and_maps_lines_using_a_read_only_library() {
@@ -584,6 +587,186 @@ public class Main {
             .arg(classpath)
             .arg("Main"));
         assert_eq!(result.stdout, b"21:ABA\n");
+    }
+}
+
+#[test]
+#[ignore = "requires compiled upstream fixtures, the upstream +local.jar, and JDK 17 or later"]
+fn parallel_stack_preparation_preserves_shared_class_access() {
+    use std::io::Write;
+    use upstream_reference::{Corpus, jdk_tool, run, upstream_jar};
+
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path();
+    let library = root.join("library");
+    let annotated = root.join("TestCondy.java");
+    fs::write(
+        &annotated,
+        "@Deprecated(since = \"1\", forRemoval = true) public class TestCondy {}",
+    )
+    .unwrap();
+    compile_java17(&[&annotated], &library);
+
+    let subject = root.join("WarningSubject.java");
+    fs::write(
+        &subject,
+        r#"
+package art;
+public class WarningSubject {
+    static int value = 1;
+    public int branch(boolean a, boolean b) {
+        if (a) {
+            if (b) return 1;
+        }
+        return 0;
+    }
+}
+"#,
+    )
+    .unwrap();
+    let classes = root.join("classes");
+    compile_java17(&[&subject], &classes);
+    let subject = "art/WarningSubject.class";
+
+    let fixtures = Corpus::discover().root;
+    let fixture = |group: &str, entry: &'static str| {
+        (entry, fs::read(fixtures.join(group).join(entry)).unwrap())
+    };
+    // Put the Condy method first so its import lookup first loads the annotated library.
+    let mut entries = [
+        fixture("jasm", "pkg/TestComplexCondy.class"),
+        (subject, fs::read(classes.join(subject)).unwrap()),
+        fixture("java25", "pkg/TestAssertInterface2.class"),
+        fixture("java25", "pkg/TestAssertInterface2$1.class"),
+        fixture("java25", "pkg/TestAssertInterface2$Interface.class"),
+    ];
+    let write_input = |name, entries: &[(&str, Vec<u8>)]| {
+        let input = root.join(name);
+        let mut jar = zip::ZipWriter::new(fs::File::create(&input).unwrap());
+        for (entry, bytes) in entries {
+            jar.start_file(*entry, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            jar.write_all(bytes).unwrap();
+        }
+        jar.finish().unwrap();
+        input
+    };
+    let valid = write_input("valid.jar", &entries);
+
+    // Replace the first instruction of the five-byte <clinit> with tableswitch.
+    // The class retains the Code attribute, and decoding the instruction fails.
+    let code = &mut entries[1].1;
+    let initializers = code
+        .windows(15)
+        .enumerate()
+        .filter_map(|(index, bytes)| {
+            matches!(
+                bytes,
+                [0, 1, 0, 0, 0, 0, 0, 5, 0x04, 0xb3, _, _, 0xb1, 0, 0]
+            )
+            .then_some(index + 8)
+        })
+        .collect::<Vec<_>>();
+    let [opcode] = initializers.as_slice() else {
+        panic!("expected one <clinit> with iconst_1, putstatic and return");
+    };
+    code[*opcode] = 0xaa;
+    let malformed = write_input("malformed.jar", &entries);
+
+    let options = [
+        "--include-runtime=1",
+        "--legacy-saving",
+        "--bytecode-source-mapping=1",
+        "--dump-code-lines=1",
+        "--decompile-complex-constant-dynamic=1",
+        "--log-level=INFO",
+    ];
+    let dependency = format!("-e={}", library.display());
+    let upstream = root.join("upstream");
+    fs::create_dir(&upstream).unwrap();
+    run(Command::new(jdk_tool("java"))
+        .arg("-jar")
+        .arg(upstream_jar())
+        .arg("--thread-count=1")
+        .args(options)
+        .arg(&dependency)
+        .arg(&valid)
+        .arg(&upstream));
+    let expected = archive(&upstream.join("valid.jar"));
+    for (name, source) in [
+        ("pkg/TestComplexCondy.java", "pkg.TestCondy.class"),
+        ("art/WarningSubject.java", "branch(boolean a, boolean b)"),
+        ("pkg/TestAssertInterface2.java", "assert x > 10;"),
+    ] {
+        assert!(String::from_utf8_lossy(&expected[name].1).contains(source));
+        assert!(!expected[name].2.is_empty(), "missing mapping for {name}");
+    }
+
+    let decompile = |input: &Path, count| {
+        let name = input.file_name().unwrap();
+        let output = root.join(count).join(name);
+        fs::create_dir_all(&output).unwrap();
+        let result = run(Command::new(env!("CARGO_BIN_EXE_vineflower-rs"))
+            .arg(format!("--thread-count={count}"))
+            .args(options)
+            .arg(&dependency)
+            .arg(input)
+            .arg(&output));
+        assert!(
+            result.stderr.is_empty(),
+            "{:?}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let jar = output.join(name);
+        let entries = zip::ZipArchive::new(fs::File::open(&jar).unwrap()).unwrap();
+        assert_eq!(
+            entries.file_names().collect::<Vec<_>>(),
+            [
+                "pkg/",
+                "art/",
+                "pkg/TestComplexCondy.java",
+                "art/WarningSubject.java",
+                "pkg/TestAssertInterface2.java",
+            ],
+            "{name:?}, thread-count={count}"
+        );
+        (archive(&jar), String::from_utf8(result.stdout).unwrap())
+    };
+
+    // The malformed initializer has native diagnostics that differ from Java's.
+    let damaged = decompile(&malformed, "1");
+    let diagnostics = [
+        "Preprocessing class pkg/TestComplexCondy",
+        "Loading Class: TestCondy from directory",
+        "Preprocessing class art/WarningSubject",
+        "Could not read method properties of art/WarningSubject.<clinit>",
+        "Could not decompile art/WarningSubject.<clinit>",
+        "Preprocessing class pkg/TestAssertInterface2",
+    ];
+    assert_eq!(
+        damaged
+            .1
+            .lines()
+            .filter_map(|line| diagnostics
+                .iter()
+                .copied()
+                .find(|message| line.contains(message)))
+            .collect::<Vec<_>>(),
+        diagnostics,
+        "{}",
+        damaged.1
+    );
+    for count in ["1", "2", "0"] {
+        let (actual, log) = decompile(&valid, count);
+        assert_eq!(actual, expected, "thread-count={count}");
+        assert!(!log.contains("Could not read method properties"));
+    }
+    for count in ["2", "0"] {
+        assert_eq!(
+            decompile(&malformed, count),
+            damaged,
+            "thread-count={count}"
+        );
     }
 }
 
