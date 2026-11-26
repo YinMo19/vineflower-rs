@@ -187,8 +187,17 @@ impl StructContext {
 
     /// `addSpace(source, isOwn)`.
     pub fn add_space(&mut self, source: Arc<dyn ContextSource>, is_own: bool) {
-        self.add_unit(source, is_own, true)
+        self.try_add_space(source, is_own)
             .expect("Could not add context source");
+    }
+
+    /// Register a context source with fallible enumeration.
+    pub fn try_add_space(
+        &mut self,
+        source: Arc<dyn ContextSource>,
+        is_own: bool,
+    ) -> io::Result<()> {
+        self.add_unit(source, is_own, true)
     }
 
     fn add_unit(

@@ -82,6 +82,7 @@ impl Case {
 }
 
 pub struct Manifest {
+    pub fixture: Preferences,
     pub cases: Vec<Case>,
 }
 
@@ -134,8 +135,10 @@ impl Manifest {
                 _ => panic!("invalid upstream registration: {line}"),
             }
         }
-        assert!(defaults.is_some(), "missing fixture defaults");
-        Self { cases }
+        Self {
+            fixture: defaults.expect("missing fixture defaults"),
+            cases,
+        }
     }
 }
 

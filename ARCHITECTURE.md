@@ -2,6 +2,20 @@
 
 行为基准是 Vineflower 1.12.0，提交 `b8273988af850e8cfb234ca08d129058502b032f`。比较一次反编译时，输入包括整组 class 文件、库的查找顺序、选项、启用的插件和运行原版的 JDK。同一段字节码可以对应多种合法源码，因此识别优先级、遍历顺序、编号和格式也属于兼容目标。上游 [ARCHITECTURE.md](../vineflower/ARCHITECTURE.md) 介绍算法背景，具体调用顺序以同版本源码为准。
 
+## 使用原生入口
+
+在仓库根目录运行以下命令，可以将一个归档反编译到输出目录。单个 class、目录和多个输入也走同一条处理路径。
+
+```sh
+cargo run --release --locked -- --folder input.jar output
+```
+
+库调用从 `Decompiler::new(Options)` 开始。`add_source` 登记需要写出的输入，`add_library` 登记用于类型查找的依赖。`decompile` 返回各根类的源码和行映射，`save` 按输出模式保存源码、目录和资源。每个输入单元先准备全部根类，再恢复各根类自己的导入表、计数器和源码映射器，依次写出。类关系和已发布的方法包装器在两阶段间共享。当前调度以单工作线程执行。`--legacy-saving` 是原版保留输入归档布局的保存模式。[库入口](src/engine/driver/mod.rs) · [命令行](src/bin/vineflower-rs.rs) · [保存器](src/engine/driver/saver.rs)
+
+启用 `rename-members` 时，先建立类与接口的继承关系，再沿继承链传播可重命名方法的映射。接口方法、外部库和 native 方法会约束派生类的名称。随后用同一映射重新载入常量池与类路径，内部类的简单名沿用同一个命名器。[标识符转换](src/renamer/identifier_converter.rs)
+
+IDEA 的 `@NotNull` 恢复位于 Java 方法主循环末段。启用插件及其 `resugar-idea-notnull` 选项后，根据不可见注解和语句图识别参数与返回值的插桩，删除后从本轮的清边步骤重新开始。命令行默认安装该插件，库调用可通过 `Options::idea_notnull` 控制。[IDEA 插件](src/decompiler/idea_not_null.rs)
+
 ## 从输入到编译单元
 
 | 阶段 | 输入与产生的结果 | 上游入口 |

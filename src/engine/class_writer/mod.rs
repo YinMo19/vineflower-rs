@@ -18,6 +18,7 @@ pub mod javadoc;
 mod lambda;
 mod late_methods;
 mod method_errors;
+pub(crate) use method_errors::{write_class_error, write_exception};
 mod method_parameters;
 mod methods;
 mod record_components;

@@ -13,7 +13,7 @@ use rawzip::{CompressionMethod, FileReader, ZipArchive, ZipArchiveEntryWayfinder
 use rustc_hash::FxHashMap;
 
 use super::struct_context::invalid_source;
-use crate::engine::context_source::{CLASS_SUFFIX, ContextSource, Entries, Entry};
+use crate::engine::context_source::{CLASS_SUFFIX, ContextSource, Entries, Entry, OutputLayout};
 
 pub struct JarContextSource {
     path: PathBuf,
@@ -96,6 +96,21 @@ impl ContextSource for JarContextSource {
 
     fn get_entries(&self) -> Entries {
         self.entries.clone()
+    }
+
+    fn output_layout(&self) -> OutputLayout {
+        OutputLayout::Archive {
+            name: self
+                .path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            directory: self
+                .relative_path
+                .trim_start_matches(std::path::is_separator)
+                .to_owned(),
+        }
     }
 
     fn get_input_stream(&self, resource: &str) -> io::Result<Option<Vec<u8>>> {

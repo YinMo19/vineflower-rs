@@ -26,11 +26,16 @@ path = "test/structured_flow.rs"
 name = "class_nodes"
 path = "test/class_nodes.rs"
 
+[[test]]
+name = "driver"
+path = "test/driver.rs"
+
 [dependencies]
 arcstr = "1.2.0"
 bit-set = "0.11.1"
 bitflags = "2"
 clap = { version = "4.6", features = ["derive"] }
+fancy-regex = "0.16"
 flate2 = "1"
 index_vec = "0.1.4"
 indexmap = "2"

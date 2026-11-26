@@ -55,15 +55,33 @@ pub(super) fn dump_error(
     }
 }
 
-pub(super) fn write_exception(cx: &Cx, buffer: &mut TextBuffer, error: &dyn Error) {
+pub(crate) fn write_exception(cx: &Cx, buffer: &mut TextBuffer, error: &dyn Error) {
     append_error_comment(buffer, "$VF: Couldn't be decompiled", 0);
     if cx.options.dump_exception_on_error {
-        let mut lines: Vec<_> = error_comment(&cx.options.error_message).map(str::to_owned).collect();
+        let mut lines: Vec<_> = error_comment(&cx.options.error_message)
+            .map(str::to_owned)
+            .collect();
         append_error_lines(&mut lines, error);
         for line in lines {
             append_error_comment(buffer, &line, 0);
         }
     }
+}
+
+pub(crate) fn write_class_error(cx: &Cx, buffer: &mut TextBuffer, error: &dyn Error) {
+    buffer
+        .append("/*")
+        .append_line_separator()
+        .append("$VF: Unable to decompile class")
+        .append_line_separator();
+    let mut lines: Vec<_> = error_comment(&cx.options.error_message)
+        .map(str::to_owned)
+        .collect();
+    append_error_lines(&mut lines, error);
+    for line in lines {
+        buffer.append(&line).append_line_separator();
+    }
+    buffer.append("*/");
 }
 
 fn append_error_comment(buffer: &mut TextBuffer, line: &str, indent: i32) {

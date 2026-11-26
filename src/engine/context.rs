@@ -44,6 +44,17 @@ pub struct Cx {
     pub source_mapper: super::bytecode_source_mapper::BytecodeSourceMapper,
 }
 
+// Imports and counters are per class while the wrapper arena is shared.
+pub(super) struct ClassSession {
+    current_method_wrapper: Option<super::class_wrapper::MethodSlot>,
+    current_method: Option<(Arc<StructMethod>, VarProcessorId)>,
+    expression_ids: ExpressionIds,
+    current_class_node: Option<arcstr::ArcStr>,
+    current_node_id: Option<super::class_nodes::ClassNodeId>,
+    imports: ImportCollector,
+    source_mapper: super::bytecode_source_mapper::BytecodeSourceMapper,
+}
+
 impl Cx {
     /// Creates the worker state for processing a root class against a registered class path.
     pub fn new(struct_context: Arc<StructContext>) -> Self {
@@ -62,6 +73,29 @@ impl Cx {
             source_mapper: Default::default(),
             ir: Ir::default(),
         }
+    }
+
+    /// Take one class's ambient state, leaving shared wrappers and expressions in place.
+    pub(super) fn take_class_session(&mut self) -> ClassSession {
+        ClassSession {
+            current_method_wrapper: self.current_method_wrapper.take(),
+            current_method: self.current_method.take(),
+            expression_ids: std::mem::take(&mut self.expression_ids),
+            current_class_node: self.current_class_node.take(),
+            current_node_id: self.current_node_id.take(),
+            imports: std::mem::take(&mut self.imports),
+            source_mapper: std::mem::take(&mut self.source_mapper),
+        }
+    }
+
+    pub(super) fn restore_class_session(&mut self, session: ClassSession) {
+        self.current_method_wrapper = session.current_method_wrapper;
+        self.current_method = session.current_method;
+        self.expression_ids = session.expression_ids;
+        self.current_class_node = session.current_class_node;
+        self.current_node_id = session.current_node_id;
+        self.imports = session.imports;
+        self.source_mapper = session.source_mapper;
     }
 
     pub(crate) fn classes(&self) -> ClassResolver<'_> {

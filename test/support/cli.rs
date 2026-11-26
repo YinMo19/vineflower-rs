@@ -10,6 +10,7 @@ use std::process::Command;
 use zip::ZipArchive;
 
 use crate::inputs::require_file;
+use crate::manifest::Preferences;
 use crate::{Failure, difference, normalized};
 
 #[derive(Clone, Copy)]
@@ -90,7 +91,7 @@ impl CliCase {
         }
     }
 
-    pub fn run(&self, data: &Path, scratch: &Path) -> Result<(), Failure> {
+    pub fn run(&self, data: &Path, scratch: &Path, fixture: &Preferences) -> Result<(), Failure> {
         let expected = match self.destination {
             Destination::Archive => {
                 let path = require_file(data.join("bulk_decomp.jar"), "archive golden")?;
@@ -123,18 +124,17 @@ impl CliCase {
             }
         };
         let output = workspace.path().join(match self.destination {
-            Destination::Directory => "bulk_out",
-            Destination::Archive | Destination::UnpackedArchive => "bulk_out.jar",
+            Destination::Directory | Destination::UnpackedArchive => "bulk_out",
+            Destination::Archive => "bulk_out.jar",
         });
         let mut command = Command::new(env!("CARGO_BIN_EXE_vineflower-rs"));
         if self.fixture_options {
-            // The bulk corpus has no special literals or errors. The fixture's other
-            // non-default settings affect diagnostics or are inert without source maps.
-            command.args([
-                "--decompile-generics=1",
-                "--remove-synthetic=1",
-                "--remove-bridge=1",
-            ]);
+            command.arg("--legacy-saving");
+            command.args(
+                fixture
+                    .iter()
+                    .map(|(name, value)| format!("--{name}={value}")),
+            );
         }
         let run = command
             .arg(&input)
@@ -143,16 +143,11 @@ impl CliCase {
             .map_err(|e| Failure::io(&input, e))?;
         if !run.status.success() {
             let stderr = String::from_utf8_lossy(&run.stderr);
-            let message = format!("native CLI exited {}: {}", run.status, stderr.trim_end());
-            return Err(
-                if stderr.contains(": unsupported Java recovery:")
-                    || stderr.contains(": cannot recover ")
-                {
-                    Failure::Unsupported(message)
-                } else {
-                    Failure::Execution(message)
-                },
-            );
+            return Err(Failure::Execution(format!(
+                "native CLI exited {}: {}",
+                run.status,
+                stderr.trim_end()
+            )));
         }
         if !output.exists() {
             return Err(Failure::Mismatch(format!(
@@ -165,7 +160,8 @@ impl CliCase {
             Destination::Archive => archive_snapshot(&output)?,
             Destination::UnpackedArchive => {
                 let path = workspace.path().join("unpacked");
-                unpack(&output, &path)?;
+                let archive = output.join(input.file_name().expect("archive input has no name"));
+                unpack(&archive, &path)?;
                 tree_snapshot(&path)?
             }
         };

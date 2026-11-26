@@ -1,15 +1,15 @@
-# Testing the current port
+# Testing the native port
 
-The active method stages cover finally recovery, expression lifting, stack-variable simplification, variable type inference, increment recovery, string concatenation, assertions and the first main-loop rewrites. Intermediate entry points expose statement decomposition and the SSA and SSAU passes used during finally recovery and inlining. Run the checks against the checked-in class files with
+Run the real-class smoke tests and the native source, API and CLI checks with
 
 ```sh
-cargo test --locked --test control_flow --test structured_flow
+cargo test --locked
 ```
 
 With JDK 17 or later, a matching upstream checkout with its built `build/libs/*+local.jar`, and compiled fixture classes, run the stage comparisons against Java with
 
 ```sh
-cargo test --locked --test class_nodes --test control_flow --test structured_flow -- --include-ignored --nocapture
+cargo test --locked --test class_nodes --test control_flow --test structured_flow --test driver -- --include-ignored --nocapture
 ```
 
 `VINEFLOWER_UPSTREAM` defaults to `../vineflower`. `VINEFLOWER_RS_CLASS_ROOT` can point to a directory of compiled classes or an upstream checkout containing `testData/classes`. The CFG comparison runs the default and forced-JSR configurations. It reports differences confined to the numbering of new handlers and the order of disjoint, newly split ranges separately from exact matches. The comparison uses ordered successors in every stage. Protected-block membership and incoming exit edges are compared in order on construction and as multisets after cleanup.
@@ -64,15 +64,15 @@ The method-end comparison takes one snapshot at AT_END and one after the final e
 
 ## End-to-end source and CLI suite
 
-The retained `upstream_parity` target covers final source and CLI behavior. It currently requires library and binary entry points that still await migration. Use the explicit stage targets above to test the active implementation. The commands below document the end-to-end gate once those entry points are available.
+The `upstream_parity` target compares the native library and CLI against the upstream source and archive goldens. The separate `driver` target also runs the original Java CLI on the same input to check configuration, resources, manifests and archived line mappings.
 
 `upstream/` is a byte-preserving copy of the tracked core and plugin `testData` trees from Vineflower `b8273988af850e8cfb234ca08d129058502b032f`: 1,336 core and 154 plugin fixtures, plus the upstream Apache-2.0 license. `registrations.tsv` ports 688 active single-class registrations and their effective fixture settings. The parity target also runs the two bulk cases, six CLI file/directory/archive cases, and the lazy-library case. The upstream disabled archive cases and unconfigured external debug test are not active registrations.
 
 The two end-to-end invocations are
 
 ```sh
-cargo test --test upstream_parity                                      # original source/CLI/bulk goldens, no JDK
-cargo test --test upstream_parity full_parity -- --ignored --nocapture   # all 697 active cases
+cargo test --locked --test upstream_parity                                      # original source/CLI/bulk goldens, no JDK
+cargo test --locked --test upstream_parity full_parity -- --ignored --nocapture   # all 697 active cases
 ```
 
 Parity fails on any missing JDK, missing fixture, unsupported capability, source/output mismatch or execution error. Each is reported separately. `VINEFLOWER_RS_PARITY_FILTER` optionally selects a substring of case IDs, such as `core/LVT` or `cli/`. No golden gets created or rewritten. Comparison uses only upstream's newline and outer whitespace normalization, with the three upstream alternate goldens explicitly allowed. Upstream's failable rename case remains a failure on mismatch.
@@ -83,7 +83,7 @@ Parity fails on any missing JDK, missing fixture, unsupported capability, source
 `smoke/` holds precompiled upstream inputs for the JDK-free subset.
 The stage smoke tests also read classes from this directory.
 
-Checked-in class files are used unchanged. For registered Java source groups, set `VINEFLOWER_JDK_8`, `VINEFLOWER_JDK_9`, `VINEFLOWER_JDK_11`, `VINEFLOWER_JDK_16`, `VINEFLOWER_JDK_17`, `VINEFLOWER_JDK_21` and `VINEFLOWER_JDK_25` to the corresponding JDK homes. Set only the JDKs needed for a focused run. The harness validates the JDK major and runs its `javac` once per source group in a temporary directory, with UTF-8, debug info (except `NoDebug`) and preview flags matching the upstream Gradle configuration. A newer `javac --release` is not a substitute. Runtime-backed registrations require their indicated JDK even with prebuilt classes.
+Checked-in class files are used unchanged. For registered Java source groups, set `VINEFLOWER_JDK_8`, `VINEFLOWER_JDK_9`, `VINEFLOWER_JDK_11`, `VINEFLOWER_JDK_16`, `VINEFLOWER_JDK_17`, `VINEFLOWER_JDK_21` and `VINEFLOWER_JDK_25` to the corresponding JDK homes. Set only the JDKs needed for a focused run. The harness validates the JDK major and runs its `javac` once per source group in a temporary directory, with UTF-8, debug info (except `NoDebug`) and preview flags matching the upstream Gradle configuration. A newer `javac --release` is not a substitute. Runtime-backed registrations require their indicated JDK even with prebuilt classes. For the “Entire Classpath” registrations, include the upstream Gradle runtime libraries in `CLASSPATH`, including Kotlin stdlib, stdlib-jdk7 and stdlib-jdk8 at version 2.0.0.
 
 Alternatively, set `VINEFLOWER_RS_CLASS_ROOT` to a tree with the upstream layout: `testData/classes/<group>/` and `plugins/<plugin>/testData/classes/<group>/`. From the matching upstream checkout, the recipe for prebuilt fixture classes is:
 

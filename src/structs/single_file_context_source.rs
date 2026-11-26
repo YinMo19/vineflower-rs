@@ -12,7 +12,7 @@ use std::{
 
 use crate::engine::{
     Options,
-    context_source::{CLASS_SUFFIX, ContextSource, Entries, Entry},
+    context_source::{CLASS_SUFFIX, ContextSource, Entries, Entry, OutputLayout},
     counter_container::ExpressionIds,
 };
 use crate::renamer::pool_interceptor::PoolInterceptor;
@@ -85,6 +85,10 @@ impl ContextSource for SingleFileContextSource {
             entries.others.push(Entry::at_base(&name.to_string_lossy()));
         }
         entries
+    }
+
+    fn output_layout(&self) -> OutputLayout {
+        OutputLayout::SingleFile
     }
 
     fn get_input_stream(&self, _resource: &str) -> io::Result<Option<Vec<u8>>> {

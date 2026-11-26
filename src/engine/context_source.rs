@@ -16,6 +16,20 @@ pub use runtime::RuntimeImage;
 /// The file extension for class files.
 pub const CLASS_SUFFIX: &str = ".class";
 
+/// How the standard saver opens the output for a source unit.
+#[derive(Clone, Debug, Default)]
+pub enum OutputLayout {
+    #[default]
+    Directory,
+    SingleFile,
+    Archive {
+        /// Input archive file name, used by legacy saving.
+        name: String,
+        /// Containing path relative to the output base.
+        directory: String,
+    },
+}
+
 /// A specific type of context unit.
 ///
 /// Implementations do not need to cache the results of any provided methods.
@@ -29,6 +43,12 @@ pub trait ContextSource: Send + Sync {
     /// List entries from a source whose contents can fail to enumerate.
     fn try_get_entries(&self) -> io::Result<Entries> {
         Ok(self.get_entries())
+    }
+
+    /// Format the source's entries for the built-in output savers. Custom
+    /// sources normally use the same paths as a directory.
+    fn output_layout(&self) -> OutputLayout {
+        OutputLayout::Directory
     }
 
     /// Whether this context source is lazy. A lazy context source may return

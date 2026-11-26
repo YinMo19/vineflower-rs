@@ -12,6 +12,7 @@ pub mod class_writer;
 pub mod context;
 pub mod context_source;
 pub mod counter_container;
+pub mod driver;
 pub mod import_collector;
 pub mod method_processor;
 pub mod nested;
