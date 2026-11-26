@@ -334,6 +334,90 @@ public final class Consumer {
 
 #[test]
 #[ignore = "requires the upstream +local.jar and JDK 17 or later"]
+fn parallel_lambda_discovery_preserves_nested_call_sites_and_output() {
+    use upstream_reference::{jdk_tool, run, upstream_jar};
+
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path();
+    let classes = root.join("classes");
+    let source = root.join("Main.java");
+    fs::write(
+        &source,
+        r#"
+import java.util.function.IntSupplier;
+import java.util.function.Supplier;
+
+class Left {
+    static Supplier<IntSupplier> make(int n) { return () -> () -> n + 1; }
+}
+class Right {
+    static IntSupplier make(String s) { return s::length; }
+}
+public class Main {
+    public static void main(String[] args) {
+        System.out.println(Left.make(7).get().getAsInt() + Right.make("abcd").getAsInt());
+    }
+}
+"#,
+    )
+    .unwrap();
+    run(Command::new(jdk_tool("javac"))
+        .args(["-g", "-d"])
+        .arg(&classes)
+        .arg(&source));
+    let expected = root.join("upstream");
+    fs::create_dir(&expected).unwrap();
+    let flags = ["--include-runtime=1", "--folder", "--silent"];
+    run(Command::new(jdk_tool("java"))
+        .arg("-jar")
+        .arg(upstream_jar())
+        .arg("--thread-count=1")
+        .args(flags)
+        .arg(&classes)
+        .arg(&expected));
+
+    let cli = env!("CARGO_BIN_EXE_vineflower-rs");
+    for count in ["1", "2", "0", "-1"] {
+        let output = root.join(count);
+        fs::create_dir(&output).unwrap();
+        run(Command::new(cli)
+            .arg(format!("-thr={count}"))
+            .args(flags)
+            .arg(&classes)
+            .arg(&output));
+        assert_eq!(
+            directory(&output),
+            directory(&expected),
+            "thread-count={count}"
+        );
+    }
+
+    let output = root.join("2");
+    let rebuilt = root.join("rebuilt");
+    run(Command::new(jdk_tool("javac"))
+        .arg("-d")
+        .arg(&rebuilt)
+        .args(["Main.java", "Left.java", "Right.java"].map(|name| output.join(name))));
+    for classpath in [&classes, &rebuilt] {
+        let result = run(Command::new(jdk_tool("java"))
+            .arg("-cp")
+            .arg(classpath)
+            .arg("Main"));
+        assert_eq!(result.stdout, b"12\n");
+    }
+    let invalid = Command::new(cli)
+        .arg("--thread-count=32768")
+        .args(flags)
+        .arg(&classes)
+        .arg(root.join("invalid"))
+        .output()
+        .unwrap();
+    assert!(!invalid.status.success());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("32767"));
+}
+
+#[test]
+#[ignore = "requires the upstream +local.jar and JDK 17 or later"]
 fn native_cli_saving_and_configuration_match_upstream() {
     let scratch = tempfile::tempdir().unwrap();
     let root = scratch.path();

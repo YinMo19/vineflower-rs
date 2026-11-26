@@ -23,6 +23,7 @@ use crate::util::jhash::{JHashMap, JHashSet};
 mod lambda;
 mod load;
 
+pub(super) use lambda::LambdaScan;
 pub use lambda::process_lambdas;
 pub use load::load_classes;
 

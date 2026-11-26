@@ -126,7 +126,7 @@ preferences! {
     preferred_line_length: i32 = 160, "preferred-line-length" | "pll";
     banner: String = "", "banner" | "ban";
     error_message: String = "Please report this to the Vineflower issue tracker, at https://github.com/Vineflower/vineflower/issues with a copy of the class file (if you have the rights to distribute it!)", "error-message" | "erm";
-    thread_count: i32 = std::thread::available_parallelism().map_or(1, |count| count.get() as i32), "thread-count" | "thr";
+    thread_count: i32 = available_processors(), "thread-count" | "thr";
     dump_original_lines: bool = false, "__dump_original_lines__";
     unit_test_mode: bool = false, "__unit_test_mode__";
     skip_extra_files: bool = false, "skip-extra-files" | "sef";
@@ -164,7 +164,20 @@ preferences! {
     resugar_idea_notnull: bool = true, "resugar-idea-notnull" | "inn";
 }
 
+fn available_processors() -> i32 {
+    std::thread::available_parallelism().map_or(1, |count| count.get() as i32)
+}
+
 impl Options {
+    /// ContextUnit uses the processor count for a non-positive preference.
+    pub(super) fn worker_count(&self) -> usize {
+        if self.thread_count > 0 {
+            self.thread_count as usize
+        } else {
+            available_processors() as usize
+        }
+    }
+
     /// `DecompilerContext.getNewLineSeparator`.
     pub fn line_separator(&self) -> &'static str {
         if self.new_line_separator { "\n" } else { "\r\n" }

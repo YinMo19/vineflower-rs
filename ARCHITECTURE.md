@@ -10,7 +10,7 @@
 cargo run --release --locked -- --folder input.jar output
 ```
 
-库调用从 `Decompiler::new(Options)` 开始。`add_source` 登记需要写出的输入，`add_library` 登记用于类型查找的依赖。`decompile` 返回各根类的源码和行映射，`save` 按输出模式保存源码、目录和资源。每个输入单元先准备全部根类，再恢复各根类自己的导入表、计数器和源码映射器，依次写出。类关系和已发布的方法包装器在两阶段间共享。当前调度以单工作线程执行。`--legacy-saving` 是原版保留输入归档布局的保存模式。[库入口](src/engine/driver/mod.rs) · [命令行](src/bin/vineflower-rs.rs) · [保存器](src/engine/driver/saver.rs)
+库调用从 `Decompiler::new(Options)` 开始。`add_source` 登记需要写出的输入，`add_library` 登记用于类型查找的依赖。`decompile` 返回各根类的源码和行映射，`save` 按输出模式保存源码、目录和资源。每个输入单元先准备全部根类，再恢复各根类自己的导入表、计数器和源码映射器，依次写出。类关系和已发布的方法包装器在两阶段间共享。元数据以外的根类可以按 `thread-count` 并行扫描 lambda 调用点。工作线程仅读取已载入的 class 和常量池，扫描结果归各根类持有。协调线程在原调用位置依次发布类节点和方法包装器、执行方法图改写并写出。单线程在准备每个根类时直接扫描；非正线程数取可用处理器数。`--legacy-saving` 是原版保留输入归档布局的保存模式。[库入口](src/engine/driver/mod.rs) · [命令行](src/bin/vineflower-rs.rs) · [保存器](src/engine/driver/saver.rs)
 
 启用 `rename-members` 时，先建立类与接口的继承关系，再沿继承链传播可重命名方法的映射。接口方法、外部库和 native 方法会约束派生类的名称。随后用同一映射重新载入常量池与类路径，内部类的简单名沿用同一个命名器。[标识符转换](src/renamer/identifier_converter.rs)
 

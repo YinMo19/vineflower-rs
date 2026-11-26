@@ -7,7 +7,7 @@ use std::io;
 use std::sync::Arc;
 
 use super::Cx;
-use super::class_nodes::{ClassKind, ClassNode, ClassNodeId, ClassNodes, process_lambdas};
+use super::class_nodes::{ClassKind, ClassNode, ClassNodeId, ClassNodes, LambdaScan};
 use super::class_writer::metadata::{module_info_to_java, package_info_to_java};
 use super::import_collector::{ImportCollector, short_name, write_imports};
 use crate::code::code_constants::{ACC_FINAL, ACC_MODULE, ACC_STATIC, ACC_SYNTHETIC, CLINIT_NAME};
@@ -33,6 +33,23 @@ fn metadata<'a>(node: &ClassNode, class: &'a StructClass) -> Option<Metadata<'a>
 /// Start the root's import scope before discovering lambda classes. Nested
 /// classes share this scope throughout method processing and source writing.
 pub fn prepare_class(cx: &mut Cx, root: ClassNodeId) -> io::Result<()> {
+    prepare_class_with_lambda_scan(cx, root, LambdaScan::default())
+}
+
+pub(super) fn scan_class_lambdas(nodes: &ClassNodes, root: ClassNodeId) -> LambdaScan {
+    let node = &nodes[root];
+    if node.kind == ClassKind::Root && metadata(node, &node.class).is_none() {
+        LambdaScan::for_root(nodes, root)
+    } else {
+        LambdaScan::default()
+    }
+}
+
+fn prepare_class_with_lambda_scan(
+    cx: &mut Cx,
+    root: ClassNodeId,
+    scan: LambdaScan,
+) -> io::Result<()> {
     let node = &cx.class_nodes[root];
     if node.kind != ClassKind::Root {
         return Ok(());
@@ -45,7 +62,7 @@ pub fn prepare_class(cx: &mut Cx, root: ClassNodeId) -> io::Result<()> {
     if metadata(node, &node.class).is_some() {
         return Ok(());
     }
-    process_lambdas(&mut cx.class_nodes, root)?;
+    scan.publish(&mut cx.class_nodes, root)?;
     let mut pending = vec![root];
     while let Some(id) = pending.pop() {
         let node = &cx.class_nodes[id];
@@ -87,10 +104,18 @@ pub fn initialize_java_wrappers(cx: &mut Cx, root: ClassNodeId) -> io::Result<()
 
 /// Run the selected language pipeline for all wrappers belonging to a compilation unit.
 pub fn process_class(cx: &mut Cx, root: ClassNodeId) -> io::Result<()> {
+    process_class_with_lambda_scan(cx, root, LambdaScan::default())
+}
+
+pub(super) fn process_class_with_lambda_scan(
+    cx: &mut Cx,
+    root: ClassNodeId,
+    scan: LambdaScan,
+) -> io::Result<()> {
     if cx.class_nodes[root].kind != ClassKind::Root {
         return Ok(());
     }
-    prepare_class(cx, root)?;
+    prepare_class_with_lambda_scan(cx, root, scan)?;
     let class = cx.class_nodes[root].class.clone();
     if metadata(&cx.class_nodes[root], &class).is_some() {
         return Ok(());
