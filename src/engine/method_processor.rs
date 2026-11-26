@@ -504,6 +504,9 @@ impl ExpressionMethod {
             if self.make_do_while_loops(cx)? || self.condense_infinite_loops(cx)? {
                 continue;
             }
+            if crate::decompiler::idea_not_null::run(cx, &mut self.flow.counters, self.root)? {
+                continue;
+            }
             if stage == MainLoopStage::Exits || !self.condense_exits(cx)? {
                 return Ok(());
             }

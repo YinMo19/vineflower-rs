@@ -14,6 +14,8 @@ mod method_writer;
 mod compilation_unit;
 #[path = "support/identifier_rename.rs"]
 mod identifier_rename;
+#[path = "support/idea_not_null.rs"]
+mod idea_not_null;
 #[path = "support/function_writer.rs"]
 mod function_writer;
 #[path = "support/invocation_writer.rs"]
