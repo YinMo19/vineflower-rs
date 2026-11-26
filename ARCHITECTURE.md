@@ -143,7 +143,7 @@ CFG、语句图和 DirectGraph 具有不同的边契约。
 
 方法处理失败时仍可写出同一类的其他成员。错误注释和剩余字节码列表遵循原选项；异常说明记录 Rust 返回的原因。上游 JVM 异常的类名和 Java 栈帧会与 Rust 的诊断文本不同。[错误写出](src/engine/class_writer/method_errors.rs)
 
-`RuntimeImage::open` 将模块化 JDK 的每个模块作为独立库登记，按 JRT 的目录遍历和模块描述符顺序提供条目。普通镜像与 ZIP 压缩镜像可由现有 JImage 库读取；该库遇到 compact-cp 压缩时返回 Unsupported。[运行时类路径](src/engine/context_source/runtime.rs)
+`RuntimeImage::open` 将模块化 JDK 的每个模块作为独立库登记，按 JRT 的目录遍历和模块描述符顺序提供条目。随仓库固定的 `jimage-rs` 复用内存映射和资源索引，普通资源直接借用映射中的字节。读取压缩资源时，按镜像头的字节序逐层解码 ZIP 或 `compact-cp`。后者从镜像的共享字符串表重建 class 常量池，直接复制 Modified UTF-8 字节，保留 JVM 字符串的原始表示。[运行时类路径](src/engine/context_source/runtime.rs) · [镜像读取器及版本来源](vendor/jimage-rs/README.md)
 
 `StructContext::add_file` 根据文件后缀和 ZIP 结束记录登记目录、归档或单文件。重新载入上下文时再次扫描目录及其子归档。ZIP 保留中央目录顺序和重复条目，按 Java 的规则解释多版本路径。单个 class 文件在预读内部名称和正式解析时使用同一上下文的注解表达式计数器。直接读取缺失资源或目录时，Rust 的 `ContextSource` 返回 `Ok(None)`。Java 的目录源打开这些路径时抛出 I/O 异常，ZIP 源读取缺失条目时抛出空引用异常，读取显式目录条目时返回空流。正常登记按已有条目读取类和资源。[文件登记](src/structs/struct_context.rs)
 

@@ -48,6 +48,8 @@ mod oddities;
 mod statement_writer;
 #[path = "support/type_annotations.rs"]
 mod type_annotations;
+#[path = "support/runtime_images.rs"]
+mod runtime_images;
 #[path = "support/upstream_reference.rs"]
 mod upstream_reference;
 #[path = "support/writer_enum_records.rs"]

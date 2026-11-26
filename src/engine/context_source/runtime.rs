@@ -29,7 +29,7 @@ pub struct RuntimeImage {
 
 impl RuntimeImage {
     /// Open a modular image at `java_home/lib/modules` using the native JImage reader.
-    /// The reader supports uncompressed and ZIP-compressed resources.
+    /// Resources may use ZIP compression or a shared constant pool.
     pub fn open(java_home: &Path) -> io::Result<Self> {
         let home = if java_home.is_absolute() {
             java_home.to_owned()
@@ -141,6 +141,7 @@ fn module_name(
     let bytes = match image.find_resource(&format!("/{module}/{MODULE_INFO}")) {
         Ok(Some(bytes)) => bytes,
         Err(error @ JImageError::UnsupportedDecompressor { .. }) => return Err(image_error(error)),
+        // JrtFinder.getEntries skips a module whose descriptor cannot be read.
         Ok(None) | Err(_) => return Ok(None),
     };
     let Ok(class) =

@@ -367,11 +367,8 @@ dependencies = [
 [[package]]
 name = "jimage-rs"
 version = "0.0.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1dc3c972dbd62bdbb35c179b61a49ab2ddfd83e5c9465dae5e842ed01e2d9c15"
 dependencies = [
  "byteorder",
- "clap",
  "flate2",
  "memchr",
  "memmap2",

@@ -1,0 +1,15 @@
+[package]
+name = "jimage-rs"
+version = "0.0.5"
+edition = "2021"
+rust-version = "1.74"
+description = "Reader for Java Platform Module System jimage files"
+repository = "https://github.com/hextriclosan/rusty-jvm/tree/main/jimage-rs"
+license = "MIT"
+
+[dependencies]
+byteorder = "1.5.0"
+flate2 = "1.1.5"
+memchr = "2.7.6"
+memmap2 = "0.9.9"
+snafu = "0.9.0"

@@ -48,7 +48,7 @@ flate2 = "1"
 index_vec = "0.1.4"
 indexmap = "2"
 itertools = "0.15.0"
-jimage-rs = "0.0.5"
+jimage-rs = { version = "0.0.5", path = "vendor/jimage-rs" }
 la-arena = "0.3.1"
 log = "0.4.35"
 num-bigint = "0.4"
