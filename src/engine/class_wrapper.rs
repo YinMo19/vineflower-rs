@@ -15,29 +15,48 @@ use super::context::Cx;
 use super::counter_container::CounterContainer;
 use super::method_processor::ExpressionMethod;
 use crate::decompiler::flow::{DirectGraph, flatten::build_direct_graph};
-use crate::decompiler::ir::{ExprListId, Ir, StatId, VarProcessorId};
+use crate::decompiler::ir::{ExprId, ExprListId, Ir, StatId, VarProcessorId};
 use crate::decompiler::stats::StatementKind;
 use crate::decompiler::vars::{processor::VarNamesCollector, var_version_pair::VarVersionPair};
 use crate::structs::{StructClass, StructMethod};
 use crate::util::interpreter_util::make_unique_key;
+use crate::util::vb_style_collection::VBStyleCollection;
 
 /// Methods follow the declaring class's method table, including native,
 /// abstract and individually failed methods.
 pub struct ClassWrapper {
     pub methods: Vec<MethodWrapper>,
+    /// Encounter order of assignments. The writer follows the class field table.
+    pub static_field_initializers: VBStyleCollection<ExprId, String>,
+    pub dynamic_field_initializers: VBStyleCollection<ExprId, String>,
 }
 
 pub struct MethodWrapper {
     pub method: Arc<StructMethod>,
     pub body: io::Result<Option<MethodBody>>,
     pub variables: VarProcessorId,
+    /// Available even for a failed, abstract or native method.
+    pub counters: CounterContainer,
     pub synthetic_parameters: Option<Vec<Option<VarVersionPair>>>,
     pub outer_var_names: FxHashSet<Option<ArcStr>>,
     pub comment_lines: Option<IndexSet<String>>,
     pub add_error_comment: bool,
+    pub is_compact_record_constructor: bool,
+    /// A class-level processing failure leaves the method tree available.
+    pub(super) write_error: Option<io::Error>,
 }
 
 impl MethodWrapper {
+    pub fn root(&self) -> Option<StatId> {
+        self.body.as_ref().ok()?.as_ref().map(|body| body.root)
+    }
+
+    pub fn decompile_error(&self) -> Option<&io::Error> {
+        self.write_error
+            .as_ref()
+            .or_else(|| self.body.as_ref().err())
+    }
+
     pub(super) fn add_comment(&mut self, comment: &str) {
         self.comment_lines
             .get_or_insert_with(IndexSet::new)
@@ -80,21 +99,34 @@ pub(super) fn initialize_wrappers(
     ) -> io::Result<Option<ExpressionMethod>>,
 ) -> io::Result<()> {
     let order = cx.class_nodes.wrapper_order(root).to_vec();
-    let previous = cx.current_class_node.take();
-    let result = order.into_iter().try_for_each(|node| {
-        let class = Arc::clone(&cx.class_nodes[node].class);
-        class.prepare_method_properties();
-        cx.current_class_node = Some(class.qualified_name.clone());
-        let methods = class
-            .methods
-            .iter()
-            .map(|method| process_method(cx, &class, method, &mut process))
-            .collect::<io::Result<_>>()?;
-        cx.class_nodes[node].wrapper = Some(ClassWrapper { methods });
-        Ok(())
-    });
-    cx.current_class_node = previous;
-    result
+    order.into_iter().try_for_each(|node| {
+        cx.with_class_node(node, |cx| {
+            let class = Arc::clone(&cx.class_nodes[node].class);
+            class.prepare_method_properties();
+            let methods = class
+                .methods
+                .iter()
+                .map(|method| process_method(cx, &class, method, &mut process))
+                .collect::<io::Result<_>>()?;
+            cx.class_nodes[node].wrapper = Some(ClassWrapper {
+                methods,
+                static_field_initializers: VBStyleCollection::new(),
+                dynamic_field_initializers: VBStyleCollection::new(),
+            });
+            Ok(())
+        })
+    })
+}
+
+pub(super) fn catch_method_failure<T>(process: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+    catch_unwind(AssertUnwindSafe(process)).unwrap_or_else(|payload| {
+        let reason = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("Unrecognized method processing failure");
+        Err(io::Error::other(reason.to_owned()))
+    })
 }
 
 fn process_method(
@@ -114,15 +146,7 @@ fn process_method(
     // last method remains the ambient sequence during nested-class processing.
     cx.expression_ids = Default::default();
     let previous = cx.current_method.replace((Arc::clone(method), variables));
-    let outcome =
-        catch_unwind(AssertUnwindSafe(|| process(cx, class, method))).unwrap_or_else(|payload| {
-            let reason = payload
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .or_else(|| payload.downcast_ref::<&str>().copied())
-                .unwrap_or("Unrecognized method processing failure");
-            Err(io::Error::other(reason.to_owned()))
-        });
+    let outcome = catch_method_failure(|| process(cx, class, method));
     cx.current_method = previous;
     let variables = outcome
         .as_ref()
@@ -178,13 +202,20 @@ fn process_method(
             Err(error)
         }
     };
+    let counters = body.as_ref().ok().and_then(Option::as_ref).map_or_else(
+        || CounterContainer::with_expression_ids(cx.expression_ids.clone()),
+        |body| body.counters.shared(),
+    );
     Ok(MethodWrapper {
         method: Arc::clone(method),
         variables,
+        counters,
         synthetic_parameters: None,
         outer_var_names: Default::default(),
         comment_lines,
         add_error_comment,
+        write_error: None,
+        is_compact_record_constructor: false,
         body,
     })
 }
@@ -226,7 +257,11 @@ impl Cx {
     /// StructMethod and VarProcessor until publication is complete.
     pub(crate) fn writing_method(&self) -> Option<&MethodWrapper> {
         let slot = self.current_method_wrapper?;
-        self.class_nodes[slot.node].wrapper.as_ref()?.methods.get(slot.index)
+        self.class_nodes[slot.node]
+            .wrapper
+            .as_ref()?
+            .methods
+            .get(slot.index)
     }
 
     pub(crate) fn wrapper_method(

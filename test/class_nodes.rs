@@ -4,6 +4,10 @@ use std::{env, fmt::Display, fs, io::Write, path::Path, process::Command, sync::
 
 #[path = "support/literals.rs"]
 mod literals;
+#[path = "support/writer_enum_records.rs"]
+mod writer_enum_records;
+#[path = "support/class_initializers.rs"]
+mod class_initializers;
 #[path = "support/generic_chains.rs"]
 mod generic_chains;
 #[path = "support/nested_classes.rs"]

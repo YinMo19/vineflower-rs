@@ -59,6 +59,27 @@ impl Cx {
         self.struct_context.resolving_with(&self.expression_ids)
     }
 
+    /// Imports and type names resolve against the class currently being written.
+    pub(crate) fn with_class_node<T>(
+        &mut self,
+        node: super::class_nodes::ClassNodeId,
+        write: impl FnOnce(&mut Cx) -> T,
+    ) -> T {
+        struct ClassScope<'a> {
+            cx: &'a mut Cx,
+            previous: Option<arcstr::ArcStr>,
+        }
+        impl Drop for ClassScope<'_> {
+            fn drop(&mut self) {
+                self.cx.current_class_node = self.previous.take();
+            }
+        }
+        let previous = self
+            .current_class_node
+            .replace(self.class_nodes[node].class.qualified_name.clone());
+        write(ClassScope { cx: self, previous }.cx)
+    }
+
     /// Allow lookups during speculative rendering without adding imports.
     pub(crate) fn with_locked_imports<T>(&mut self, render: impl FnOnce(&mut Cx) -> T) -> T {
         struct ImportLock<'a> {

@@ -119,6 +119,8 @@ CFG、语句图和 DirectGraph 具有不同的边契约。
 
 常量写出保留 JVM 类型、UTF-16 字符、字节码映射和源码 token。浮点数先按 JDK 17 的十进制转换规则求值，再应用 Vineflower 的截短和符号常量恢复。宽整数运算由 `num-bigint` 提供；普通转换走固定宽度路径。注解元素和方法里的常量共用同一入口。[字面量写出](src/decompiler/exps/literal/mod.rs) · [十进制转换](src/util/java_decimal.rs)
 
+写出普通类前，`prepare_class_for_writing` 逐个恢复当前方法及其计数器，执行末轮 switch 和 if 改写。随后按声明和执行顺序抽取静态初始化器与各构造器共有的实例初始化器，处理合成构造器、Java 1.4 类字面量和 enum 成员。最后检查 record 的规范构造器并重新核对变量重名。抽出的右值保留原表达式身份，后续写字段仍能访问原字节码位置。[写出准备](src/engine/class_writer/mod.rs) · [初始化器](src/engine/class_writer/initializers.rs)
+
 包描述符和模块描述符可以直接从已准备的根类写出。包注解先登记导入，再把导入写在包声明之后。模块先生成正文，随后在正文前写入导入。两条路径和普通声明共用注解值、类型 token 和换行组。[元数据写出](src/engine/class_writer/metadata.rs) · [写出入口](src/engine/class_processor.rs)
 
 `RuntimeImage::open` 将模块化 JDK 的每个模块作为独立库登记，按 JRT 的目录遍历和模块描述符顺序提供条目。普通镜像与 ZIP 压缩镜像可由现有 JImage 库读取；该库遇到 compact-cp 压缩时返回 Unsupported。[运行时类路径](src/engine/context_source/runtime.rs)
