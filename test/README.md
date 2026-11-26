@@ -137,6 +137,14 @@ For the larger memory comparison, use the Minecraft 26.3 client (SHA-256 `4508d0
 | 760 | `com/mojang/blaze3d/`, `net/minecraft/advancements/`, `net/minecraft/nbt/`, `net/minecraft/network/chat/`, `net/minecraft/server/commands/` |
 | 2,831 | `com/mojang/renderpearl/`, `net/minecraft/client/gui/`, `net/minecraft/network/`, `net/minecraft/server/`, `net/minecraft/world/item/` |
 
+From the repository root, generate either layout set in a fresh directory with
+
+```sh
+python3 test/prepare_client.py ~/Downloads/26.3.jar 2831 /tmp/vineflower-2831
+```
+
+The script writes `combined.jar`, `part-1.jar` through `part-5.jar` and `external.jar`. It includes explicit directories from the selected subtrees and places `META-INF/LICENSE` in the combined JAR and the first part. The combined JAR for 2,831 classes has SHA-256 `c9e10a42272d5d75139f64285214ac12f05d0f3c3d461a7b4f2140320b8ea3fb`. For the smaller input, pass `760` and a different destination.
+
 Build both revisions with `cargo build --release --locked`. With the same JDK, run each binary on the identical archives and write each output to a fresh directory. The macOS comparison used JDK 25.0.2 and the median maximum resident set size from three runs of each binary. Retain the exact inputs, command lines and output manifests between revisions.
 
 ```sh
@@ -182,3 +190,31 @@ The following release CLI runs used the same Apple M4 Pro, JDK and directory out
 The full-client pairs produced the same 7,301 Java files and 21,495 resources as the pinned Java CLI. Peak RSS increased in both pairs despite the reduction in live objects at the preparation barrier.
 
 `public_method_callback_retains_its_cfg_after_wrapper_publication` processes the checked-in `TestSimpleWhile.class` through the public method callback and reads its saved CFG entry after the wrapper is published. It checks the identities and order of its incoming and outgoing blocks.
+
+### Published method tables and direct graphs
+
+At the same single-worker preparation barrier, compare `dfc0263` and `cc92d63` by visiting every published method and its cached graph in class-node allocation order. For each direct node check its statement, expression-list and block handles, the four ordered lists of neighbors, and its enclosing finally node. Include traversal order, branch and destination maps in the comparison. On the complete client both revisions retained 82,030 graphs with 266,886 nodes and the same topology. For each direction there were 217,247 regular edges and 6,343 exception edges.
+
+| Storage at the full-client barrier | Before | After |
+| --- | ---: | ---: |
+| Reserved slots for 98,739 method wrappers | 139,416 | 98,739 |
+| Reserved direct-node slots | 457,864 | 266,886 |
+| Bytes per direct node (arm64 macOS) | 136 | 88 |
+| Separate adjacency buffers | 377,659 | 3,360 |
+| Method, node and adjacency arrays, requested bytes | 117,427,536 | 57,586,296 |
+| Same allocations, usable bytes reported by macOS `malloc_size` | 132,738,320 | 68,282,336 |
+
+The byte counts cover the three listed arrays at the barrier. The graphs' traversal vectors and lookup maps are counted separately for the topology check. On the single-JAR 2,831-class subset the same arrays used 36,369,120 and 18,563,328 allocator bytes before and after, with identical topology across 22,548 graphs.
+
+Ordinary release builds on the same M4 Pro and JDK 25.0.2 gave the following paired samples. The before and after binaries processed identical input archives into fresh directories.
+
+| Input | Workers | Elapsed before / after (s) | Peak RSS before / after (GiB) | Peak macOS footprint before / after (GiB) |
+| --- | ---: | ---: | ---: | ---: |
+| 2,831 classes in one JAR | 1 | 9.83 / 9.78 | 1.002 / 0.982 | 0.759 / 0.743 |
+| 2,831 classes in five JARs | 1 | 10.03 / 9.89 | 0.762 / 0.750 | 0.589 / 0.587 |
+| Complete 26.3 client | 1 | 44.72 / 44.20 | 7.089 / 6.921 | 4.061 / 3.866 |
+| Complete 26.3 client | auto (14) | 43.84 / 43.48 | 7.019 / 6.966 | 3.957 / 3.884 |
+
+The other round used the reverse execution order and a build with identical executable instructions. It also showed lower single-worker peak RSS on all three inputs. Full-client automatic peak RSS changed from 6.974 to 6.999 GiB in that round. The full output trees matched Java at both worker settings. Both subset layouts preserved archive entry order, source bytes and all 1,520 native line maps.
+
+A separate instrumented single-worker run on the combined subset timed the passes inside the ordinary CLI. Of 10.072 s in the driver, 0.326 s went to the existing decode and structure prefix. Finally recovery, final cleanup and expression lifting, and the first stack SSA split took 0.044, 0.121 and 0.236 s respectively. The remainder of the first stack simplification took 3.603 s. These timings exclude nested phases from their parent totals. The instrumented run produced the same files as the ordinary release.
