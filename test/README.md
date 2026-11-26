@@ -218,3 +218,24 @@ Ordinary release builds on the same M4 Pro and JDK 25.0.2 gave the following pai
 The other round used the reverse execution order and a build with identical executable instructions. It also showed lower single-worker peak RSS on all three inputs. Full-client automatic peak RSS changed from 6.974 to 6.999 GiB in that round. The full output trees matched Java at both worker settings. Both subset layouts preserved archive entry order, source bytes and all 1,520 native line maps.
 
 A separate instrumented single-worker run on the combined subset timed the passes inside the ordinary CLI. Of 10.072 s in the driver, 0.326 s went to the existing decode and structure prefix. Finally recovery, final cleanup and expression lifting, and the first stack SSA split took 0.044, 0.121 and 0.236 s respectively. The remainder of the first stack simplification took 3.603 s. These timings exclude nested phases from their parent totals. The instrumented run produced the same files as the ordinary release.
+
+### Stack variable analysis
+
+On the same 2,831-class combined input, 25,130 methods had code. In an instrumented single-worker run at `d8efd3c`, their first stack simplification took 3.943 s in total. All SSA splits in that call took 0.633 s, SSAU splits took 1.822 s, and stack inlining took 0.782 s. These numbers include the final SSAU and inlining pass after convergence.
+
+The SSA sweeps in that call saved 1,316,606 input maps containing 9,910,607 version sets. All 2,754 lookups of the saved inputs from finally edges missed. Vineflower 1.12.0 looks up an uppercase `_FINALLY` suffix, while its graph builder assigns lowercase node IDs. The native sweeps now move the merged input directly into expression processing. The catchable map starts with a separate copy of the incoming locals.
+
+The stack inliner visits a node with the replacement map from its first incoming path in FIFO order. Counting at that boundary showed 320,912 map copies before and 45,948 after, containing 1,621,671 and 222,826 entries respectively. Both runs visited 359,417 nodes and processed 1,081,008 expression positions. The output trees matched the Java CLI.
+
+The driver test `wide_reaching_versions_match_upstream_and_recompile` compiles 150 conditional assignments to one local, followed by a loop with a catch and a finally block. It compares both CLIs' source bytes and checks the rebuilt program against the input class on 256 values.
+
+The ordinary release CLI ran each input twice per revision, reversing the execution order for the second pair. The table gives the means on the same M4 Pro with JDK 25.0.2 and the directory output options above. The before binary is from `cc92d63`, which has the same production code as `d8efd3c`. The after binary is from `b007c8f`. CPU is user plus system time.
+
+| Input | Workers | Elapsed before / after (s) | CPU before / after (s) | Peak RSS before / after (GiB) | Peak macOS footprint before / after (GiB) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 2,831 classes in one JAR | 1 | 9.975 / 8.400 | 9.860 / 8.300 | 0.976 / 1.020 | 0.742 / 0.783 |
+| 2,831 classes in five JARs | 1 | 10.005 / 8.365 | 9.925 / 8.345 | 0.757 / 0.791 | 0.590 / 0.609 |
+| Complete 26.3 client | 1 | 44.555 / 38.515 | 44.460 / 38.420 | 6.784 / 6.741 | 3.951 / 4.023 |
+| Complete 26.3 client | auto (14) | 43.580 / 37.455 | 45.520 / 39.365 | 6.815 / 6.728 | 4.064 / 4.067 |
+
+The pinned Java CLI ran once per worker setting on the full client with the same options and `-Xmx6g`. One worker took 42.37 s elapsed and 120.84 s CPU, with 4.440 GiB peak RSS. Automatic took 14.84 s elapsed and 165.30 s CPU, with 6.301 GiB peak RSS. Every full run produced the same 7,301 Java files and 21,495 resources. The two subset layouts also matched their Java output trees and preserved the same native archive entries and line mappings as before.

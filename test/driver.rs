@@ -170,10 +170,29 @@ impl JavadocProvider for Documentation {
     }
 }
 
+fn compile_java17(sources: &[&Path], dest: &Path) {
+    use upstream_reference::{jdk_tool, run};
+
+    run(Command::new(jdk_tool("javac"))
+        .args(["--release", "17", "-g", "-d"])
+        .arg(dest)
+        .args(sources));
+}
+
+fn run_main(classpath: &Path, class_name: &str) -> Vec<u8> {
+    use upstream_reference::{jdk_tool, run};
+
+    run(Command::new(jdk_tool("java"))
+        .arg("-cp")
+        .arg(classpath)
+        .arg(class_name))
+    .stdout
+}
+
 #[test]
 #[ignore = "requires JDK 17 or later"]
 fn generic_inner_class_and_loop_survive_recompilation() {
-    use upstream_reference::{jdk_tool, run};
+    use upstream_reference::run;
 
     let scratch = tempfile::tempdir().unwrap();
     let classes = scratch.path().join("classes");
@@ -181,27 +200,13 @@ fn generic_inner_class_and_loop_survive_recompilation() {
     let rebuilt = scratch.path().join("rebuilt");
     fs::create_dir(&output).unwrap();
 
-    let compile = |source: &Path, dest: &Path| {
-        run(Command::new(jdk_tool("javac"))
-            .args(["--release", "17", "-g", "-d"])
-            .arg(dest)
-            .arg(source));
-    };
-    let execute = |dir: &Path| {
-        run(Command::new(jdk_tool("java"))
-            .arg("-cp")
-            .arg(dir)
-            .arg("Ledger"))
-        .stdout
-    };
-
-    compile(Path::new("test/support/Ledger.java"), &classes);
+    compile_java17(&[Path::new("test/support/Ledger.java")], &classes);
     run(Command::new(env!("CARGO_BIN_EXE_vineflower-rs"))
         .args(["--include-runtime=0", "--silent", "--folder"])
         .arg(&classes)
         .arg(&output));
-    compile(&output.join("Ledger.java"), &rebuilt);
-    assert_eq!(execute(&classes), execute(&rebuilt));
+    compile_java17(&[&output.join("Ledger.java")], &rebuilt);
+    assert_eq!(run_main(&classes, "Ledger"), run_main(&rebuilt, "Ledger"));
 }
 
 #[test]
@@ -274,21 +279,13 @@ public final class Consumer {
     )
     .unwrap();
     let compile = |sources: &Path, dest: &Path| {
-        run(Command::new(jdk_tool("javac"))
-            .args(["--release", "17", "-g", "-d"])
-            .arg(dest)
-            .arg(sources.join("Owner.java"))
-            .arg(sources.join("Consumer.java")));
-    };
-    let execute = |dir: &Path| {
-        run(Command::new(jdk_tool("java"))
-            .arg("-cp")
-            .arg(dir)
-            .arg("Consumer"))
-        .stdout
+        compile_java17(
+            &[&sources.join("Owner.java"), &sources.join("Consumer.java")],
+            dest,
+        );
     };
     compile(root, &classes);
-    let expected_execution = execute(&classes);
+    let expected_execution = run_main(&classes, "Consumer");
     assert_eq!(expected_execution, b"42\n13\n17\n23\n");
 
     // ZIP entry order controls preprocessing within a unit independently of
@@ -355,8 +352,93 @@ public final class Consumer {
         assert!(source.contains("owner.new Member(11)"), "{layout}");
         let rebuilt = root.join(format!("{layout}-rebuilt"));
         compile(&actual, &rebuilt);
-        assert_eq!(execute(&rebuilt), expected_execution, "{layout}");
+        assert_eq!(
+            run_main(&rebuilt, "Consumer"),
+            expected_execution,
+            "{layout}"
+        );
     }
+}
+
+#[test]
+#[ignore = "requires the upstream +local.jar and JDK 17 or later"]
+fn wide_reaching_versions_match_upstream_and_recompile() {
+    use std::fmt::Write as _;
+
+    use upstream_reference::{jdk_tool, run, upstream_jar};
+
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path();
+    let source = root.join("WideFlow.java");
+    let mut java = String::from(
+        "public class WideFlow {\n    static int run(int bits) {\n        int value = bits;\n",
+    );
+    // Each conditional introduces a definition that meets the previous value.
+    for branch in 0..150 {
+        let mask = 1 << (branch % 29);
+        let offset = 11 * branch;
+        writeln!(
+            java,
+            "        if ((bits & {mask}) != 0) value ^= (bits + {offset});"
+        )
+        .unwrap();
+    }
+    java.push_str(
+        r#"        for (int i = 0; i < 5; ++i) {
+            try {
+                value += 100 / ((bits >>> (i * 3)) & 7);
+                if ((value & 15) == 2) break;
+            } catch (ArithmeticException ex) {
+                value ^= i + 271;
+            } finally {
+                value = Integer.rotateLeft(value, 7);
+            }
+        }
+        return value;
+    }
+    public static void main(String[] args) {
+        long checksum = 3;
+        int seed = 17;
+        for (int i = 0; i < 256; ++i) {
+            seed = 1664525 * seed + 1013904223;
+            checksum = 31 * checksum + run(seed);
+        }
+        System.out.println(checksum);
+    }
+}
+"#,
+    );
+    fs::write(&source, java).unwrap();
+    let classes = root.join("classes");
+    compile_java17(&[&source], &classes);
+    let expected = run_main(&classes, "WideFlow");
+    assert_eq!(expected, b"317456771009520057\n");
+
+    let input = classes.join("WideFlow.class");
+    let upstream = root.join("upstream");
+    let native = root.join("native");
+    fs::create_dir(&upstream).unwrap();
+    fs::create_dir(&native).unwrap();
+    let flags = ["--folder", "--log-level=ERROR", "--thread-count=1"];
+    run(Command::new(jdk_tool("java"))
+        .arg("-jar")
+        .arg(upstream_jar())
+        .args(flags)
+        .arg(&input)
+        .arg(&upstream));
+    run(Command::new(env!("CARGO_BIN_EXE_vineflower-rs"))
+        .args(flags)
+        .arg(&input)
+        .arg(&native));
+
+    let rendered = native.join("WideFlow.java");
+    assert_eq!(
+        fs::read_to_string(&rendered).unwrap(),
+        fs::read_to_string(upstream.join("WideFlow.java")).unwrap()
+    );
+    let rebuilt = root.join("rebuilt");
+    compile_java17(&[&rendered], &rebuilt);
+    assert_eq!(run_main(&rebuilt, "WideFlow"), expected);
 }
 
 #[test]
