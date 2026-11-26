@@ -316,12 +316,7 @@ public final class Consumer {
         jar.finish().unwrap();
     }
 
-    let options = [
-        "--thread-count=1",
-        "--include-runtime=0",
-        "--folder",
-        "--silent",
-    ];
+    let options = ["--include-runtime=0", "--folder", "--silent"];
     let upstream = upstream_jar();
     for (layout, inputs, enum_switch) in [
         ("holder-first", &["owner-first"][..], true),
@@ -329,28 +324,184 @@ public final class Consumer {
         ("holder-unit-first", &["owner", "consumer"][..], true),
         ("holder-unit-last", &["consumer", "owner"][..], false),
     ] {
-        let actual = root.join(format!("{layout}-native"));
         let expected = root.join(format!("{layout}-upstream"));
-        fs::create_dir(&actual).unwrap();
         fs::create_dir(&expected).unwrap();
         let inputs = inputs.iter().map(|name| root.join(format!("{name}.jar")));
-        run(Command::new(env!("CARGO_BIN_EXE_vineflower-rs"))
-            .args(options)
-            .args(inputs.clone())
-            .arg(&actual));
         run(Command::new(jdk_tool("java"))
             .arg("-jar")
             .arg(&upstream)
+            .arg("--thread-count=1")
             .args(options)
-            .args(inputs)
+            .args(inputs.clone())
             .arg(&expected));
-        assert_eq!(directory(&actual), directory(&expected), "{layout}");
+        let expected = directory(&expected);
+        for count in [1, 2] {
+            let actual = root.join(format!("{layout}-native-{count}"));
+            fs::create_dir(&actual).unwrap();
+            run(Command::new(env!("CARGO_BIN_EXE_vineflower-rs"))
+                .arg(format!("--thread-count={count}"))
+                .args(options)
+                .args(inputs.clone())
+                .arg(&actual));
+            assert_eq!(
+                directory(&actual),
+                expected,
+                "{layout}, thread-count={count}"
+            );
+        }
+        let actual = root.join(format!("{layout}-native-2"));
         let source = fs::read_to_string(actual.join("Consumer.java")).unwrap();
         assert_eq!(source.contains("switch (mode)"), enum_switch, "{layout}");
         assert!(source.contains("owner.new Member(11)"), "{layout}");
         let rebuilt = root.join(format!("{layout}-rebuilt"));
         compile(&actual, &rebuilt);
         assert_eq!(execute(&rebuilt), expected_execution, "{layout}");
+    }
+}
+
+#[test]
+#[ignore = "requires the upstream +local.jar and JDK 17 or later"]
+fn parallel_method_graphs_preserve_archive_order_and_mappings() {
+    use upstream_reference::{jdk_tool, run, upstream_jar};
+
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path();
+    let source = root.join("Main.java");
+    fs::write(
+        &source,
+        r#"
+abstract class First {
+    abstract int unavailable(long value, double scale);
+
+    static int choose(int n, StringBuilder trace) {
+        try {
+            if (n < 0) return -n;
+            int total = 0;
+            for (int i = 0; i < n; i++) {
+                if ((i & 1) == 0) total += i;
+            }
+            return total;
+        } finally {
+            trace.append('A');
+        }
+    }
+
+    static Missing absentFromClasspath(Missing value) { return value; }
+}
+
+class Second {
+    native int unavailable(long value, double scale);
+
+    static int choose(int n, StringBuilder trace) {
+        try {
+            switch (n) {
+                case 2: return 11;
+                case 3: return 13;
+                default: return 17;
+            }
+        } finally {
+            trace.append('B');
+        }
+    }
+}
+
+class Missing {}
+
+public class Main {
+    public static void main(String[] args) {
+        StringBuilder trace = new StringBuilder();
+        int total = First.choose(6, trace) + Second.choose(3, trace) + First.choose(-2, trace);
+        System.out.println(total + ":" + trace);
+    }
+}
+"#,
+    )
+    .unwrap();
+    let classes = root.join("classes");
+    run(Command::new(jdk_tool("javac"))
+        .args(["--release", "17", "-g", "-d"])
+        .arg(&classes)
+        .arg(source));
+    let input = root.join("methods.jar");
+    let mut jar = zip::ZipWriter::new(fs::File::create(&input).unwrap());
+    for entry in ["Second.class", "Main.class", "First.class"] {
+        jar.start_file(entry, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::copy(&mut fs::File::open(classes.join(entry)).unwrap(), &mut jar).unwrap();
+    }
+    jar.finish().unwrap();
+
+    let options = [
+        "--include-runtime=1",
+        "--legacy-saving",
+        "--bytecode-source-mapping=1",
+        "--dump-code-lines=1",
+        "--silent",
+    ];
+    let upstream = root.join("upstream");
+    fs::create_dir(&upstream).unwrap();
+    run(Command::new(jdk_tool("java"))
+        .arg("-jar")
+        .arg(upstream_jar())
+        .arg("--thread-count=1")
+        .args(options)
+        .arg(&input)
+        .arg(&upstream));
+    let expected = archive(&upstream.join("methods.jar"));
+    let sources = ["Second.java", "Main.java", "First.java"];
+    for name in sources {
+        assert!(!expected[name].2.is_empty(), "missing mapping for {name}");
+    }
+
+    let rebuilt_sources = root.join("rebuilt-sources");
+    fs::create_dir(&rebuilt_sources).unwrap();
+    for (name, count) in [
+        ("default", None),
+        ("one", Some("1")),
+        ("two", Some("2")),
+        ("auto", Some("0")),
+        ("two-again", Some("2")),
+    ] {
+        let output = root.join(name);
+        fs::create_dir(&output).unwrap();
+        run(Command::new(env!("CARGO_BIN_EXE_vineflower-rs"))
+            .args(count.map(|count| format!("--thread-count={count}")))
+            .args(options)
+            .arg(&input)
+            .arg(&output));
+        let output = output.join("methods.jar");
+        let entries = zip::ZipArchive::new(fs::File::open(&output).unwrap()).unwrap();
+        assert_eq!(entries.file_names().collect::<Vec<_>>(), sources, "{name}");
+        let actual = archive(&output);
+        assert_eq!(actual, expected, "{name}");
+        if name == "two" {
+            for name in sources {
+                fs::write(rebuilt_sources.join(name), &actual[name].1).unwrap();
+            }
+        }
+    }
+
+    let dependency = root.join("dependency");
+    fs::create_dir(&dependency).unwrap();
+    fs::copy(
+        classes.join("Missing.class"),
+        dependency.join("Missing.class"),
+    )
+    .unwrap();
+    let rebuilt = root.join("rebuilt");
+    run(Command::new(jdk_tool("javac"))
+        .arg("-cp")
+        .arg(&dependency)
+        .arg("-d")
+        .arg(&rebuilt)
+        .args(sources.map(|name| rebuilt_sources.join(name))));
+    for output in [&classes, &rebuilt] {
+        let classpath = std::env::join_paths([output, &dependency]).unwrap();
+        let result = run(Command::new(jdk_tool("java"))
+            .arg("-cp")
+            .arg(classpath)
+            .arg("Main"));
+        assert_eq!(result.stdout, b"21:ABA\n");
     }
 }
 
