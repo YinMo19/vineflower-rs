@@ -99,6 +99,40 @@ impl JavadocProvider for Documentation {
 }
 
 #[test]
+#[ignore = "requires JDK 17 or later"]
+fn generic_inner_class_and_loop_survive_recompilation() {
+    use upstream_reference::{jdk_tool, run};
+
+    let scratch = tempfile::tempdir().unwrap();
+    let classes = scratch.path().join("classes");
+    let output = scratch.path().join("output");
+    let rebuilt = scratch.path().join("rebuilt");
+    fs::create_dir(&output).unwrap();
+
+    let compile = |source: &Path, dest: &Path| {
+        run(Command::new(jdk_tool("javac"))
+            .args(["--release", "17", "-g", "-d"])
+            .arg(dest)
+            .arg(source));
+    };
+    let execute = |dir: &Path| {
+        run(Command::new(jdk_tool("java"))
+            .arg("-cp")
+            .arg(dir)
+            .arg("Ledger"))
+        .stdout
+    };
+
+    compile(Path::new("test/support/Ledger.java"), &classes);
+    run(Command::new(env!("CARGO_BIN_EXE_vineflower-rs"))
+        .args(["--include-runtime=0", "--silent", "--folder"])
+        .arg(&classes)
+        .arg(&output));
+    compile(&output.join("Ledger.java"), &rebuilt);
+    assert_eq!(execute(&classes), execute(&rebuilt));
+}
+
+#[test]
 #[ignore = "requires the upstream +local.jar and JDK 17 or later"]
 fn native_cli_saving_and_configuration_match_upstream() {
     let scratch = tempfile::tempdir().unwrap();

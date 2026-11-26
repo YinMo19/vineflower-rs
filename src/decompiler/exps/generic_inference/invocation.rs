@@ -11,10 +11,11 @@ use super::{
     invocation, name_type,
 };
 use crate::code::code_constants::{ACC_ENUM, ACC_PRIVATE, ACC_PROTECTED, ACC_PUBLIC, ACC_STATIC};
+use crate::decompiler::exps::expr_util::{synthetic_parameters_mask, visible_parameters};
 use crate::decompiler::exps::{Expr, ExprKind, Invocation, InvocationFunction};
 use crate::decompiler::ir::ExprId;
 use crate::engine::Cx;
-use crate::engine::class_nodes::{ClassKind, ClassNode, ClassNodeId};
+use crate::engine::class_nodes::ClassNodeId;
 use crate::structs::{StructClass, StructMember, StructMethod};
 use crate::types::{CodeType, GenericType, GenericsMap, TypeFamily, VarType};
 use crate::util::jhash::{JHashMap, JHashSet};
@@ -26,7 +27,7 @@ impl Inference<'_> {
         upper: Option<&VarType>,
     ) -> io::Result<VarType> {
         let method = Invocation::resolve_description(self.cx, expr);
-        let (receiver, klass, erased, constructor, unboxing, descriptor) = {
+        let (receiver, klass, erased, constructor, unboxing) = {
             let call = invocation(&self.cx.ir, expr);
             (
                 call.instance,
@@ -34,7 +35,6 @@ impl Inference<'_> {
                 call.descriptor.ret.clone(),
                 call.function == InvocationFunction::Init,
                 call.is_unboxing_call(),
-                call.descriptor.clone(),
             )
         };
         let state = self.invocation_state(expr);
@@ -192,23 +192,36 @@ impl Inference<'_> {
         }
 
         let mut parameter_generics = JHashSet::new();
-        let arguments = invocation(&self.cx.ir, expr).parameters.clone();
+        let call = invocation(&self.cx.ir, expr);
         if let Some(signature) = &method_signature
-            && !arguments.is_empty()
+            && !call.parameters.is_empty()
         {
-            let slots = invocation_parameter_indices(
-                self.cx,
-                &owner,
-                descriptor.as_str(),
-                arguments.len(),
-                constructor,
-            )?;
+            let node = self.cx.class_nodes.get(&owner.qualified_name);
+            let (mask, start) = if constructor {
+                let is_enum = node.is_some_and(|node| node.class.has_modifier(ACC_ENUM));
+                (
+                    synthetic_parameters_mask(self.cx, call)?,
+                    if is_enum { 2 } else { 0 },
+                )
+            } else {
+                let has_outer = node.is_some_and(|node| {
+                    !node.enclosing_classes.is_empty() && node.access & ACC_STATIC == 0
+                });
+                (None, usize::from(has_outer))
+            };
+            let visible = visible_parameters(mask.as_deref());
+            let arguments = call
+                .parameters
+                .clone()
+                .into_iter()
+                .enumerate()
+                .skip(start)
+                .filter_map(|(index, argument)| visible(index).then_some(argument));
             let common = self.common_class_generics(&owner, &method);
-            for (index, formal) in slots.zip(&signature.parameter_types) {
+            for (argument, formal) in arguments.zip(&signature.parameter_types) {
                 if !formal.is_generic() {
                     continue;
                 }
-                let argument = arguments[index];
                 let excluded = self.excluded_lambda_generics(argument, formal)?;
                 let mut combined = JHashMap::copy_of(&mapping.values);
                 for (key, value) in upper_mappings.iter() {
@@ -491,62 +504,6 @@ fn can_access(cx: &Cx, current: Option<&StructClass>, method: &StructMethod) -> 
         class.rsplit_once('/').map(|(p, _)| p) == owner.rsplit_once('/').map(|(p, _)| p);
     Ok(same_package
         || (method.has_modifier(ACC_PROTECTED) && cx.classes().instance_of(class, owner)))
-}
-
-fn invocation_parameter_indices(
-    cx: &Cx,
-    owner: &StructClass,
-    descriptor: &str,
-    count: usize,
-    constructor: bool,
-) -> io::Result<std::ops::Range<usize>> {
-    let mut start = 0;
-    let Some(node_id) = cx.class_nodes.id(&owner.qualified_name) else {
-        return Ok(start..count);
-    };
-    let node = &cx.class_nodes[node_id];
-    if constructor {
-        if let Some(wrapper_owner) = cx.class_nodes.wrapper_owner(node_id)
-            && cx.class_nodes[wrapper_owner].wrapper.is_some()
-        {
-            // Constructor wrappers have no synthetic mask until the later
-            // NestedClassProcessor pass allocates it.
-            if cx.class_nodes[wrapper_owner]
-                .class
-                .get_method("<init>", descriptor)
-                .is_none()
-                && !cx.options.ignore_invalid_bytecode
-            {
-                return Err(invalid(
-                    "Constructor missing from the published class wrapper",
-                ));
-            }
-        } else if count > 0 && node.kind == ClassKind::Member && !is_static_member(node) {
-            start = 1;
-        }
-        if owner.has_modifier(ACC_ENUM) {
-            start = 2;
-        }
-    } else if !node.enclosing_classes.is_empty() && node.access & ACC_STATIC == 0 {
-        start = 1;
-    }
-    Ok(start..count)
-}
-
-fn is_static_member(node: &ClassNode) -> bool {
-    node.class.has_modifier(ACC_STATIC)
-        || node
-            .class
-            .attributes
-            .inner_classes
-            .as_ref()
-            .and_then(|entries| {
-                entries
-                    .entries
-                    .iter()
-                    .find(|entry| entry.inner_name == node.class.qualified_name)
-            })
-            .is_some_and(|entry| entry.access_flags & ACC_STATIC != 0)
 }
 
 fn is_formal_mapping(

@@ -75,7 +75,7 @@ pub(crate) fn condense_sequences(cx: &mut Cx, counters: &mut CounterContainer, m
             let can_disband = match (child_edge, parent_edge) {
                 (Some(edge), Some(outer)) => {
                     if ir[edge].destination == ir[outer].destination {
-                        edge.remove(ir);
+                        child.remove_successor(ir, edge);
                         true
                     } else {
                         false
@@ -143,7 +143,7 @@ fn unfold_sequence(ir: &mut Ir, parent: StatId, stat: StatId, next: Option<StatI
     }
 
     for edge in stat.get_successor_edges(ir, STATEDGE_ALL) {
-        edge.remove(ir);
+        stat.remove_successor(ir, edge);
     }
     let label_owner = if matches!(ir[last].kind, StatementKind::BasicBlock { .. }) {
         parent
@@ -215,7 +215,7 @@ fn remove_empty_statement(ir: &mut Ir, stat: StatId) -> bool {
     if kind == EdgeType::FinallyExit {
         return false;
     }
-    outgoing.remove(ir);
+    stat.remove_successor(ir, outgoing);
     for edge in stat.get_predecessor_edges(ir, STATEDGE_ALL) {
         if kind != EdgeType::Regular {
             edge.change_type(ir, kind);
@@ -298,8 +298,10 @@ fn destroy_statement_content(ir: &mut Ir, stat: StatId, remove_self: bool) {
     }
     ir[stat].stats.clear();
     if remove_self {
+        // Do-while recovery can attach an exit to the loop before the old
+        // condition block's successor entries are removed.
         for edge in stat.get_successor_edges(ir, STATEDGE_ALL) {
-            edge.remove(ir);
+            stat.remove_successor(ir, edge);
         }
         for edge in stat.get_predecessor_edges(ir, STATEDGE_ALL) {
             edge.remove(ir);
@@ -381,7 +383,8 @@ fn build_monitor(
         }
     }
 
-    head.get_successor_edges(ir, STATEDGE_DIRECT_ALL)[0].remove(ir);
+    let edge = ir[head].direct_successors()[0];
+    head.remove_successor(ir, edge);
     for edge in head.get_predecessor_edges(ir, STATEDGE_DIRECT_ALL) {
         edge.change_destination(ir, next);
     }

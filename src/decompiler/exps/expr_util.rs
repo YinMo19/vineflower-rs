@@ -13,6 +13,13 @@ use crate::engine::class_nodes::ClassKind;
 use crate::structs::{StructClass, StructMember};
 use crate::util::interpreter_util::make_unique_key;
 
+/// The mask is indexed by JVM parameter, including captured and enum arguments.
+pub(crate) fn visible_parameters(
+    mask: Option<&[Option<VarVersionPair>]>,
+) -> impl Fn(usize) -> bool {
+    move |index| mask.is_none_or(|slots| slots[index].is_none())
+}
+
 pub(crate) fn synthetic_parameters_mask(
     cx: &Cx,
     call: &Invocation,

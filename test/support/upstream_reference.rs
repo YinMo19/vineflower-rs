@@ -131,7 +131,7 @@ pub(super) fn upstream_root() -> PathBuf {
         .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../vineflower"))
 }
 
-fn jdk_tool(name: &str) -> PathBuf {
+pub(super) fn jdk_tool(name: &str) -> PathBuf {
     let name = format!("{name}{}", env::consts::EXE_SUFFIX);
     env::var_os("JAVA_HOME")
         .map(PathBuf::from)
@@ -153,7 +153,7 @@ pub fn jdk_home() -> PathBuf {
         .expect("Java reported no java.home")
 }
 
-fn run(command: &mut Command) -> Output {
+pub(super) fn run(command: &mut Command) -> Output {
     let output = command
         .output()
         .unwrap_or_else(|error| panic!("starting {command:?}: {error}"));

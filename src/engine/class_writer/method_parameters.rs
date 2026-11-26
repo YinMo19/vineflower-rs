@@ -11,6 +11,7 @@ use super::annotations::append_parameter_annotations;
 use super::type_annotations::TypeAnnotations;
 use crate::code::code_constants::{ACC_ABSTRACT, ACC_FINAL, ACC_NATIVE, ACC_STATIC, ACC_VARARGS};
 use crate::decompiler::expr_processor::get_cast_type_name;
+use crate::decompiler::exps::expr_util::visible_parameters;
 use crate::decompiler::vars::{var_version_pair::VarVersionPair, versions::FinalType};
 use crate::engine::{Cx, class_wrapper::MethodSlot};
 use crate::structs::{StructClass, StructMember, StructMethod, attr::TypeAnnotationData};
@@ -36,10 +37,7 @@ pub(super) fn append(
     let method = header.method;
     let params = &header.descriptor.params;
     let mask = header.slot.get(cx).synthetic_parameters.clone();
-    let visible = |index: usize| {
-        mask.as_ref()
-            .is_none_or(|mask| mask.get(index).is_none_or(Option::is_none))
-    };
+    let visible = visible_parameters(mask.as_deref());
     let last_visible = (0..params.len()).rev().find(|&index| visible(index));
     buffer.append_char('(');
     if last_visible.is_some() {

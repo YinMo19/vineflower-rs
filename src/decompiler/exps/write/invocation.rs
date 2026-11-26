@@ -17,7 +17,9 @@ use crate::code::code_constants::{
 };
 use crate::decompiler::exps::{
     Expr, ExprKind, FunctionType, Invocation, InvocationFunction, InvocationType, WriteFlags,
-    expr_util::synthetic_parameters_mask, generic_inference::Inference, literal,
+    expr_util::{synthetic_parameters_mask, visible_parameters},
+    generic_inference::Inference,
+    literal,
 };
 use crate::decompiler::ir::ExprId;
 use crate::engine::Cx;
@@ -546,11 +548,8 @@ pub(crate) fn append_param_list(cx: &mut Cx, expr: ExprId, indent: i32) -> io::R
     if resolved_signature_missing(cx, expr) {
         infer_for_argument_types(cx, expr)?;
     }
-    let visible = |i: usize| {
-        mask.as_ref()
-            .is_none_or(|mask| mask.get(i).is_none_or(Option::is_none))
-    };
-    update_argument_types(cx, expr, &mut types, start, visible)?;
+    let visible = visible_parameters(mask.as_deref());
+    update_argument_types(cx, expr, &mut types, start, &visible)?;
 
     let mut buffer = TextBuffer::new(cx);
     if arity != 0 {
