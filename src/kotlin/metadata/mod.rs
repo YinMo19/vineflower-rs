@@ -136,6 +136,49 @@ pub fn parse_annotation(
     class: &StructClass,
     annotation: &AnnotationData,
 ) -> Result<Option<Metadata>, ParseError> {
+    let mut warnings = Vec::new();
+    let Some(decoded) = read_annotation(class, annotation, |warning| warnings.push(warning))?
+    else {
+        return Ok(None);
+    };
+    let payload = match decoded.payload {
+        DecodedPayload::Complete(payload) => payload,
+        DecodedPayload::MultifilePart { package, facade } => {
+            let (facade, was_missing) = facade?;
+            if was_missing {
+                warnings.push(Warning::MissingFacade);
+            }
+            Payload::MultifilePart { package, facade }
+        }
+    };
+    Ok(Some(Metadata {
+        header: decoded.header,
+        payload,
+        names: decoded.names,
+        warnings,
+    }))
+}
+
+pub(crate) struct Decoded {
+    header: Header,
+    pub names: Option<NameResolver>,
+    pub payload: DecodedPayload,
+}
+
+pub(crate) enum DecodedPayload {
+    Complete(Payload),
+    MultifilePart {
+        package: Box<proto::Package>,
+        // KotlinChooser binds the package's members before it examines xs.
+        facade: Result<(JavaString, bool), ParseError>,
+    },
+}
+
+pub(crate) fn read_annotation(
+    class: &StructClass,
+    annotation: &AnnotationData,
+    mut warn: impl FnMut(Warning),
+) -> Result<Option<Decoded>, ParseError> {
     let field = |name: &str| {
         let index = annotation
             .par_names
@@ -159,26 +202,28 @@ pub fn parse_annotation(
             .as_ref()
             .is_some_and(|parent| parent.get_string() == FUNCTION_REFERENCE)
         {
-            return Ok(Some(Metadata {
+            warn(Warning::MissingDataAssumingFunctionReference);
+            return Ok(Some(Decoded {
                 header,
-                payload: Payload::FunctionReference,
+                payload: DecodedPayload::Complete(Payload::FunctionReference),
                 names: None,
-                warnings: vec![Warning::MissingDataAssumingFunctionReference],
             }));
         }
         return Err(ParseError::MissingData);
     };
 
+    let strings = field("d2");
+    if strings.is_none() {
+        warn(Warning::MissingStrings);
+    }
     let data = string_array(data).ok_or(ParseError::AnnotationType("d1"))?;
     let bytes = decode_bytes(&data);
     let mut input = bytes.as_slice();
-    let mut warnings = Vec::new();
-    let names = if let Some(strings) = field("d2") {
+    let names = if let Some(strings) = strings {
         let strings = string_array(strings).ok_or(ParseError::AnnotationType("d2"))?;
         let table = read_string_table(&mut input)?;
         Some(NameResolver::new(table, strings))
     } else {
-        warnings.push(Warning::MissingStrings);
         None
     };
 
@@ -192,22 +237,28 @@ pub fn parse_annotation(
             let facade = match field("xs") {
                 Some(value) => string(value)
                     .cloned()
-                    .ok_or(ParseError::AnnotationType("xs"))?,
+                    .map(|facade| (facade, false))
+                    .ok_or(ParseError::AnnotationType("xs")),
                 None => {
-                    warnings.push(Warning::MissingFacade);
                     let parts = java_str::split(&class.qualified_name, "__");
-                    (*parts.first().ok_or(ParseError::MissingFacade)?).into()
+                    parts
+                        .first()
+                        .map(|part| ((*part).into(), true))
+                        .ok_or(ParseError::MissingFacade)
                 }
             };
-            Payload::MultifilePart { package, facade }
+            return Ok(Some(Decoded {
+                header,
+                names,
+                payload: DecodedPayload::MultifilePart { package, facade },
+            }));
         }
         _ => return Ok(None),
     };
-    Ok(Some(Metadata {
+    Ok(Some(Decoded {
         header,
-        payload,
         names,
-        warnings,
+        payload: DecodedPayload::Complete(payload),
     }))
 }
 

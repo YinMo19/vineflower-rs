@@ -4,6 +4,7 @@
 
 pub mod declarations;
 pub mod imports;
+pub mod members;
 pub mod metadata;
 pub mod passes;
 pub mod types;

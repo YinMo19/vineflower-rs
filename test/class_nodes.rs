@@ -14,6 +14,8 @@ mod method_writer;
 mod compilation_unit;
 #[path = "support/identifier_rename.rs"]
 mod identifier_rename;
+#[path = "support/kotlin_members.rs"]
+mod kotlin_members;
 #[path = "support/kotlin_metadata.rs"]
 mod kotlin_metadata;
 #[path = "support/kotlin_types.rs"]

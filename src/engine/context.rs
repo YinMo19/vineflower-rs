@@ -34,6 +34,8 @@ pub struct Cx {
     pub ir: Ir,
     /// ClassesProcessor.mapRootClasses in this root-class worker.
     pub class_nodes: ClassNodes,
+    /// Kotlin attributes shared across this decompilation session.
+    pub(crate) kotlin_members: Option<Box<crate::kotlin::members::KotlinMembers>>,
     /// ClassNode currently used for import shadowing.
     pub current_class_node: Option<arcstr::ArcStr>,
     /// Lambda call sites can share their declaring class and even their
@@ -67,6 +69,7 @@ impl Cx {
             expression_ids: struct_context.metadata_ids().clone(),
             struct_context,
             class_nodes: ClassNodes::default(),
+            kotlin_members: None,
             current_class_node: None,
             current_node_id: None,
             imports: ImportCollector::default(),
@@ -100,6 +103,10 @@ impl Cx {
 
     pub(crate) fn classes(&self) -> ClassResolver<'_> {
         self.struct_context.resolving_with(&self.expression_ids)
+    }
+
+    pub fn kotlin_members(&self) -> Option<&crate::kotlin::members::KotlinMembers> {
+        self.kotlin_members.as_deref()
     }
 
     pub(crate) fn current_node(&self) -> Option<super::class_nodes::ClassNodeId> {

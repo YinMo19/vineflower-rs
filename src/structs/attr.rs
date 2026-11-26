@@ -766,13 +766,22 @@ impl AnnotationData {
         }
 
         let class_name = VarType::from_signature(&class_name).value.unwrap();
-        Ok(AnnotationData {
+        Ok(Self::from_elements(class_name, par_names, par_values, ids))
+    }
+
+    pub(crate) fn from_elements(
+        class_name: ArcStr,
+        par_names: Vec<ArcStr>,
+        par_values: Vec<AnnotationElement>,
+        ids: &ExpressionIds,
+    ) -> Self {
+        Self {
             id: ids.next(),
             did_write_already: Arc::default(),
             class_name,
             par_names,
             par_values,
-        })
+        }
     }
 }
 
