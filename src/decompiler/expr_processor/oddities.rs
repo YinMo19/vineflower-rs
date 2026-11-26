@@ -10,12 +10,12 @@ use arcstr::ArcStr;
 
 use super::get_cast_type_name;
 use crate::decompiler::assertions::assertion_field;
-use crate::decompiler::exps::{ConstantValue, Expr, ExprKind, FunctionType};
+use crate::decompiler::exps::{Expr, ExprKind, FunctionType};
 use crate::decompiler::ir::{ExprId, StatId};
 use crate::decompiler::stats::StatementKind;
 use crate::engine::Cx;
 use crate::structs::StructClass;
-use crate::types::{CodeType, VarType};
+use crate::types::VarType;
 
 const VARIABLE_TYPE_WARNING: &str = "$VF: Could not properly define all variable types!";
 
@@ -135,7 +135,7 @@ fn cast_operand_string(cx: &mut Cx, expr: ExprId) -> io::Result<String> {
     // ConstExprents. ConstExprent.toString renders the type before wrapping it,
     // which can resolve classes even with import writes locked.
     let ExprKind::Constant {
-        value: ConstantValue::Null,
+        value,
         var_type,
         was_condy,
         ..
@@ -146,16 +146,12 @@ fn cast_operand_string(cx: &mut Cx, expr: ExprId) -> io::Result<String> {
             "Cast target is not a type constant",
         ));
     };
-    let ty = var_type.clone();
-    let prefix = if *was_condy {
-        "/* $VF: constant dynamic */ "
-    } else {
-        ""
-    };
-    let name = if ty.ty == CodeType::Null {
-        "null".to_owned()
-    } else {
-        get_cast_type_name(cx, &ty)
-    };
-    Ok(format!("const({prefix}{name})"))
+    let (ty, value, was_condy) = (var_type.clone(), value.clone(), *was_condy);
+    let offsets = cx.ir[expr].bytecode.clone();
+    let rendered =
+        crate::decompiler::exps::literal::render(cx, &ty, &value, offsets.as_ref(), was_condy)?;
+    Ok(format!(
+        "const({})",
+        rendered.convert_to_string_and_allow_data_discard()
+    ))
 }

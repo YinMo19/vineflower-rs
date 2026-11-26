@@ -23,6 +23,7 @@ pub struct Cx {
     pub options: Arc<Options>,
     /// `DecompilerContext.getStructContext()`.
     pub struct_context: Arc<StructContext>,
+    pub(crate) current_method_wrapper: Option<super::class_wrapper::MethodSlot>,
     pub(crate) current_method: Option<(Arc<StructMethod>, VarProcessorId)>,
     pub(crate) expression_ids: ExpressionIds,
     /// `DecompilerContext.getPoolInterceptor()`.
@@ -43,6 +44,7 @@ impl Cx {
         Self {
             options: Arc::clone(struct_context.options()),
             pool_interceptor: struct_context.pool_interceptor().cloned(),
+            current_method_wrapper: None,
             current_method: None,
             expression_ids: struct_context.metadata_ids().clone(),
             struct_context,

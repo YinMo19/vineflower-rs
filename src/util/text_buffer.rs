@@ -177,6 +177,60 @@ impl TextBuffer {
         self
     }
 
+    /// Append the Java type spelling with class tokens at their UTF-16 positions.
+    pub fn append_cast_type_name(&mut self, cx: &mut Cx, ty: &crate::types::VarType) -> &mut Self {
+        use crate::{decompiler::expr_processor::get_cast_type_name, types::CodeType};
+        let name = get_cast_type_name(cx, ty);
+        if ty.ty != CodeType::Object {
+            return self.append(&name);
+        }
+        let (component, brackets) = name.split_at(name.len() - 2 * ty.array_dim as usize);
+        let start = self.length();
+        self.append_all_classes(component, ty.name());
+        self.add_generic_type_tokens(cx, start, component, ty);
+        self.append(brackets)
+    }
+
+    fn add_generic_type_tokens(
+        &mut self,
+        cx: &mut Cx,
+        start: i32,
+        text: &str,
+        ty: &crate::types::VarType,
+    ) {
+        use crate::{
+            decompiler::expr_processor::get_cast_type_name,
+            types::{CodeType, GenericType, generic_main::get_generic_cast_type_name},
+        };
+        let mut offset = start + text.find('<').map_or(0, |i| utf16_len(&text[..=i]));
+        for argument in ty.arguments() {
+            let Some(arg) = argument else {
+                offset += 3; // '?', then the argument separator.
+                continue;
+            };
+            offset += match arg.wildcard() {
+                GenericType::WILDCARD_EXTENDS => 10,
+                GenericType::WILDCARD_SUPER => 8,
+                _ => 0,
+            };
+            let name = if arg.is_generic() {
+                get_generic_cast_type_name(cx, arg)
+            } else {
+                get_cast_type_name(cx, arg)
+            };
+            if arg.ty == CodeType::Object {
+                let name = if arg.is_generic() {
+                    name.as_str()
+                } else {
+                    &name[..name.len() - 2 * arg.array_dim as usize]
+                };
+                self.add_all_class_tokens(offset, name, arg.name());
+            }
+            self.add_generic_type_tokens(cx, offset, &name, arg);
+            offset += utf16_len(&name) + 2;
+        }
+    }
+
     pub fn append_all_classes(&mut self, text: &str, qualified_name: &str) -> &mut Self {
         self.add_all_class_tokens(self.length(), text, qualified_name);
         self.append(text)
@@ -773,6 +827,11 @@ impl TextBuffer {
         self.count(self.options.line_separator(), from)
     }
 
+    /// Number of occurrences of a single Java char.
+    pub fn count_chars(&self, unit: u16) -> usize {
+        self.text.iter().filter(|&&c| c == unit).count()
+    }
+
     /// The occurrences of `substring` from `from` on; one at the very start
     /// of the text ends the count, as upstream's `> 0` does.
     pub fn count(&self, substring: &str, from: i32) -> i32 {
@@ -874,5 +933,10 @@ fn split_count(text: &[u16], separator: &[u16]) -> usize {
         return 1;
     }
     parts.push(text.len() - start);
-    parts.len() - parts.iter().rev().take_while(|&&length| length == 0).count()
+    parts.len()
+        - parts
+            .iter()
+            .rev()
+            .take_while(|&&length| length == 0)
+            .count()
 }

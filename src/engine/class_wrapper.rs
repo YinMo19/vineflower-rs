@@ -222,6 +222,13 @@ pub(crate) enum WrapperMethod {
 }
 
 impl Cx {
+    /// Class writing selects a published wrapper. Method analysis has only its
+    /// StructMethod and VarProcessor until publication is complete.
+    pub(crate) fn writing_method(&self) -> Option<&MethodWrapper> {
+        let slot = self.current_method_wrapper?;
+        self.class_nodes[slot.node].wrapper.as_ref()?.methods.get(slot.index)
+    }
+
     pub(crate) fn wrapper_method(
         &self,
         owner: &str,

@@ -5,6 +5,7 @@
 pub mod data_input;
 pub mod fast_sparse_set;
 pub mod interpreter_util;
+pub(crate) mod java_decimal;
 pub mod java_str;
 pub mod jhash;
 pub mod list_stack;

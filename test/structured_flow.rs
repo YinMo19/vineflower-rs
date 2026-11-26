@@ -25,6 +25,8 @@ use vineflower_rs::engine::{Cx, Options};
 use vineflower_rs::structs::{StructClass, StructContext, consts::ConstantValue};
 use vineflower_rs::util::data_input::DataInputFullStream;
 
+#[path = "support/decimal_literals.rs"]
+mod decimal_literals;
 #[path = "support/direct_graph_snapshot.rs"]
 mod direct_graph_snapshot;
 #[path = "support/expression_snapshot.rs"]

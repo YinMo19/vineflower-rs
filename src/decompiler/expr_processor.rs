@@ -33,15 +33,7 @@ pub(crate) fn cast_type_name(cx: &mut Cx, ty: &VarType, short: bool) -> String {
         CodeType::Object if ty.is_generic() => ty.get_cast_name(cx),
         CodeType::Object => {
             let name = ty.name();
-            let mut dotted = name.replace('/', ".");
-            if name.contains('$')
-                && !cx
-                    .classes()
-                    .get_class(name)
-                    .is_some_and(|class| class.own)
-            {
-                dotted = dotted.replace('$', ".");
-            }
+            let dotted = import_collector::java_class_name(cx,name);
             if short {
                 import_collector::get_short_name(cx, &dotted)
             } else {

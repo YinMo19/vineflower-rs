@@ -237,6 +237,16 @@ fn inherited_names(
     names
 }
 
+/// ExprProcessor.buildJavaClassName preserves the binary name of an own class.
+pub fn java_class_name(cx: &Cx, internal: &str) -> String {
+    let name = internal.replace('/', ".");
+    if internal.contains('$') && !cx.classes().get_class(internal).is_some_and(|class| class.own) {
+        name.replace('$', ".")
+    } else {
+        name
+    }
+}
+
 pub fn short_name(cx: &mut Cx, full_name: &str, imported: bool) -> Option<String> {
     let current = cx.current_class_node.as_deref().map(|name| {
         cx.class_nodes

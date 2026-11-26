@@ -8,6 +8,7 @@ mod bytecode;
 mod function;
 pub(crate) mod generic_inference;
 mod increments;
+pub mod literal;
 mod operations;
 mod traversal;
 

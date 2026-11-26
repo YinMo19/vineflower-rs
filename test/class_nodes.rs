@@ -2,6 +2,8 @@
 
 use std::{env, fmt::Display, fs, io::Write, path::Path, process::Command, sync::Arc};
 
+#[path = "support/literals.rs"]
+mod literals;
 #[path = "support/generic_chains.rs"]
 mod generic_chains;
 #[path = "support/nested_classes.rs"]

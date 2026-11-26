@@ -53,6 +53,20 @@ pub enum ConstantValue {
     String(JavaString),
 }
 
+impl ConstantValue {
+    /// The boxed constant's Java toString, preserving a String's UTF-16 units.
+    pub fn java_string(&self) -> Option<JavaString> {
+        Some(match self {
+            Self::Null => return None,
+            Self::Integer(n) => n.to_string().into(),
+            Self::Long(n) => n.to_string().into(),
+            Self::Float(n) => crate::util::java_decimal::float(*n).into(),
+            Self::Double(n) => crate::util::java_decimal::double(*n).into(),
+            Self::String(s) => s.clone(),
+        })
+    }
+}
+
 /// `Object.equals` of the boxed values: floating-point numbers compare by
 /// their bits, with all NaNs equal.
 impl PartialEq for ConstantValue {
