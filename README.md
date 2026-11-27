@@ -1,34 +1,20 @@
 # vineflower-rs
 
-[Usage and Development Guide](GUIDE.md)
+YinMo19, Codex
+---
 
-## 许可证与版权声明
+> Disclaimer: This repository was developed by AI AGENT.
+>
+> The README you are reading now was handwritten by me; but the rest is not. You can refer to the more detailed [AI-generated documentation](GUIDE.md) for develop.
 
-本项目以 Apache License 2.0 发布（`SPDX-License-Identifier: Apache-2.0`）。以下为 Rust 移植、测试及开发工具所沿用的版权声明，年份对应各自的上游来源。[许可证全文](LICENSE.md) · [Vineflower 1.12.0 基准版本](https://github.com/Vineflower/vineflower/tree/b8273988af850e8cfb234ca08d129058502b032f)
+This is a Rust implementation of a `.jar -> .java` decompiler, rewritten in Rust based on [Vineflower](https://github.com/Vineflower/vineflower). I hope that using Rust will enable more efficient computation throughout the entire process.
 
-**Vineflower 反编译器与测试**
+Although we have not conducted extensive testing, we can currently say that this project has almost fully replicated Vineflower, with functionality that is nearly complete. 
 
-```text
-Copyright 2000-2017 JetBrains s.r.o. and the Vineflower contributors.
-Copyright 2000-2018 JetBrains s.r.o. and the Vineflower contributors.
-Copyright 2000-2020 JetBrains s.r.o. and the Vineflower contributors.
-Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors.
-Copyright 2000-2024 JetBrains s.r.o. and the Vineflower contributors.
-Copyright 2000-2025 JetBrains s.r.o. and the Vineflower contributors.
-Copyright 2000-2025 Vineflower contributors.
-```
+In terms of performance, on my M4 Pro, the Rust CLI was about 4.5× as fast as Vineflower on Guava, 5.5× on Gson, and 2× on the Minecraft 26.3 client. Both tools produced identical files on all three inputs.
 
-**ForgeFlower 输入源实现**（单文件、目录和归档）[源码目录](src/structs/)
+Pull requests are welcome. Feel free to use AI tools, but please write the PR description yourself and explain what you changed and why. Code quality matters most to me. I’ll review PRs when I have time.
 
-```text
-Copyright 2000-2022 JetBrains s.r.o. and the ForgeFlower contributors.
-```
-
-**Kotlin 元数据**（位编码、标志位和根据 Kotlin schema 生成的绑定与校验代码）[源码目录](src/kotlin/metadata/) · [Schema 来源](tools/kotlin-schema/README.md)
-
-```text
-Copyright 2000-2018 JetBrains s.r.o. and Kotlin Programming Language contributors.
-Copyright 2010-2015 JetBrains s.r.o. and Kotlin Programming Language contributors.
-```
-
-上游测试样本随附原始署名与 [Apache License 2.0](test/upstream/LICENSE.md)。随仓库分发的 JDK 镜像读取库 `jimage-rs` 采用 MIT 许可证（`SPDX-License-Identifier: MIT`），Copyright (c) 2026 Igor Rudenko。[MIT 许可证全文](vendor/jimage-rs/LICENSE)
+Licenses and Dependencies
+---
+See [ABOUT.md](ABOUT.md) for details. We rewrote it based on the original Vineflower and retained the Apache 2.0 license.
