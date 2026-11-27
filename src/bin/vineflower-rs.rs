@@ -43,7 +43,7 @@ fn run(arguments: Vec<OsString>) -> io::Result<()> {
         return Ok(());
     }
     if args.iter().any(|arg| arg == "--list-plugins") {
-        println!("Built-in plugins: IDEA @NotNull, variable renaming (jad, tiny)");
+        print_plugins();
         return Ok(());
     }
     let Some(command) = parse(args)? else {
@@ -122,7 +122,8 @@ fn parse(args: Vec<OsString>) -> io::Result<Option<Command>> {
     let mut user_save_type = None;
     let mut reading_options = true;
     let mut last_path = None;
-    for arg in args {
+    let mut thread_count = None;
+    for arg in &args {
         let text = arg.to_str();
         if let Some(save_type) = match text {
             Some("--file") => Some(SaveType::File),
@@ -142,8 +143,13 @@ fn parse(args: Vec<OsString>) -> io::Result<Option<Command>> {
             && let Some(arg) = text
             && arg.starts_with('-')
             && arg.encode_utf16().count() > 5
-            && parse_option(arg, &mut options)
+            && let Some((name, value)) = parse_option(arg)
         {
+            if matches!(name, "thread-count" | "thr") {
+                thread_count = Some(value);
+            } else {
+                options.set(name, value);
+            }
             continue;
         }
 
@@ -178,6 +184,15 @@ fn parse(args: Vec<OsString>) -> io::Result<Option<Command>> {
         println!("error: no sources given");
         return Ok(None);
     }
+    if let Some(value) = thread_count {
+        // ContextUnit reads the final setting with Integer.parseInt.
+        options.thread_count = value.parse().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid thread-count '{value}'"),
+            )
+        })?;
+    }
     let output = match last_path {
         None => Output::Stdout,
         Some(path) => match user_save_type {
@@ -205,7 +220,7 @@ fn parse(args: Vec<OsString>) -> io::Result<Option<Command>> {
     }))
 }
 
-fn parse_option(arg: &str, options: &mut Options) -> bool {
+fn parse_option(arg: &str) -> Option<(&str, &str)> {
     const CUSTOM: &[&str] = &[
         "-e=",
         "--add-external=",
@@ -215,7 +230,7 @@ fn parse_option(arg: &str, options: &mut Options) -> bool {
         "--silent",
     ];
     if CUSTOM.iter().any(|prefix| arg.starts_with(prefix)) {
-        return false;
+        return None;
     }
 
     let (name, value) = if let Some(long) = arg.strip_prefix("--") {
@@ -223,13 +238,7 @@ fn parse_option(arg: &str, options: &mut Options) -> bool {
             .or_else(|| long.strip_prefix("no-").map(|name| (name, "0")))
             .unwrap_or((long, "1"))
     } else {
-        let Some(name) = arg.get(1..4) else {
-            return true;
-        };
-        let Some(value) = arg.get(5..) else {
-            return true;
-        };
-        (name, value)
+        (arg.get(1..4).unwrap_or(""), arg.get(5..).unwrap_or(""))
     };
     let value = if value.eq_ignore_ascii_case("true") {
         "1"
@@ -238,8 +247,7 @@ fn parse_option(arg: &str, options: &mut Options) -> bool {
     } else {
         value
     };
-    options.set(name, value);
-    true
+    Some((name, value))
 }
 
 fn add_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
@@ -258,9 +266,29 @@ fn archive_name(path: &Path) -> bool {
     name.contains(".zip") || name.contains(".jar")
 }
 
+const BANNER: &str = "=== Vineflower Decompiler 1.12.0 (native Rust) ===";
+
+fn print_plugins() {
+    let plugins = [
+        (
+            "VariableRenaming",
+            "Allows automatic renaming of variables with a common naming scheme.",
+        ),
+        ("Kotlin", "Detects and decompiles Kotlin class files."),
+        (
+            "IdeaNotNull",
+            "Decompiles code inserted by Intellij IDEA's @NotNull annotation.",
+        ),
+    ];
+    println!("{BANNER}\n\nLoaded {} plugins:", plugins.len());
+    for (name, description) in plugins {
+        println!("{name} (loaded from native binary)\n - {description}\n");
+    }
+}
+
 fn print_help() {
     println!(
-        "=== Vineflower Decompiler 1.12.0 (native Rust) ===\n\n\
+        "{BANNER}\n\n\
         Usage: vineflower-rs [options] <source>... [destination]\n\n\
         Supply class files, directories or archives as sources. Omit the destination for stdout.\n\
         --folder           Unpack classes and resources into a directory\n\
@@ -268,6 +296,8 @@ fn print_help() {
         --legacy-saving    Keep input archives under their original names\n\
         --add-external=PATH[,PATH]  Add libraries for lookups\n\
         --only=PREFIX[,PREFIX]      Select classes by internal-name prefix\n\
+        --thread-count=N, -thr=N    Worker threads (default: all available processors)\n\
+        --list-plugins     Display loaded plugin information\n\
         -cfg PATH          Read one command-line argument per line\n\
         -s, --silent       Suppress informational logs"
     );

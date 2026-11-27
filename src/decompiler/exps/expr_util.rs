@@ -63,7 +63,7 @@ pub(crate) fn synthetic_parameters_mask(
     Ok(None)
 }
 
-fn is_static_member(class: &StructClass) -> bool {
+pub(crate) fn is_static_member(class: &StructClass) -> bool {
     class.has_modifier(ACC_STATIC)
         || class
             .attributes

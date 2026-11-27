@@ -3,6 +3,7 @@
 
 //! Decompile the own classes in a registered group and write Java source.
 
+mod class_groups;
 mod manifest;
 mod memory;
 mod prepare;
@@ -154,10 +155,13 @@ impl Decompiler {
         let mut cx = Cx::new(Arc::clone(&context));
         cx.class_nodes = nodes;
         cx.javadoc = self.javadoc;
+        // Driver callers receive source and mappings. Tokens are consumed only by the dump.
+        cx.collect_text_tokens = options.dump_text_tokens;
 
         let mut result = Vec::new();
         let mut reclaim = ReclaimSchedule::default();
         let definitions = OnceCell::new();
+        let single_unit = context.get_units().iter().filter(|unit| unit.own).count() == 1;
         for unit in context.get_units().iter().filter(|unit| unit.own) {
             let layout = unit.source.output_layout();
             let mut sink = output
@@ -166,27 +170,31 @@ impl Decompiler {
                 .transpose()?;
 
             let mut classes = unit_classes(&mut cx, unit, &layout);
-            let root_session = cx.take_class_session();
-            prepare::unit(
-                &mut cx,
-                &mut classes,
-                &mut reclaim,
-                &root_session,
-                &definitions,
-            )?;
-            let mut classes = classes.into_iter();
-            while let Some(pending) = classes.next() {
-                reclaim.retired_bytes += pending.prepared_bytes;
-                if let Some(class) = render(&mut cx, pending)? {
-                    if let Some(sink) = &mut sink {
-                        sink.class(&class, options.dump_code_lines)?;
-                    } else {
-                        result.push(class);
-                    }
+            let mut emit = |class: DecompiledClass| {
+                if let Some(sink) = &mut sink {
+                    sink.class(&class, options.dump_code_lines)
+                } else {
+                    result.push(class);
+                    Ok(())
                 }
-                reclaim.after_root(&mut cx, classes.as_slice(), &root_session);
+            };
+            if let Some(plan) = class_groups::plan(&cx, &classes, single_unit)? {
+                for (_, class) in class_groups::run(&cx, classes, plan)? {
+                    emit(class)?;
+                }
+            } else {
+                let root_session = cx.take_class_session();
+                prepare::unit(
+                    &mut cx,
+                    &mut classes,
+                    &mut reclaim,
+                    &root_session,
+                    &definitions,
+                )?;
+                render_unit(&mut cx, classes, &mut reclaim, root_session, |_, class| {
+                    emit(class)
+                })?;
             }
-            cx.restore_class_session(root_session);
             if let Some(sink) = sink {
                 sink.finish()?;
             }
@@ -275,6 +283,27 @@ fn unit_classes(cx: &mut Cx, unit: &ContextUnit, layout: &OutputLayout) -> Vec<P
             })
         })
         .collect()
+}
+
+fn render_unit(
+    cx: &mut Cx,
+    classes: Vec<PendingClass>,
+    reclaim: &mut ReclaimSchedule,
+    parent: ClassSession,
+    mut emit: impl FnMut(usize, DecompiledClass) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut index = 0;
+    let mut classes = classes.into_iter();
+    while let Some(pending) = classes.next() {
+        reclaim.retired_bytes += pending.prepared_bytes;
+        if let Some(class) = render(cx, pending)? {
+            emit(index, class)?;
+        }
+        reclaim.after_root(cx, classes.as_slice(), &parent);
+        index += 1;
+    }
+    cx.restore_class_session(parent);
+    Ok(())
 }
 
 fn render(cx: &mut Cx, pending: PendingClass) -> io::Result<Option<DecompiledClass>> {

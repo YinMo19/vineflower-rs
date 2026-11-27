@@ -15,8 +15,8 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use bit_set::BitSet;
-use indexmap::IndexMap;
-use rustc_hash::FxHashMap;
+use indexmap::{IndexMap, IndexSet};
+use rustc_hash::{FxBuildHasher, FxHashMap};
 
 use super::java_str::utf16_len;
 use super::token::{TextToken, TextTokenVisitor, TokenKind};
@@ -28,32 +28,40 @@ use crate::types::{FieldDescriptor, MethodDescriptor};
 pub struct TextBuffer {
     options: Arc<Options>,
     text: Vec<u16>,
+    collect_tokens: bool,
     root_group: NewlineGroup,
     /// The child indices leading from the root group to the current one.
     current_group: Vec<usize>,
     has_reformatted: bool,
     /// Bytecode offset to offset in the text, in insertion order.
-    bytecode_offset_mapping: IndexMap<BytecodeMappingKey, i32>,
+    bytecode_offset_mapping: IndexMap<BytecodeMappingKey, i32, FxBuildHasher>,
+    /// Most expression buffers contain only offsets for their enclosing method.
+    /// Intern named owners once when those buffers join a method or a class.
+    mapping_owners: Option<Box<IndexSet<MappingOwner, FxBuildHasher>>>,
     /// New line number to original line numbers.
     line_mapping: Option<FxHashMap<i32, BTreeSet<i32>>>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct BytecodeMappingKey {
     bytecode_offset: i32,
-    /// `None` signifies the current class.
-    class: Option<String>,
-    method: Option<String>,
+    /// Zero is the unassigned owner. Named owners are one-based.
+    owner: usize,
 }
 
 impl BytecodeMappingKey {
     fn unassigned(bytecode_offset: i32) -> Self {
         Self {
             bytecode_offset,
-            class: None,
-            method: None,
+            owner: 0,
         }
     }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct MappingOwner {
+    class: Option<String>,
+    method: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -133,10 +141,12 @@ impl TextBuffer {
         Self {
             options: Arc::clone(&cx.options),
             text: Vec::with_capacity(size),
+            collect_tokens: cx.collect_text_tokens,
             root_group: NewlineGroup::default(),
             current_group: Vec::new(),
             has_reformatted: false,
-            bytecode_offset_mapping: IndexMap::new(),
+            bytecode_offset_mapping: IndexMap::default(),
+            mapping_owners: None,
             line_mapping: None,
         }
     }
@@ -314,6 +324,9 @@ impl TextBuffer {
         text: &str,
         qualified_name: &str,
     ) -> &mut Self {
+        if !self.collect_tokens {
+            return self;
+        }
         let mut text = text.find('<').map_or(text, |generics| &text[..generics]);
 
         let mut pos = 0;
@@ -333,14 +346,16 @@ impl TextBuffer {
     }
 
     pub fn add_class_token(&mut self, index: i32, length: i32, name: &str) -> &mut Self {
-        self.add_token(TextToken::new(
-            index,
-            length,
-            false,
-            TokenKind::Class {
-                qualified_name: name.to_owned(),
-            },
-        ));
+        if self.collect_tokens {
+            self.current_group_mut().tokens.push(TextToken::new(
+                index,
+                length,
+                false,
+                TokenKind::Class {
+                    qualified_name: name.to_owned(),
+                },
+            ));
+        }
         self
     }
 
@@ -350,15 +365,9 @@ impl TextBuffer {
         declaration: bool,
         qualified_name: &str,
     ) -> &mut Self {
-        self.add_token(TextToken::new(
-            self.length(),
-            utf16_len(value),
-            declaration,
-            TokenKind::Class {
-                qualified_name: qualified_name.to_owned(),
-            },
-        ));
-        self.append(value)
+        self.append_token(value, declaration, || TokenKind::Class {
+            qualified_name: qualified_name.to_owned(),
+        })
     }
 
     /// `appendField(value, declaration, className, name, String descriptor)`.
@@ -388,17 +397,11 @@ impl TextBuffer {
         name: &str,
         descriptor: FieldDescriptor,
     ) -> &mut Self {
-        self.add_token(TextToken::new(
-            self.length(),
-            utf16_len(value),
-            declaration,
-            TokenKind::Field {
-                class_name: class_name.to_owned(),
-                name: name.to_owned(),
-                descriptor,
-            },
-        ));
-        self.append(value)
+        self.append_token(value, declaration, || TokenKind::Field {
+            class_name: class_name.to_owned(),
+            name: name.to_owned(),
+            descriptor,
+        })
     }
 
     /// `appendMethod(value, declaration, className, name, String descriptor)`.
@@ -428,17 +431,11 @@ impl TextBuffer {
         name: &str,
         descriptor: MethodDescriptor,
     ) -> &mut Self {
-        self.add_token(TextToken::new(
-            self.length(),
-            utf16_len(value),
-            declaration,
-            TokenKind::Method {
-                class_name: class_name.to_owned(),
-                name: name.to_owned(),
-                descriptor,
-            },
-        ));
-        self.append(value)
+        self.append_token(value, declaration, || TokenKind::Method {
+            class_name: class_name.to_owned(),
+            name: name.to_owned(),
+            descriptor,
+        })
     }
 
     /// `appendVariable` with the method descriptor already parsed.
@@ -454,24 +451,27 @@ impl TextBuffer {
         index: i32,
         name: &str,
     ) -> &mut Self {
-        self.add_token(TextToken::new(
-            self.length(),
-            utf16_len(value),
-            declaration,
-            TokenKind::Variable {
-                parameter,
-                class_name: class_name.to_owned(),
-                method_name: method_name.to_owned(),
-                method_descriptor,
-                index,
-                name: name.to_owned(),
-            },
-        ));
-        self.append(value)
+        self.append_token(value, declaration, || TokenKind::Variable {
+            parameter,
+            class_name: class_name.to_owned(),
+            method_name: method_name.to_owned(),
+            method_descriptor,
+            index,
+            name: name.to_owned(),
+        })
     }
 
-    pub(super) fn add_token(&mut self, token: TextToken) {
-        self.current_group_mut().tokens.push(token);
+    fn append_token(
+        &mut self,
+        value: &str,
+        declaration: bool,
+        kind: impl FnOnce() -> TokenKind,
+    ) -> &mut Self {
+        if self.collect_tokens {
+            let token = TextToken::new(self.length(), utf16_len(value), declaration, kind());
+            self.current_group_mut().tokens.push(token);
+        }
+        self.append(value)
     }
 
     fn current_group_mut(&mut self) -> &mut NewlineGroup {
@@ -586,8 +586,10 @@ impl TextBuffer {
     }
 
     pub fn clear_unassigned_bytecode_mapping_data(&mut self) {
-        self.bytecode_offset_mapping
-            .retain(|key, _| key.class.is_some());
+        let owners = &self.mapping_owners;
+        self.bytecode_offset_mapping.retain(|key, _| {
+            key.owner != 0 && owners.as_ref().unwrap()[key.owner - 1].class.is_some()
+        });
     }
 
     /// One tracer per class and method key, holding the line of every
@@ -601,17 +603,10 @@ impl TextBuffer {
             index = index_of(&self.text, &separator, index + 1);
         }
 
-        let mut tracers: IndexMap<(String, Option<String>), BytecodeMappingTracer> =
-            IndexMap::new();
+        let mut tracers: IndexMap<usize, BytecodeMappingTracer, FxBuildHasher> =
+            IndexMap::default();
         for (key, text_offset) in &self.bytecode_offset_mapping {
-            let Some(class) = &key.class else {
-                panic!(
-                    "getTracers called when not all bytecode offsets have a valid class and method"
-                );
-            };
-            let tracer = tracers
-                .entry((class.clone(), key.method.clone()))
-                .or_default();
+            let tracer = tracers.entry(key.owner).or_default();
             let line = newline_offsets
                 .binary_search(text_offset)
                 .unwrap_or_else(|insertion_point| insertion_point);
@@ -619,6 +614,16 @@ impl TextBuffer {
             tracer.add_mapping(key.bytecode_offset);
         }
         tracers
+            .into_iter()
+            .map(|(owner, tracer)| {
+                let Some(MappingOwner { class: Some(class), method }) = owner
+                    .checked_sub(1)
+                    .and_then(|index| self.mapping_owners.as_ref()?.get_index(index)) else {
+                    panic!("getTracers called when not all bytecode offsets have a valid class and method");
+                };
+                ((class.clone(), method.clone()), tracer)
+            })
+            .collect()
     }
 
     /// Recursive reformatting of groups.
@@ -850,19 +855,39 @@ impl TextBuffer {
         }
 
         let length = self.length();
-        for (key, value) in &buffer.bytecode_offset_mapping {
-            let key = if key.class.is_none() {
-                BytecodeMappingKey {
-                    bytecode_offset: key.bytecode_offset,
+        if !buffer.bytecode_offset_mapping.is_empty() {
+            let unassigned = if class_name.is_some() || method_key.is_some() {
+                self.intern_owner(MappingOwner {
                     class: class_name.map(str::to_owned),
                     method: method_key.map(str::to_owned),
-                }
+                })
             } else {
-                key.clone()
+                0
             };
-            self.bytecode_offset_mapping
-                .entry(key)
-                .or_insert(value + length);
+            let mut named = Vec::new();
+            if let Some(owners) = &buffer.mapping_owners {
+                named.reserve(owners.len());
+                for owner in owners.iter() {
+                    named.push(if owner.class.is_some() {
+                        self.intern_owner(owner.clone())
+                    } else {
+                        unassigned
+                    });
+                }
+            }
+            for (key, value) in &buffer.bytecode_offset_mapping {
+                let owner = if key.owner == 0 {
+                    unassigned
+                } else {
+                    named[key.owner - 1]
+                };
+                self.bytecode_offset_mapping
+                    .entry(BytecodeMappingKey {
+                        bytecode_offset: key.bytecode_offset,
+                        owner,
+                    })
+                    .or_insert(value + length);
+            }
         }
 
         let mut other_root = buffer.root_group.clone();
@@ -874,6 +899,14 @@ impl TextBuffer {
 
         self.text.extend_from_slice(&buffer.text);
         self
+    }
+
+    fn intern_owner(&mut self, owner: MappingOwner) -> usize {
+        self.mapping_owners
+            .get_or_insert_with(Default::default)
+            .insert_full(owner)
+            .0
+            + 1
     }
 
     /// `append(TextBuffer)`.

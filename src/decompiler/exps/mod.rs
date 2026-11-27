@@ -280,6 +280,8 @@ impl Variable {
         if let Some(lvt) = &self.lvt {
             match lvt.get_signature() {
                 Some(signature) => {
+                    // Parsing a malformed local signature logs at the original method position.
+                    cx.class_nodes.require_class_session();
                     if let Some(descriptor) = generic_main::parse_field_signature(signature) {
                         return descriptor.ty;
                     }

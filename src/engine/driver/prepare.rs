@@ -3,9 +3,11 @@
 //! ContextUnit preparation. Workers own the initial method graphs until the
 //! coordinator reaches the corresponding root in publication order.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, mpsc};
-use std::thread;
 use std::{cell::OnceCell, io};
+
+use rayon::ThreadPoolBuilder;
 
 use super::{ClassSession, Cx, PendingClass, ReclaimSchedule};
 use crate::decompiler::ir::Ir;
@@ -73,46 +75,56 @@ pub(super) fn unit(
     }
     let count = count.min(roots.len());
     if count <= 1 {
-        for i in 0..roots.len() {
-            publish(cx, &mut roots[i], PreparedRoot::default())?;
-            reclaim.after_root(cx, &roots[..=i], parent);
-        }
-        return Ok(());
+        return ordered(cx, roots, reclaim, parent);
     }
 
-    thread::scope(|scope| {
-        // One configured thread publishes wrappers and finishes methods. Each
-        // other thread may prepare one root ahead, bounding unpublished IR.
-        let mut workers = Vec::with_capacity(count - 1);
-        for (i, root) in roots.iter().take(count - 1).enumerate() {
-            let context = Arc::clone(&cx.struct_context);
-            let (jobs, inputs) = mpsc::channel::<RootWork>();
-            let (results, ready) = mpsc::sync_channel(0);
-            thread::Builder::new()
-                .name(format!("Vineflower-DecompilerThread-{i}"))
-                .spawn_scoped(scope, move || {
-                    for work in inputs {
-                        if results.send(work.prepare(&context)).is_err() {
-                            break;
-                        }
-                    }
-                })?;
-            jobs.send(RootWork::snapshot(cx, root, definitions))
-                .unwrap();
-            workers.push((jobs, ready));
-        }
+    let workers = count - 1;
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(workers)
+        .thread_name(|i| format!("Vineflower-DecompilerThread-{i}"))
+        .build()
+        .map_err(io::Error::other)?;
+    let context = Arc::clone(&cx.struct_context);
+    let context = &context;
+    pool.in_place_scope_fifo(|scope| {
+        // A second job per worker absorbs uneven root sizes without retaining
+        // prepared graphs for the whole unit. Only the caller waits on results.
+        let window = (2 * workers).min(roots.len());
+        let mut pending = VecDeque::with_capacity(window);
+        let mut next = 0;
         for i in 0..roots.len() {
-            let (jobs, ready) = &workers[i % workers.len()];
-            let prepared = ready.recv().expect("root preparation worker stopped");
-            if let Some(next) = roots.get(i + workers.len()) {
-                jobs.send(RootWork::snapshot(cx, next, definitions))
-                    .unwrap();
+            while pending.len() < window && next < roots.len() {
+                let work = RootWork::snapshot(cx, &roots[next], definitions);
+                let (result, ready) = mpsc::channel();
+                scope.spawn_fifo(move |_| {
+                    let _ = result.send(work.prepare(context));
+                });
+                pending.push_back(ready);
+                next += 1;
             }
+            let prepared = pending
+                .pop_front()
+                .unwrap()
+                .recv()
+                .map_err(io::Error::other)?;
             publish(cx, &mut roots[i], prepared)?;
             reclaim.after_root(cx, &roots[..=i], parent);
         }
         Ok(())
     })
+}
+
+pub(super) fn ordered(
+    cx: &mut Cx,
+    roots: &mut [PendingClass],
+    reclaim: &mut ReclaimSchedule,
+    parent: &ClassSession,
+) -> io::Result<()> {
+    for i in 0..roots.len() {
+        publish(cx, &mut roots[i], PreparedRoot::default())?;
+        reclaim.after_root(cx, &roots[..=i], parent);
+    }
+    Ok(())
 }
 
 fn publish(cx: &mut Cx, root: &mut PendingClass, prepared: PreparedRoot) -> io::Result<()> {

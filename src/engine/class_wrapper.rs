@@ -179,7 +179,7 @@ fn process_method(
     let (variables, expression_ids) = cx
         .prepared_methods
         .as_mut()
-        .and_then(|prepared| prepared.start_method(method, &cx.class_nodes))
+        .and_then(|prepared| prepared.start_method(method, &cx.class_nodes, &cx.struct_context))
         .unwrap_or_else(|| {
             (
                 cx.ir.variable_processors.push(Default::default()),

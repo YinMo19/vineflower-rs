@@ -78,6 +78,86 @@ fn memory_group_writes_roots_and_maps_lines_using_a_read_only_library() {
     assert!(classes[1].source.contains("Hello from inner class 2"));
 }
 
+#[test]
+fn library_workers_keep_java_root_order_and_mixed_language_output() {
+    let java: &[(&str, &[u8])] = &[
+        (
+            "pkg/TestSimpleWhile",
+            include_bytes!("smoke/java8/TestSimpleWhile.class"),
+        ),
+        (
+            "pkg/TestSingleMethodInInnerClass",
+            include_bytes!("smoke/java8/TestSingleMethodInInnerClass.class"),
+        ),
+        (
+            "pkg/TestSingleMethodInInnerClass$Inner",
+            include_bytes!("smoke/java8/TestSingleMethodInInnerClass$Inner.class"),
+        ),
+    ];
+    let mixed: &[(&str, &[u8])] = &[
+        (
+            "pkg/TestParams",
+            include_bytes!("smoke/kt/TestParams.class"),
+        ),
+        java[0],
+    ];
+    let decompile = |entries: &[(&str, &[u8])], workers: Option<i32>| {
+        let mut options = Options::default();
+        if let Some(count) = workers {
+            options.thread_count = count;
+        }
+        options.include_runtime = "0".into();
+        options.decompile_kotlin = true;
+        options.bytecode_source_mapping = true;
+        let mut driver = Decompiler::new(options).unwrap();
+        driver
+            .add_source_context(Arc::new(MemorySource::new(
+                "ordered roots",
+                entries
+                    .iter()
+                    .map(|&(name, bytes)| (name.to_owned(), bytes.to_vec())),
+            )))
+            .unwrap();
+        driver
+            .decompile()
+            .unwrap()
+            .into_iter()
+            .map(|class| (class.entry_name, class.source, class.mapping))
+            .collect::<Vec<_>>()
+    };
+    for (entries, names) in [
+        (
+            java,
+            [
+                "pkg/TestSimpleWhile.java",
+                "pkg/TestSingleMethodInInnerClass.java",
+            ],
+        ),
+        (mixed, ["pkg/TestParams.kt", "pkg/TestSimpleWhile.java"]),
+    ] {
+        let expected = decompile(entries, Some(1));
+        assert_eq!(
+            expected
+                .iter()
+                .map(|class| class.0.as_str())
+                .collect::<Vec<_>>(),
+            names
+        );
+        assert!(
+            expected
+                .iter()
+                .any(|class| class.2.as_ref().is_some_and(|mapping| !mapping.is_empty()))
+        );
+        for workers in [Some(2), Some(0), None] {
+            assert_eq!(
+                decompile(entries, workers),
+                expected,
+                "{names:?}, thread-count={workers:?}"
+            );
+        }
+    }
+}
+
 struct LazyLibrary {
     before_read: fn(&str),
 }
@@ -308,6 +388,15 @@ public final class Consumer {
         );
     };
     compile(root, &classes);
+    // Keep another independent root so the Owner/Consumer component can run
+    // alongside it even when their cross-root wrapper access connects them.
+    let other_source = root.join("Other.java");
+    fs::write(
+        &other_source,
+        "public class Other { int value() { return 41; } }",
+    )
+    .unwrap();
+    compile_java17(&[&other_source], &classes);
     let expected_execution = run_main(&classes, "Consumer");
     assert_eq!(expected_execution, b"42\n13\n17\n23\n");
 
@@ -323,8 +412,14 @@ public final class Consumer {
     for (name, entries) in [
         ("owner", owner.to_vec()),
         ("consumer", consumer.to_vec()),
-        ("owner-first", [owner.as_slice(), &consumer].concat()),
-        ("consumer-first", [consumer.as_slice(), &owner].concat()),
+        (
+            "owner-first",
+            [owner.as_slice(), &["Other.class"], &consumer].concat(),
+        ),
+        (
+            "consumer-first",
+            [consumer.as_slice(), &["Other.class"], &owner].concat(),
+        ),
     ] {
         let mut jar =
             zip::ZipWriter::new(fs::File::create(root.join(format!("{name}.jar"))).unwrap());
@@ -355,31 +450,33 @@ public final class Consumer {
             .args(inputs.clone())
             .arg(&expected));
         let expected = directory(&expected);
-        for count in [1, 2] {
-            let actual = root.join(format!("{layout}-native-{count}"));
+        for (name, count) in [
+            ("one", Some(1)),
+            ("two", Some(2)),
+            ("auto", Some(0)),
+            ("default", None),
+        ] {
+            let actual = root.join(format!("{layout}-native-{name}"));
             fs::create_dir(&actual).unwrap();
             run(Command::new(env!("CARGO_BIN_EXE_vineflower-rs"))
-                .arg(format!("--thread-count={count}"))
+                .args(count.map(|count| format!("--thread-count={count}")))
                 .args(options)
                 .args(inputs.clone())
                 .arg(&actual));
-            assert_eq!(
-                directory(&actual),
-                expected,
-                "{layout}, thread-count={count}"
-            );
+            assert_eq!(directory(&actual), expected, "{layout}, {name}");
+            if count.is_none() {
+                let source = fs::read_to_string(actual.join("Consumer.java")).unwrap();
+                assert_eq!(source.contains("switch (mode)"), enum_switch, "{layout}");
+                assert!(source.contains("owner.new Member(11)"), "{layout}");
+                let rebuilt = root.join(format!("{layout}-rebuilt"));
+                compile(&actual, &rebuilt);
+                assert_eq!(
+                    run_main(&rebuilt, "Consumer"),
+                    expected_execution,
+                    "{layout}"
+                );
+            }
         }
-        let actual = root.join(format!("{layout}-native-2"));
-        let source = fs::read_to_string(actual.join("Consumer.java")).unwrap();
-        assert_eq!(source.contains("switch (mode)"), enum_switch, "{layout}");
-        assert!(source.contains("owner.new Member(11)"), "{layout}");
-        let rebuilt = root.join(format!("{layout}-rebuilt"));
-        compile(&actual, &rebuilt);
-        assert_eq!(
-            run_main(&rebuilt, "Consumer"),
-            expected_execution,
-            "{layout}"
-        );
     }
 }
 
@@ -536,6 +633,17 @@ public class Main {
     }
     jar.finish().unwrap();
 
+    // The common CLI invocation uses just an input and a destination.
+    let mut java_cli = Command::new(jdk_tool("java"));
+    java_cli.arg("-jar").arg(upstream_jar());
+    let java_default = root.join("java-default");
+    let native_default = root.join("native-default");
+    run(java_cli.arg(&input).arg(&java_default));
+    run(Command::new(env!("CARGO_BIN_EXE_vineflower-rs"))
+        .arg(&input)
+        .arg(&native_default));
+    assert_eq!(directory(&native_default), directory(&java_default));
+
     let options = [
         "--include-runtime=1",
         "--legacy-saving",
@@ -579,7 +687,7 @@ public class Main {
         assert_eq!(entries.file_names().collect::<Vec<_>>(), sources, "{name}");
         let actual = archive(&output);
         assert_eq!(actual, expected, "{name}");
-        if name == "two" {
+        if name == "default" {
             for name in sources {
                 fs::write(rebuilt_sources.join(name), &actual[name].1).unwrap();
             }

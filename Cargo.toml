@@ -55,6 +55,7 @@ num-bigint = "0.4"
 num-integer = "0.1"
 prost = "0.14"
 rawzip = "0.5.3"
+rayon = "1.12"
 rustc-hash = "2"
 smallvec = { version = "1", features = ["union"] }
 tempfile = "3"

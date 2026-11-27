@@ -158,6 +158,10 @@ impl StructMethod {
             .transpose()
     }
 
+    pub(crate) fn stored_code_len(&self) -> usize {
+        self.code_and_exceptions.as_ref().map_or(0, Vec::len)
+    }
+
     pub fn contains_code(&self) -> bool {
         self.code_and_exceptions.is_some()
     }

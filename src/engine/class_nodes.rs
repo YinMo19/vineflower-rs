@@ -44,6 +44,18 @@ pub struct ClassNodes {
 }
 
 impl ClassNodes {
+    /// Copy the tree returned by `load_classes` before publishing any method
+    /// graphs or lambda nodes. IDs, aliases and nested-class order stay valid.
+    /// Parsed classes are shared; each session owns its mutable node table.
+    pub(super) fn initial_copy(&self) -> Self {
+        assert!(self.preparing.is_none() && self.wrapper_orders.is_empty());
+        Self {
+            arena: self.arena.iter().map(ClassNode::initial_copy).collect(),
+            names: self.names.clone(),
+            ..Self::default()
+        }
+    }
+
     pub(super) fn ir_root_scan_bytes(&self) -> u64 {
         self.arena.len() as u64 * size_of::<ClassNode>() as u64
     }
@@ -176,6 +188,34 @@ pub struct LambdaInformation {
 }
 
 impl ClassNode {
+    fn initial_copy(&self) -> Self {
+        assert!(
+            self.wrapper.is_none()
+                && self.super_invocation.is_none()
+                && self.lambda.is_none()
+                && self.kind != ClassKind::Lambda
+                && self.fields_to_vars.is_empty()
+                && self.hidden_members.is_empty(),
+            "class groups require the initial class tree"
+        );
+        Self {
+            class: Arc::clone(&self.class),
+            kind: self.kind,
+            access: self.access,
+            simple_name: self.simple_name.clone(),
+            enclosing_method: self.enclosing_method.clone(),
+            enclosing_classes: self.enclosing_classes.clone(),
+            parent: self.parent,
+            nested: self.nested.clone(),
+            anonymous_type: self.anonymous_type.clone(),
+            lambda: None,
+            wrapper: None,
+            fields_to_vars: Default::default(),
+            super_invocation: None,
+            hidden_members: Default::default(),
+        }
+    }
+
     pub fn root(class: Arc<StructClass>) -> Self {
         let simple_name = class.qualified_name.rsplit('/').next().unwrap().into();
         let enclosing_method = class.attributes.enclosing_method.as_ref().and_then(|attr| {

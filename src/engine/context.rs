@@ -7,7 +7,7 @@
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
-use super::class_nodes::ClassNodes;
+use super::class_nodes::{ClassNodes, NeedsClassSession};
 use super::counter_container::{CounterContainer, ExpressionIds};
 use super::import_collector::ImportCollector;
 use super::options::Options;
@@ -50,6 +50,7 @@ pub struct Cx {
     /// `DecompilerContext.getImportCollector()`.
     pub imports: ImportCollector,
     pub source_mapper: super::bytecode_source_mapper::BytecodeSourceMapper,
+    pub(crate) collect_text_tokens: bool,
 }
 
 // Imports and counters are per class while the wrapper arena is shared.
@@ -82,6 +83,7 @@ impl Cx {
             current_node_id: None,
             imports: ImportCollector::default(),
             source_mapper: Default::default(),
+            collect_text_tokens: true,
             ir: Ir::default(),
             prepared_methods: None,
             kotlin_body: None,
@@ -135,8 +137,12 @@ impl Cx {
     }
 
     pub(crate) fn classes(&self) -> ClassResolver<'_> {
-        self.class_nodes.require_class_session();
-        self.struct_context.resolving_with(&self.expression_ids)
+        if let Some(observations) = self.class_nodes.classpath_observations() {
+            self.struct_context
+                .observing(observations, NeedsClassSession::defer)
+        } else {
+            self.struct_context.resolving_with(&self.expression_ids)
+        }
     }
 
     pub(crate) fn method_properties<'a>(

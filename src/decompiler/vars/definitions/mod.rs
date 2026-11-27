@@ -22,12 +22,34 @@ pub(crate) fn define(
     owner: VarProcessorId,
     descriptor: &MethodDescriptor,
 ) -> io::Result<()> {
+    place(cx, counters, root, owner, descriptor)?;
+    name(cx, counters, root, owner, descriptor)
+}
+
+pub(crate) fn place(
+    cx: &mut Cx,
+    counters: &mut CounterContainer,
+    root: StatId,
+    owner: VarProcessorId,
+    descriptor: &MethodDescriptor,
+) -> io::Result<()> {
     let cx = &mut *cx.enter_method(counters);
     let method = Arc::clone(root.method(&cx.ir));
     let implicit = placement::initialize(cx, root, owner, descriptor);
     merge::merge(cx, root, &method, owner)?;
     placement::place(cx, counters, root, owner, implicit);
-    merge::merge(cx, root, &method, owner)?;
+    merge::merge(cx, root, &method, owner)
+}
+
+pub(crate) fn name(
+    cx: &mut Cx,
+    counters: &CounterContainer,
+    root: StatId,
+    owner: VarProcessorId,
+    descriptor: &MethodDescriptor,
+) -> io::Result<()> {
+    let cx = &mut *cx.enter_method(counters);
+    let method = Arc::clone(root.method(&cx.ir));
     locals::propagate(cx, root, owner, &method, descriptor)?;
     finality::set_non_final(&mut cx.ir, root);
     let clashes = clashes::remap_clashing_names(cx, root, &method, owner)?;

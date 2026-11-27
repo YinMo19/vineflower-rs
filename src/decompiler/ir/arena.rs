@@ -14,7 +14,11 @@ const SLOTS: usize = u64::BITS as usize;
 /// another arena in the same session. Within a page, the set bits identify
 /// the slots packed into its value vector, in order.
 pub struct Arena<I, T> {
+    // The coordinator indexes all pages from zero. Workers index their current
+    // run here and move older, non-adjacent runs into the sparse table.
     pages: Vec<Page<T>>,
+    first_page: usize,
+    reserved_end: usize,
     page_numbers: Option<Arc<AtomicUsize>>,
     worker_pages: Option<FxHashMap<usize, Page<T>>>,
     next: u64,
@@ -31,6 +35,8 @@ impl<I, T> Default for Arena<I, T> {
     fn default() -> Self {
         Self {
             pages: Vec::new(),
+            first_page: 0,
+            reserved_end: 0,
             page_numbers: None,
             worker_pages: None,
             next: 0,
@@ -58,19 +64,42 @@ impl<I: Idx, T> Arena<I, T> {
 
     #[cold]
     fn start_page(&mut self) {
-        let number = self.page_numbers.as_ref().map_or_else(
-            || self.pages.len(),
-            |numbers| numbers.fetch_add(1, Ordering::Relaxed),
-        );
+        let number = if let Some(older) = &mut self.worker_pages {
+            let following = self.first_page + self.pages.len();
+            if following < self.reserved_end {
+                following
+            } else {
+                // Reserve 1, 2, 4, then 8 pages. A one-page arena leaves no
+                // unused page numbers and a larger one leaves at most seven.
+                let count = (1 + self.allocations as usize / SLOTS)
+                    .next_power_of_two()
+                    .min(8);
+                let first = self
+                    .page_numbers
+                    .as_ref()
+                    .unwrap()
+                    .fetch_add(count, Ordering::Relaxed);
+                self.reserved_end = first + count;
+                if first != following {
+                    older.extend((self.first_page..).zip(self.pages.drain(..)));
+                    self.first_page = first;
+                }
+                first
+            }
+        } else {
+            self.page_numbers.as_ref().map_or_else(
+                || self.pages.len(),
+                |numbers| numbers.fetch_add(1, Ordering::Relaxed),
+            )
+        };
         let first_slot = number
             .checked_mul(SLOTS)
             .expect("IR handle space exhausted");
         I::from_usize(first_slot);
-        if let Some(pages) = &mut self.worker_pages {
-            pages.insert(number, Page::empty());
-        } else {
-            self.pages.resize_with(number + 1, Page::empty);
+        if self.worker_pages.is_none() {
+            self.pages.resize_with(number, Page::empty);
         }
+        self.pages.push(Page::empty());
         self.next = first_slot as u64;
     }
 
@@ -109,6 +138,9 @@ impl<I: Idx, T> Arena<I, T> {
         for (number, page) in worker_pages {
             self.pages[number] = page;
         }
+        for (number, page) in (worker.first_page..).zip(worker.pages) {
+            self.pages[number] = page;
+        }
         self.allocations += worker.allocations;
     }
 
@@ -134,13 +166,13 @@ impl<I: Idx, T> Arena<I, T> {
     #[inline(always)]
     fn page(&self, number: usize) -> &Page<T> {
         self.pages
-            .get(number)
+            .get(number.wrapping_sub(self.first_page))
             .unwrap_or_else(|| self.sparse_page(number))
     }
 
     #[inline(always)]
     fn page_mut(&mut self, number: usize) -> &mut Page<T> {
-        if let Some(page) = self.pages.get_mut(number) {
+        if let Some(page) = self.pages.get_mut(number.wrapping_sub(self.first_page)) {
             return page;
         }
         Self::sparse_page_mut(&mut self.worker_pages, number)

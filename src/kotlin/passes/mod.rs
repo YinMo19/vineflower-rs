@@ -17,7 +17,7 @@ use crate::decompiler::{
 use crate::engine::method_timeout::checkpoint;
 use crate::engine::{
     Cx,
-    method_processor::{ExpressionMethod, initial_stack_method_for_language},
+    method_processor::{ExpressionMethod, defined_method_for_language},
 };
 use crate::structs::{StructClass, StructMethod};
 
@@ -28,16 +28,20 @@ pub fn defined_method(
     class: &StructClass,
     method: &Arc<StructMethod>,
 ) -> io::Result<Option<ExpressionMethod>> {
-    let Some(mut result) = initial_stack_method_for_language(cx, class, method, true)? else {
-        return Ok(None);
-    };
+    defined_method_for_language(cx, class, method, true)
+}
+
+pub(crate) fn prepare_for_definitions(
+    cx: &mut Cx,
+    class: &StructClass,
+    result: &mut ExpressionMethod,
+) -> io::Result<()> {
     let cx = &mut *cx.enter_method(&result.flow.counters);
     let root = result.root;
-    result.finish_initial_increments(cx, class)?;
     increments::inline_in_conditions(cx, root);
     result.build_assertions(cx, class)?;
 
-    main_loop(cx, class, &mut result)?;
+    main_loop(cx, class, result)?;
 
     simplify_stack_vars(
         cx,
@@ -50,9 +54,8 @@ pub fn defined_method(
     );
     post_process::adjust_returns(&mut cx.ir, root, &result.descriptor.ret);
     post_process::remove_redundant_returns(&mut cx.ir, root);
-    identify_secondary(cx, &mut result)?;
-    result.set_var_definitions(cx)?;
-    Ok(Some(result))
+    identify_secondary(cx, result)?;
+    Ok(())
 }
 
 fn main_loop(cx: &mut Cx, class: &StructClass, method: &mut ExpressionMethod) -> io::Result<()> {

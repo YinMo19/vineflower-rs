@@ -10,7 +10,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use arcstr::ArcStr;
 use rustc_hash::FxHashMap;
@@ -29,12 +29,54 @@ use crate::util::java_str;
 
 type LoadedClass = Arc<OnceLock<Option<Arc<StructClass>>>>;
 
-/// The same class path can serve several method workers. The worker that
-/// first resolves a library class supplies the IDs for its annotations.
+/// The ordered caller supplies IDs for the annotations of newly loaded classes.
+/// A root worker can only use classes or misses already in the cache.
 #[derive(Clone, Copy)]
 pub(crate) struct ClassResolver<'a> {
     context: &'a StructContext,
-    ids: &'a ExpressionIds,
+    lookup: ClassLookup<'a>,
+}
+
+#[derive(Clone, Copy)]
+enum ClassLookup<'a> {
+    Load(&'a ExpressionIds),
+    Observe(&'a Mutex<ClasspathObservations>, fn() -> !),
+}
+
+#[derive(Default)]
+pub(crate) struct ClasspathObservations(FxHashMap<ArcStr, LoadedClass>);
+
+impl ClasspathObservations {
+    fn observe(&mut self, context: &StructContext, name: &str) -> Option<Option<Arc<StructClass>>> {
+        if let Some(entry) = self.0.get(name) {
+            return entry.get().cloned();
+        }
+        let classes = context.classes.read().unwrap();
+        let entry = classes.get(name)?;
+        let class = entry.get()?;
+        if class
+            .as_ref()
+            .is_some_and(|class| class.qualified_name != name)
+        {
+            // Resolving this name would move the entry to its canonical key.
+            return None;
+        }
+        self.0.insert(name.into(), Arc::clone(entry));
+        Some(class.clone())
+    }
+
+    pub(crate) fn valid_for(&self, context: &StructContext) -> bool {
+        if self.0.is_empty() {
+            return true;
+        }
+        let classes = context.classes.read().unwrap();
+        self.0.iter().all(|(name, observed)| {
+            // Moving a wrong-name class can overwrite a cached class or miss.
+            classes
+                .get(name)
+                .is_some_and(|entry| Arc::ptr_eq(entry, observed))
+        })
+    }
 }
 
 pub struct StructContext {
@@ -82,7 +124,21 @@ impl StructContext {
     }
 
     pub(crate) fn resolving_with<'a>(&'a self, ids: &'a ExpressionIds) -> ClassResolver<'a> {
-        ClassResolver { context: self, ids }
+        ClassResolver {
+            context: self,
+            lookup: ClassLookup::Load(ids),
+        }
+    }
+
+    pub(crate) fn observing<'a>(
+        &'a self,
+        observations: &'a Mutex<ClasspathObservations>,
+        defer: fn() -> !,
+    ) -> ClassResolver<'a> {
+        ClassResolver {
+            context: self,
+            lookup: ClassLookup::Observe(observations, defer),
+        }
     }
 
     pub(crate) fn resolver(&self) -> ClassResolver<'_> {
@@ -316,6 +372,17 @@ pub(super) fn invalid_source(kind: &str, path: &Path, error: io::Error) -> io::E
 
 impl ClassResolver<'_> {
     pub(crate) fn get_class(&self, name: &str) -> Option<Arc<StructClass>> {
+        match self.lookup {
+            ClassLookup::Load(ids) => self.get_or_load_class(name, ids),
+            ClassLookup::Observe(observations, defer) => {
+                // Release the observation lock before deferring to publication.
+                let resolved = observations.lock().unwrap().observe(self.context, name);
+                resolved.unwrap_or_else(|| defer())
+            }
+        }
+    }
+
+    fn get_or_load_class(&self, name: &str, ids: &ExpressionIds) -> Option<Arc<StructClass>> {
         let classes = &self.context.classes;
         let cached = classes.read().unwrap().get(name).cloned();
         let entry = cached.unwrap_or_else(|| {
@@ -326,7 +393,7 @@ impl ClassResolver<'_> {
                 .or_default()
                 .clone()
         });
-        let class = entry.get_or_init(|| self.load_class(name)).clone()?;
+        let class = entry.get_or_init(|| self.load_class(name, ids)).clone()?;
         if class.qualified_name != name {
             let mut classes = classes.write().unwrap();
             if classes
@@ -342,7 +409,7 @@ impl ClassResolver<'_> {
 
     /// Loads a class from the context unit known to have it, or else from
     /// the first lazy unit that has it.
-    fn load_class(&self, key: &str) -> Option<Arc<StructClass>> {
+    fn load_class(&self, key: &str, ids: &ExpressionIds) -> Option<Arc<StructClass>> {
         let unit_for_class = self
             .context
             .units_by_class_name
@@ -353,20 +420,21 @@ impl ClassResolver<'_> {
         unit_for_class
             .iter()
             .chain(&self.context.lazy_units)
-            .find_map(|unit| self.try_load_class(unit, key))
+            .find_map(|unit| self.try_load_class(unit, key, ids))
     }
 
     fn try_load_class(
         &self,
         unit_for_class: &Arc<ContextUnit>,
         key: &str,
+        ids: &ExpressionIds,
     ) -> Option<Arc<StructClass>> {
         log::info!("Loading Class: {key} from {}", unit_for_class.get_name());
         match unit_for_class.try_load_class_with_ids(
             key,
             &self.context.options,
             self.context.interceptor.clone(),
-            self.ids,
+            ids,
         ) {
             Ok(clazz) => {
                 let clazz = Arc::new(clazz?);

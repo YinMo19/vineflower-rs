@@ -13,6 +13,7 @@ use std::{
 use super::{
     ArcStr, ClassKind, ClassNode, ClassNodes, FxHashMap, LambdaInformation, StructClass, VarType,
 };
+use crate::structs::{StructContext, struct_context::ClasspathObservations};
 
 #[derive(Clone, Copy)]
 pub(crate) struct AllocationClass<'a> {
@@ -89,28 +90,40 @@ impl ClassSnapshot {
 pub(super) struct WorkerClasses {
     published: ClassSnapshot,
     lambdas: Definitions,
-    observed: Mutex<ClassObservations>,
+    allocations: Mutex<ObservedAllocations>,
+    classpath: Mutex<ClasspathObservations>,
 }
 
-#[derive(Default)]
-pub(in crate::engine) struct ClassObservations(FxHashMap<ArcStr, Option<Arc<Definition>>>);
+type ObservedAllocations = FxHashMap<ArcStr, Option<Arc<Definition>>>;
+
+pub(in crate::engine) struct ClassObservations {
+    allocations: ObservedAllocations,
+    classpath: ClasspathObservations,
+}
 
 impl ClassObservations {
     // Methods keep allocation flags and types, never a provisional class-node
     // ID. Two nodes with the same facts give the same answer. A recorded miss
     // matters too: another root may since have published a lambda of that name.
-    pub(in crate::engine) fn valid_for(&self, nodes: &ClassNodes) -> bool {
-        self.0
+    pub(in crate::engine) fn valid_for(&self, nodes: &ClassNodes, context: &StructContext) -> bool {
+        self.allocations
             .iter()
             .all(|(name, observed)| match (observed, nodes.get(name)) {
                 (Some(observed), Some(node)) => observed.matches(node),
                 (None, None) => true,
                 _ => false,
             })
+            && self.classpath.valid_for(context)
     }
 }
 
 pub(in crate::engine) struct NeedsClassSession;
+
+impl NeedsClassSession {
+    pub(in crate::engine) fn defer() -> ! {
+        resume_unwind(Box::new(Self))
+    }
+}
 
 impl ClassNodes {
     pub(in crate::engine) fn for_preparation(
@@ -122,7 +135,8 @@ impl ClassNodes {
             preparing: Some(Box::new(WorkerClasses {
                 published,
                 lambdas: lambdas.definitions(classes),
-                observed: Mutex::default(),
+                allocations: Mutex::default(),
+                classpath: Mutex::default(),
             })),
             ..Self::default()
         }
@@ -136,28 +150,31 @@ impl ClassNodes {
             .lambdas
             .get(name)
             .or_else(|| worker.published.0.get(name));
-        let mut observed = worker.observed.lock().unwrap();
-        if !observed.0.contains_key(name) {
-            observed.0.insert(name.into(), definition.cloned());
+        let mut observed = worker.allocations.lock().unwrap();
+        if !observed.contains_key(name) {
+            observed.insert(name.into(), definition.cloned());
         }
         definition.map(|definition| definition.view())
     }
 
     pub(in crate::engine) fn take_observations(&mut self) -> ClassObservations {
-        mem::take(
-            self.preparing
-                .as_mut()
-                .expect("worker class snapshot")
-                .observed
-                .get_mut()
-                .unwrap(),
-        )
+        let worker = self.preparing.as_mut().expect("worker class snapshot");
+        ClassObservations {
+            allocations: mem::take(worker.allocations.get_mut().unwrap()),
+            classpath: mem::take(worker.classpath.get_mut().unwrap()),
+        }
+    }
+
+    pub(in crate::engine) fn classpath_observations(
+        &self,
+    ) -> Option<&Mutex<ClasspathObservations>> {
+        self.preparing.as_ref().map(|worker| &worker.classpath)
     }
 
     /// Lazy loading, imports and wrapper queries use the ordered class session.
     pub(crate) fn require_class_session(&self) {
         if self.preparing.is_some() {
-            resume_unwind(Box::new(NeedsClassSession));
+            NeedsClassSession::defer();
         }
     }
 }

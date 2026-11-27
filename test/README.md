@@ -273,3 +273,27 @@ The following pairs use the ordinary release binaries from `b007c8f` and `085199
 | 2,831 classes in five JARs | auto (14) | 8.350 / 5.960 | 8.835 / 10.475 | 0.795 / 0.797 | 0.651 / 0.662 |
 
 All 20 runs matched the pinned Java output trees. Full-client automatic elapsed time fell by 25.4%, with the two new runs taking 27.40 and 27.90 seconds. The Java reference at the same worker setting took 14.84 seconds. Both subset layouts also reproduced the previous native archive entry order, sources and all 1,520 native line mappings at two workers.
+
+### Default CLI and Rayon class groups
+
+The full Minecraft 26.3 client was decompiled with the Rust release binary and the pinned Java 1.12.0 CLI. Each invocation took just the input JAR and a fresh output directory. These runs on the 14-core M4 Pro used JDK 25.0.2, default logging redirected to files, and the default settings for source mappings, worker count and JVM heap. Each process started separately. Both CLIs had one filesystem warm-up run before the three measured pairs. The order was Rust/Java, Java/Rust, Rust/Java.
+
+| Implementation | Run 1 | Run 2 | Run 3 | Median |
+| --- | ---: | ---: | ---: | ---: |
+| Rust, default | 7.75 s | 8.06 s | 7.52 s | 7.75 s |
+| Java 1.12.0, default | 15.91 s | 17.09 s | 15.60 s | 15.91 s |
+
+The native CLI automatically placed 7,301 Java roots in 14 Rayon groups. All six timed runs produced the same relative paths and file bytes for 7,301 Java files and 21,495 resources. Separate native runs took 13.43 s with `--thread-count=4` and 37.24 s with `-thr=1`. Both produced the same tree. The driver tests also compare archived line maps and entry order and recompile and execute a cross-root inner constructor and enum switch.
+
+The same two-argument CLI comparison on smaller archives used JDK 25.0.2, one warm-up per implementation, and three interleaved runs each. The medians include process startup. All paths and file bytes matched on each run.
+
+| Input | Java sources | Other files | Rust median | Java median | Speedup |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Gson 2.11.0 | 83 | 4 | 0.161 s | 0.889 s | 5.54× |
+| Guava 33.3.1-jre | 627 | 11 | 0.724 s | 3.266 s | 4.51× |
+
+In a separate instrumented default run, copying 21,495 resources and preparing their directories took 1.55 s, Java group execution took 5.25 s, and writing the final Java files took 0.51 s. Input registration took 0.45 s and group planning took 0.05 s. Across the 14 group workers, method and class preparation consumed 41.49 CPU-seconds and source rendering consumed 15.65 CPU-seconds. The difference between the slowest group and the mean finish time was 0.31 s.
+
+An isolated prototype overlapped resource copying with class processing for a single JAR written to a fresh directory. An A/B/B/A run measured 7.49 and 7.77 s for the current code and 6.29 and 6.41 s for the prototype, a 16.8% reduction in mean elapsed time. All four output trees matched the Java reference. A separate collision test confirmed that generated source overwrote a same-named resource. The default implementation still copies resources first. This preserves the order in which copy errors and class diagnostics appear and matters when a resource overwrites an external library in an existing destination.
+
+A separate three-second macOS `sample` captured 5,844 class-preparation stacks across the 14 workers at a four-millisecond interval. Of those stacks, 72.2% included `simplify_stack_vars`, 38.7% included the SForms data-flow split, and 11.3% included `BTreeMap` subtree cloning. These inclusive samples overlap. A CPU optimization to measure next is reducing deep copies of variable-version maps during data-flow analysis.
