@@ -342,9 +342,10 @@ fn try_parse_method_signature(signature: &str) -> Option<GenericMethodDescriptor
     })
 }
 
-/// The type parameters at the start of a signature, with their bounds, and
-/// the rest of the signature.
-fn parse_formal_parameters(signature: &str) -> Option<(&str, Vec<String>, Vec<Vec<VarType>>)> {
+/// The remaining signature, followed by the formal parameter names and their bounds.
+type ParsedFormalParameters<'a> = (&'a str, Vec<String>, Vec<Vec<VarType>>);
+
+fn parse_formal_parameters(signature: &str) -> Option<ParsedFormalParameters<'_>> {
     let mut parameters = Vec::new();
     let mut bounds = Vec::new();
     if signature.chars().next()? != '<' {

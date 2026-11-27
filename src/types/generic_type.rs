@@ -554,12 +554,11 @@ impl VarType {
                 {
                     return false;
                 }
-            } else if t_wild == G::WILDCARD_NO
+            } else if (t_wild == G::WILDCARD_NO
                 && f_wild != t_wild
-                && from.wildcard() == to.wildcard()
+                && from.wildcard() == to.wildcard())
+                || Some(f.name()) != t.value.as_deref()
             {
-                return false;
-            } else if Some(f.name()) != t.value.as_deref() {
                 return false;
             }
 

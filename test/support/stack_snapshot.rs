@@ -932,6 +932,13 @@ fn split_counters(snapshot: &str) -> (&str, &str) {
     }
 }
 
+#[derive(Clone, Copy)]
+struct GroupCase {
+    index: usize,
+    profile: Profile,
+    check: Check,
+}
+
 struct Fixture {
     path: PathBuf,
     name: String,
@@ -990,10 +997,12 @@ pub(super) fn check(corpus: &Corpus, check: Check) {
                     &mut input,
                     &mut snapshots,
                     &mut methods,
-                    group_index,
+                    GroupCase {
+                        index: group_index,
+                        profile,
+                        check,
+                    },
                     group,
-                    profile,
-                    check,
                     runtime.as_ref(),
                 );
             }
@@ -1216,12 +1225,11 @@ fn write_group(
     input: &mut impl Write,
     snapshots: &mut impl Write,
     methods: &mut Vec<String>,
-    group_index: usize,
+    case: GroupCase,
     group: &[Fixture],
-    profile: Profile,
-    check: Check,
     runtime: Option<&Arc<dyn ContextSource>>,
 ) {
+    let GroupCase { profile, check, .. } = case;
     let mut options = Options::default();
     options.simplify_stack = profile.simplify;
     options.ternary_in_if = profile.ternary;
@@ -1246,16 +1254,7 @@ fn write_group(
         |_, _| None,
     );
     if check.publishes_wrappers() {
-        write_published_group(
-            input,
-            snapshots,
-            methods,
-            group_index,
-            group,
-            profile,
-            &mut cx,
-            check,
-        );
+        write_published_group(input, snapshots, methods, case, group, &mut cx);
         return;
     }
     let mut prepared = HashMap::new();
@@ -1281,17 +1280,7 @@ fn write_group(
             let initial = initial_statement_graph(&mut cx, &class, method)
                 .unwrap()
                 .unwrap();
-            write_method_input(
-                input,
-                methods,
-                group_index,
-                fixture,
-                profile,
-                check,
-                &cx,
-                method,
-                &initial,
-            );
+            write_method_input(input, methods, case, fixture, &cx, method, &initial);
 
             let snapshot = match imports {
                 Ok(imports) => describe(&mut cx, id, &class, method, initial, imports, check),
@@ -1305,14 +1294,17 @@ fn write_group(
 fn write_method_input(
     input: &mut impl Write,
     methods: &mut Vec<String>,
-    group_index: usize,
+    case: GroupCase,
     fixture: &Fixture,
-    profile: Profile,
-    check: Check,
     cx: &Cx,
     method: &StructMethod,
     initial: &InitialMethod,
 ) {
+    let GroupCase {
+        index,
+        profile,
+        check,
+    } = case;
     let options = &cx.options;
     write_int(input, i32::try_from(methods.len()).unwrap()).unwrap();
     write_text(input, fixture.path.to_str().unwrap()).unwrap();
@@ -1326,7 +1318,7 @@ fn write_method_input(
     ] {
         write_flag(input, flag).unwrap();
     }
-    write_count(input, group_index).unwrap();
+    write_count(input, index).unwrap();
     write_flag(input, profile.simplify).unwrap();
     write_flag(input, profile.ternary).unwrap();
     write_flag(input, profile.boolean_as_int).unwrap();
@@ -1352,12 +1344,11 @@ fn write_published_group(
     input: &mut impl Write,
     snapshots: &mut impl Write,
     methods: &mut Vec<String>,
-    group_index: usize,
+    case: GroupCase,
     group: &[Fixture],
-    profile: Profile,
     cx: &mut Cx,
-    check: Check,
 ) {
+    let check = case.check;
     let mut roots = BTreeMap::<ClassNodeId, Vec<&Fixture>>::new();
     let mut order = Vec::new();
     let fixtures: HashMap<_, _> = group
@@ -1381,17 +1372,7 @@ fn write_published_group(
                 return Ok(None);
             };
             let fixture = fixtures[class.qualified_name.as_str()];
-            write_method_input(
-                input,
-                methods,
-                group_index,
-                fixture,
-                profile,
-                check,
-                cx,
-                method,
-                &initial,
-            );
+            write_method_input(input, methods, case, fixture, cx, method, &initial);
             let owner = cx.class_nodes.id(&class.qualified_name).unwrap();
             let operation = Cell::new("structure");
             let processed = catch_unwind(AssertUnwindSafe(|| {
@@ -1469,17 +1450,7 @@ fn write_published_group(
                     let Some(initial) = initial_statement_graph(cx, &class, method).unwrap() else {
                         continue;
                     };
-                    write_method_input(
-                        input,
-                        methods,
-                        group_index,
-                        fixture,
-                        profile,
-                        check,
-                        cx,
-                        method,
-                        &initial,
-                    );
+                    write_method_input(input, methods, case, fixture, cx, method, &initial);
                     writeln!(snapshots, "class-rejected={}", one_line(&error.to_string())).unwrap();
                 }
             }

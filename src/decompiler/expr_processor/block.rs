@@ -421,12 +421,10 @@ impl BlockProcessor<'_> {
                     self.push_kind(field, offsets, None);
                 }
             }
+            OPC_INVOKEDYNAMIC if !instruction.bytecode_version.has_invoke_dynamic() => {}
             OPC_INVOKEVIRTUAL..=OPC_INVOKEDYNAMIC => {
-                if opcode != OPC_INVOKEDYNAMIC || instruction.bytecode_version.has_invoke_dynamic()
-                {
-                    let constant = link(&self.class.pool, operand(instruction, 0)?)?;
-                    self.invoke(opcode, &constant, offsets, false)?;
-                }
+                let constant = link(&self.class.pool, operand(instruction, 0)?)?;
+                self.invoke(opcode, &constant, offsets, false)?;
             }
             OPC_NEW | OPC_ANEWARRAY | OPC_MULTIANEWARRAY => {
                 let dimensions = match opcode {

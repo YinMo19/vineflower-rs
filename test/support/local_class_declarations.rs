@@ -45,20 +45,19 @@ fn local_class_declarations_match_upstream_scopes() {
         let children: BTreeMap<_, _> = cx
             .class_nodes
             .iter()
-            .filter_map(|(name, node)| {
-                (node.kind == ClassKind::Local).then(|| {
-                    let key = node.enclosing_method.as_ref().unwrap();
-                    let owner = &cx.class_nodes[root];
-                    let index = owner.class.methods.index_of_key(key.as_str()).unwrap();
-                    let wrapper = &owner.wrapper.as_ref().unwrap().methods[index];
-                    let slot = wrapper
-                        .body
-                        .as_ref()
-                        .unwrap()
-                        .as_ref()
-                        .map(|body| body.counters.get_counter(VAR_COUNTER));
-                    (name.to_string(), (index, slot))
-                })
+            .filter(|(_, node)| node.kind == ClassKind::Local)
+            .map(|(name, node)| {
+                let key = node.enclosing_method.as_ref().unwrap();
+                let owner = &cx.class_nodes[root];
+                let index = owner.class.methods.index_of_key(key.as_str()).unwrap();
+                let wrapper = &owner.wrapper.as_ref().unwrap().methods[index];
+                let slot = wrapper
+                    .body
+                    .as_ref()
+                    .unwrap()
+                    .as_ref()
+                    .map(|body| body.counters.get_counter(VAR_COUNTER));
+                (name.to_string(), (index, slot))
             })
             .collect();
         assert_eq!(children.len(), 9);

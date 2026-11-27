@@ -53,6 +53,7 @@ pub struct StatEdge {
 
 impl StatEdge {
     /// Allocates an edge. The source registers it using `add_successor`.
+    #[expect(clippy::new_ret_no_self, reason = "edges are allocated in the IR arena")]
     pub fn new(
         ir: &mut Ir,
         edge_type: EdgeType,

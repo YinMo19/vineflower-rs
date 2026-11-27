@@ -1,6 +1,6 @@
 [package]
 name = "vineflower-rs"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "Apache-2.0"
 description = "Native Rust JVM decompiler based on Vineflower"
@@ -42,7 +42,10 @@ path = "test/jhash.rs"
 arcstr = "1.2.0"
 bit-set = "0.11.1"
 bitflags = "2"
-clap = { version = "4.6", features = ["derive"] }
+clap = { version = "4.6", features = ["derive", "string"] }
+# 4.6.1 through 4.6.12 break Bash subcommand completion for hyphenated binary names.
+clap_complete = "=4.6.0"
+clap_lex = "1.1"
 fancy-regex = "0.16"
 flate2 = "1"
 index_vec = "0.1.4"

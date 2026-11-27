@@ -27,11 +27,29 @@ The same CLI detects Kotlin metadata. With a single input and no destination, it
 
 ```sh
 "$vf" --log-level=ERROR test/smoke/kt/TestParams.class
+"$vf" -h
 "$vf" --help
+"$vf" --version
 "$vf" --list-plugins
 ```
 
+Use `-h` for a short option summary, `--help` for the full help from clap, and `--version` to see which build is on your PATH.
+
 The plugin list contains VariableRenaming, Kotlin, and IdeaNotNull. The Kotlin plugin uses metadata to match declarations and types to their JVM members. IdeaNotNull can recognize checks inserted by IntelliJ IDEA for annotated parameters and return values. [CLI](src/bin/vineflower-rs.rs) · [Kotlin implementation](src/kotlin/mod.rs) · [IdeaNotNull pass](src/decompiler/idea_not_null.rs)
+
+## Shell completions
+
+Install `vineflower-rs` on your PATH first. If you built it locally, run `export PATH="$PWD/target/release:$PATH"` from the repository root in Bash or Zsh. The `completions` subcommand writes a script for the selected shell to standard output.
+
+| Shell | Enable completion |
+| --- | --- |
+| Bash | Run `eval "$(vineflower-rs completions bash)"`. Add that line to `~/.bashrc` for future interactive sessions. |
+| Zsh | After `autoload -Uz compinit && compinit`, run `source <(vineflower-rs completions zsh)`. Put the source line after completion initialization in `~/.zshrc`. |
+| Fish | Run `mkdir -p ~/.config/fish/completions`, then `vineflower-rs completions fish > ~/.config/fish/completions/vineflower-rs.fish`. Fish loads the file on demand. If you use a custom XDG configuration directory, use the `completions` directory under `$__fish_config_dir`. |
+| PowerShell | Run `vineflower-rs completions powershell \| Out-String \| Invoke-Expression`. Add that line to your PowerShell profile (`$PROFILE`) to register it at startup. |
+| Elvish | Run `eval (vineflower-rs completions elvish \| slurp)` in an interactive shell. Add that line to your Elvish `rc.elv` for future sessions (usually `~/.config/elvish/rc.elv` on Unix). |
+
+To check, type `vineflower-rs --thread-cou` and press **Tab**. The shell should offer or insert `--thread-count`. In Fish you can also run `complete -C 'vineflower-rs --thread-cou'`. Regenerate saved scripts after upgrading the CLI.
 
 ## Archives, resources, and dependencies
 
@@ -66,12 +84,14 @@ Register dependencies separately from classes you want to decompile. Here the de
 cat "$work/caller/TestLibraryIsOnClasspath.java"
 ```
 
-Put ordinary options such as `--thread-count=4` and `--log-level=ERROR` before `--silent` (`-s`), `--add-external=` (`-e=`), `--only=` (`-only=`), and the first input path. The CLI stops reading ordinary options when it reaches any of those arguments. A configuration file expands in place with `-cfg` and takes one argument per line. Quotes, comment lines, and blank lines are read literally.
+Options can appear before or after input paths. Options with a required value accept a space or an equals sign. For example, `"$vf" input.jar --thread-count 4 --log-level=ERROR out/` writes sources to `out/`. Set a boolean with `--ascii-strings`, `--no-ascii-strings`, or an explicit value such as `--ascii-strings=0`. The positional paths keep their order. The upstream spellings `-thr=4`, `-e=lib/a.jar`, and `-only=pkg/` are also accepted. Use `--` before a filename that starts with a dash, as in `"$vf" -- --input.jar out/`.
+
+A configuration file expands in place with `--config PATH` or the legacy `-cfg PATH`. Put each argument, including each separate option value, on its own line. Paths containing spaces fit on one line without shell quotes.
 
 ```sh
 printf '%s\n' '--thread-count=1' '--log-level=ERROR' '--only=pkg/' \
   "$work/sample.jar" "$work/config-out" > "$work/args.txt"
-"$vf" -cfg "$work/args.txt"
+"$vf" --config "$work/args.txt"
 cmp "$work/sources/pkg/TestRecordSimple.java" "$work/config-out/pkg/TestRecordSimple.java"
 ```
 

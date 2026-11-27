@@ -16,6 +16,9 @@ use vineflower_rs::{
 #[path = "support/upstream_reference.rs"]
 mod upstream_reference;
 
+#[path = "support/cli_interface.rs"]
+mod cli_interface;
+
 #[path = "support/worker_allocations.rs"]
 mod worker_allocations;
 

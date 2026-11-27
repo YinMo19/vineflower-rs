@@ -98,12 +98,10 @@ impl<E, K: Hash + Eq + Clone> VBStyleCollection<E, K> {
         elements: impl IntoIterator<Item = E>,
         keys: impl IntoIterator<Item = Option<K>>,
     ) {
-        let mut index = self.elements.len();
-        for key in keys {
+        for (index, key) in (self.elements.len()..).zip(keys) {
             if let Some(key) = &key {
                 self.map.insert(key.clone(), index);
             }
-            index += 1;
             self.lst_keys.push(key);
         }
         self.elements.extend(elements);

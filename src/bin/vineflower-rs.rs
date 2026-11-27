@@ -1,20 +1,20 @@
 //! Command-line front end for the native Java pipeline.
 
+mod cli;
+
 use std::{
     env,
     ffi::{OsStr, OsString},
     fs, io,
     io::Write,
-    path::{Path, PathBuf},
+    path::Path,
     process::ExitCode,
 };
 
+use clap::FromArgMatches;
+use cli::{Action, Cli};
 use log::{Level, LevelFilter, Log, Metadata, Record};
-use vineflower_rs::engine::{
-    Options,
-    driver::{Decompiler, Output},
-};
-use vineflower_rs::util::java_str;
+use vineflower_rs::engine::driver::{Decompiler, Output};
 
 fn main() -> ExitCode {
     match run(env::args_os().skip(1).collect()) {
@@ -28,36 +28,78 @@ fn main() -> ExitCode {
 }
 
 fn run(arguments: Vec<OsString>) -> io::Result<()> {
-    let Some(args) = expand_config(arguments)? else {
+    let args = cli::arguments(arguments)?;
+    let mut command = cli::command();
+    if args.is_empty() {
+        command.print_help()?;
         return Ok(());
-    };
-    if args.is_empty()
-        || args
-            .iter()
-            .any(|arg| matches!(arg.to_str(), Some("-h" | "--help" | "-help")))
+    }
+    let matches = command
+        .try_get_matches_from_mut(
+            std::iter::once(OsString::from(env!("CARGO_BIN_NAME"))).chain(args),
+        )
+        .unwrap_or_else(|e| e.exit());
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    if let Some(Action::Completions { shell }) = cli.action {
+        return cli::completions(shell, &mut io::stdout().lock());
+    }
+    if cli.list_plugins {
+        print_plugins(&command);
+        return Ok(());
+    }
+    let options = cli::options(&matches, cli.silent).unwrap_or_else(|e| e.exit());
+    configure_log(&options.log_level);
+    let mut paths = cli.paths;
+    let mut destination = paths.pop();
+    let mut sources: Vec<_> = paths
+        .into_iter()
+        .filter(|path| input_exists(path))
+        .collect();
+    if sources.is_empty()
+        && let Some(last) = destination.take()
+        && input_exists(&last)
     {
-        print_help();
-        return Ok(());
+        sources.push(last);
     }
-    if args.iter().any(|arg| arg == "--list-plugins") {
-        print_plugins();
-        return Ok(());
+    if sources.is_empty() {
+        command
+            .error(
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "no sources given",
+            )
+            .exit();
     }
-    let Some(command) = parse(args)? else {
-        return Ok(());
+    let output = match destination {
+        None => Output::Stdout,
+        Some(path) if cli.file => Output::File(path),
+        Some(path) if cli.folder => Output::Folder(path),
+        Some(path) if cli.legacy_saving => Output::Legacy(path),
+        Some(path) if archive_name(&path) => {
+            if let Some(base) = path.parent().filter(|base| !base.as_os_str().is_empty()) {
+                fs::create_dir_all(base)?;
+            }
+            Output::File(path)
+        }
+        Some(path) => {
+            fs::create_dir_all(&path)?;
+            Output::Folder(path)
+        }
     };
-    configure_log(&command.options.log_level);
-    let mut decompiler = Decompiler::new(command.options)?;
-    for library in command.libraries {
+    let mut decompiler = Decompiler::new(options)?;
+    for library in cli
+        .add_external
+        .into_iter()
+        .filter(|path| input_exists(path))
+    {
         decompiler.add_library(library)?;
     }
-    for source in command.sources {
+    for source in sources {
         decompiler.add_source(source)?;
     }
-    for prefix in command.whitelist {
+    for prefix in cli.only {
         decompiler.add_whitelist(prefix);
     }
-    match decompiler.save(command.output) {
+    match decompiler.save(output) {
         Err(error) if error.kind() == io::ErrorKind::Interrupted => {
             println!("Decompilation canceled");
             Ok(())
@@ -66,193 +108,12 @@ fn run(arguments: Vec<OsString>) -> io::Result<()> {
     }
 }
 
-fn expand_config(arguments: Vec<OsString>) -> io::Result<Option<Vec<OsString>>> {
-    let mut result = Vec::new();
-    let mut args = arguments.into_iter();
-    while let Some(arg) = args.next() {
-        let Some(text) = arg.to_str().filter(|text| text.starts_with("-cfg")) else {
-            result.push(arg);
-            continue;
-        };
-        let path = if let Some(path) = text.strip_prefix("-cfg=") {
-            PathBuf::from(path)
-        } else if let Some(path) = args.next() {
-            PathBuf::from(path)
-        } else {
-            println!("Must specify a file when using -cfg argument.");
-            return Ok(None);
-        };
-        if !path.exists() {
-            println!("error: missing config '{}'", path.display());
-            return Ok(None);
-        }
-        let contents = fs::read_to_string(&path).map_err(|error| {
-            println!("error: Failed to read config file '{}'", path.display());
-            error
-        })?;
-        result.extend(contents.lines().map(OsString::from));
-    }
-    Ok(Some(result))
-}
-
-struct Command {
-    options: Options,
-    sources: Vec<PathBuf>,
-    libraries: Vec<PathBuf>,
-    whitelist: Vec<String>,
-    output: Output,
-}
-
-enum SaveType {
-    File,
-    Folder,
-    Legacy,
-}
-
-fn parse(args: Vec<OsString>) -> io::Result<Option<Command>> {
-    let mut options = Options::default();
-    options.idea_notnull = true;
-    options.decompile_kotlin = true;
-    let mut sources = Vec::new();
-    let mut libraries = Vec::new();
-    let mut whitelist = Vec::new();
-    let mut user_save_type = None;
-    let mut reading_options = true;
-    let mut last_path = None;
-    let mut thread_count = None;
-    for arg in &args {
-        let text = arg.to_str();
-        if let Some(save_type) = match text {
-            Some("--file") => Some(SaveType::File),
-            Some("--folder") => Some(SaveType::Folder),
-            Some("--legacy-saving") => Some(SaveType::Legacy),
-            _ => None,
-        } {
-            if user_save_type.replace(save_type).is_some() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "Multiple save types specified",
-                ));
-            }
-            continue;
-        }
-        if reading_options
-            && let Some(arg) = text
-            && arg.starts_with('-')
-            && arg.encode_utf16().count() > 5
-            && let Some((name, value)) = parse_option(arg)
-        {
-            if matches!(name, "thread-count" | "thr") {
-                thread_count = Some(value);
-            } else {
-                options.set(name, value);
-            }
-            continue;
-        }
-
-        reading_options = false;
-        match text {
-            Some("-s" | "--silent") => options.log_level = "error".to_owned(),
-            Some(text) if text.starts_with("-e=") || text.starts_with("--add-external=") => {
-                for path in java_str::split(text.split_once('=').unwrap().1, ",") {
-                    add_path(&mut libraries, PathBuf::from(path));
-                }
-            }
-            Some(text) if text.starts_with("-only=") || text.starts_with("--only=") => {
-                whitelist.extend(
-                    java_str::split(text.split_once('=').unwrap().1, ",")
-                        .into_iter()
-                        .map(str::to_owned),
-                );
-            }
-            _ => {
-                if let Some(previous) = last_path.replace(PathBuf::from(arg)) {
-                    add_path(&mut sources, previous);
-                }
-            }
-        }
-    }
-    if sources.is_empty()
-        && let Some(last) = last_path.take()
-    {
-        add_path(&mut sources, last);
-    }
-    if sources.is_empty() {
-        println!("error: no sources given");
-        return Ok(None);
-    }
-    if let Some(value) = thread_count {
-        // ContextUnit reads the final setting with Integer.parseInt.
-        options.thread_count = value.parse().map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("invalid thread-count '{value}'"),
-            )
-        })?;
-    }
-    let output = match last_path {
-        None => Output::Stdout,
-        Some(path) => match user_save_type {
-            Some(SaveType::File) => Output::File(path),
-            Some(SaveType::Folder) => Output::Folder(path),
-            Some(SaveType::Legacy) => Output::Legacy(path),
-            None if archive_name(&path) => {
-                if let Some(base) = path.parent().filter(|base| !base.as_os_str().is_empty()) {
-                    fs::create_dir_all(base)?;
-                }
-                Output::File(path)
-            }
-            None => {
-                fs::create_dir_all(&path)?;
-                Output::Folder(path)
-            }
-        },
-    };
-    Ok(Some(Command {
-        options,
-        sources,
-        libraries,
-        whitelist,
-        output,
-    }))
-}
-
-fn parse_option(arg: &str) -> Option<(&str, &str)> {
-    const CUSTOM: &[&str] = &[
-        "-e=",
-        "--add-external=",
-        "-only=",
-        "--only=",
-        "-s",
-        "--silent",
-    ];
-    if CUSTOM.iter().any(|prefix| arg.starts_with(prefix)) {
-        return None;
-    }
-
-    let (name, value) = if let Some(long) = arg.strip_prefix("--") {
-        long.split_once('=')
-            .or_else(|| long.strip_prefix("no-").map(|name| (name, "0")))
-            .unwrap_or((long, "1"))
-    } else {
-        (arg.get(1..4).unwrap_or(""), arg.get(5..).unwrap_or(""))
-    };
-    let value = if value.eq_ignore_ascii_case("true") {
-        "1"
-    } else if value.eq_ignore_ascii_case("false") {
-        "0"
-    } else {
-        value
-    };
-    Some((name, value))
-}
-
-fn add_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
-    if path.exists() {
-        paths.push(path);
-    } else {
+fn input_exists(path: &Path) -> bool {
+    let exists = path.exists();
+    if !exists {
         println!("warn: missing '{}', ignored", path.display());
     }
+    exists
 }
 
 fn archive_name(path: &Path) -> bool {
@@ -263,9 +124,7 @@ fn archive_name(path: &Path) -> bool {
     name.contains(".zip") || name.contains(".jar")
 }
 
-const BANNER: &str = "Vineflower-rs: Native Java decompiler\nBy YinMo19.";
-
-fn print_plugins() {
+fn print_plugins(command: &clap::Command) {
     let plugins = [
         (
             "VariableRenaming",
@@ -277,27 +136,16 @@ fn print_plugins() {
             "Decompiles code inserted by Intellij IDEA's @NotNull annotation.",
         ),
     ];
-    println!("{BANNER}\n\nLoaded {} plugins:", plugins.len());
+    if let Some(about) = command.get_about() {
+        println!("{about}");
+    }
+    if let Some(credit) = command.get_after_help() {
+        println!("{credit}");
+    }
+    println!("\nLoaded {} plugins:", plugins.len());
     for (name, description) in plugins {
         println!("{name} (loaded from native binary)\n - {description}\n");
     }
-}
-
-fn print_help() {
-    println!(
-        "{BANNER}\n\n\
-        Usage: vineflower-rs [options] <source>... [destination]\n\n\
-        Supply class files, directories or archives as sources. Omit the destination for stdout.\n\
-        --folder           Unpack classes and resources into a directory\n\
-        --file             Write output to a ZIP or JAR\n\
-        --legacy-saving    Keep input archives under their original names\n\
-        --add-external=PATH[,PATH]  Add libraries for lookups\n\
-        --only=PREFIX[,PREFIX]      Select classes by internal-name prefix\n\
-        --thread-count=N, -thr=N    Worker threads (default: all available processors)\n\
-        --list-plugins     Display loaded plugin information\n\
-        -cfg PATH          Read one command-line argument per line\n\
-        -s, --silent       Suppress informational logs"
-    );
 }
 
 struct ConsoleLogger;

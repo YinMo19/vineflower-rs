@@ -21,6 +21,7 @@ pub struct BasicBlock {
 
 impl BasicBlock {
     /// `new BasicBlock(id)`.
+    #[expect(clippy::new_ret_no_self, reason = "blocks are allocated in the IR arena")]
     pub fn new(ir: &mut Ir, id: i32) -> BlockId {
         ir.blocks.push(BasicBlock {
             id,

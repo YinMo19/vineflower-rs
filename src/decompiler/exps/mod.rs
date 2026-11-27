@@ -485,6 +485,7 @@ impl SwitchCaseValues {
 }
 
 impl Expr {
+    #[expect(clippy::new_ret_no_self, reason = "expressions are allocated in the IR arena")]
     pub fn new(
         ir: &mut Ir,
         counters: &mut CounterContainer,

@@ -197,20 +197,17 @@ fn snapshot(cx: &Cx, id: ClassNodeId, rows: &mut Vec<String>) {
                     .get(p)
                     .map(|(method, v)| format!("{method}@{},{}", v.var, v.version));
                 rows.push(format!(
-                    "var {},{} {} {fin} {} {} {} {}",
+                    "var {},{} {} {fin} {} {} {} {} {}",
                     p.var,
                     p.version,
                     name.as_deref().unwrap_or("null"),
                     vars.this_vars.get(p).map_or("null", |s| s.as_str()),
                     vars.inherited_names.contains_key(p),
                     vars.external_vars.contains(p),
-                    format!(
-                        "{} {}",
-                        source.as_deref().unwrap_or("-"),
-                        vars.local_variables
-                            .get(p)
-                            .map_or_else(|| "null".to_owned(), |lv| lv.to_string())
-                    )
+                    source.as_deref().unwrap_or("-"),
+                    vars.local_variables
+                        .get(p)
+                        .map_or_else(|| "null".to_owned(), |lv| lv.to_string())
                 ));
             }
             expression_rows(cx, body.root, method.variables, rows);

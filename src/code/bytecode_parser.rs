@@ -113,14 +113,11 @@ pub fn parse_bytecode(
                         group = GROUP_INVOCATION;
                     }
                 }
-                OPC_INVOKEDYNAMIC => {
-                    // instruction unused in Java 6 and before
-                    if bytecode_version.has_invoke_dynamic() {
-                        operands.push(input.read_unsigned_short()?);
-                        input.discard(2)?;
-                        group = GROUP_INVOCATION;
-                        i += 4;
-                    }
+                OPC_INVOKEDYNAMIC if bytecode_version.has_invoke_dynamic() => {
+                    operands.push(input.read_unsigned_short()?);
+                    input.discard(2)?;
+                    group = GROUP_INVOCATION;
+                    i += 4;
                 }
                 OPC_ILOAD | OPC_LLOAD | OPC_FLOAD | OPC_DLOAD | OPC_ALOAD | OPC_ISTORE
                 | OPC_LSTORE | OPC_FSTORE | OPC_DSTORE | OPC_ASTORE | OPC_RET => {

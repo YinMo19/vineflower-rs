@@ -1052,9 +1052,9 @@ fn write_cfg(out: &mut impl Write, ir: &Ir, graph: &ControlFlowGraph) -> io::Res
             if original >= 0 {
                 continue;
             }
-            write_int(out, i32::from(instruction.opcode))?;
+            write_int(out, instruction.opcode)?;
             write_flag(out, instruction.wide)?;
-            write_int(out, i32::from(instruction.group))?;
+            write_int(out, instruction.group)?;
             write_int(out, instruction.start_offset)?;
             write_int(out, instruction.length)?;
             write_ints(
