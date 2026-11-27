@@ -33,6 +33,38 @@ fn help_lists_commands_and_decompiler_preferences() {
 }
 
 #[test]
+fn root_help_places_the_credit_and_decompilation_examples_before_commands() {
+    for args in [&[][..], &["-h"], &["--help"]] {
+        let help = stdout(Command::new(CLI).args(args));
+        assert_eq!(help.lines().nth(1), Some("By YinMo19."), "{args:?}");
+        let (_, usage) = help.split_once("Usage:").expect("missing usage");
+        let (intro, _) = usage.split_once("Commands:").expect("missing commands");
+        let (_, examples) = intro
+            .split_once("Examples:")
+            .expect("missing examples after usage");
+        for command in [
+            "vineflower-rs app.jar out/",
+            "vineflower-rs Example.class",
+            "vineflower-rs --file app.jar sources.zip",
+        ] {
+            assert!(
+                examples.lines().any(|line| line.trim() == command),
+                "{command}"
+            );
+        }
+    }
+
+    for (args, marker) in [
+        (&["completions", "--help"][..], "powershell"),
+        (&["--list-plugins"][..], "Kotlin"),
+    ] {
+        let output = stdout(Command::new(CLI).args(args));
+        assert!(output.contains(marker), "{args:?}");
+        assert!(!output.contains("Examples:"), "{args:?}");
+    }
+}
+
+#[test]
 fn completions_register_the_cli_in_each_shell() {
     for (shell, registration) in [
         ("bash", "complete -F"),

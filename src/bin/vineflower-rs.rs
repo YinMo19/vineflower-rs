@@ -139,9 +139,6 @@ fn print_plugins(command: &clap::Command) {
     if let Some(about) = command.get_about() {
         println!("{about}");
     }
-    if let Some(credit) = command.get_after_help() {
-        println!("{credit}");
-    }
     println!("\nLoaded {} plugins:", plugins.len());
     for (name, description) in plugins {
         println!("{name} (loaded from native binary)\n - {description}\n");

@@ -11,15 +11,17 @@ use vineflower_rs::engine::{
 };
 
 /// Vineflower-rs: Native Java decompiler
+/// By YinMo19.
 ///
 /// Boolean preferences accept --name, --no-name, or --name=true/false/1/0.
 /// Vineflower's three-letter options are also supported, e.g. -thr=4.
 #[derive(Parser)]
 #[command(
+    verbatim_doc_comment,
     name = env!("CARGO_BIN_NAME"),
     bin_name = env!("CARGO_BIN_NAME"),
     version,
-    after_help = "By YinMo19.",
+    help_template = help_template(),
     args_override_self = true
 )]
 #[command(group(ArgGroup::new("output mode").args(["folder", "file", "legacy_saving"])))]
@@ -73,6 +75,27 @@ pub(super) enum Action {
         #[arg(value_enum)]
         shell: Shell,
     },
+}
+
+fn help_template() -> String {
+    let styles = clap::builder::Styles::styled();
+    let heading = styles.get_header();
+    format!(
+        "{{about-with-newline}}
+{{usage-heading}} {{usage}}
+
+{heading}Examples:{heading:#}
+  # Decompile a JAR into the out/ directory
+  {{name}} app.jar out/
+
+  # Print the Java source for one class to the terminal
+  {{name}} Example.class
+
+  # Save the decompiled sources and resources in a ZIP
+  {{name}} --file app.jar sources.zip
+
+{{all-args}}"
+    )
 }
 
 pub(super) fn command() -> clap::Command {
