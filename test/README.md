@@ -1,5 +1,7 @@
 # Testing the native port
 
+The comparison with the official Java CLI covers eight published Maven artifacts. It also documents how the Elasticsearch generic-scope and `InternalEngine.closeNoLock` fixes were verified. [Large JAR parity report](large-jar-parity.md)
+
 Run the real-class smoke tests and the native source, API and CLI checks with
 
 ```sh
@@ -297,3 +299,22 @@ In a separate instrumented default run, copying 21,495 resources and preparing t
 An isolated prototype overlapped resource copying with class processing for a single JAR written to a fresh directory. An A/B/B/A run measured 7.49 and 7.77 s for the current code and 6.29 and 6.41 s for the prototype, a 16.8% reduction in mean elapsed time. All four output trees matched the Java reference. A separate collision test confirmed that generated source overwrote a same-named resource. The default implementation still copies resources first. This preserves the order in which copy errors and class diagnostics appear and matters when a resource overwrites an external library in an existing destination.
 
 A separate three-second macOS `sample` captured 5,844 class-preparation stacks across the 14 workers at a four-millisecond interval. Of those stacks, 72.2% included `simplify_stack_vars`, 38.7% included the SForms data-flow split, and 11.3% included `BTreeMap` subtree cloning. These inclusive samples overlap. A CPU optimization to measure next is reducing deep copies of variable-version maps during data-flow analysis.
+
+### Direct graph reuse and variable-version snapshots
+
+On the full Minecraft 26.3 client, an instrumented `v0.1.2` built 2,339,565 direct control-flow graphs. Stack inlining accounted for 583,797 builds immediately after SSAU, and variable type inference accounted for 211,923 immediately after SSA. The new code reuses the graph from the preceding analysis at both sites. Together they account for 34.0% of the original builds. Passes that change statement structure still build a fresh graph.
+
+The same run cloned 20,202,548 variable-version maps containing 169,480,939 entries. Local variables accounted for 129,630,671 entries. Exception edges separately copied 7,590,938 local entries. A snapshot now shares three ordered maps for fields, operand-stack slots and local variables. Writing to one of the three copies that tree only if another snapshot still holds it. Expression traversal also reads child IDs from borrowed slices and reserves space for the immediate children in one step.
+
+The following medians compare the ordinary release binaries against `v0.1.2` on the 14-core M4 Pro with JDK 25.0.2. Each binary had one warm-up per configuration followed by five interleaved pairs with alternating execution order. Each process wrote to a fresh directory with stdout redirected. CPU time sums user and system time across threads. Output verification ran outside the timed interval.
+
+| Input | Workers | Elapsed before / after (s) | Elapsed reduction | CPU before / after (s) |
+| --- | --- | ---: | ---: | ---: |
+| Minecraft 26.3 client | Auto | 7.758 / 7.510 | 3.2% | 59.39 / 56.25 |
+| Guava 33.3.1-jre | Auto | 0.687 / 0.646 | 6.0% | 5.87 / 5.74 |
+| Gson 2.11.0 | Auto | 0.155 / 0.151 | 2.5% | 0.74 / 0.73 |
+| Guava 33.3.1-jre | 1 | 3.495 / 3.267 | 6.5% | 3.47 / 3.25 |
+
+All 40 timed output trees matched the recorded Java reference for their input. Minecraft's median peak RSS went from 5.15 to 5.01 GiB. Individual elapsed times on that input ranged from 7.49 to 7.79 s before and 7.31 to 7.64 s after. For Gson the difference in medians was about 4 ms.
+
+A separate three-second sample of the updated Minecraft build captured 5,792 class-preparation stacks across 14 workers. Of those, 4,115 (71.0%) included stack-variable simplification, 2,335 (40.3%) included the SForms data-flow split, and 385 (6.6%) included B-tree cloning. These overlapping counts describe the sampled preparation stage. A remaining cost is that changing one local variable in a shared map can still copy every local entry in that snapshot.

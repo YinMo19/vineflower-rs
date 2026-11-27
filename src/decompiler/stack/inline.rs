@@ -6,7 +6,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::StackSimplifyOptions;
 use crate::decompiler::exps::{Expr, ExprKind, FunctionType, MonitorType};
-use crate::decompiler::flow::{DirectEdgeType, DirectGraph, NodeType, flatten::build_direct_graph};
+use crate::decompiler::flow::{DirectEdgeType, DirectGraph, NodeType};
 use crate::decompiler::ir::{ExprId, ExprListId, Ir, StatId};
 use crate::decompiler::sforms::{Ssau, SsauResult};
 use crate::decompiler::stats::{LoopType, StatementKind};
@@ -27,11 +27,11 @@ type Dependencies = FxHashMap<i32, FxHashSet<Version>>;
 pub(super) fn iterate_statements(
     cx: &mut Cx,
     counters: &mut CounterContainer,
-    root: StatId,
     ssau: &mut SsauResult,
     options: &StackSimplifyOptions,
 ) -> bool {
-    let graph = build_direct_graph(&mut cx.ir, root);
+    // SSAU and capture marking update variables without changing edges or expression lists.
+    let graph = &ssau.graph;
     let mut inliner = Inliner {
         cx,
         counters,
@@ -122,7 +122,7 @@ pub(super) fn iterate_statements(
             stat.set_loop_type(ir, LoopType::While);
         }
     }
-    inliner.apply_locals(&graph);
+    inliner.apply_locals(graph);
     changed
 }
 

@@ -1,5 +1,7 @@
 //! Expression order used by the statement and SSA passes.
 
+use std::slice;
+
 use crate::decompiler::ir::{ExprId, ExprListId, Ir, StatId};
 use crate::decompiler::stats::{LoopType, StatementKind};
 
@@ -9,23 +11,32 @@ impl Expr {
     /// The immediate expressions in `Exprent.getAllExprents()` order.
     /// Aliased expressions are yielded at each position where they occur.
     pub fn children(ir: &Ir, expr: ExprId) -> impl Iterator<Item = ExprId> + '_ {
-        let (leading, lists): ([Option<ExprId>; 2], [&[ExprId]; 2]) = match &ir[expr].kind {
-            ExprKind::Assert { condition, message } => ([*condition, *message], [&[], &[]]),
+        let (first, second) = Self::child_slices(ir, expr);
+        first.iter().chain(second).copied()
+    }
+
+    fn child_slices(ir: &Ir, expr: ExprId) -> (&[ExprId], &[ExprId]) {
+        match &ir[expr].kind {
+            ExprKind::Assert { condition, message } => (condition.as_slice(), message.as_slice()),
             ExprKind::Constant { .. } | ExprKind::Variable(_) | ExprKind::Switch { .. } => {
-                ([None, None], [&[], &[]])
+                (&[], &[])
             }
-            ExprKind::Assignment { left, right, .. } => ([Some(*left), Some(*right)], [&[], &[]]),
-            ExprKind::Array { array, index, .. } => ([Some(*array), Some(*index)], [&[], &[]]),
-            ExprKind::Field(field) => ([field.instance, None], [&[], &[]]),
-            ExprKind::Invocation(invoke) => ([invoke.instance, None], [&invoke.parameters, &[]]),
-            ExprKind::Function { operands, .. } => ([None, None], [operands, &[]]),
-            ExprKind::Pattern(pattern) => ([None, None], [&pattern.children, &[]]),
+            ExprKind::Assignment { left, right, .. } => {
+                (slice::from_ref(left), slice::from_ref(right))
+            }
+            ExprKind::Array { array, index, .. } => {
+                (slice::from_ref(array), slice::from_ref(index))
+            }
+            ExprKind::Field(field) => (field.instance.as_slice(), &[]),
+            ExprKind::Invocation(invoke) => (invoke.instance.as_slice(), &invoke.parameters),
+            ExprKind::Function { operands, .. } => (operands, &[]),
+            ExprKind::Pattern(pattern) => (&pattern.children, &[]),
             ExprKind::New {
                 new_type,
                 dimensions,
                 array_elements,
                 ..
-            } if new_type.array_dim != 0 => ([None, None], [dimensions, array_elements]),
+            } if new_type.array_dim != 0 => (dimensions, array_elements),
             ExprKind::New {
                 constructor: Some(constructor),
                 ..
@@ -34,23 +45,17 @@ impl Expr {
                 let ExprKind::Invocation(invoke) = &ir[*constructor].kind else {
                     unreachable!("NewExprent constructor must be an invocation");
                 };
-                ([invoke.instance, None], [&invoke.parameters, &[]])
+                (invoke.instance.as_slice(), &invoke.parameters)
             }
             ExprKind::New {
                 constructor: None, ..
-            } => ([None, None], [&[], &[]]),
-            ExprKind::Exit { value, .. } => ([*value, None], [&[], &[]]),
+            } => (&[], &[]),
+            ExprKind::Exit { value, .. } => (value.as_slice(), &[]),
             ExprKind::Monitor { value, .. }
             | ExprKind::SwitchHead { value, .. }
-            | ExprKind::Yield { value, .. } => {
-                ([Some(*value), None], [&[], &[]])
-            }
-            ExprKind::If { condition } => ([Some(*condition), None], [&[], &[]]),
-        };
-        leading
-            .into_iter()
-            .flatten()
-            .chain(lists.into_iter().flatten().copied())
+            | ExprKind::Yield { value, .. } => (slice::from_ref(value), &[]),
+            ExprKind::If { condition } => (slice::from_ref(condition), &[]),
+        }
     }
 
     /// `Exprent.getAllExprents(recursive, self)`.
@@ -67,7 +72,10 @@ impl Expr {
     /// reverse child order, as in `Exprent.getAllExprents`.
     pub(crate) fn append_exprents(ir: &Ir, expr: ExprId, recursive: bool, out: &mut Vec<ExprId>) {
         let start = out.len();
-        out.extend(Self::children(ir, expr));
+        let (first, second) = Self::child_slices(ir, expr);
+        out.reserve(first.len() + second.len());
+        out.extend_from_slice(first);
+        out.extend_from_slice(second);
         if recursive {
             for index in (start..out.len()).rev() {
                 Self::append_exprents(ir, out[index], true, out);

@@ -262,10 +262,11 @@ fn replace_assertion(
     for edge in throw_stat.get_successor_edges(ir, STATEDGE_ALL) {
         edge.remove(ir);
     }
-    for edge in stat.get_successor_edges(ir, STATEDGE_ALL) {
-        if ir[edge].edge_type == EdgeType::Break {
-            edge.change_source(ir, block);
-        }
+    // A surviving arm runs after the assertion. The original if's break
+    // leaves that whole sequence, whereas a trailing assertion exits directly.
+    let break_source = if branch.has_else { replacement } else { block };
+    for edge in stat.get_successor_edges(ir, EdgeType::Break.mask()) {
+        edge.change_source(ir, break_source);
     }
 
     let definitions = ir[stat].var_definitions.clone();

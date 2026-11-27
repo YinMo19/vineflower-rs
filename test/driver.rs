@@ -314,6 +314,73 @@ fn generic_inner_class_and_loop_survive_recompilation() {
 }
 
 #[test]
+#[ignore = "requires JDK 17 or later"]
+fn guarded_nested_finally_preserves_cleanup_and_exception_paths() {
+    use upstream_reference::{jdk_tool, run};
+
+    let scratch = tempfile::tempdir().unwrap();
+    let classes = scratch.path().join("classes");
+    let output = scratch.path().join("output");
+    let rebuilt = scratch.path().join("rebuilt");
+    compile_java17(&[Path::new("test/support/CloseTransaction.java")], &classes);
+    run(Command::new(env!("CARGO_BIN_EXE_vineflower-rs"))
+        .arg("--include-runtime=0")
+        .arg(&classes)
+        .arg(&output));
+    let rendered = output.join("CloseTransaction.java");
+    let source = fs::read_to_string(&rendered).unwrap();
+    assert!(!source.contains("Couldn't be decompiled"), "{source}");
+    // A spurious exit from the assertion leaves a labeled, empty then arm.
+    assert!(source.contains("if (open) {"), "{source}");
+    compile_java17(&[&rendered], &rebuilt);
+    for classpath in [classes, rebuilt] {
+        let execution = run(Command::new(jdk_tool("java"))
+            .args(["-ea", "-cp"])
+            .arg(classpath)
+            .arg("CloseTransaction"));
+        let lines = String::from_utf8(execution.stdout).unwrap();
+        assert_eq!(
+            lines.lines().collect::<Vec<_>>(),
+            ["assert", "1345", "12345", "135!", "1345!", "1345!"]
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires JDK 17 or later"]
+fn local_class_keeps_its_generic_scope_when_enclosing_method_is_referenced() {
+    let scratch = tempfile::tempdir().unwrap();
+    let classes = scratch.path().join("classes");
+    let output = scratch.path().join("output");
+    let rebuilt = scratch.path().join("rebuilt");
+    compile_java17(&[Path::new("test/support/ScopedReferences.java")], &classes);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_vineflower-rs"))
+        .arg(&classes)
+        .arg(&output)
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("decompiling ScopedReferences exceeded 30 seconds");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(child.wait().unwrap().success());
+
+    let rendered = output.join("ScopedReferences.java");
+    let source = fs::read_to_string(&rendered).unwrap();
+    // The method reference in length() must not replace copy()'s bound for T.
+    assert!(source.contains("T apply(T input)"), "{source}");
+    compile_java17(&[&rendered], &rebuilt);
+    assert_eq!(run_main(&rebuilt, "ScopedReferences"), b"5");
+}
+
+#[test]
 #[ignore = "requires the upstream +local.jar and JDK 17 or later"]
 fn nested_constructor_and_switch_map_survive_class_and_unit_order() {
     use upstream_reference::{jdk_tool, run, upstream_jar};

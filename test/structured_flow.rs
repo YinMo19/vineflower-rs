@@ -128,6 +128,54 @@ fn structure_retains_statement_and_edge_links() {
 }
 
 #[test]
+fn secondary_preserves_an_empty_then_with_another_predecessor() {
+    use vineflower_rs::decompiler::stats::stat_edge::StatEdge;
+    use vineflower_rs::engine::method_processor::expression_method;
+
+    let options = Arc::new(Options::default());
+    let mut cx = make_context(&options);
+    let class = parse_class(
+        include_bytes!("smoke/java8/TestCompoundAssignment.class"),
+        &options,
+    )
+    .unwrap();
+    let member = class.get_method("testComplexTernary", "(IIIIZ)I").unwrap();
+    let mut method = expression_method(&mut cx, &class, member).unwrap().unwrap();
+    let (stat, branch) = std::iter::successors(Some(method.root), |&stat| cx.ir[stat].first)
+        .find_map(|stat| match cx.ir[stat].kind {
+            StatementKind::If(branch) if branch.has_else => Some((stat, branch)),
+            _ => None,
+        })
+        .expect("the first ternary has two branches");
+    let empty = branch.if_stat.unwrap();
+    let other = branch.else_stat.unwrap();
+    let body = cx.ir[empty].exprents.unwrap();
+    cx.ir[body].clear();
+    let successor = cx.ir[empty].first_successor().unwrap();
+    cx.ir[successor].explicit = false;
+    let jump = StatEdge::new(&mut cx.ir, EdgeType::Break, other, empty, Some(stat));
+    other.add_successor(&mut cx.ir, jump);
+
+    method.identify_secondary(&mut cx).unwrap();
+    assert!(cx.ir[stat].stats.contains(&empty));
+    assert_eq!(
+        cx.ir[empty].all_predecessors(),
+        &[branch.if_edge.unwrap(), jump]
+    );
+    assert_eq!(cx.ir[jump].destination, empty);
+
+    jump.remove(&mut cx.ir);
+    method.identify_secondary(&mut cx).unwrap();
+    let StatementKind::If(folded) = cx.ir[stat].kind else {
+        unreachable!()
+    };
+    assert_eq!(folded.if_stat, Some(other));
+    assert_eq!(folded.if_edge, branch.else_edge);
+    assert!(!folded.has_else);
+    assert!(!cx.ir[stat].stats.contains(&empty));
+}
+
+#[test]
 fn structured_method_lifts_switch_expressions() {
     let options = Arc::new(Options::default());
     let mut cx = make_context(&options);
@@ -463,6 +511,42 @@ fn structured_flow_matches_upstream() {
 #[ignore = "requires the upstream +local.jar and JDK 17 or later"]
 fn ssa_matches_upstream() {
     check_flow(Check::Ssa);
+}
+
+#[test]
+fn version_map_clone_and_union_keep_variable_domains_independent() {
+    use vineflower_rs::decompiler::{exps::STACK_BASE, sforms::VersionMap};
+    use vineflower_rs::util::fast_sparse_set::FastSparseSetFactory;
+
+    const FIELD: i32 = -1;
+    const LOCAL: i32 = 0;
+    let factory = FastSparseSetFactory::new(0..=160);
+    let entries = [(FIELD, 1), (STACK_BASE, 2), (LOCAL, 3)];
+    let mut original = VersionMap::new(&factory);
+    for (key, version) in entries {
+        original.set_current(key, version);
+    }
+
+    let mut branch = original.clone();
+    branch.get_mut(LOCAL).unwrap().add(160);
+    branch.clear_fields();
+    branch.clear_stacks();
+    assert!(branch.get(FIELD).is_none() && branch.get(STACK_BASE).is_none());
+    assert_eq!(branch.get(LOCAL).unwrap().iter().collect_vec(), [3, 160]);
+
+    branch.union(&original);
+    assert_eq!(branch.get(FIELD).unwrap().iter().collect_vec(), [1]);
+    assert_eq!(branch.get(STACK_BASE).unwrap().iter().collect_vec(), [2]);
+    branch.set_current(FIELD, 4);
+    branch.get_mut(STACK_BASE).unwrap().add(159);
+    assert_eq!(branch.get(FIELD).unwrap().iter().collect_vec(), [4]);
+    assert_eq!(
+        branch.get(STACK_BASE).unwrap().iter().collect_vec(),
+        [2, 159]
+    );
+    for (key, version) in entries {
+        assert_eq!(original.get(key).unwrap().iter().collect_vec(), [version]);
+    }
 }
 
 #[test]

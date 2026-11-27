@@ -3,28 +3,48 @@
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 use std::fmt;
+use std::rc::Rc;
 
 use crate::decompiler::exps::STACK_BASE;
 use crate::util::fast_sparse_set::{FastSparseSet, FastSparseSetFactory};
 
 pub type Versions = FastSparseSet<i32>;
 
+// A flow or liveness snapshot shares each tree until the first write to that
+// domain. An exception edge can share locals while discarding stacks and fields.
+type Domain = Rc<BTreeMap<i32, Versions>>;
+
+thread_local! {
+    static EMPTY_DOMAIN: Domain = Rc::new(BTreeMap::new());
+}
+
+fn clear_domain(domain: &mut Domain) {
+    if !domain.is_empty() {
+        if let Some(unique) = Rc::get_mut(domain) {
+            unique.clear();
+        } else {
+            *domain = EMPTY_DOMAIN.with(Rc::clone);
+        }
+    }
+}
+
 /// `SFormsFastMapDirect`, with sparse storage within each variable domain.
 #[derive(Clone)]
 pub struct VersionMap {
     factory: FastSparseSetFactory<i32>,
-    fields: BTreeMap<i32, Versions>,
-    stacks: BTreeMap<i32, Versions>,
-    locals: BTreeMap<i32, Versions>,
+    fields: Domain,
+    stacks: Domain,
+    locals: Domain,
 }
 
 impl VersionMap {
     pub fn new(factory: &FastSparseSetFactory<i32>) -> Self {
+        let empty = EMPTY_DOMAIN.with(Rc::clone);
         Self {
             factory: factory.clone(),
-            fields: BTreeMap::new(),
-            stacks: BTreeMap::new(),
-            locals: BTreeMap::new(),
+            fields: empty.clone(),
+            stacks: empty.clone(),
+            locals: empty,
         }
     }
 
@@ -41,20 +61,22 @@ impl VersionMap {
     }
 
     pub fn get_mut(&mut self, key: i32) -> Option<&mut Versions> {
-        self.domain_mut(key).get_mut(&key)
+        self.domain_containing_mut(key)?.get_mut(&key)
     }
 
     pub fn put(&mut self, key: i32, versions: Versions) {
-        self.domain_mut(key).insert(key, versions);
+        Rc::make_mut(self.domain_mut(key)).insert(key, versions);
     }
 
     pub fn remove(&mut self, key: i32) -> Option<Versions> {
-        self.domain_mut(key).remove(&key)
+        self.domain_containing_mut(key)?.remove(&key)
     }
 
     pub(crate) fn retain(&mut self, mut keep: impl FnMut(i32, &mut Versions) -> bool) {
         for domain in [&mut self.fields, &mut self.stacks, &mut self.locals] {
-            domain.retain(|&key, versions| keep(key, versions));
+            if !domain.is_empty() {
+                Rc::make_mut(domain).retain(|&key, versions| keep(key, versions));
+            }
         }
     }
 
@@ -65,54 +87,67 @@ impl VersionMap {
     }
 
     pub fn clear_fields(&mut self) {
-        self.fields.clear();
+        clear_domain(&mut self.fields);
     }
 
     pub fn clear_stacks(&mut self) {
-        self.stacks.clear();
+        clear_domain(&mut self.stacks);
     }
 
     /// Throwing clears the operand stack and invalidates tracked field reads.
     pub(super) fn catchable_locals(&self) -> Self {
+        let empty = EMPTY_DOMAIN.with(Rc::clone);
         Self {
+            factory: self.factory.clone(),
+            fields: empty.clone(),
+            stacks: empty,
             locals: self.locals.clone(),
-            ..Self::new(&self.factory)
         }
     }
 
     pub fn union(&mut self, other: &Self) {
-        for (key, versions) in other.iter() {
-            match self.domain_mut(key).entry(key) {
-                Entry::Occupied(mut slot) => slot.get_mut().union(versions),
-                Entry::Vacant(slot) => {
-                    slot.insert(versions.clone());
+        for (domain, incoming) in [
+            (&mut self.fields, &other.fields),
+            (&mut self.stacks, &other.stacks),
+            (&mut self.locals, &other.locals),
+        ] {
+            if incoming.is_empty() {
+                continue;
+            }
+            if domain.is_empty() {
+                *domain = incoming.clone();
+                continue;
+            }
+            let domain = Rc::make_mut(domain);
+            for (&key, versions) in incoming.iter() {
+                match domain.entry(key) {
+                    Entry::Occupied(mut slot) => slot.get_mut().union(versions),
+                    Entry::Vacant(slot) => {
+                        slot.insert(versions.clone());
+                    }
                 }
             }
         }
     }
 
     pub fn intersection(&mut self, other: &Self) {
-        for domain in [&mut self.fields, &mut self.stacks, &mut self.locals] {
-            domain.retain(|&key, versions| {
-                let Some(overlap) = other.get(key) else {
-                    return false;
-                };
-                versions.intersection(overlap);
-                !versions.is_empty()
-            });
-        }
+        self.retain(|key, versions| {
+            let Some(overlap) = other.get(key) else {
+                return false;
+            };
+            versions.intersection(overlap);
+            !versions.is_empty()
+        });
     }
 
     pub fn complement(&mut self, other: &Self) {
-        for domain in [&mut self.fields, &mut self.stacks, &mut self.locals] {
-            domain.retain(|&key, versions| {
-                let Some(removed) = other.get(key) else {
-                    return true;
-                };
-                versions.complement(removed);
-                !versions.is_empty()
-            });
-        }
+        self.retain(|key, versions| {
+            let Some(removed) = other.get(key) else {
+                return true;
+            };
+            versions.complement(removed);
+            !versions.is_empty()
+        });
     }
 
     /// `entryList()`: fields by increasing absolute index, then stack
@@ -121,8 +156,8 @@ impl VersionMap {
         self.fields
             .iter()
             .rev()
-            .chain(&self.stacks)
-            .chain(&self.locals)
+            .chain(self.stacks.iter())
+            .chain(self.locals.iter())
             .map(|(&key, versions)| (key, versions))
     }
 
@@ -136,7 +171,7 @@ impl VersionMap {
         }
     }
 
-    fn domain_mut(&mut self, key: i32) -> &mut BTreeMap<i32, Versions> {
+    fn domain_mut(&mut self, key: i32) -> &mut Domain {
         if key < 0 {
             &mut self.fields
         } else if key >= STACK_BASE {
@@ -144,6 +179,14 @@ impl VersionMap {
         } else {
             &mut self.locals
         }
+    }
+
+    fn domain_containing_mut(&mut self, key: i32) -> Option<&mut BTreeMap<i32, Versions>> {
+        let domain = self.domain_mut(key);
+        if Rc::strong_count(domain) > 1 && !domain.contains_key(&key) {
+            return None;
+        }
+        Some(Rc::make_mut(domain))
     }
 }
 

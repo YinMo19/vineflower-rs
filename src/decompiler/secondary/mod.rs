@@ -83,9 +83,11 @@ impl Rewrite<'_> {
         let Some(empty) = branch.if_stat.filter(|_| branch.has_else) else {
             return false;
         };
+        let if_edge = branch.if_edge.expect("If-else statement has no then edge");
         let successor = ir[empty].first_successor();
         if !ir[empty].exprents.is_some_and(|body| ir[body].is_empty())
             || successor.is_some_and(|edge| ir[edge].explicit)
+            || ir[empty].all_predecessors() != [if_edge]
         {
             return false;
         }
@@ -102,7 +104,7 @@ impl Rewrite<'_> {
             }
             stat.add_successor(ir, edge);
         }
-        branch.if_edge.unwrap().remove(ir);
+        if_edge.remove(ir);
         let StatementKind::If(branch) = &mut ir[stat].kind else {
             unreachable!()
         };

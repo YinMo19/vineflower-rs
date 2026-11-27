@@ -48,14 +48,14 @@ pub fn simplify_stack_vars(
             effectively_final::mark(cx, root, &ssau.versions);
             first = false;
         }
-        changed |= inline::iterate_statements(cx, counters, root, &mut ssau, options);
+        changed |= inline::iterate_statements(cx, counters, &mut ssau, options);
         reset_versions(&mut cx.ir, root);
         if !changed {
             break;
         }
     }
     let mut ssau = split_ssau(&mut cx.ir, root, &method);
-    inline::iterate_statements(cx, counters, root, &mut ssau, options);
+    inline::iterate_statements(cx, counters, &mut ssau, options);
     reset_versions(&mut cx.ir, root);
 }
 

@@ -7,7 +7,7 @@ use rustc_hash::FxHashMap;
 use super::var_version_pair::VarVersionPair as Version;
 use crate::decompiler::exps::ExprKind;
 use crate::decompiler::ir::{StatId, VarProcessorId};
-use crate::decompiler::{flow::flatten::build_direct_graph, sforms::split_ssa};
+use crate::decompiler::sforms::split_ssa;
 use crate::engine::{
     Cx,
     counter_container::{CounterContainer, VAR_COUNTER},
@@ -105,11 +105,10 @@ pub(crate) fn set_versions(
     .original;
     let method = std::sync::Arc::clone(root.method(&cx.ir));
     let ssa = split_ssa(&mut cx.ir, root, &method);
-    let graph = build_direct_graph(&mut cx.ir, root);
     let reps = ssa.versions.phi_representatives();
     // No pass below changes the shape of an expression. Preserve repeated
     // visits to shared nodes when applying the upstream graph traversal.
-    let expressions = graph.deep_exprents(&cx.ir);
+    let expressions = ssa.graph.deep_exprents(&cx.ir);
     for &id in &expressions {
         if let ExprKind::Variable(var) = &mut cx.ir[id].kind
             && let Some(&version) = reps.get(&var.pair())

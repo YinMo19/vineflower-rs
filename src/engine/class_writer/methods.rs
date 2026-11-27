@@ -12,7 +12,7 @@ use super::{javadoc, records, with_method_for_writing};
 use crate::code::code_constants::{
     ACC_ABSTRACT, ACC_ANNOTATION, ACC_BRIDGE, ACC_ENUM, ACC_FINAL, ACC_INTERFACE, ACC_NATIVE,
     ACC_PRIVATE, ACC_PROTECTED, ACC_PUBLIC, ACC_STATIC, ACC_STRICT, ACC_SYNCHRONIZED, CLINIT_NAME,
-    CONSTANT_METHODHANDLE_REF_NEWINVOKESPECIAL, INIT_NAME,
+    INIT_NAME,
 };
 use crate::decompiler::exps::literal::add_offsets;
 use crate::decompiler::stats::{StatementKind, write};
@@ -475,7 +475,7 @@ fn verification_parameters(
 fn generic_context(cx: &Cx, node: ClassNodeId) -> GenericsChecker {
     let mut checker = GenericsChecker::default();
     let mut current = Some(node);
-    'parents: while let Some(id) = current {
+    while let Some(id) = current {
         let node = &cx.class_nodes[id];
         if let (Some(key), Some(parent)) = (&node.enclosing_method, node.parent) {
             let parent = &cx.class_nodes[parent];
@@ -484,18 +484,18 @@ fn generic_context(cx: &Cx, node: ClassNodeId) -> GenericsChecker {
                     checker = checker
                         .copy_with(&signature.type_parameters, &signature.type_parameter_bounds);
                 }
-                for &child in &parent.nested {
-                    let lambda = &cx.class_nodes[child];
-                    if lambda.kind == ClassKind::Lambda
-                        && let Some(info) = &lambda.lambda
-                        && info.content_method_key == *key
-                        && (info.content_method_invocation_type
-                            != CONSTANT_METHODHANDLE_REF_NEWINVOKESPECIAL
-                            || info.content_class_name == parent.class.qualified_name)
-                    {
-                        current = Some(child);
-                        continue 'parents;
-                    }
+                // A local or anonymous class in a lambda body is attached to the
+                // declaring class. Lambda nodes already have their lexical parent.
+                if matches!(node.kind, ClassKind::Local | ClassKind::Anonymous)
+                    && method.is_synthetic()
+                    && let Some(&body) = parent.nested.iter().find(|&&child| {
+                        cx.class_nodes[child].lambda.as_ref().is_some_and(|info| {
+                            !info.is_method_reference && info.content_method_key == *key
+                        })
+                    })
+                {
+                    current = Some(body);
+                    continue;
                 }
             }
         }
