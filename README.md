@@ -21,7 +21,9 @@ Pull requests are welcome. Feel free to use AI tools, but please write the PR de
 
 ```sh
 curl -fsSL https://github.com/YinMo19/vineflower-rs/releases/latest/download/install.sh | sh
-"$HOME/.local/bin/vineflower-rs" input.jar out/
+
+# add $HOME/.local/bin/ to your path.
+vineflower-rs input.jar out/
 ```
 
 **Windows (PowerShell)**
