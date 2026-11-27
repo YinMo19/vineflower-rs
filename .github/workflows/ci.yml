@@ -1,0 +1,102 @@
+name: Build and release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and smoke-test ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {runner: ubuntu-22.04, target: x86_64-unknown-linux-gnu}
+          - {runner: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu}
+          - {runner: macos-15-intel, target: x86_64-apple-darwin}
+          - {runner: macos-15, target: aarch64-apple-darwin}
+          - {runner: windows-2022, target: x86_64-pc-windows-msvc}
+          - {runner: windows-11-arm, target: aarch64-pc-windows-msvc}
+    runs-on: ${{ matrix.runner }}
+    env:
+      TARGET: ${{ matrix.target }}
+      EXT: ${{ endsWith(matrix.target, '-windows-msvc') && '.exe' || '' }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build native release and verify decompilation
+        shell: bash
+        run: |
+          rustup toolchain install "stable-$TARGET" --profile minimal
+          cargo "+stable-$TARGET" build --locked --release --target "$TARGET" --bin vineflower-rs
+          mkdir dist
+          binary="dist/vineflower-rs-$TARGET$EXT"
+          cp "target/$TARGET/release/vineflower-rs$EXT" "$binary"
+          "$binary" --help > cli-help.txt
+          grep -F 'Usage: vineflower-rs' cli-help.txt
+          "$binary" --include-runtime=0 test/smoke/java16/TestRecordSimple.class smoke-output
+          git diff --no-index --ignore-blank-lines --ignore-cr-at-eol -- \
+            test/upstream/testData/results/pkg/TestRecordSimple.dec smoke-output/TestRecordSimple.java
+      - name: Verify the Windows installer with the freshly built executable
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $asset = "vineflower-rs-$env:TARGET.exe"
+          $hash = (Get-FileHash "dist/$asset" -Algorithm SHA256).Hash
+          "$hash  $asset" | Set-Content dist/SHA256SUMS -Encoding ascii
+          function Invoke-WebRequest([switch] $UseBasicParsing, [uri] $Uri, [string] $OutFile) {
+            Copy-Item -LiteralPath (Join-Path dist $Uri.Segments[-1]) -Destination $OutFile
+          }
+          Get-Content -Raw ./install.ps1 | Invoke-Expression
+          $installed = (Get-Command vineflower-rs.exe).Source
+          if ((Get-FileHash -LiteralPath $installed).Hash -ne $hash) { throw 'Installed executable differs from the build' }
+          vineflower-rs --help
+      - uses: actions/upload-artifact@v7
+        with:
+          path: dist/vineflower-rs-${{ matrix.target }}${{ env.EXT }}
+          archive: false
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    concurrency:
+      group: release-${{ github.ref }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: vineflower-rs-*
+          path: dist
+          merge-multiple: true
+          skip-decompress: true
+      - name: Checksum and publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp install.sh install.ps1 dist/
+          cd dist
+          binaries=(vineflower-rs-*)
+          test "${#binaries[@]}" -eq 6
+          sha256sum "${binaries[@]}" install.sh install.ps1 > SHA256SUMS
+          if published=$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq '.isDraft'); then
+            if [[ "$published" == false ]]; then
+              gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name' | sort > "$RUNNER_TEMP/release-assets"
+              comm -23 <(printf '%s\n' * | sort) "$RUNNER_TEMP/release-assets" > "$RUNNER_TEMP/missing-assets"
+              test ! -s "$RUNNER_TEMP/missing-assets"
+              exit 0
+            fi
+            gh release upload "$GITHUB_REF_NAME" * --clobber
+            gh release edit "$GITHUB_REF_NAME" --draft=false
+          else
+            gh release create "$GITHUB_REF_NAME" * --verify-tag --generate-notes
+          fi

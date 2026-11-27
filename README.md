@@ -15,6 +15,22 @@ In terms of performance, on my M4 Pro, the Rust CLI was about 4.5× as fast as V
 
 Pull requests are welcome. Feel free to use AI tools, but please write the PR description yourself and explain what you changed and why. Code quality matters most to me. I’ll review PRs when I have time.
 
+## Install and use
+
+**macOS and Linux**
+
+```sh
+curl -fsSL https://github.com/YinMo19/vineflower-rs/releases/latest/download/install.sh | sh
+"$HOME/.local/bin/vineflower-rs" input.jar out/
+```
+
+**Windows (PowerShell)**
+
+```powershell
+irm https://github.com/YinMo19/vineflower-rs/releases/latest/download/install.ps1 | iex
+vineflower-rs input.jar out/
+```
+
 Licenses and Dependencies
 ---
 See [ABOUT.md](ABOUT.md) for details. We rewrote it based on the original Vineflower and retained the Apache 2.0 license.
