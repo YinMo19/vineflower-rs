@@ -263,7 +263,7 @@ fn archive_name(path: &Path) -> bool {
     name.contains(".zip") || name.contains(".jar")
 }
 
-const BANNER: &str = "=== Vineflower Decompiler 1.12.0 (native Rust) ===";
+const BANNER: &str = "Vineflower-rs: Native Java decompiler\nBy YinMo19.";
 
 fn print_plugins() {
     let plugins = [
