@@ -1,6 +1,3 @@
-// Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! Discover `LambdaMetafactory` call sites and attach their class nodes.
 
 use std::{

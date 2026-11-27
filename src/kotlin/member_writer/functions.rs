@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 use std::io;
 
 use super::{method_slot, modality_of, modality_word, visibility, visibility_of, write_parameters};

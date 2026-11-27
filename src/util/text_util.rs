@@ -1,6 +1,3 @@
-// Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! `util.TextUtil`: identifier checks and other small text helpers.
 
 use std::borrow::Cow;

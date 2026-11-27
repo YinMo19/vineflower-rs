@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 use std::sync::Arc;
 
 use vineflower_rs::decompiler::exps::{ConstantValue, literal::render};

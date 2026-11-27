@@ -1,6 +1,3 @@
-// Copyright 2000-2024 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! Reunite compatible versions of one bytecode local after SSA numbering.
 
 use std::{collections::VecDeque, io};

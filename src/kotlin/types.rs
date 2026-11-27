@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! Kotlin metadata classifier names, JVM descriptors and source type spelling.
 
 use std::io;

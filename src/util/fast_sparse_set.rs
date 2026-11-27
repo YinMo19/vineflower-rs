@@ -1,6 +1,3 @@
-// Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! `util.collections.FastSparseSetFactory` with its `FastSparseSet` and
 //! `FastSparseSetIterator`: bit sets over elements that a shared factory
 //! numbers in the order it first sees them.

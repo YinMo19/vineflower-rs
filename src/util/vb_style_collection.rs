@@ -1,6 +1,3 @@
-// Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! `util.collections.VBStyleCollection`: a list whose elements can also be
 //! looked up by key.
 

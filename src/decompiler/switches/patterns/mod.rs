@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! Recover Java type and enum switches from the SwitchBootstraps call.
 
 mod bootstrap;

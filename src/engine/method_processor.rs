@@ -1,6 +1,3 @@
-// Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! Method stages of `MethodProcessor.codeToJava`.
 //!
 //! The language-independent stages end immediately before upstream dispatches

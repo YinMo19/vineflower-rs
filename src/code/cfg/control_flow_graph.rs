@@ -1,6 +1,3 @@
-// Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! `code.cfg.ControlFlowGraph`: the method's basic blocks and their edges.
 
 use std::collections::{VecDeque, hash_map::Entry};

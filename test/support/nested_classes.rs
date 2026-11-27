@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 use super::*;
 use vineflower_rs::engine::{class_processor::initialize_java_wrappers, nested};
 

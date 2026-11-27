@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! Upstream's `util` packages: Java-compatible collections and text building.
 
 pub mod data_input;

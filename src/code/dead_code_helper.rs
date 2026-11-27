@@ -1,6 +1,3 @@
-// Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! `modules.code.DeadCodeHelper`: cleanup and normalization of a method CFG.
 
 use std::collections::VecDeque;

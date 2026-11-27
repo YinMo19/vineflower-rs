@@ -1,6 +1,3 @@
-// Copyright 2000-2024 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! Method results published together at the end of ClassWrapper.init.
 
 use arcstr::ArcStr;

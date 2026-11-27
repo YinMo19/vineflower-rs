@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! Kotlin contract effects and their conditional predicates.
 
 use super::{KParameter, KType};

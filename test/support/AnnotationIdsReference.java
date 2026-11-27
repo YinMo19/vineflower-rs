@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 import java.lang.annotation.*;
 import java.nio.file.Files;
 import java.nio.file.Path;

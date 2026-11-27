@@ -1,6 +1,3 @@
-// Copyright 2000-2020 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! Label rewrites used after declarations have been placed.
 
 use rustc_hash::FxHashSet;

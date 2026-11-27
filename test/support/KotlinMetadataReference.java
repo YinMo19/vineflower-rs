@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 import java.io.ByteArrayInputStream;
 import java.nio.file.Path;
 import java.util.Comparator;

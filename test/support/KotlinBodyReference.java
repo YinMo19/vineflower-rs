@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 import java.io.File;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;

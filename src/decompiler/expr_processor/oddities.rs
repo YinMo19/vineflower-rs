@@ -1,6 +1,3 @@
-// Copyright 2000-2024 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! Diagnostics for residual expressions that would make the method invalid Java.
 
 use std::io;

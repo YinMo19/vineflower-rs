@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! Parse the Kotlin JVM metadata annotation without binding declarations
 //! to fields or methods of the owning class.
 

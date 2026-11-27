@@ -1,5 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
-
 """Prepare the Minecraft 26.3 input layouts used for CLI memory comparisons."""
 
 import argparse

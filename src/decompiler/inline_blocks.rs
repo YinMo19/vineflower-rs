@@ -1,6 +1,3 @@
-// Copyright 2000-2020 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! Inline a sequence tail into the source of its single incoming break.
 
 use std::io;

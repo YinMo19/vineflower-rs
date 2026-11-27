@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! Expression subclass writers. A superclass call bypasses the dispatch
 //! for its own handle while retaining the children's dynamic types.
 

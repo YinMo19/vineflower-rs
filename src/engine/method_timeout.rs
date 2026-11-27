@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! Cooperative deadlines for code-to-source method processing.
 
 use std::cell::Cell;

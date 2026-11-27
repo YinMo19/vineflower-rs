@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! jlink stores the built-in loader assignments in a generated class. Read
 //! only the operands used to construct the Set assigned to bootModules.
 

@@ -1,6 +1,3 @@
-// Copyright 2000-2024 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! `InvocationExprent.getInferredExprType`, including qualifier and argument constraints.
 
 use std::{io, sync::Arc};

@@ -1,6 +1,3 @@
-// Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! `struct.gen.VarType` with `CodeType` and `TypeFamily`: the type of a
 //! value, and the lattice the type inference works on.
 //!

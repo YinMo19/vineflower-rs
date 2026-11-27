@@ -1,6 +1,3 @@
-// Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! `util.StartEndPair`: the first and last bytecode offset covered by a statement.
 
 use std::fmt;

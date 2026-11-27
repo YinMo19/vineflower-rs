@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! The decimal spelling produced by the Java 17 Float and Double wrappers.
 
 use num_bigint::BigUint;

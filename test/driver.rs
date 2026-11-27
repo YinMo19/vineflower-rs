@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 use std::{
     collections::BTreeMap, fs, io::Read, path::Path, process::Command, sync::Arc, time::Duration,
 };

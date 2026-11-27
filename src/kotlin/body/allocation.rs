@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! KNewExprent's constructor and array output.
 
 use std::io;

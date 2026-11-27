@@ -1,6 +1,3 @@
-// Copyright 2000-2018 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! Per-compilation-unit aggregation of method bytecode and original source lines.
 
 use super::bytecode_mapping_tracer::BytecodeMappingTracer;

@@ -1,6 +1,3 @@
-// Copyright 2000-2018 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! InvocationExprent source writing and argument-list reuse by NewExprent.
 
 mod classpath;

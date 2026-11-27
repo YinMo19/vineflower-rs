@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 use vineflower_rs::util::{text_buffer::TextBuffer, token::TokenKind};
 
 pub(super) fn compare_snapshot(oracle: &str, name: &str, actual: &mut TextBuffer) {

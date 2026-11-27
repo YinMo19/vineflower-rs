@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! Upstream's `code` package: the bytecode instruction model, and the decoder
 //! that builds it from a method's `Code` attribute.
 

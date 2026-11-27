@@ -1,6 +1,3 @@
-// Copyright 2000-2022 JetBrains s.r.o. and the ForgeFlower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! SingleFileContextSource registers a class by its internal name, regardless
 //! of the name of the file supplied on the command line.
 

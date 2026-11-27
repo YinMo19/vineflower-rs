@@ -1,6 +1,3 @@
-// Copyright 2000-2024 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! Standard output sinks for folder, archive and console output.
 
 use std::{

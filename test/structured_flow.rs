@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io::{self, BufRead, BufReader, BufWriter, Seek, Write};

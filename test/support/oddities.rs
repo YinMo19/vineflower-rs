@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 

@@ -1,6 +1,3 @@
-// Copyright 2000-2018 JetBrains s.r.o. and Kotlin Programming Language contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! Kotlin 2.2.20 metadata deserialization flags.
 
 use std::marker::PhantomData;

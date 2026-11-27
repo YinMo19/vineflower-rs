@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! Restore string selectors and literal labels from lowered string switches.
 
 mod cases;

@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! Vineflower's shortening of Java Float and Double strings for source output.
 
 use crate::util::java_decimal;

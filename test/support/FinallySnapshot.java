@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.IdentityHashMap;

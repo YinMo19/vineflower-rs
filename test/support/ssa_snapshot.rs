@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind};

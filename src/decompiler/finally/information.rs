@@ -1,6 +1,3 @@
-// Copyright 2000-2024 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! Track uses of the exception captured by a catch-all to identify its rethrows.
 
 use std::{collections::VecDeque, io};

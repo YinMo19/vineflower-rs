@@ -1,6 +1,3 @@
-// Copyright 2000-2025 Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! Name resolution in Vineflower's Kotlin JVM string table.
 
 use super::proto::jvm::{StringTableTypes, string_table_types::record::Operation};

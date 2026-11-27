@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! ContextUnit preparation. Workers own the initial method graphs until the
 //! coordinator reaches the corresponding root in publication order.
 

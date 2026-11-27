@@ -1,6 +1,3 @@
-// Copyright 2000-2024 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! Expression rendering retains the operand's IR identity through recursive
 //! calls so inference, qualifier state and source mappings follow the JVM tree.
 

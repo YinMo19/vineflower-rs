@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;

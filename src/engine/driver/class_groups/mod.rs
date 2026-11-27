@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! Each task prepares and renders its own Java roots. Bytecode and the class
 //! path are shared. Method graphs, class wrappers and import scopes stay local.
 

@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 use std::fs::File;
 use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};

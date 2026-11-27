@@ -1,6 +1,3 @@
-// Copyright 2000-2018 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! Constant expressions reconstructed from the value of the inlined field.
 
 use super::{BytecodeOffsets, Cx, FieldDescriptor, TextBuffer, static_field};

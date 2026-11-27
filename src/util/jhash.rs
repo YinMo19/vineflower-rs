@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! Maps and sets that iterate in the order of `java.util.HashMap`.
 //!
 //! Vineflower sometimes depends on the iteration order of hash collections

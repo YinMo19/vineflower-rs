@@ -1,6 +1,3 @@
-// Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! `util.TextBuffer`: generated source text together with the bytecode
 //! offsets, tokens and optional line breaks attached to positions in it.
 //!

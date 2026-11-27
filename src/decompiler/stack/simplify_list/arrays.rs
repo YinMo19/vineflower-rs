@@ -1,6 +1,3 @@
-// Copyright 2000-2018 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! Fold consecutive element writes into array allocations.
 
 use rustc_hash::FxHashMap;

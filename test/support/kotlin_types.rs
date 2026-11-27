@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 use crate::upstream_reference::Corpus;
 use std::{fmt::Write, fs, sync::Arc};
 use vineflower_rs::{

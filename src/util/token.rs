@@ -1,6 +1,3 @@
-// Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! `util.token`: the ranges of generated source that name a class, field,
 //! method or variable, and `main.extern.TextTokenVisitor`, which receives them.
 //!

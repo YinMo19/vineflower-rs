@@ -1,6 +1,3 @@
-// Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! `code.BytecodeVersion`: the class-file version of a class, and the
 //! language and VM features that version brings.
 

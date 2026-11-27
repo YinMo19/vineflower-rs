@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 import java.io.IOException;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;

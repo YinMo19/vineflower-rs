@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! Recover default argument values from Kotlin's mask and marker wrappers.
 
 use std::io;

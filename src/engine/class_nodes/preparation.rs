@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! The class facts used while lifting allocations and simplifying stack vars.
 //! Worker graphs carry the names they consulted back to wrapper publication.
 

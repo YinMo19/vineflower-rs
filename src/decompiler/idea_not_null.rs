@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! The bundled IdeaNotNull Java main-loop pass.
 
 use std::io;

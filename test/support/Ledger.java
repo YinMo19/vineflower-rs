@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 public class Ledger<K, V> {
     class Entry {
         final K key;

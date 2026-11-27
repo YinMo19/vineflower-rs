@@ -1,6 +1,3 @@
-// Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! ClassWriter.writeClass renders members into separate buffers so their
 //! bytecode ranges and skipped declarations agree with the final layout.
 

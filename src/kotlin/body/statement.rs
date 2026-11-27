@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! Kotlin's statement subclasses and KExprProcessor's jump wrapper.
 
 use std::io;

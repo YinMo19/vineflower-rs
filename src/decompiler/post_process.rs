@@ -1,6 +1,3 @@
-// Copyright 2000-2024 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! Return and monitor rewrites after switch simplification.
 
 use super::exps::{ExitType, Expr, ExprKind, Variable};

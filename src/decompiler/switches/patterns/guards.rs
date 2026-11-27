@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! Remove restart-index assignments and recover guarded case conditions.
 
 use std::collections::VecDeque;

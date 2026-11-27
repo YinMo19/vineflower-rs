@@ -1,6 +1,3 @@
-// Copyright 2000-2024 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! NewExprent.setLambdaGenericTypes publishes the SAM's inferred signature
 //! into the method body immediately before ClassWriter renders the lambda.
 

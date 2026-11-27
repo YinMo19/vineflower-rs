@@ -1,6 +1,3 @@
-// Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! `struct.StructContext`: every class the decompiler knows about — the
 //! classes to decompile, loaded up front, and the library classes, loaded
 //! when something first asks for them.

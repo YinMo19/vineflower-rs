@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 import java.nio.file.Path;
 import java.util.Map;
 import org.jetbrains.java.decompiler.api.plugin.LanguageSpec;

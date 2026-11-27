@@ -1,6 +1,3 @@
-// Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! Arenas and handles of the statement / expression IR.
 //!
 //! Upstream's statements, edges, expressions and basic blocks form a mutable

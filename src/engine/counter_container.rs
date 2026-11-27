@@ -1,6 +1,3 @@
-// Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! `main.collectors.CounterContainer`: the per-method id counters whose
 //! values surface in the output as label numbers and variable names.
 

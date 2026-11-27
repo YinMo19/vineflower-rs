@@ -1,6 +1,3 @@
-// Copyright 2000-2024 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! Lexical name resolution for declarations, flow-scoped patterns and nested methods.
 
 use std::io;

@@ -1,6 +1,3 @@
-// Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! `code.InstructionSequence` and `code.FullInstructionSequence`: the
 //! instructions of a basic block, and those of a whole method together with
 //! its offset index and exception table.

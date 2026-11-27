@@ -1,6 +1,3 @@
-// Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! The graph traversal in ExprProcessor.processStatement. A node inherits the
 //! first incoming stack discovered, and every entry on that stack is a fresh
 //! copy. Expression IDs make both discovery order and copy order observable.

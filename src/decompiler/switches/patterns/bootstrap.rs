@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! Install the labels described by SwitchBootstraps arguments.
 
 use std::io;

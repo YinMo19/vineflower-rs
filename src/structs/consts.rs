@@ -1,6 +1,3 @@
-// Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! `struct.consts`: the constant pool of a class with its two kinds of
 //! entries, `PrimitiveConstant` (a value, or a name) and `LinkConstant` (a
 //! reference to a class member).

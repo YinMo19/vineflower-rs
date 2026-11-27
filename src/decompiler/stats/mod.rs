@@ -1,6 +1,3 @@
-// Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! `modules.decompiler.stats.Statement` variants and the
 //! operations shared by statements in a control-flow graph.
 

@@ -1,6 +1,3 @@
-// Copyright 2000-2017 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! Sparse SSA with a distinct version for each use.
 
 use rustc_hash::{FxHashMap, FxHashSet};

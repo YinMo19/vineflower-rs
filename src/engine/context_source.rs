@@ -1,6 +1,3 @@
-// Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! `main.extern.IContextSource`: a place classes are read from — a
 //! directory, an archive, a single file, a runtime image.
 

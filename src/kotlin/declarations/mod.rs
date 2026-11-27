@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! Kotlin declaration types read from the metadata attached to JVM classes.
 
 mod contract;

@@ -1,6 +1,3 @@
-// Copyright 2000-2017 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! Immediate dominators in reverse postorder, as in `GenericDominatorEngine`.
 //! The result is a snapshot: exception-range passes continue to query it
 //! while they edit the live graph.

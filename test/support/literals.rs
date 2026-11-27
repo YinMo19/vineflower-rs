@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 use super::*;
 use vineflower_rs::{decompiler::exps::literal, util::token::TokenKind};
 

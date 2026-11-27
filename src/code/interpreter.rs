@@ -1,6 +1,3 @@
-// Copyright 2000-2020 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! `code.interpreter.InstructionImpact`: applies the local and stack effects
 //! of a decoded instruction. Wide values normally occupy two slots, with a
 //! `Group2empty` marker in the second slot.

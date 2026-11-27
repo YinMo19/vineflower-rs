@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! Kotlin class-based and invokedynamic lambdas, and callable references.
 
 use std::io;

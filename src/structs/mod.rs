@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! Upstream's `struct` packages: the loaded class model and the context
 //! classes are looked up in.
 

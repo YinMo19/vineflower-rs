@@ -1,6 +1,3 @@
-// Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! `struct.gen.generics`: `GenericMain`, the parser of `Signature`
 //! attributes, with the descriptors it produces (`GenericClassDescriptor`,
 //! `GenericFieldDescriptor`, `GenericMethodDescriptor`) and the

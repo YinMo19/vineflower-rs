@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! KotlinWriter's field and method writers for declarations without Kotlin bindings.
 
 use std::{io, sync::Arc};

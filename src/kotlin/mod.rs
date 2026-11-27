@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! The Kotlin language plugin bundled with Vineflower.
 
 pub mod body;

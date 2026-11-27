@@ -1,6 +1,3 @@
-// Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! Lifts the instructions in one basic block to expression trees and
 //! assignments to the synthetic variables that stand for the operand stack.
 

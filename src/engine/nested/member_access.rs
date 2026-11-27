@@ -1,6 +1,3 @@
-// Copyright 2000-2018 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! Eliminate synthetic accessors between classes in the same nested tree.
 
 use std::io;

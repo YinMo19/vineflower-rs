@@ -1,6 +1,3 @@
-// Copyright 2000-2017 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! The default IdentifierRenamer, with counters shared across class loading.
 
 use rustc_hash::FxHashSet;

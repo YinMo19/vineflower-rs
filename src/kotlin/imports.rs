@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! The additional reserved names and implicit packages of KotlinImportCollector.
 
 use super::types::MAPPED_CLASSES;

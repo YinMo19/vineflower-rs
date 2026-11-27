@@ -1,6 +1,3 @@
-// Copyright 2000-2020 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! Recover a counted for-loop from the initializer, loop condition and
 //! trailing action at a while-loop's continue target.
 

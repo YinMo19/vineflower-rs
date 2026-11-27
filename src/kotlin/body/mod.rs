@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! Kotlin's late replacements and its method-body objects. The arena holds
 //! actual replacements, including fresh counters and redirected statement
 //! edges. Kotlin-only subclass state is keyed by those replacement handles.

@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! The four structured forms of a lowered string switch.
 
 use crate::decompiler::exps::{ExitType, Expr, ExprKind, FunctionType};

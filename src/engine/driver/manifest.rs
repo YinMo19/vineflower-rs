@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! Java ZIP savers write a parsed JAR manifest when the input has one.
 
 use std::io;

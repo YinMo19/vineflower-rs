@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 use std::{fs, io::Write, process::Command};
 
 use super::upstream_reference::{jdk_tool, run, upstream_jar};

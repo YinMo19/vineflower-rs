@@ -1,6 +1,3 @@
-// Copyright 2000-2018 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! Replace synthetic parameters and fields by variables from enclosing scopes.
 
 use super::{ClassKind, ClassNodeId, Cx};

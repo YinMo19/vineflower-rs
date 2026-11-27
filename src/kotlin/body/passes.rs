@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! ReplaceStatsPass, ReplaceExprentsPass, ResugarKotlinMethodsPass and
 //! CollapseStringConcatPass. Traversal follows the owners' expression slots.
 

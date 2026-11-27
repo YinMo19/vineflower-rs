@@ -1,6 +1,3 @@
-// Copyright 2000-2024 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! SFormsConstructor's fixed-point iteration. Each sweep visits the entire
 //! direct graph in its stored order. A change schedules another sweep only
 //! when the affected successor has already been passed or is the current node.

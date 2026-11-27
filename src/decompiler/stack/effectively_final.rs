@@ -1,6 +1,3 @@
-// Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! Relate captured constructor arguments to the local assignments that must
 //! remain effectively final. This runs only on the first SSAU graph.
 

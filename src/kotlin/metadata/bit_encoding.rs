@@ -1,6 +1,3 @@
-// Copyright 2000-2018 JetBrains s.r.o. and Kotlin Programming Language contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! Decode the bytes embedded in the metadata annotation's d1 strings.
 
 use crate::util::java_str::JavaString;

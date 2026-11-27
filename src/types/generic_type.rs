@@ -1,6 +1,3 @@
-// Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! `struct.gen.generics.GenericType`: the type arguments, enclosing type and
 //! wildcard of a [`VarType`], the parser of generic signatures, and the
 //! assignability rules between parameterized types.

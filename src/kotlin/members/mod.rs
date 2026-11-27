@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! The attributes published by the Kotlin metadata parser on class, method,
 //! and field objects. The session retains their original JVM identities.
 

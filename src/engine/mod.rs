@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! Upstream's `main` packages: the decompilation session, its ambient
 //! context and the class-level processors.
 

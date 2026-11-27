@@ -1,6 +1,3 @@
-// Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! `struct.attr`: the class-file attributes the decompiler understands. Each
 //! type's `read` is upstream's `initContent`.
 //!

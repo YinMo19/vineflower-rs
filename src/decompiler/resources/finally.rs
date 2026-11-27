@@ -1,6 +1,3 @@
-// Copyright 2000-2024 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! The resource variable and primary exception are initialized before the outer finally.
 
 use super::{Initializer, catches_throwable, close_receiver, resource_list};

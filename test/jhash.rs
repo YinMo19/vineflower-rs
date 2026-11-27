@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 use std::env;
 use std::fmt::Write as _;
 use std::io::{Seek as _, Write as _};

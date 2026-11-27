@@ -1,6 +1,3 @@
-// Copyright 2000-2020 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! MergeHelper.enhanceLoops. A change to the loop type restarts this pass
 //! after the rest of the tree has been visited.
 

@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 use std::{fmt::Write, path::Path, sync::Arc};
 
 use crate::upstream_reference::Corpus;

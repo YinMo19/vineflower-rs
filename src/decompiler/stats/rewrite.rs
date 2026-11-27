@@ -1,6 +1,3 @@
-// Copyright 2000-2024 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! Tree and edge changes shared by statement recognition and replacement.
 
 use std::collections::VecDeque;

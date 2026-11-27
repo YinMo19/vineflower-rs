@@ -1,6 +1,3 @@
-// Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! `util.DataInputFullStream`: big-endian reads from the bytes of a class
 //! file, with the operations of `java.io.DataInputStream` that upstream uses.
 

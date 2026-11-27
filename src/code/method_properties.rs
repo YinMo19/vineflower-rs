@@ -1,6 +1,3 @@
-// Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! `code.MethodProperties`: what `MethodPropertiesProcessor` learns about a
 //! method from its bytecode before the method is decompiled.
 

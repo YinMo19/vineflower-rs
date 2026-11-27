@@ -1,6 +1,3 @@
-// Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! State tied to a method for the lifetime of its wrapper. Recomputing SSA
 //! replaces the version and type tables while keeping the naming state.
 

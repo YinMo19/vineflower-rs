@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 import java.io.BufferedInputStream;
 import java.io.DataInputStream;
 import java.io.IOException;

@@ -1,6 +1,3 @@
-// Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! `struct.StructMember`: what classes, fields and methods have in common —
 //! access flags and attributes.
 //!

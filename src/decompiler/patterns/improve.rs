@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! Narrow record components when a merged condition binds a stronger type.
 
 use std::io;

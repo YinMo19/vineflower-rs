@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 use crate::structs::StructMethod;
 use crate::types::{CodeType, VarType};
 use crate::util::text_util::is_keyword;

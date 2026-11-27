@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! Optional source documentation supplied by an embedder (IFabricJavadocProvider).
 
 use crate::structs::{StructClass, StructField, StructMethod};

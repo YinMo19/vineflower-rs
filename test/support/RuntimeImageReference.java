@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 import java.io.IOException;
 import java.lang.module.ModuleDescriptor;
 import java.net.URI;

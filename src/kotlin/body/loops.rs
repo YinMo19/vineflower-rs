@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! KDoStatement's loop printers and range recovery at the source boundary.
 
 use std::io;

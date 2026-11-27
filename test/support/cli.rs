@@ -1,6 +1,4 @@
 // Based on Vineflower's BulkDecompilationTest and CommandLineTest.
-// Copyright 2000-2018 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};

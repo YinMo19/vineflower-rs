@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! Canonical record constructor preparation before writing the class body.
 
 use std::{borrow::Cow, sync::Arc};

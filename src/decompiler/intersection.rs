@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! Combine nested reference casts using bounds from their uses.
 
 use std::io;

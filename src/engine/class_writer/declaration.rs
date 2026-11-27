@@ -1,6 +1,3 @@
-// Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! ClassWriter.writeClassDefinition, including the type signatures shared with members.
 
 use std::{io, sync::Arc};

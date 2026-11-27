@@ -1,6 +1,3 @@
-// Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! `code.CodeConstants`: variable type tags, access flags, instruction
 //! groups, constant pool tags and the JVM opcodes.
 

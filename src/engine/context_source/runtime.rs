@@ -1,6 +1,3 @@
-// Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! Java 9+ runtime libraries from the modular `lib/modules` image.
 
 use std::cmp::Ordering;

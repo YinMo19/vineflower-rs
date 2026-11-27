@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 import java.lang.reflect.InvocationTargetException;
 import java.util.Arrays;
 import org.jetbrains.java.decompiler.main.plugins.PluginSources;

@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 use std::{fmt::Write, io, sync::Arc};
 
 use arcstr::{ArcStr, literal};

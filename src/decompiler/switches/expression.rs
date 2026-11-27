@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! Recover switch result expressions and their yielding branches.
 
 use std::io;

@@ -1,6 +1,3 @@
-// Copyright 2000-2018 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! JVM descriptor lookup for preserving Java overload selection.
 
 use std::collections::VecDeque;

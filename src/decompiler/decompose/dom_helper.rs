@@ -1,6 +1,3 @@
-// Copyright 2000-2020 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! The initial statement graph built by `decompose.DomHelper`.
 
 use std::sync::Arc;

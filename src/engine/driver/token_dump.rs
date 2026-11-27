@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! The optional TextTokenDumpVisitor output.
 
 use crate::engine::Cx;

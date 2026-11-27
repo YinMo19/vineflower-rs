@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 use std::marker::PhantomData;
 use std::ops::{Index, IndexMut};
 use std::sync::Arc;

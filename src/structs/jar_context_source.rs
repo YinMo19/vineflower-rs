@@ -1,6 +1,3 @@
-// Copyright 2000-2022 JetBrains s.r.o. and the ForgeFlower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! The input side of `JarContextSource`, including other ZIP-based archives.
 
 use std::fs::File;

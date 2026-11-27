@@ -1,5 +1,4 @@
 # Registration data ported from Vineflower b8273988af850e8cfb234ca08d129058502b032f.
-# Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors; Apache-2.0.
 # Fields are TAB-separated. A case uses the preceding set and the shared fixture options.
 # case <version> <registration kind> <JVM internal name> <output override or -> <alternate .dec or -> [<companion> ...]
 fixture	log-level=warn	decompile-generics=1	remove-synthetic=1	remove-bridge=1	keep-literals=1	__unit_test_mode__=1	new-line-separator=1	error-message=	include-runtime=

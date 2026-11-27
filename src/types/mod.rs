@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! Upstream's `struct.gen` packages: JVM types, descriptors and generic
 //! signatures.
 

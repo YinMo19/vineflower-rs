@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 use super::upstream_reference::Corpus;
 use super::writer_snapshot::compare_snapshot;
 use std::sync::Arc;

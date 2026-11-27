@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! Upstream's `code.cfg` package: basic blocks and the control-flow graph.
 
 pub mod basic_block;

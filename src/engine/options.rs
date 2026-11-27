@@ -1,6 +1,3 @@
-// Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! The decompiler preferences of `IFernflowerPreferences` and of the bundled
 //! plugins. A field is named after its option key, so `decompile-generics`
 //! is `decompile_generics`.

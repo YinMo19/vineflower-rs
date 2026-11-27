@@ -1,6 +1,3 @@
-// Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! RecordHelper's declaration of the record components in a class header.
 
 use super::{annotations, type_annotations::TypeAnnotations};

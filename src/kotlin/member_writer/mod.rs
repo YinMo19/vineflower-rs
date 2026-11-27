@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! Source rendering for Kotlin functions, constructors, and properties.
 
 mod constructors;

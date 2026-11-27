@@ -1,6 +1,3 @@
-// Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! `modules.renamer.PoolInterceptor`: the old and new names of renamed
 //! classes and members, consulted while classes are loaded again.
 

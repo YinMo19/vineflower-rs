@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! Register the host or a configured JDK without starting a JVM.
 
 use std::{

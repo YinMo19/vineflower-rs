@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 use std::{env, fmt::Display, fs, io::Write, path::Path, process::Command, sync::Arc};
 
 #[path = "support/class_declarations.rs"]

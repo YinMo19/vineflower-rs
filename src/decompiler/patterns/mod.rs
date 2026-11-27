@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! Recover bindings introduced by a successful instanceof check.
 
 mod improve;

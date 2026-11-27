@@ -1,6 +1,3 @@
-// Copyright 2000-2017 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! Bound inference over the direct graph after merging SSA phi versions.
 
 use std::{collections::VecDeque, io};

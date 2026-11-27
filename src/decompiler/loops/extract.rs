@@ -1,6 +1,3 @@
-// Copyright 2000-2020 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! LoopExtractHelper: move an entry or exit conditional's body.
 
 use crate::decompiler::decompose::finish::condense_sequences;

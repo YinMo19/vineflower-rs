@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 use std::{env, fmt::Write, path::PathBuf, sync::Arc};
 
 use prost::Message;

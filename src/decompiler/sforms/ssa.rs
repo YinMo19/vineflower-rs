@@ -1,6 +1,3 @@
-// Copyright 2000-2021 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! Ordinary sparse SSA, where a read uses its reaching version or names a phi.
 
 use super::{Version, VersionAnalysis, VersionCounters, VersionMap, Versions};

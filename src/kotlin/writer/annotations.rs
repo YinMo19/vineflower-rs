@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! Annotation values, use-site prefixes and modifiers represented by JVM annotations.
 
 use std::io;

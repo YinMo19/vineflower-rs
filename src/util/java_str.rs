@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! Operations of `java.lang.String` whose results differ from those of
 //! their Rust look-alikes.
 

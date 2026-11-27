@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 import java.nio.charset.StandardCharsets;
 import java.util.HexFormat;
 import org.jetbrains.java.decompiler.util.TextBuffer;

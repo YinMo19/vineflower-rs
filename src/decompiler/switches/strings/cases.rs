@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-
 //! Recover string labels and the case targets attached to them.
 
 use rustc_hash::FxHashMap;

@@ -1,6 +1,3 @@
-// Copyright 2000-2024 JetBrains s.r.o. and the Vineflower contributors.
-// SPDX-License-Identifier: Apache-2.0
-
 //! Match each normal exit from a protected region against its finally handler.
 
 use std::collections::VecDeque;
